@@ -1,0 +1,14 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+node_modules
+apps/web/node_modules
+apps/web/dist
+.env
+.env.*
+!.env.example
+edge-data
+**/*.sqlite
+**/*.sqlite3
+*.log
