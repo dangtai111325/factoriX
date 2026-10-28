@@ -31,6 +31,8 @@ class HttpPullConnector:
                 response = await client.get(url, headers=headers or {})
         except httpx.HTTPError as exc:
             raise ConnectorError("NETWORK", "HTTP pull không kết nối được.") from exc
+        if 300 <= response.status_code < 400:
+            raise ConnectorError("REDIRECT", "HTTP redirect bị từ chối.")
         if response.status_code == 401:
             raise ConnectorError("AUTH", "HTTP từ chối xác thực.")
         if response.status_code == 429:

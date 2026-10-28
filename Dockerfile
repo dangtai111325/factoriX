@@ -34,6 +34,8 @@ ENV PATH="/usr/lib/postgresql/17/bin:${PATH}" \
     FACTORIX_OUTBOX_PATH=/data/outbox.sqlite \
     FACTORIX_CREDENTIAL_PATH=/data/edge-credential \
     FACTORIX_ENROLLMENT_FILE=/data/enrollment \
+    FACTORIX_CONFIG_PATH=/data/active-config.json \
+    FACTORIX_EDGE_HEALTH=/data/edge-health.json \
     FACTORIX_SCHEMA_SQL=/opt/factorix/infrastructure/postgres/001_schema.sql
 EXPOSE 8080
 VOLUME ["/data"]

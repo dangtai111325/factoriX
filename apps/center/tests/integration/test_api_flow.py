@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -243,6 +244,24 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
         )
         assert first.status_code == 200, first.text
         assert first.json()["results"][0]["status"] == "committed"
+        foreign = await client.post(
+            "/api/v1/edge-sync/observations",
+            headers=edge_headers,
+            json={
+                "observations": [
+                    {
+                        **payload,
+                        "resource_id": str(uuid4()),
+                        "event_uid": "edge-01:temp:foreign",
+                        "event_time": newer,
+                        "received_time": newer,
+                        "value": 1,
+                    }
+                ]
+            },
+        )
+        assert foreign.status_code == 200, foreign.text
+        assert foreign.json()["results"][0]["status"] == "quarantined"
         replay = await client.post(
             "/api/v1/edge-sync/observations",
             headers=edge_headers,

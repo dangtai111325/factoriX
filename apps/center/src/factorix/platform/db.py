@@ -38,6 +38,9 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+        from factorix.platform.after_commit import flush
+
+        await flush(session)
 
 
 async def ensure_observation_partitions(session: AsyncSession, *, today: date | None = None) -> list[str]:
