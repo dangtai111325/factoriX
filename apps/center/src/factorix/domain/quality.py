@@ -19,6 +19,7 @@ class Origin(StrEnum):
     MANUAL = "MANUAL"
     TEST = "TEST"
     DERIVED = "DERIVED"
+    CALCULATED = "CALCULATED"
 
 
 class Freshness(StrEnum):

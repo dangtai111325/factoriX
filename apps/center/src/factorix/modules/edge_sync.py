@@ -112,15 +112,15 @@ async def acknowledge(session: AsyncSession, edge: dict[str, Any], revision: int
     if state == "ACTIVE":
         await execute(
             session,
-            "UPDATE edge_nodes SET active_revision = :revision, health = 'ACTIVE' WHERE id = :id",
+            "UPDATE edge_nodes SET active_revision = :revision, health = 'CONFIG_VALIDATED' WHERE id = :id",
             {"revision": revision, "id": as_uuid(edge["id"])},
         )
         await execute(
             session,
             """
             UPDATE connections
-            SET status = 'ACTIVE', health = 'HEALTHY', last_success_at = :now, updated_at = :now
-            WHERE edge_id = :id AND tenant_id = :tenant_id AND status IN ('DRAFT', 'PUBLISHED', 'DEPLOYING')
+            SET status = 'ACTIVE', health = 'UNKNOWN', updated_at = :now
+            WHERE edge_id = :id AND tenant_id = :tenant_id AND status = 'DRAFT'
             """,
             {"now": utcnow(), "id": as_uuid(edge["id"]), "tenant_id": as_uuid(edge["tenant_id"])},
         )

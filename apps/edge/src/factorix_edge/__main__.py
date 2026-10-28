@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -66,12 +67,25 @@ async def main() -> None:
         enroll_path = Path(os.environ.get("FACTORIX_ENROLLMENT_FILE", "/data/enrollment"))
         if os.environ.get("FACTORIX_EDGE_WAIT") == "1" and enroll_path.exists():
             enroll_path.unlink()
-        runtime = EdgeRuntime(client, credential, allow, outbox)
+        runtime = EdgeRuntime(
+            client,
+            credential,
+            allow,
+            outbox,
+            snapshot_path=Path(os.environ.get("FACTORIX_CONFIG_PATH", str(outbox_path.parent / "active-config.json"))),
+        )
+        health_path = Path(os.environ.get("FACTORIX_EDGE_HEALTH", str(outbox_path.parent / "edge-health.json")))
         while True:
+            ok = False
             try:
                 await runtime.cycle()
+                ok = True
             except Exception:
-                await asyncio.sleep(2)
+                ok = False
+            try:
+                health_path.write_text(json.dumps({"ok": ok, "pending": runtime.outbox.pending_count()}), encoding="utf-8")
+            except OSError:
+                pass
             await asyncio.sleep(float(os.environ.get("FACTORIX_EDGE_INTERVAL_S", "1")))
 
 

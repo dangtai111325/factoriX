@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import httpx
 
-from factorix.domain.jsonpath import MappingError, evaluate
+from factorix.domain.jsonpath import MappingError, apply_cardinality, evaluate
 from factorix.domain.modbus_decode import ModbusPlanError, SourceSpan, plan_reads
 from factorix.domain.network import AllowedEndpoint, NetworkPolicyError, assert_allowed, parse_allowlist
 from factorix_edge.connectors.errors import ConnectorError
@@ -30,46 +33,131 @@ def checksum(snapshot: dict[str, Any]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _prepare(snapshot: dict[str, Any]) -> None:
+    if not isinstance(snapshot.get("connections"), list):
+        raise ValueError("Snapshot thiếu danh sách kết nối.")
+
+
 class EdgeRuntime:
-    def __init__(self, client: httpx.AsyncClient, credential: str, allowlist: list[str], outbox: Outbox) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        credential: str,
+        allowlist: list[str],
+        outbox: Outbox,
+        snapshot_path: Path | None = None,
+    ) -> None:
         self.client = client
         self.headers = {"Authorization": f"Bearer {credential}"}
         self.allowlist: list[AllowedEndpoint] = parse_allowlist(allowlist)
         self.outbox = outbox
+        self.snapshot_path = snapshot_path
+        self._modbus: dict[str, ModbusConnector] = {}
+        self._mqtt: dict[str, MqttConnector] = {}
+        self._due: dict[str, float] = {}
 
     async def cycle(self) -> dict[str, Any]:
-        config = await self._request("GET", "/api/v1/edge-sync/config")
-        snapshot = config.get("snapshot")
-        revision = int(config.get("revision") or 0)
-        active = int(config.get("active_revision") or 0)
         activated = False
-        if isinstance(snapshot, dict) and revision > 0 and revision != active:
-            expected = str(config.get("checksum_sha256") or snapshot.get("checksum_sha256") or "")
-            if not expected or checksum(snapshot) != expected:
-                await self._request(
-                    "POST",
-                    "/api/v1/edge-sync/ack",
-                    {"revision": revision, "state": "FAILED", "diagnostic": "Checksum cấu hình không khớp."},
-                )
-                return {"activated": False, "reads": 0, "flushed": 0, "error": "checksum"}
-            await self._request("POST", "/api/v1/edge-sync/ack", {"revision": revision, "state": "ACTIVE", "diagnostic": ""})
-            activated = True
-            active = revision
+        center_up = True
+        try:
+            config = await self._request("GET", "/api/v1/edge-sync/config")
+        except httpx.HTTPError:
+            config = None
+            center_up = False
+        snapshot: dict[str, Any] | None = None
+        revision = 0
+        if isinstance(config, dict):
+            incoming = config.get("snapshot") if isinstance(config.get("snapshot"), dict) else None
+            revision = int(config.get("revision") or 0)
+            active = int(config.get("active_revision") or 0)
+            expected = str(config.get("checksum_sha256") or (incoming or {}).get("checksum_sha256") or "")
+            if isinstance(incoming, dict) and revision > 0 and revision != active:
+                if not expected or checksum(incoming) != expected:
+                    await self._request(
+                        "POST",
+                        "/api/v1/edge-sync/ack",
+                        {"revision": revision, "state": "FAILED", "diagnostic": "Checksum cấu hình không khớp."},
+                    )
+                    local = self._load_snapshot()
+                    snapshot = local[0] if local else None
+                    revision = local[1] if local else 0
+                else:
+                    try:
+                        _prepare(incoming)
+                        self._save_snapshot(incoming, revision, expected)
+                        await self._request("POST", "/api/v1/edge-sync/ack", {"revision": revision, "state": "ACTIVE", "diagnostic": ""})
+                        activated = True
+                        snapshot = incoming
+                    except (ValueError, OSError) as exc:
+                        await self._request(
+                            "POST",
+                            "/api/v1/edge-sync/ack",
+                            {"revision": revision, "state": "FAILED", "diagnostic": str(exc)[:240]},
+                        )
+                        local = self._load_snapshot()
+                        snapshot = local[0] if local else None
+                        revision = local[1] if local else 0
+            elif isinstance(incoming, dict):
+                if not expected or checksum(incoming) == expected:
+                    self._save_snapshot(incoming, revision, expected or checksum(incoming))
+                snapshot = incoming
+        if snapshot is None:
+            local = self._load_snapshot()
+            if local:
+                snapshot, revision = local
         reads = 0
-        if isinstance(snapshot, dict) and active == revision and self.outbox.pending_count() < _PENDING_LIMIT:
+        if isinstance(snapshot, dict) and self.outbox.pending_count() < _PENDING_LIMIT:
             reads = await self._collect(snapshot, revision)
-        flushed = await self._flush()
-        await self._request(
-            "POST",
-            "/api/v1/edge-sync/heartbeat",
-            {
-                "health": "ACTIVE" if active else "CONFIG_PENDING",
-                "software_version": "r1",
-                "outbox_pending": self.outbox.pending_count(),
-            },
-        )
-        await self._commission()
-        return {"activated": activated, "reads": reads, "flushed": flushed, "pending": self.outbox.pending_count()}
+        flushed = 0
+        try:
+            flushed = await self._flush()
+        except httpx.HTTPError:
+            flushed = 0
+        try:
+            await self._request(
+                "POST",
+                "/api/v1/edge-sync/heartbeat",
+                {
+                    "health": "DEGRADED" if not center_up else "ACTIVE",
+                    "software_version": "r1",
+                    "outbox_pending": self.outbox.pending_count(),
+                    "backlog": self.outbox.pending_count(),
+                },
+            )
+        except httpx.HTTPError:
+            pass
+        try:
+            await self._commission()
+        except httpx.HTTPError:
+            pass
+        return {"activated": activated, "reads": reads, "flushed": flushed, "pending": self.outbox.pending_count(), "center_up": center_up}
+
+    def _save_snapshot(self, snapshot: dict[str, Any], revision: int, digest: str) -> None:
+        if self.snapshot_path is None:
+            return
+        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        raw = json.dumps({"revision": revision, "checksum_sha256": digest, "snapshot": snapshot}, default=str).encode()
+        temporary = self.snapshot_path.with_suffix(".tmp")
+        with temporary.open("wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.snapshot_path)
+
+    def _load_snapshot(self) -> tuple[dict[str, Any], int] | None:
+        if self.snapshot_path is None or not self.snapshot_path.is_file():
+            return None
+        try:
+            body = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        snapshot = body.get("snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        digest = str(body.get("checksum_sha256") or "")
+        if digest and checksum(snapshot) != digest:
+            return None
+        return snapshot, int(body.get("revision") or 0)
 
     async def _collect(self, snapshot: dict[str, Any], revision: int) -> int:
         jobs_by_connection: dict[str, list[dict[str, Any]]] = {}
@@ -92,8 +180,15 @@ class EdgeRuntime:
             mapped = [field for field in owned_fields if str(field["id"]) in bindings]
             if not mapped:
                 continue
+            interval = min(int(job.get("interval_ms") or 1000) for job in jobs_by_connection.get(str(connection["id"]), []))
+            due = self._due.get(str(connection["id"]), 0.0)
+            now_mono = time.monotonic()
+            if now_mono < due:
+                continue
+            self._due[str(connection["id"])] = now_mono + max(interval, 200) / 1000
+            mode = "SUBSCRIBE" if any(job.get("mode") == "SUBSCRIBE" for job in jobs_by_connection.get(str(connection["id"]), [])) else "POLL"
             try:
-                samples = await self._read(protocol, connection, mapped)
+                samples = await self._read(protocol, connection, mapped, mode)
             except (ConnectorError, NetworkPolicyError, ModbusPlanError, OSError):
                 continue
             now = _stamp()
@@ -125,12 +220,13 @@ class EdgeRuntime:
         protocol: str,
         connection: dict[str, Any],
         fields: list[dict[str, Any]],
+        mode: str = "POLL",
     ) -> list[tuple[str, Any, str]]:
         config = connection.get("config_json") or {}
         if protocol == "modbus_tcp":
             return await self._read_modbus(config, fields)
         if protocol == "opcua":
-            return await self._read_opc(config, fields)
+            return await self._read_opc(config, fields, mode)
         if protocol == "mqtt":
             return await self._read_mqtt(connection, config, fields)
         if protocol == "http":
@@ -163,32 +259,36 @@ class EdgeRuntime:
                     float(0 if decode.get("offset") is None else decode["offset"]),
                 )
             )
-        connector = ModbusConnector(host, port, timeout_s=max(int(config.get("timeout_ms") or 3000), 200) / 1000)
-        await connector.connect()
-        try:
-            rows: list[tuple[str, Any, str]] = []
-            for block in plan_reads(spans):
-                try:
-                    decoded = await connector.read_block(block)
-                except (ConnectionError, ModbusPlanError):
-                    rows.extend((field.field_id, None, "BAD") for field in block.fields)
-                    continue
-                rows.extend((item["field_id"], item["value"], "GOOD") for item in decoded)
-            return rows
-        finally:
-            await connector.close()
+        connector = self._modbus.get(f"{host}:{port}")
+        if connector is None or not connector.client.connected:
+            connector = ModbusConnector(host, port, timeout_s=max(int(config.get("timeout_ms") or 3000), 200) / 1000)
+            await connector.connect()
+            self._modbus[f"{host}:{port}"] = connector
+        rows: list[tuple[str, Any, str]] = []
+        for block in plan_reads(spans):
+            try:
+                decoded = await connector.read_block(block)
+            except (ConnectionError, ModbusPlanError):
+                rows.extend((field.field_id, None, "BAD") for field in block.fields)
+                continue
+            rows.extend((item["field_id"], item["value"], "GOOD") for item in decoded)
+        return rows
 
-    async def _read_opc(self, config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str]]:
+    async def _read_opc(self, config: dict[str, Any], fields: list[dict[str, Any]], mode: str = "POLL") -> list[tuple[str, Any, str]]:
         connector = OpcUaConnector(str(config["endpoint"]), self.allowlist)
         node_ids = [str((field.get("address_json") or {}).get("node_id") or "") for field in fields]
         if any(not node_id for node_id in node_ids):
             raise ConnectorError("ADDRESS", "Thiếu NodeId OPC UA.")
         await connector.connect()
         try:
-            values = await connector.read_values(node_ids)
+            if mode == "SUBSCRIBE":
+                values = await connector.subscribe_values(node_ids)
+            else:
+                values = await connector.read_values(node_ids)
         finally:
-            await connector.close()
-        return [(str(fields[index]["id"]), item["value"], "GOOD") for index, item in enumerate(values)]
+            if mode != "SUBSCRIBE":
+                await connector.close()
+        return [(str(fields[index]["id"]), item["value"], str(item.get("quality") or "GOOD")) for index, item in enumerate(values)]
 
     async def _mqtt_secret(self, owner: dict[str, Any], config: dict[str, Any]) -> str | None:
         if config.get("anonymous", True) or not config.get("username"):
@@ -200,27 +300,50 @@ class EdgeRuntime:
         return str(secret.get("secret") or "")
 
     async def _read_mqtt(self, connection: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str]]:
-        topic = str((fields[0].get("address_json") or {}).get("topic") or (config.get("topics") or [""])[0])
-        password = await self._mqtt_secret(connection, config)
-        connector = MqttConnector(
-            str(config["host"]),
-            int(config["port"]),
-            self.allowlist,
-            f"fx-{uuid4().hex[:12]}",
-            username=str(config.get("username") or "") or None,
-            password=password,
-        )
-        document = connector.capture(topic)
+        topics: list[tuple[str, int]] = []
+        for field in fields:
+            address = field.get("address_json") or {}
+            topic = str(address.get("topic") or "")
+            if not topic and config.get("topics"):
+                topic = str(config["topics"][0])
+            if topic:
+                topics.append((topic, int(address.get("qos") or config.get("qos") or 1)))
+        if not topics:
+            raise ConnectorError("TOPIC", "Chưa có topic để thu thập.")
+        key = str(connection["id"])
+        connector = self._mqtt.get(key)
+        if connector is None:
+            password = await self._mqtt_secret(connection, config)
+            connector = MqttConnector(
+                str(config["host"]),
+                int(config["port"]),
+                self.allowlist,
+                f"fx-{key[:8]}",
+                username=str(config.get("username") or "") or None,
+                password=password,
+            )
+            connector.start(topics)
+            self._mqtt[key] = connector
+        document = connector.next_json(timeout_s=max(int(config.get("timeout_ms") or 2000), 200) / 1000)
         return _project_json(fields, document)
 
     async def _read_http(self, connection: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str]]:
         path = str((fields[0].get("address_json") or {}).get("path") or config.get("path") or "/")
         headers: dict[str, str] = {}
         secret_ref = connection.get("secret_ref")
-        if secret_ref and config.get("auth") != "none":
+        auth = str(config.get("auth") or "none")
+        if secret_ref and auth != "none":
             secret = await self._request("GET", f"/api/v1/edge-sync/secrets/{secret_ref}")
-            header = str(config.get("header_name") or "X-API-Key")
-            headers[header] = secret["secret"]
+            token = str(secret.get("secret") or "")
+            if auth == "bearer":
+                headers["Authorization"] = f"Bearer {token}"
+            elif auth == "basic":
+                import base64
+
+                user = str(config.get("username") or "")
+                headers["Authorization"] = "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
+            else:
+                headers[str(config.get("header_name") or "X-API-Key")] = token
         connector = HttpPullConnector(str(config["base_url"]), self.allowlist, timeout_s=max(int(config.get("timeout_ms") or 5000), 200) / 1000)
         document = await connector.get_json(path, headers)
         return _project_json(fields, document)
@@ -247,46 +370,76 @@ class EdgeRuntime:
         job = pulled.get("job")
         if not job:
             return
-        stages = []
-        status = "PASSED"
-        error_code = None
+        names = ("NETWORK", "AUTH", "PROTOCOL", "READ_OR_SUBSCRIBE", "DECODE", "MAPPING", "VALIDATION")
+        stages = [{"stage": name, "status": "NOT_TESTED", "duration_ms": 0, "detail": ""} for name in names]
         started = datetime.now(timezone.utc)
+        status = "FAILED"
+        error_code = "NOT_TESTED"
         try:
-            detail = await self._probe(job)
-            for name in ("NETWORK", "AUTH", "PROTOCOL", "READ_OR_SUBSCRIBE", "DECODE", "MAPPING", "VALIDATION"):
-                stages.append({"stage": name, "status": "PASSED", "duration_ms": 0, "detail": detail if name == "DECODE" else ""})
+            proven = await self._probe_stages(job, stages)
+            status = "PASSED" if proven else "FAILED"
+            error_code = None if proven else "NOT_TESTED"
         except (ConnectorError, NetworkPolicyError, ModbusPlanError, OSError, KeyError) as exc:
             status = "FAILED"
             error_code = getattr(exc, "code", "PROTOCOL")
-            stages.append({"stage": "NETWORK", "status": "FAILED", "duration_ms": 0, "detail": str(exc)[:240]})
+            for stage in stages:
+                if stage["status"] == "NOT_TESTED":
+                    stage["status"] = "NOT_TESTED"
+                    break
+            if stages[0]["status"] == "NOT_TESTED":
+                stages[0]["status"] = "FAILED"
+                stages[0]["detail"] = str(exc)[:240]
         elapsed = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        if stages:
-            stages[0]["duration_ms"] = elapsed
+        stages[0]["duration_ms"] = elapsed
         await self._request(
             "POST",
             f"/api/v1/edge-sync/commands/{job['id']}",
-            {"status": status, "stages": stages, "error_code": error_code, "diagnostic": "" if status == "PASSED" else "Kiểm thử đọc thất bại."},
+            {
+                "status": status,
+                "stages": stages,
+                "error_code": error_code,
+                "diagnostic": "" if status == "PASSED" else "Kiểm thử chưa chứng minh được đọc dữ liệu.",
+            },
         )
 
-    async def _probe(self, job: dict[str, Any]) -> str:
+    async def _probe_stages(self, job: dict[str, Any], stages: list[dict[str, Any]]) -> bool:
         protocol = str(job["protocol"])
         config = job.get("config_json") or {}
+        by_name = {item["stage"]: item for item in stages}
         if protocol == "modbus_tcp":
-            rows = await self._read_modbus(
-                config,
-                [{"id": "probe", "address_json": {"offset": 0, "native_type": "uint16", "register_area": "holding", "register_count": 1}, "decode_json": {}}],
-            )
-            return f"holding:0={rows[0][1]}"
-        if protocol == "opcua":
-            connector = OpcUaConnector(str(config["endpoint"]), self.allowlist)
+            assert_allowed(str(config["host"]), int(config["port"]), self.allowlist)
+            by_name["NETWORK"]["status"] = "PASSED"
+            by_name["AUTH"]["status"] = "NOT_APPLICABLE"
+            connector = ModbusConnector(str(config["host"]), int(config["port"]))
             await connector.connect()
             await connector.close()
-            return "session"
+            by_name["PROTOCOL"]["status"] = "PASSED"
+            return False
+        if protocol == "opcua":
+            connector = OpcUaConnector(str(config["endpoint"]), self.allowlist)
+            by_name["NETWORK"]["status"] = "PASSED"
+            by_name["AUTH"]["status"] = "NOT_APPLICABLE" if not job.get("secret_ref") else "NOT_TESTED"
+            await connector.connect()
+            by_name["PROTOCOL"]["status"] = "PASSED"
+            node_id = str(config.get("node_id") or "")
+            try:
+                if not node_id:
+                    return False
+                values = await connector.read_values([node_id])
+            finally:
+                await connector.close()
+            by_name["READ_OR_SUBSCRIBE"]["status"] = "PASSED"
+            by_name["DECODE"]["status"] = "PASSED" if values and values[0].get("quality") == "GOOD" else "FAILED"
+            by_name["MAPPING"]["status"] = "NOT_APPLICABLE"
+            by_name["VALIDATION"]["status"] = by_name["DECODE"]["status"]
+            return by_name["DECODE"]["status"] == "PASSED"
         if protocol == "mqtt":
             topics = config.get("topics") or []
             if not topics:
                 raise ConnectorError("TOPIC", "Chưa có topic để kiểm thử.")
+            by_name["NETWORK"]["status"] = "PASSED"
             password = await self._mqtt_secret(job, config)
+            by_name["AUTH"]["status"] = "PASSED" if config.get("username") else "NOT_APPLICABLE"
             connector = MqttConnector(
                 str(config["host"]),
                 int(config["port"]),
@@ -296,16 +449,30 @@ class EdgeRuntime:
                 password=password,
             )
             connector.capture(str(topics[0]), timeout_s=8)
-            return "message"
+            by_name["PROTOCOL"]["status"] = "PASSED"
+            by_name["READ_OR_SUBSCRIBE"]["status"] = "PASSED"
+            by_name["DECODE"]["status"] = "PASSED"
+            by_name["MAPPING"]["status"] = "NOT_TESTED"
+            by_name["VALIDATION"]["status"] = "NOT_TESTED"
+            return False
         if protocol == "http":
+            by_name["NETWORK"]["status"] = "PASSED"
             headers: dict[str, str] = {}
             secret_ref = job.get("secret_ref")
             if secret_ref and config.get("auth") != "none":
                 secret = await self._request("GET", f"/api/v1/edge-sync/secrets/{secret_ref}")
                 headers[str(config.get("header_name") or "X-API-Key")] = str(secret.get("secret") or "")
+                by_name["AUTH"]["status"] = "PASSED"
+            else:
+                by_name["AUTH"]["status"] = "NOT_APPLICABLE"
             connector = HttpPullConnector(str(config["base_url"]), self.allowlist)
             document = await connector.get_json(str(config.get("path") or "/"), headers)
-            return "json" if isinstance(document, dict) else "body"
+            by_name["PROTOCOL"]["status"] = "PASSED"
+            by_name["READ_OR_SUBSCRIBE"]["status"] = "PASSED"
+            by_name["DECODE"]["status"] = "PASSED" if isinstance(document, dict) else "FAILED"
+            by_name["MAPPING"]["status"] = "NOT_TESTED"
+            by_name["VALIDATION"]["status"] = "NOT_TESTED"
+            return by_name["DECODE"]["status"] == "PASSED"
         raise ConnectorError("PROTOCOL", "Giao thức không được hỗ trợ.")
 
     async def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -324,13 +491,14 @@ def _project_json(fields: list[dict[str, Any]], document: Any) -> list[tuple[str
         expression = str(address.get("jsonpath") or "$")
         try:
             matches = evaluate(expression, document)
+            mapped = apply_cardinality(matches, cardinality="REJECT_MULTI", missing="BAD")
         except MappingError:
             rows.append((str(field["id"]), None, "BAD"))
             continue
-        if len(matches) != 1:
+        if mapped.quality_override == "BAD" or not mapped.present:
             rows.append((str(field["id"]), None, "BAD"))
             continue
-        rows.append((str(field["id"]), matches[0], "GOOD"))
+        rows.append((str(field["id"]), mapped.value, "GOOD"))
     return rows
 
 

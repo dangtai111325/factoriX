@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from factorix.modules.collect import (
     SignalPatch,
 )
 from factorix.modules.common import as_uuid, fetch_all, fetch_one, parse_uuid
+from factorix.platform.after_commit import listen
 from factorix.modules.identity import (
     SESSION_COOKIE,
     BootstrapIn,
@@ -91,23 +93,37 @@ def _ids(row: dict[str, Any]) -> tuple[Any, Any]:
 
 class Hub:
     def __init__(self) -> None:
-        self.sockets: list[tuple[WebSocket, set[str]]] = []
+        self.sockets: list[tuple[WebSocket, set[str], str]] = []
 
-    async def publish(self, signal_id: str, payload: dict[str, Any]) -> None:
-        dead: list[tuple[WebSocket, set[str]]] = []
-        for socket, signals in self.sockets:
-            if signal_id in signals or "*" in signals:
-                try:
-                    await socket.send_json(payload)
-                except Exception:
-                    dead.append((socket, signals))
+    async def publish(self, tenant_id: str, signal_id: str, payload: dict[str, Any]) -> None:
+        dead: list[tuple[WebSocket, set[str], str]] = []
+        for socket, signals, owner in self.sockets:
+            if owner != tenant_id:
+                continue
+            if signal_id not in signals:
+                continue
+            try:
+                await socket.send_json(payload)
+            except Exception:
+                dead.append((socket, signals, owner))
         for item in dead:
             if item in self.sockets:
                 self.sockets.remove(item)
 
 
 hub = Hub()
-app = FastAPI(title="FactoriX IIoT Center", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+async def _publish_committed(events: list[dict[str, Any]]) -> None:
+    for event in events:
+        if event.get("kind") != "latest":
+            continue
+        await hub.publish(str(event["tenant_id"]), str(event["signal_id"]), event["payload"])
+
+
+listen(_publish_committed)
+
+app = FastAPI(title="FactoriX IIoT Center", version="1.0.0", openapi_url="/api/openapi.json")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.web_origin],
@@ -153,6 +169,20 @@ async def live() -> dict[str, str]:
 @app.get("/health/ready")
 async def ready(session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     await fetch_one(session, "SELECT 1 AS ok", {})
+    health_path = os.environ.get("FACTORIX_EDGE_HEALTH", "")
+    if settings.appliance and health_path:
+        file = Path(health_path)
+        if file.is_file():
+            import json
+            import time
+
+            try:
+                body = json.loads(file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                body = {"ok": False}
+            age = time.time() - file.stat().st_mtime
+            if not body.get("ok") or age > 30:
+                raise AppError(503, "EDGE_DOWN", "The acquisition loop is not healthy.")
     return {"status": "ready"}
 
 
@@ -840,10 +870,6 @@ async def edge_secret(secret_id: str, request: Request, session: AsyncSession = 
 async def edge_observations(body: EdgeBatchIn, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     result = await edge_sync.accept_observations(session, edge, body.observations)
-    for item in body.observations:
-        signal_id = str(item.get("signal_id", ""))
-        if signal_id:
-            await hub.publish(signal_id, {"type": "latest", "signal_id": signal_id, "value": item.get("value"), "quality": item.get("quality")})
     return result
 
 
@@ -867,26 +893,39 @@ async def stream(socket: WebSocket) -> None:
     async with factory() as session:
         cookie = socket.cookies.get(SESSION_COOKIE)
         try:
-            await principal_from_token(session, cookie)
+            principal = await principal_from_token(session, cookie)
         except AppError:
             await socket.close(code=4401)
             return
+        tenant_id = str(principal["tenant_id"])
     subscribed: set[str] = set()
-    hub.sockets.append((socket, subscribed))
+    hub.sockets.append((socket, subscribed, tenant_id))
     try:
         while True:
             message = await socket.receive_json()
             if message.get("op") == "subscribe":
+                try:
+                    requested = [parse_uuid(str(item)) for item in message.get("signal_ids", [])[:200]]
+                except AppError:
+                    await socket.send_json({"type": "subscribed", "count": 0})
+                    continue
+                factory = session_factory()
+                async with factory() as session:
+                    rows = await fetch_all(
+                        session,
+                        "SELECT id FROM signal_definitions WHERE tenant_id = :tenant_id AND id = ANY(:ids)",
+                        {"tenant_id": principal["tenant_id"], "ids": requested},
+                    ) if requested else []
                 subscribed.clear()
-                subscribed.update(str(item) for item in message.get("signal_ids", [])[:200])
+                subscribed.update(str(row["id"]) for row in rows)
                 await socket.send_json({"type": "subscribed", "count": len(subscribed)})
             elif message.get("op") == "ping":
                 await socket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         pass
     finally:
-        if (socket, subscribed) in hub.sockets:
-            hub.sockets.remove((socket, subscribed))
+        if (socket, subscribed, tenant_id) in hub.sockets:
+            hub.sockets.remove((socket, subscribed, tenant_id))
 
 
 def _mount_spa() -> None:
