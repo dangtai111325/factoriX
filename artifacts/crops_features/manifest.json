@@ -1,0 +1,92 @@
+[
+  {
+    "id": "02",
+    "name": "add_resource_modal",
+    "file": "02_add_resource_modal.png",
+    "path": "artifacts/crops_features\\02_add_resource_modal.png"
+  },
+  {
+    "id": "06",
+    "name": "add_data_wizard",
+    "file": "06_add_data_wizard.png",
+    "path": "artifacts/crops_features\\06_add_data_wizard.png"
+  },
+  {
+    "id": "07",
+    "name": "mqtt_mapping_flow",
+    "file": "07_mqtt_mapping_flow.png",
+    "path": "artifacts/crops_features\\07_mqtt_mapping_flow.png"
+  },
+  {
+    "id": "09",
+    "name": "create_calculated_rule",
+    "file": "09_create_calculated_rule.png",
+    "path": "artifacts/crops_features\\09_create_calculated_rule.png"
+  },
+  {
+    "id": "16",
+    "name": "modbus_wizard",
+    "file": "16_modbus_wizard.png",
+    "path": "artifacts/crops_features\\16_modbus_wizard.png"
+  },
+  {
+    "id": "17",
+    "name": "opcua_wizard",
+    "file": "17_opcua_wizard.png",
+    "path": "artifacts/crops_features\\17_opcua_wizard.png"
+  },
+  {
+    "id": "18",
+    "name": "jsonpath_mapping",
+    "file": "18_jsonpath_mapping.png",
+    "path": "artifacts/crops_features\\18_jsonpath_mapping.png"
+  },
+  {
+    "id": "21",
+    "name": "add_child_move_toolbar",
+    "file": "21_add_child_move_toolbar.png",
+    "path": "artifacts/crops_features\\21_add_child_move_toolbar.png"
+  },
+  {
+    "id": "24",
+    "name": "import_template_test",
+    "file": "24_import_template_test.png",
+    "path": "artifacts/crops_features\\24_import_template_test.png"
+  },
+  {
+    "id": "27",
+    "name": "bulk_edit_signals",
+    "file": "27_bulk_edit_signals.png",
+    "path": "artifacts/crops_features\\27_bulk_edit_signals.png"
+  },
+  {
+    "id": "29",
+    "name": "live_monitor_controls",
+    "file": "29_live_monitor_controls.png",
+    "path": "artifacts/crops_features\\29_live_monitor_controls.png"
+  },
+  {
+    "id": "38",
+    "name": "live_monitor_v2",
+    "file": "38_live_monitor_v2.png",
+    "path": "artifacts/crops_features\\38_live_monitor_v2.png"
+  },
+  {
+    "id": "39",
+    "name": "diagnostics_detail",
+    "file": "39_diagnostics_detail.png",
+    "path": "artifacts/crops_features\\39_diagnostics_detail.png"
+  },
+  {
+    "id": "48",
+    "name": "live_monitor_v3",
+    "file": "48_live_monitor_v3.png",
+    "path": "artifacts/crops_features\\48_live_monitor_v3.png"
+  },
+  {
+    "id": "49",
+    "name": "diagnostics_troubleshoot",
+    "file": "49_diagnostics_troubleshoot.png",
+    "path": "artifacts/crops_features\\49_diagnostics_troubleshoot.png"
+  }
+]

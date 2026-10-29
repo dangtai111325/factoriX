@@ -1,0 +1,10 @@
+services:
+  factorix-frontend:
+    build: .
+    image: factorix-iiot-frontend:latest
+    container_name: factorix-frontend
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

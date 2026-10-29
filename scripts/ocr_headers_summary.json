@@ -1,0 +1,345 @@
+[
+  {
+    "id": "01",
+    "file": "01_header.png",
+    "title": "Home > Live Overview",
+    "subtitle": "Live Overview 9 Last15 minutes",
+    "raw": "Home > Live Overview // Live Overview 9 Last15 minutes"
+  },
+  {
+    "id": "02",
+    "file": "02_header.png",
+    "title": "actory Model — Structure Explorer + Add Resource",
+    "subtitle": "del and manage your factory hierarchy, resources, and relationships.",
+    "raw": "actory Model — Structure Explorer + Add Resource // del and manage your factory hierarchy, resources, and relationships."
+  },
+  {
+    "id": "03",
+    "file": "03_header.png",
+    "title": "fome > Factory Model > Layout Designer",
+    "subtitle": "Factory Model — Layout Designer 2 cave | © Monon",
+    "raw": "fome > Factory Model > Layout Designer // Factory Model — Layout Designer 2 cave | © Monon"
+  },
+  {
+    "id": "04",
+    "file": "04_header.png",
+    "title": "Factory Model — Knowledge Graph",
+    "subtitle": "",
+    "raw": "Factory Model — Knowledge Graph"
+  },
+  {
+    "id": "05",
+    "file": "05_header.png",
+    "title": "me > Connections",
+    "subtitle": "J = y ~~ Plant OPC >onnections + Add Connection SR",
+    "raw": "me > Connections // J = y ~~ Plant OPC // >onnections + Add Connection SR"
+  },
+  {
+    "id": "06",
+    "file": "06_header.png",
+    "title": "ome > DataPoints > Add Data",
+    "subtitle": "\\dd Data [ snnect and configure a data source for your machine to start collecting industrial data.",
+    "raw": "ome > DataPoints > Add Data // \\dd Data [ // snnect and configure a data source for your machine to start collecting industrial data."
+  },
+  {
+    "id": "07",
+    "file": "07_header.png",
+    "title": "Home > Data Points > Add Data— MQTT Mapping",
+    "subtitle": "o [1] Map Fields 2 Pre Add Data — MQTT Mapping Pr ei va",
+    "raw": "Home > Data Points > Add Data— MQTT Mapping // o [1] Map Fields 2 Pre // Add Data — MQTT Mapping Pr ei va"
+  },
+  {
+    "id": "08",
+    "file": "08_header.png",
+    "title": "fome > Signals",
+    "subtitle": "3rowse, search and inspect all collected and calculated signals in your industrial data environment.",
+    "raw": "fome > Signals // 3rowse, search and inspect all collected and calculated signals in your industrial data environment."
+  },
+  {
+    "id": "09",
+    "file": "09_header.png",
+    "title": "Home > Calulated Signals > Create Rule",
+    "subtitle": "Create Calculated Signal",
+    "raw": "Home > Calulated Signals > Create Rule // Create Calculated Signal"
+  },
+  {
+    "id": "10",
+    "file": "10_header.png",
+    "title": "Data Collection > Operations Overview",
+    "subtitle": "Data Collection Overview o scars Real-time vicibility into vour industrial data acauicition infrastructiire San SBT. 6",
+    "raw": "Data Collection > Operations Overview // Data Collection Overview o scars // Real-time vicibility into vour industrial data acauicition infrastructiire San SBT. 6"
+  },
+  {
+    "id": "11",
+    "file": "11_header.png",
+    "title": "Data Collection > Context Model",
+    "subtitle": "Context Model © Validate Hierarchy 2, import & Manage your industrial asset hierarchy, relationships and contextual information",
+    "raw": "Data Collection > Context Model // Context Model © Validate Hierarchy 2, import & // Manage your industrial asset hierarchy, relationships and contextual information"
+  },
+  {
+    "id": "12",
+    "file": "12_header.png",
+    "title": "Data Collection > Factory Layouts",
+    "subtitle": "Factory Layout Designer ho whe ws © Previewin Create and manage your industrial plant layouts with assets, zones and real equipment connections",
+    "raw": "Data Collection > Factory Layouts // Factory Layout Designer ho whe ws © Previewin // Create and manage your industrial plant layouts with assets, zones and real equipment connections"
+  },
+  {
+    "id": "13",
+    "file": "13_header.png",
+    "title": "Data Collection > Knowledge Graph",
+    "subtitle": "Knowledge Graph © GiaphData eat Last updated: Apr 22,20 Explore relationships between industrial assets, signals, and data flow in your OT environment —La",
+    "raw": "Data Collection > Knowledge Graph // Knowledge Graph © GiaphData eat // Last updated: Apr 22,20 // Explore relationships between industrial assets, signals, and data flow in your OT environment —La"
+  },
+  {
+    "id": "14",
+    "file": "14_header.png",
+    "title": "onnections & Acquisition Jobs OLE",
+    "subtitle": "nage industrial data connections and their acquisition jobs. Monitor real-time health, performance and data flow. a",
+    "raw": "onnections & Acquisition Jobs OLE // nage industrial data connections and their acquisition jobs. Monitor real-time health, performance and data flow. a"
+  },
+  {
+    "id": "15",
+    "file": "15_header.png",
+    "title": "ction > Signal Definitions",
+    "subtitle": "HH ® Collector Syste al Definitions ar manage and monitor all data points (signals) from your industrial assets Signals Protocol / Source Rescusalavel ‘Signal State Type Thea Slaad",
+    "raw": "ction > Signal Definitions // HH ® Collector Syste // al Definitions ar // manage and monitor all data points (signals) from your industrial assets // Signals Protocol / Source Rescusalavel ‘Signal State Type Thea Slaad"
+  },
+  {
+    "id": "16",
+    "file": "16_header.png",
+    "title": "Data Collection > Signal Definitions > Add Data",
+    "subtitle": "Add Data Wizard — Modbus TCP Create one or more signals from a Modbus TCP source",
+    "raw": "Data Collection > Signal Definitions > Add Data // Add Data Wizard — Modbus TCP // Create one or more signals from a Modbus TCP source"
+  },
+  {
+    "id": "17",
+    "file": "17_header.png",
+    "title": "Data Gollecton > Signal Definitions > Add Data (OPC UA)",
+    "subtitle": "Add Data Wizard — OPC UA Connect to an OPC UA server, browse and select nodes, then map them to signal definitions.",
+    "raw": "Data Gollecton > Signal Definitions > Add Data (OPC UA) // Add Data Wizard — OPC UA // Connect to an OPC UA server, browse and select nodes, then map them to signal definitions."
+  },
+  {
+    "id": "18",
+    "file": "18_header.png",
+    "title": ")N Mapping Studio — MQTT / HTTP API {+ Freel 2 XL",
+    "subtitle": "\\coming JSON payloads to industrial signals using JSONPath",
+    "raw": ")N Mapping Studio — MQTT / HTTP API {+ Freel 2 XL // \\coming JSON payloads to industrial signals using JSONPath"
+  },
+  {
+    "id": "19",
+    "file": "19_header.png",
+    "title": "ata Collection > Signal Definitions > Calculated Signals & Output Groups",
+    "subtitle": "n, . All Syst Zalculated Signals & Output Groups he reate derived signals using powerful formulas and organize them into output groups for publishing.",
+    "raw": "ata Collection > Signal Definitions > Calculated Signals & Output Groups // n, . All Syst // Zalculated Signals & Output Groups he // reate derived signals using powerful formulas and organize them into output groups for publishing."
+  },
+  {
+    "id": "20",
+    "file": "20_header.png",
+    "title": "Operations Overview B",
+    "subtitle": "Real-time status and health of your industrial data acquisition environment.",
+    "raw": "Operations Overview B // Real-time status and health of your industrial data acquisition environment."
+  },
+  {
+    "id": "21",
+    "file": "21_header.png",
+    "title": "Context & Assets ET G+ AddChld © Move ©",
+    "subtitle": "Manage your industrial hierarchy, assets and resources. Organize assets, define context, and view related signals, connections and data",
+    "raw": "Context & Assets ET G+ AddChld © Move © // Manage your industrial hierarchy, assets and resources. Organize assets, define context, and view related signals, connections and data"
+  },
+  {
+    "id": "22",
+    "file": "22_header.png",
+    "title": "Factory Layout Designer",
+    "subtitle": "Design and manage your industrial facility layout with assets, zones, lines and equipment",
+    "raw": "Factory Layout Designer // Design and manage your industrial facility layout with assets, zones, lines and equipment"
+  },
+  {
+    "id": "23",
+    "file": "23_header.png",
+    "title": "Context & Assets",
+    "subtitle": "Explore the relationships between your industrial assets, signals, and data flows.",
+    "raw": "Context & Assets // Explore the relationships between your industrial assets, signals, and data flows."
+  },
+  {
+    "id": "24",
+    "file": "24_header.png",
+    "title": "Connections B mportTemplte > Tes",
+    "subtitle": "Manage and monitor all data connection profiles across your industrial environment.",
+    "raw": "Connections B mportTemplte > Tes // Manage and monitor all data connection profiles across your industrial environment."
+  },
+  {
+    "id": "25",
+    "file": "25_header.png",
+    "title": "Acquisition Studio",
+    "subtitle": "Connect to industrial devices and configure data acquisition, mapping, and validation.",
+    "raw": "Acquisition Studio // Connect to industrial devices and configure data acquisition, mapping, and validation."
+  },
+  {
+    "id": "26",
+    "file": "26_header.png",
+    "title": "Acquisition Studio",
+    "subtitle": "Connect to industrial data sources and create signals from your assets.",
+    "raw": "Acquisition Studio // Connect to industrial data sources and create signals from your assets."
+  },
+  {
+    "id": "27",
+    "file": "27_header.png",
+    "title": "Signals & Mapping + AddSgnal © BukE",
+    "subtitle": "vlanage your signal catalog and map incoming data to standardized signals using JSON, MQTT or API payloads.",
+    "raw": "Signals & Mapping + AddSgnal © BukE // vlanage your signal catalog and map incoming data to standardized signals using JSON, MQTT or API payloads."
+  },
+  {
+    "id": "28",
+    "file": "28_header.png",
+    "title": "Calculations & Output 8",
+    "subtitle": "Create calculated signals from existing data and organize outputs into publishable groups.",
+    "raw": "Calculations & Output 8 // Create calculated signals from existing data and organize outputs into publishable groups."
+  },
+  {
+    "id": "29",
+    "file": "29_header.png",
+    "title": "Live Monitor » strtacqistion [IES ci",
+    "subtitle": "Real-time signal acquisition, monitoring and diagnostics for your industrial environment.",
+    "raw": "Live Monitor » strtacqistion [IES ci // Real-time signal acquisition, monitoring and diagnostics for your industrial environment."
+  },
+  {
+    "id": "30",
+    "file": "30_header.png",
+    "title": "o . @® All Systems Oper:",
+    "subtitle": "Operations Overview Lape: Ar, Real-time view of industrial data acquisition health and performance.",
+    "raw": "o . @® All Systems Oper: // Operations Overview Lape: Ar, // Real-time view of industrial data acquisition health and performance."
+  },
+  {
+    "id": "31",
+    "file": "31_header.png",
+    "title": "@® All Systems Oper:",
+    "subtitle": "Context & Assets rh Browse and manage your industrial asset hierarchy, view asset context and related signals, and maintain asset details.",
+    "raw": "@® All Systems Oper: // Context & Assets rh // Browse and manage your industrial asset hierarchy, view asset context and related signals, and maintain asset details."
+  },
+  {
+    "id": "32",
+    "file": "32_header.png",
+    "title": "Factory Layout & Topology flag verside anutacturin",
+    "subtitle": "Design and manage your factory assets, lines and connections",
+    "raw": "Factory Layout & Topology flag verside anutacturin // Design and manage your factory assets, lines and connections"
+  },
+  {
+    "id": "33",
+    "file": "33_header.png",
+    "title": "CONTEXT & ASSETS",
+    "subtitle": "; : Relationship Graph Explore how assets, signals, connections, calculations and outputs are related in your industrial environment.",
+    "raw": "CONTEXT & ASSETS // ; : // Relationship Graph // Explore how assets, signals, connections, calculations and outputs are related in your industrial environment."
+  },
+  {
+    "id": "34",
+    "file": "34_header.png",
+    "title": "DATA COLLECTOR",
+    "subtitle": "o @ All Systems Operational Connections Lastupdated: Apr 25,2024 145 Manage data source connections for industrial assets, controllers and systems.",
+    "raw": "DATA COLLECTOR // o @ All Systems Operational // Connections Lastupdated: Apr 25,2024 145 // Manage data source connections for industrial assets, controllers and systems."
+  },
+  {
+    "id": "35",
+    "file": "35_header.png",
+    "title": "Acquisition Studio",
+    "subtitle": "Configure industrial data sources, map signals, test and activate data collection.",
+    "raw": "Acquisition Studio // Configure industrial data sources, map signals, test and activate data collection."
+  },
+  {
+    "id": "36",
+    "file": "36_header.png",
+    "title": ". . Connection ~~ @ Paint_Line_PLC",
+    "subtitle": "Signals & Mapping 3rowse signals from your industrial assets and map incoming data to standardize and enrich your data model.",
+    "raw": ". . Connection ~~ @ Paint_Line_PLC // Signals & Mapping // 3rowse signals from your industrial assets and map incoming data to standardize and enrich your data model."
+  },
+  {
+    "id": "37",
+    "file": "37_header.png",
+    "title": "Calculations & Output ow Caliati",
+    "subtitle": "Create formulas, generate calculated signals, and configure output groups for external systems.",
+    "raw": "Calculations & Output ow Caliati // Create formulas, generate calculated signals, and configure output groups for external systems."
+  },
+  {
+    "id": "38",
+    "file": "38_header.png",
+    "title": "Live Monitor wee | c",
+    "subtitle": "Monitor real-time data acquisition, signal streams, and system health.",
+    "raw": "Live Monitor wee | c // Monitor real-time data acquisition, signal streams, and system health."
+  },
+  {
+    "id": "39",
+    "file": "39_header.png",
+    "title": "DATA COLLECTOR",
+    "subtitle": "o . ® All Systems Oper. Diagnostics Lost updote or 25, Troubleshoot connections, protocols and data quality issues across your industrial data acquisition pipeline.",
+    "raw": "DATA COLLECTOR // o . ® All Systems Oper. // Diagnostics Lost updote or 25, // Troubleshoot connections, protocols and data quality issues across your industrial data acquisition pipeline."
+  },
+  {
+    "id": "40",
+    "file": "40_header.png",
+    "title": "Operations Overview @ Date Collector Running",
+    "subtitle": "Real-time industrial data acquisition health and performance",
+    "raw": "Operations Overview @ Date Collector Running // Real-time industrial data acquisition health and performance"
+  },
+  {
+    "id": "41",
+    "file": "41_header.png",
+    "title": "Context & Assets",
+    "subtitle": "Browse and manage your industrial asset hierarchy and context.",
+    "raw": "Context & Assets // Browse and manage your industrial asset hierarchy and context."
+  },
+  {
+    "id": "42",
+    "file": "42_header.png",
+    "title": "Connections @ 0 Collector runing",
+    "subtitle": "Manage industrial data source connections to acquire real-time and historical data.",
+    "raw": "Connections @ 0 Collector runing // Manage industrial data source connections to acquire real-time and historical data."
+  },
+  {
+    "id": "43",
+    "file": "43_header.png",
+    "title": "Acquisition Studio",
+    "subtitle": "Configure industrial data acquisition, map signals and validate data before activation.",
+    "raw": "Acquisition Studio // Configure industrial data acquisition, map signals and validate data before activation."
+  },
+  {
+    "id": "44",
+    "file": "44_header.png",
+    "title": "4 5",
+    "subtitle": "Mapping Service Running Signals & Mapping @ Vong sence Browse available signals and map incoming data to your asset model.",
+    "raw": "4 5 // Mapping Service Running // Signals & Mapping @ Vong sence // Browse available signals and map incoming data to your asset model."
+  },
+  {
+    "id": "45",
+    "file": "45_header.png",
+    "title": "Calculations & Output",
+    "subtitle": "Create formulas, calculated signals, and output groups for real-time and historical data.",
+    "raw": "Calculations & Output // Create formulas, calculated signals, and output groups for real-time and historical data."
+  },
+  {
+    "id": "46",
+    "file": "46_header.png",
+    "title": "> Factory Layout & Topology",
+    "subtitle": "Factory Context 3 Factory Layout & Topology FactoriX Manufacturing Plant © View Options Design and manaae factory assets. lines. zones. and connections.",
+    "raw": "> Factory Layout & Topology // Factory Context 3 // Factory Layout & Topology FactoriX Manufacturing Plant © View Options // Design and manaae factory assets. lines. zones. and connections."
+  },
+  {
+    "id": "47",
+    "file": "47_header.png",
+    "title": "Relationship Graph",
+    "subtitle": "Explore how assets, signals, connections, calculations and outputs are related in your environment.",
+    "raw": "Relationship Graph // Explore how assets, signals, connections, calculations and outputs are related in your environment."
+  },
+  {
+    "id": "48",
+    "file": "48_header.png",
+    "title": "Live Monitor nee (CEP ©",
+    "subtitle": "Monitor real-time data acquisition and signal streams across your assets.",
+    "raw": "Live Monitor nee (CEP © // Monitor real-time data acquisition and signal streams across your assets."
+  },
+  {
+    "id": "49",
+    "file": "49_header.png",
+    "title": "Diagnostics",
+    "subtitle": "Troubleshoot and analyze industrial data acquisition, connectivity, and signal health.",
+    "raw": "Diagnostics // Troubleshoot and analyze industrial data acquisition, connectivity, and signal health."
+  }
+]

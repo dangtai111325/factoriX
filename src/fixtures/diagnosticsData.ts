@@ -1,0 +1,67 @@
+import { DiagnosticItem } from '../types';
+
+export const initialDiagnostics: DiagnosticItem[] = [
+  {
+    id: 'diag-1',
+    connectionId: 'conn-opcua-01',
+    connectionName: 'OPC-UA Plant01 Primary Gateway',
+    protocol: 'opcua',
+    status: 'healthy',
+    uptimeSeconds: 86400,
+    messagesReceived: 4210984,
+    messagesDropped: 12,
+  },
+  {
+    id: 'diag-2',
+    connectionId: 'conn-modbus-01',
+    connectionName: 'Modbus TCP Line01 Gateway',
+    protocol: 'modbus',
+    status: 'healthy',
+    uptimeSeconds: 84200,
+    messagesReceived: 2198040,
+    messagesDropped: 0,
+  },
+  {
+    id: 'diag-3',
+    connectionId: 'conn-modbus-02',
+    connectionName: 'Modbus RTU over TCP Press 02',
+    protocol: 'modbus',
+    status: 'degraded',
+    uptimeSeconds: 41200,
+    messagesReceived: 89400,
+    messagesDropped: 1420,
+    lastError: 'CRC16 Checksum failure on register 40102 poll (3 retries elapsed)',
+    lastErrorTimestamp: '2026-10-29 11:52:10',
+  },
+  {
+    id: 'diag-4',
+    connectionId: 'conn-mqtt-01',
+    connectionName: 'EMQX Edge Broker Central',
+    protocol: 'mqtt',
+    status: 'healthy',
+    uptimeSeconds: 124000,
+    messagesReceived: 5892100,
+    messagesDropped: 5,
+  },
+  {
+    id: 'diag-5',
+    connectionId: 'conn-http-01',
+    connectionName: 'MES REST Energy & Scada API',
+    protocol: 'http',
+    status: 'healthy',
+    uptimeSeconds: 64000,
+    messagesReceived: 120400,
+    messagesDropped: 2,
+  },
+];
+
+export const runtimeSystemMetrics = {
+  cpuUsagePercent: 14.8,
+  memoryAllocatedMB: 384,
+  memoryLimitMB: 1024,
+  activeWorkerThreads: 4,
+  channelQueueDepth: 18,
+  activeSubscriptions: 24,
+  totalObservationsProcessed: 12498210,
+  uptimeString: '3d 14h 22m',
+};

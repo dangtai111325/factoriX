@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>FactoriX IIoT · Visual QA Review Gallery V7</title>
+  <style>
+    :root { font-family: Inter, system-ui, sans-serif; background: #0B1120; color: #F1F5FA; }
+    body { margin: 0; padding: 24px 3vw; }
+    header { margin-bottom: 24px; padding-bottom: 18px; border-bottom: 1px solid #1E293B; display: flex; align-items: center; justify-content: space-between; }
+    h1 { font-size: 24px; margin: 0; font-weight: 800; }
+    .badge { background: #E9FBF1; color: #0DBA67; font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 999px; }
+    .nav-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 24px; }
+    .tab-btn { background: #1E293B; color: #94A3B8; border: 1px solid #334155; padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; text-decoration: none; }
+    .tab-btn:hover { background: #334155; color: #FFF; }
+    .screen-card { background: #1E293B; border: 1px solid #334155; border-radius: 12px; padding: 18px; margin-bottom: 32px; }
+    .screen-title { font-size: 18px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; }
+    .comparison-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+    .view-col { background: #0F172A; border-radius: 8px; overflow: hidden; border: 1px solid #1E293B; }
+    .col-header { padding: 8px 12px; font-size: 12px; font-weight: 700; background: #1E293B; color: #94A3B8; text-transform: uppercase; }
+    .view-col img { width: 100%; height: auto; display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>FactoriX IIoT · Visual QA 1672×941 Review Gallery</h1>
+      <p style="color: #64748B; font-size: 13px; margin: 4px 0 0;">Automated side-by-side comparison: Reference Image (V7) vs Built Frontend (Port 3000) vs Difference Mask</p>
+    </div>
+    <span class="badge">15 Screens Verified</span>
+  </header>
+  
+  <div class="nav-tabs">
+<a class="tab-btn" href="#01">01 - Operations Overview</a>
+<a class="tab-btn" href="#02">02 - Factory Structure</a>
+<a class="tab-btn" href="#03">03 - Factory Layout Designer</a>
+<a class="tab-btn" href="#04">04 - Knowledge Graph</a>
+<a class="tab-btn" href="#05">05 - Connections</a>
+<a class="tab-btn" href="#06">06 - Add Data Wizard</a>
+<a class="tab-btn" href="#07">07 - OPC UA Protocol Studio</a>
+<a class="tab-btn" href="#08">08 - Signals Catalog</a>
+<a class="tab-btn" href="#09">09 - Calculated Signals</a>
+<a class="tab-btn" href="#10">10 - Live Operations Monitor</a>
+<a class="tab-btn" href="#11">11 - Acquisition Diagnostics</a>
+<a class="tab-btn" href="#12">12 - Activity Log</a>
+<a class="tab-btn" href="#13">13 - Output Groups</a>
+<a class="tab-btn" href="#14">14 - MQTT Protocol Studio</a>
+<a class="tab-btn" href="#15">15 - HTTP API Protocol Studio</a>
+</div>
+<div>
+
+    <div class="screen-card" id="01">
+      <div class="screen-title">
+        <span>01 — Operations Overview <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/overview)</span></span>
+        <a href="http://localhost:3000/overview" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/01_01_overview.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/01_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/01_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="02">
+      <div class="screen-title">
+        <span>02 — Factory Structure <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/factory/structure)</span></span>
+        <a href="http://localhost:3000/factory/structure" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/02_02_factory_structure.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/02_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/02_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="03">
+      <div class="screen-title">
+        <span>03 — Factory Layout Designer <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/factory/layout)</span></span>
+        <a href="http://localhost:3000/factory/layout" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/03_03_factory_layout_designer.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/03_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/03_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="04">
+      <div class="screen-title">
+        <span>04 — Knowledge Graph <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/factory/graph)</span></span>
+        <a href="http://localhost:3000/factory/graph" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/04_04_knowledge_graph.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/04_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/04_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="05">
+      <div class="screen-title">
+        <span>05 — Connections <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/acquisition/connections)</span></span>
+        <a href="http://localhost:3000/acquisition/connections" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/05_05_connections.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/05_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/05_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="06">
+      <div class="screen-title">
+        <span>06 — Add Data Wizard <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/acquisition/add-data)</span></span>
+        <a href="http://localhost:3000/acquisition/add-data" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/06_06_add_data_wizard.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/06_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/06_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="07">
+      <div class="screen-title">
+        <span>07 — OPC UA Protocol Studio <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/acquisition/studio/opcua)</span></span>
+        <a href="http://localhost:3000/acquisition/studio/opcua" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/07_07_protocol_studio_opcua.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/07_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/07_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="08">
+      <div class="screen-title">
+        <span>08 — Signals Catalog <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/signals)</span></span>
+        <a href="http://localhost:3000/signals" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/08_08_signals_catalog.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/08_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/08_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="09">
+      <div class="screen-title">
+        <span>09 — Calculated Signals <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/signals/calculated)</span></span>
+        <a href="http://localhost:3000/signals/calculated" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/09_09_calculated_signals.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/09_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/09_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="10">
+      <div class="screen-title">
+        <span>10 — Live Operations Monitor <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/live/monitor)</span></span>
+        <a href="http://localhost:3000/live/monitor" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/10_10_live_operations_monitor.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/10_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/10_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="11">
+      <div class="screen-title">
+        <span>11 — Acquisition Diagnostics <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/live/diagnostics)</span></span>
+        <a href="http://localhost:3000/live/diagnostics" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/11_11_live_operations_diagnostics.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/11_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/11_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="12">
+      <div class="screen-title">
+        <span>12 — Activity Log <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/live/activity)</span></span>
+        <a href="http://localhost:3000/live/activity" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/12_12_live_operations_activity_log.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/12_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/12_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="13">
+      <div class="screen-title">
+        <span>13 — Output Groups <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/signals/output-groups)</span></span>
+        <a href="http://localhost:3000/signals/output-groups" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/13_13_signals_output_groups.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/13_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/13_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="14">
+      <div class="screen-title">
+        <span>14 — MQTT Protocol Studio <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/acquisition/studio/mqtt)</span></span>
+        <a href="http://localhost:3000/acquisition/studio/mqtt" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/14_14_protocol_studio_mqtt.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/14_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/14_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+    <div class="screen-card" id="15">
+      <div class="screen-title">
+        <span>15 — HTTP API Protocol Studio <span style="font-size: 13px; font-weight: normal; color: #64748B;">(/acquisition/studio/http)</span></span>
+        <a href="http://localhost:3000/acquisition/studio/http" target="_blank" style="color: #EF1B24; font-size: 13px; text-decoration: none; font-weight: bold;">Open Live Page ↗</a>
+      </div>
+      <div class="comparison-grid">
+        <div class="view-col">
+          <div class="col-header">1. Reference Image (Handoff V7)</div>
+          <img src="../../FACTORIX_IIOT_COMPLETE_DESIGN_HANDOFF_V7/01_ORIGINAL_REFERENCES/15_15_protocol_studio_http_api.png" alt="Reference">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #0DBA67;">2. Built Frontend (Port 3000)</div>
+          <img src="captured/15_captured.png" alt="Captured">
+        </div>
+        <div class="view-col">
+          <div class="col-header" style="color: #FFAA23;">3. Difference Mask</div>
+          <img src="diff/15_diff.png" alt="Diff">
+        </div>
+      </div>
+    </div>
+
+  </div>
+</body>
+</html>
