@@ -18,19 +18,13 @@ const routes = [
   ['/acquisition/studio/http', '15_http_api'],
 ] as const;
 
-test.use({
-  viewport: { width: 1672, height: 941 },
-  deviceScaleFactor: 1,
-  colorScheme: 'light',
-});
-
 for (const [path, name] of routes) {
   test(`verify route ${name}`, async ({ page }) => {
     await page.goto(path);
     await expect(page.locator('h1')).toBeVisible();
     // Verify Demo Mode indicator is universally present (Review Section 10.A)
-    await expect(page.getByText('DEMO MODE')).toBeVisible();
-    // Verify Topbar brand and plant switcher
+    await expect(page.getByText('DEMO MODE', { exact: true })).toBeVisible();
+    // Verify Topbar brand
     await expect(page.getByText('FactoriX Industrial IoT')).toBeVisible();
     await page.evaluate(() => document.fonts.ready);
   });
@@ -45,9 +39,9 @@ test('verify signals catalog interactive bulk selection bar', async ({ page }) =
   await firstCheckbox.check();
 
   // Verify Floating Bulk Action Bar appears
-  await expect(page.getByText(/signal.*selected/i)).toBeVisible();
+  await expect(page.getByText(/1 signal selected/i)).toBeVisible();
   await expect(page.getByRole('button', { name: /Assign Output Group/i })).toBeVisible();
-  await expect(page.getByRole('button', { name: /Export CSV/i })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Export CSV \(1\)/i })).toBeVisible();
 });
 
 test('verify calculated signals formula evaluator reacts to input changes', async ({ page }) => {
