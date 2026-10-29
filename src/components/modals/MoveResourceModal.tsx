@@ -1,37 +1,46 @@
 import React, { useState } from 'react';
-import { X, ArrowRightLeft, FolderTree, AlertCircle } from 'lucide-react';
+import { X, ArrowRightLeft, FolderTree, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { ResourceNode } from '../../types';
 
 export interface MoveResourceModalProps {
   isOpen: boolean;
   onClose: () => void;
-  resourceName?: string;
-  currentPath?: string;
-  onMoveResource?: (resourceName: string, newParentPath: string) => void;
+  selectedResource: ResourceNode;
+  allResources: ResourceNode[];
+  onMoveResource: (targetParentId: string) => void;
 }
 
 export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
   isOpen,
   onClose,
-  resourceName = 'CNC-01',
-  currentPath = 'East Manufacturing > Plant 01 - Assembly > Zone A-Body > Line 01',
+  selectedResource,
+  allResources,
   onMoveResource,
 }) => {
-  const [selectedDestination, setSelectedDestination] = useState(
-    'East Manufacturing > Plant 01 - Assembly > Zone A-Body > Line 02'
+  // Filter valid potential parents (must not be itself or an invalid level)
+  const candidateParents = allResources.filter(
+    (r) => r.id !== selectedResource.id && r.type !== 'sensor'
   );
+
+  const [selectedTargetId, setSelectedTargetId] = useState<string>(
+    candidateParents[0]?.id || ''
+  );
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
-  const destinationOptions = [
-    'East Manufacturing > Plant 01 - Assembly > Zone A-Body > Line 02',
-    'East Manufacturing > Plant 01 - Assembly > Zone A-Body > Line 03',
-    'East Manufacturing > Plant 01 - Assembly > Zone B-Paint > Line 01',
-    'East Manufacturing > Plant 02 - Machining > Zone A > Line 01',
-    'West Manufacturing > Plant 01 > Zone Packaging > Line 01',
-  ];
+  const currentParent = allResources.find((r) => r.id === selectedResource.parentId);
 
   const handleConfirm = () => {
-    onMoveResource?.(resourceName, selectedDestination);
+    if (!selectedTargetId) {
+      setErrorMsg('Please select a destination parent.');
+      return;
+    }
+    if (selectedTargetId === selectedResource.parentId) {
+      setErrorMsg('Target destination is identical to current parent.');
+      return;
+    }
+    onMoveResource(selectedTargetId);
     onClose();
   };
 
@@ -59,72 +68,97 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
 
         {/* Content */}
         <div className="p-6 space-y-4 text-sm">
-          <div>
-            <span className="text-xs font-semibold text-slate-500 uppercase">Selected Resource</span>
-            <div className="mt-1 font-bold text-slate-800 text-base">{resourceName}</div>
-          </div>
+          {errorMsg && (
+            <div className="p-3 rounded-lg bg-red-50 border border-red-200 flex items-center gap-2 text-red-700 text-xs">
+              <AlertCircle className="w-4 h-4 flex-shrink-0" />
+              <span>{errorMsg}</span>
+            </div>
+          )}
 
           <div>
-            <span className="text-xs font-semibold text-slate-500 uppercase">Current Location</span>
-            <div className="mt-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700">
-              {currentPath}
+            <span className="text-xs font-semibold text-slate-500 uppercase">Selected Resource</span>
+            <div className="mt-1 font-bold text-slate-800 text-base flex items-center gap-2">
+              <span>{selectedResource.name}</span>
+              <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-slate-100 text-slate-600">
+                {selectedResource.code}
+              </span>
             </div>
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-slate-700 mb-1">
-              Select Target Destination (Parent Node) <span className="text-[#EF1B24]">*</span>
+            <span className="text-xs font-semibold text-slate-500 uppercase">Current Parent Node</span>
+            <div className="mt-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 flex items-center gap-2">
+              <FolderTree className="w-3.5 h-3.5 text-slate-400" />
+              <span>{currentParent ? `${currentParent.name} (${currentParent.type})` : 'Root Level / Enterprise'}</span>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+              Select New Parent Destination <span className="text-[#EF1B24]">*</span>
             </label>
-            <div className="space-y-2">
-              {destinationOptions.map((dest) => (
+            <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1">
+              {candidateParents.map((cand) => (
                 <label
-                  key={dest}
-                  className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all ${
-                    selectedDestination === dest
-                      ? 'border-[#EF1B24] bg-red-50/30 ring-1 ring-[#EF1B24]'
+                  key={cand.id}
+                  className={`flex items-center justify-between p-2.5 rounded-lg border cursor-pointer transition-all ${
+                    selectedTargetId === cand.id
+                      ? 'border-[#EF1B24] bg-red-50/40 ring-1 ring-[#EF1B24]'
                       : 'border-slate-200 hover:bg-slate-50'
                   }`}
                 >
-                  <input
-                    type="radio"
-                    name="destination"
-                    value={dest}
-                    checked={selectedDestination === dest}
-                    onChange={(e) => setSelectedDestination(e.target.value)}
-                    className="text-[#EF1B24] focus:ring-[#EF1B24]"
-                  />
-                  <div className="flex items-center gap-2 text-xs font-mono text-slate-800">
-                    <FolderTree className="w-4 h-4 text-slate-400 flex-shrink-0" />
-                    <span>{dest}</span>
+                  <div className="flex items-center gap-2.5">
+                    <input
+                      type="radio"
+                      name="destination"
+                      value={cand.id}
+                      checked={selectedTargetId === cand.id}
+                      onChange={() => {
+                        setSelectedTargetId(cand.id);
+                        setErrorMsg(null);
+                      }}
+                      className="text-[#EF1B24] focus:ring-[#EF1B24]"
+                    />
+                    <div>
+                      <span className="font-semibold text-xs text-slate-800 block">{cand.name}</span>
+                      <span className="text-[10px] text-slate-400 font-mono capitalize">{cand.type} · {cand.code}</span>
+                    </div>
                   </div>
+                  {cand.id === selectedResource.parentId && (
+                    <span className="text-[10px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">
+                      Current
+                    </span>
+                  )}
                 </label>
               ))}
             </div>
           </div>
 
-          <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-start gap-2.5 text-xs text-amber-800">
-            <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
-            <div>
-              <strong>Note:</strong> Moving this resource will update its Unified Namespace path and linked signal topic subscriptions while preserving historical records.
-            </div>
+          <div className="p-3 bg-amber-50/70 border border-amber-200 rounded-lg flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 text-amber-600 mt-0.5 flex-shrink-0" />
+            <p className="text-xs text-amber-800 leading-relaxed">
+              <strong>Impact Preview:</strong> Moving this resource will automatically update parent breadcrumbs,
+              connected telemetry paths, and the industrial knowledge graph. Sub-assets will move along with it.
+            </p>
           </div>
         </div>
 
-        {/* Actions */}
-        <div className="px-6 py-4 border-t border-slate-100 flex items-center justify-end gap-3 bg-slate-50">
+        {/* Footer */}
+        <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex items-center justify-end gap-3">
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-200 rounded-lg transition-colors"
+            className="px-4 py-2 border border-slate-200 text-slate-600 rounded-lg text-sm font-semibold hover:bg-slate-100 transition-colors"
           >
             Cancel
           </button>
           <button
             type="button"
             onClick={handleConfirm}
-            className="px-5 py-2 text-xs font-semibold text-white bg-[#EF1B24] hover:bg-[#d0171f] rounded-lg shadow-sm transition-all flex items-center gap-1.5"
+            className="px-4 py-2 bg-[#EF1B24] hover:bg-[#D9141D] text-white rounded-lg text-sm font-semibold transition-colors flex items-center gap-1.5 shadow-sm"
           >
-            <ArrowRightLeft className="w-4 h-4" /> Apply Move
+            <CheckCircle2 className="w-4 h-4" />
+            <span>Confirm Move</span>
           </button>
         </div>
       </div>

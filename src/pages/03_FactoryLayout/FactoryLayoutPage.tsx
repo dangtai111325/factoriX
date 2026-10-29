@@ -28,6 +28,7 @@ export const FactoryLayoutPage: React.FC = () => {
   const [selectedNodeId, setSelectedNodeId] = useState<string>('layout-node-1');
   const [zoom, setZoom] = useState<number>(100);
   const [snapGrid, setSnapGrid] = useState<boolean>(true);
+  const [saveToast, setSaveToast] = useState<string | null>(null);
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
@@ -100,11 +101,24 @@ export const FactoryLayoutPage: React.FC = () => {
               Live Monitor View
             </button>
           </div>
-          <Button variant="primary" icon={<Save className="w-4 h-4" />}>
+          <Button
+            variant="primary"
+            icon={<Save className="w-4 h-4" />}
+            onClick={() => {
+              setSaveToast('Layout blueprint saved to storage!');
+              setTimeout(() => setSaveToast(null), 3000);
+            }}
+          >
             Save Layout Draft
           </Button>
         </div>
       </div>
+
+      {saveToast && (
+        <div className="p-3 bg-slate-900 text-white rounded-xl text-xs font-semibold shadow-lg flex items-center justify-between animate-in fade-in">
+          <span>{saveToast}</span>
+        </div>
+      )}
 
       {/* Main Designer Grid: Palette (Reg 3, 8) - Canvas (Reg 4, 5, 6) - Inspector (Reg 7) */}
       <div className="grid grid-cols-12 gap-3.5">

@@ -14,56 +14,33 @@ import {
   Layers,
   HardDrive,
   Info,
+  Sparkles,
+  AlertTriangle,
+  RotateCw,
 } from 'lucide-react';
 import { useApp } from '../../store/AppContext';
-
-interface PlantSite {
-  id: string;
-  name: string;
-  zone: string;
-  status: 'operational' | 'warning' | 'maintenance';
-  assetsCount: number;
-}
-
-const PLANT_SITES: PlantSite[] = [
-  {
-    id: 'plant-01',
-    name: 'Plant 01 · CNC Machining',
-    zone: 'Riverside Main Facility',
-    status: 'operational',
-    assetsCount: 18,
-  },
-  {
-    id: 'plant-02',
-    name: 'Plant 02 · Robotic Welding',
-    zone: 'East Wing Automation Hall',
-    status: 'operational',
-    assetsCount: 24,
-  },
-  {
-    id: 'plant-03',
-    name: 'Plant 03 · Paint & Coating',
-    zone: 'North Chemical Processing',
-    status: 'warning',
-    assetsCount: 12,
-  },
-  {
-    id: 'plant-04',
-    name: 'Plant 04 · Final Assembly',
-    zone: 'South Logistics Hub',
-    status: 'maintenance',
-    assetsCount: 32,
-  },
-];
+import { useNavigate } from 'react-router-dom';
+import { DemoScenario } from '../../types';
 
 export const Topbar: React.FC = () => {
-  const { isStreaming, setIsStreaming, setSearchOpen } = useApp();
-  const [activeSite, setActiveSite] = useState<PlantSite>(PLANT_SITES[0]);
+  const {
+    isStreaming,
+    setIsStreaming,
+    setSearchOpen,
+    availablePlants,
+    currentPlant,
+    setCurrentPlant,
+    demoScenario,
+    setDemoScenario,
+    isDemoMode,
+  } = useApp();
+
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const [daemonPopoverOpen, setDaemonPopoverOpen] = useState(false);
 
   const siteDropdownRef = useRef<HTMLDivElement>(null);
   const daemonRef = useRef<HTMLDivElement>(null);
+  const navigate = useNavigate();
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -97,14 +74,14 @@ export const Topbar: React.FC = () => {
             >
               <span
                 className={`w-2 h-2 rounded-full ${
-                  activeSite.status === 'operational'
+                  currentPlant.status === 'operational'
                     ? 'bg-[#0DBA67]'
-                    : activeSite.status === 'warning'
+                    : currentPlant.status === 'warning'
                     ? 'bg-[#FFAA23]'
                     : 'bg-[#94A3B8]'
                 }`}
               />
-              <span>{activeSite.name}</span>
+              <span>{currentPlant.name}</span>
               <ChevronDown className="w-3.5 h-3.5 text-[#1D63BD]" />
             </button>
 
@@ -116,19 +93,19 @@ export const Topbar: React.FC = () => {
                     Select Industrial Facility
                   </span>
                   <span className="text-[10px] bg-[#F1F5FA] px-1.5 py-0.5 rounded text-[#657794] font-semibold">
-                    {PLANT_SITES.length} Sites
+                    {availablePlants.length} Sites
                   </span>
                 </div>
 
                 <div className="space-y-0.5 px-1">
-                  {PLANT_SITES.map((site) => {
-                    const isCurrent = site.id === activeSite.id;
+                  {availablePlants.map((site) => {
+                    const isCurrent = site.id === currentPlant.id;
                     return (
                       <button
                         key={site.id}
                         type="button"
                         onClick={() => {
-                          setActiveSite(site);
+                          setCurrentPlant(site);
                           setSiteDropdownOpen(false);
                         }}
                         className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between transition-colors ${
@@ -167,8 +144,21 @@ export const Topbar: React.FC = () => {
           </div>
         </div>
 
-        {/* Live streaming status pill */}
-        <div className="flex items-center gap-2 pl-3 border-l border-[#E2E8F0]">
+        {/* Global Demo Mode Pill (Review Section 10.A & FX-01) */}
+        {isDemoMode && (
+          <div className="flex items-center gap-1.5 pl-2 border-l border-[#E2E8F0]">
+            <span
+              className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-[#FFF8E7] text-[#B96B00] text-[11px] font-bold border border-[#FFE2A4] shadow-2xs"
+              title="Application is running with deterministic simulated telemetry"
+            >
+              <Sparkles className="w-3 h-3 text-[#B96B00]" />
+              DEMO MODE
+            </span>
+          </div>
+        )}
+
+        {/* Visualization stream pause button (Review FX-17) */}
+        <div className="flex items-center gap-2 pl-2 border-l border-[#E2E8F0]">
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide ${
               isStreaming
@@ -184,7 +174,7 @@ export const Topbar: React.FC = () => {
             type="button"
             onClick={() => setIsStreaming(!isStreaming)}
             className="p-1 rounded-md text-[#657794] hover:text-[#111B37] hover:bg-[#F1F5FA] transition-colors"
-            title={isStreaming ? 'Pause live telemetry stream' : 'Resume live stream'}
+            title={isStreaming ? 'Pause Visualization (Freezes UI charts)' : 'Resume Live Visualization'}
           >
             {isStreaming ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 text-[#0DBA67]" />}
           </button>
@@ -195,58 +185,106 @@ export const Topbar: React.FC = () => {
           <button
             type="button"
             onClick={() => setDaemonPopoverOpen(!daemonPopoverOpen)}
-            className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full bg-[#F6F8FC] hover:bg-[#EDF2F7] border border-[#D4DFEC] text-[11px] text-[#334568] transition-colors"
-            title="Click to view Edge Collector Daemon health details"
+            className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-[11px] transition-colors border ${
+              demoScenario === 'healthy'
+                ? 'bg-[#F6F8FC] hover:bg-[#EDF2F7] border-[#D4DFEC] text-[#334568]'
+                : 'bg-[#FFF5F5] hover:bg-[#FFEBEB] border-[#FAC6C9] text-[#EF1B24]'
+            }`}
+            title="Click to view Edge Collector Daemon health and simulate scenarios"
           >
-            <span className="w-2 h-2 rounded-full bg-[#0DBA67] animate-pulse" />
-            <span className="font-semibold text-[#111B37]">Collector Daemon</span>
+            <span
+              className={`w-2 h-2 rounded-full ${
+                demoScenario === 'healthy' ? 'bg-[#0DBA67] animate-pulse' : 'bg-[#EF1B24]'
+              }`}
+            />
+            <span className="font-semibold text-[#111B37]">
+              {demoScenario === 'healthy' ? 'Daemon: Healthy' : `Scenario: ${demoScenario}`}
+            </span>
             <span className="text-[#94A3B8]">·</span>
-            <span className="font-mono text-[#0DBA67] font-bold">1,248 msgs/s</span>
+            <span className="font-mono text-[#0DBA67] font-bold">
+              {demoScenario === 'offline' ? '0' : '1,248'} msgs/s
+            </span>
             <span className="text-[#94A3B8]">·</span>
-            <span className="font-mono text-[#657794]">18ms</span>
+            <span className="font-mono text-[#657794]">
+              {demoScenario === 'timeout_opcua' ? '5000ms' : '18ms'}
+            </span>
           </button>
 
           {/* Popover Card */}
           {daemonPopoverOpen && (
-            <div className="absolute left-0 top-full mt-2 w-80 rounded-xl bg-white border border-[#D4DFEC] shadow-2xl p-4 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
+            <div className="absolute left-0 top-full mt-2 w-88 rounded-xl bg-white border border-[#D4DFEC] shadow-2xl p-4 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
               <div className="flex items-center justify-between pb-2 border-b border-[#E3EAF3]">
                 <div className="flex items-center gap-2">
                   <Activity className="w-4 h-4 text-[#0DBA67]" />
-                  <span className="text-[13px] font-bold text-[#111B37]">Edge Daemon Health</span>
+                  <span className="text-[13px] font-bold text-[#111B37]">Edge Daemon Health (Simulated)</span>
                 </div>
                 <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#E9FBF1] text-[#0DBA67]">
                   PID 4102
                 </span>
               </div>
 
-              <div className="grid grid-cols-2 gap-3 py-3 text-[12px]">
+              {/* Demo Scenario Controller (Review FX-06) */}
+              <div className="mt-2.5 p-2.5 rounded-lg bg-[#F8FAFC] border border-[#E2E8F0]">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-[11px] font-bold text-[#475569] uppercase tracking-wider">
+                    Test Scenario Mode
+                  </span>
+                  <span className="text-[10px] text-[#64748B]">Deterministic Simulation</span>
+                </div>
+                <select
+                  value={demoScenario}
+                  onChange={(e) => setDemoScenario(e.target.value as DemoScenario)}
+                  className="w-full text-[12px] font-semibold bg-white border border-[#CBD5E1] rounded-md px-2 py-1 text-[#1E293B] focus:outline-none focus:border-[#2A82E7]"
+                >
+                  <option value="healthy">🟢 Healthy (All Gateways Online)</option>
+                  <option value="degraded_modbus">🟡 Modbus Exception (Illegal Address 0x02)</option>
+                  <option value="timeout_opcua">🔴 OPC UA Browse Timeout (5000ms)</option>
+                  <option value="auth_fail_mqtt">🔴 MQTT Auth Error (CONNACK 0x05)</option>
+                  <option value="offline">⚫ Network Host Unreachable (ECONNREFUSED)</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2.5 py-3 text-[12px]">
                 <div className="p-2.5 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3]">
                   <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Throughput</span>
-                  <span className="text-[15px] font-extrabold text-[#111B37] font-mono">1,248</span>
+                  <span className="text-[15px] font-extrabold text-[#111B37] font-mono">
+                    {demoScenario === 'offline' ? '0' : '1,248'}
+                  </span>
                   <span className="text-[10px] text-[#657794] block">msgs / second</span>
                 </div>
                 <div className="p-2.5 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3]">
                   <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Queue Depth</span>
-                  <span className="text-[15px] font-extrabold text-[#0DBA67] font-mono">0.4%</span>
-                  <span className="text-[10px] text-[#657794] block">42 / 10,000 pkts</span>
+                  <span className="text-[15px] font-extrabold text-[#0DBA67] font-mono">
+                    {demoScenario === 'timeout_opcua' ? '48.2%' : '0.4%'}
+                  </span>
+                  <span className="text-[10px] text-[#657794] block">Ring Buffer</span>
                 </div>
                 <div className="p-2.5 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3]">
-                  <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Ingestion Latency</span>
-                  <span className="text-[15px] font-extrabold text-[#111B37] font-mono">18 ms</span>
-                  <span className="text-[10px] text-[#657794] block">p99: 34 ms</span>
+                  <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Latency</span>
+                  <span className="text-[15px] font-extrabold text-[#111B37] font-mono">
+                    {demoScenario === 'timeout_opcua' ? '5000 ms' : '18 ms'}
+                  </span>
+                  <span className="text-[10px] text-[#657794] block">Roundtrip Time</span>
                 </div>
                 <div className="p-2.5 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3]">
                   <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Daemon Uptime</span>
                   <span className="text-[15px] font-extrabold text-[#111B37] font-mono">4d 18h</span>
-                  <span className="text-[10px] text-[#0DBA67] font-bold block">0 errors</span>
+                  <span className="text-[10px] text-[#0DBA67] font-bold block">Simulated Edge</span>
                 </div>
               </div>
 
               <div className="pt-2 border-t border-[#E3EAF3] flex items-center justify-between text-[11px] text-[#657794]">
                 <span>Active Channels: <strong>4 Gateways</strong></span>
-                <span className="text-[#1D63BD] font-semibold hover:underline cursor-pointer">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDaemonPopoverOpen(false);
+                    navigate('/live/diagnostics');
+                  }}
+                  className="text-[#1D63BD] font-semibold hover:underline"
+                >
                   View Diagnostics →
-                </span>
+                </button>
               </div>
             </div>
           )}
@@ -273,8 +311,9 @@ export const Topbar: React.FC = () => {
         {/* Notification Bell */}
         <button
           type="button"
+          onClick={() => navigate('/live/activity')}
           className="relative w-10 h-10 rounded-lg border border-[#E3EAF3] bg-white hover:bg-[#F9FAFD] flex items-center justify-center text-[#334568] transition-colors"
-          title="System notifications"
+          title="System notifications & activity log"
         >
           <Bell className="w-4 h-4" />
           <span className="absolute top-2.5 right-2.5 w-2 h-2 rounded-full bg-[#EF1B24] ring-2 ring-white" />
@@ -289,7 +328,7 @@ export const Topbar: React.FC = () => {
             <span className="text-[13px] font-semibold text-[#111B37] leading-tight">
               Local Operator
             </span>
-            <span className="text-[11px] text-[#657794]">Plant Automation</span>
+            <span className="text-[11px] text-[#657794]">Demo Session</span>
           </div>
         </div>
       </div>

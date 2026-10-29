@@ -51,12 +51,72 @@ const MicroSparkline: React.FC<{ value: number; quality: string }> = ({ value, q
 };
 
 export const SignalsCatalogPage: React.FC = () => {
-  const { signals, selectedSignalId, setSelectedSignalId, addSignal } = useApp();
+  const {
+    signals,
+    selectedSignalId,
+    setSelectedSignalId,
+    addSignal,
+    bulkDeleteSignals,
+    bulkAssignOutputGroup,
+    outputGroups,
+  } = useApp();
   const [filterType, setFilterType] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [drawerOpen, setDrawerOpen] = useState<boolean>(true);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [assignModalOpen, setAssignModalOpen] = useState<boolean>(false);
+  const [selectedGroupId, setSelectedGroupId] = useState<string>('');
+  const [undoDelete, setUndoDelete] = useState<(() => void) | null>(null);
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
   const navigate = useNavigate();
+
+  const handleExportCSV = (signalsToExport: SignalItem[]) => {
+    const headers = ['Tag', 'Parameter Name', 'Resource Path', 'Data Type', 'Live Value', 'Unit', 'Quality', 'Last Updated'];
+    const rows = signalsToExport.map((s) => [
+      `"${s.tag}"`,
+      `"${s.name}"`,
+      `"${s.resourcePath}"`,
+      `"${s.dataType}"`,
+      `"${s.currentValue}"`,
+      `"${s.unit || ''}"`,
+      `"${s.quality}"`,
+      `"${s.lastUpdated}"`,
+    ]);
+    const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `factorix_signals_${Date.now()}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setToastMsg(`Downloaded CSV with ${signalsToExport.length} signals`);
+    setTimeout(() => setToastMsg(null), 4000);
+  };
+
+  const handleDeleteSelected = () => {
+    const { count, undo } = bulkDeleteSignals(selectedIds);
+    setSelectedIds([]);
+    setUndoDelete(() => undo);
+    setToastMsg(`Deleted ${count} signals from catalog`);
+    setTimeout(() => {
+      setToastMsg(null);
+      setUndoDelete(null);
+    }, 6000);
+  };
+
+  const handleConfirmAssign = () => {
+    if (!selectedGroupId && outputGroups.length > 0) {
+      bulkAssignOutputGroup(selectedIds, outputGroups[0].id);
+    } else if (selectedGroupId) {
+      bulkAssignOutputGroup(selectedIds, selectedGroupId);
+    }
+    setAssignModalOpen(false);
+    setSelectedIds([]);
+    setToastMsg(`Assigned signals to output group`);
+    setTimeout(() => setToastMsg(null), 4000);
+  };
 
   const selectedSignal =
     signals.find((s) => s.id === selectedSignalId) || signals[0];
@@ -103,7 +163,11 @@ export const SignalsCatalogPage: React.FC = () => {
           >
             Create Signal
           </Button>
-          <Button variant="secondary" icon={<Download className="w-4 h-4" />}>
+          <Button
+            variant="secondary"
+            icon={<Download className="w-4 h-4" />}
+            onClick={() => handleExportCSV(filteredSignals)}
+          >
             Export CSV
           </Button>
         </div>
@@ -325,7 +389,7 @@ export const SignalsCatalogPage: React.FC = () => {
           <div className="h-4 w-px bg-slate-700" />
           <button
             type="button"
-            onClick={() => navigate('/signals/output-groups')}
+            onClick={() => setAssignModalOpen(true)}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1E293B] hover:bg-[#334155] text-[12px] font-semibold text-slate-200 transition-colors"
           >
             <Zap className="w-3.5 h-3.5 text-[#38BDF8]" />
@@ -333,19 +397,18 @@ export const SignalsCatalogPage: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={() => alert(`Exporting ${selectedIds.length} signals to CSV...`)}
+            onClick={() => {
+              const selectedSigs = signals.filter((s) => selectedIds.includes(s.id));
+              handleExportCSV(selectedSigs);
+            }}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1E293B] hover:bg-[#334155] text-[12px] font-semibold text-slate-200 transition-colors"
           >
             <Download className="w-3.5 h-3.5 text-[#34D399]" />
-            Export CSV
+            Export CSV ({selectedIds.length})
           </button>
           <button
             type="button"
-            onClick={() => {
-              if (confirm(`Delete ${selectedIds.length} signals?`)) {
-                setSelectedIds([]);
-              }
-            }}
+            onClick={handleDeleteSelected}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#EF1B24]/20 hover:bg-[#EF1B24]/30 text-[12px] font-semibold text-[#F87171] transition-colors"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -360,6 +423,73 @@ export const SignalsCatalogPage: React.FC = () => {
           >
             <X className="w-4 h-4" />
           </button>
+        </div>
+      )}
+
+      {/* Assign Output Group Modal (Review FX-07, FX-11) */}
+      {assignModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-md p-5 space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-100">
+              <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                <Zap className="w-4 h-4 text-[#2A82E7]" />
+                Assign Signals to Output Group
+              </h3>
+              <button
+                type="button"
+                onClick={() => setAssignModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-500">
+              Select an existing output group to bundle the <strong>{selectedIds.length}</strong> selected signals
+              for automated MQTT/Kafka publishing.
+            </p>
+            <div className="space-y-2">
+              <label className="block text-xs font-semibold text-slate-700">Target Output Group</label>
+              <select
+                value={selectedGroupId || outputGroups[0]?.id}
+                onChange={(e) => setSelectedGroupId(e.target.value)}
+                className="w-full text-xs p-2.5 rounded-lg border border-slate-300 bg-white text-slate-800 font-semibold"
+              >
+                {outputGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name} ({g.topicTemplate})
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <Button size="sm" variant="secondary" onClick={() => setAssignModalOpen(false)}>
+                Cancel
+              </Button>
+              <Button size="sm" variant="primary" onClick={handleConfirmAssign}>
+                Confirm Assignment
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Undo Toast Notification (Review FX-07) */}
+      {toastMsg && (
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-900 text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
+          <span className="text-xs font-semibold">{toastMsg}</span>
+          {undoDelete && (
+            <button
+              type="button"
+              onClick={() => {
+                undoDelete();
+                setToastMsg('Deletion undone! Signals restored.');
+                setUndoDelete(null);
+              }}
+              className="text-xs font-bold text-amber-400 hover:text-amber-300 underline ml-2"
+            >
+              Undo
+            </button>
+          )}
         </div>
       )}
     </div>

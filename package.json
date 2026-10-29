@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --port 3000 --host",
     "build": "tsc && vite build",
+    "check": "tsc --noEmit",
     "preview": "vite preview --port 3000",
     "test:visual": "playwright test"
   },
@@ -15,8 +16,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.28.0",
-    "tailwind-merge": "^2.5.4",
-    "tesseract.js": "^7.0.0"
+    "tailwind-merge": "^2.5.4"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",

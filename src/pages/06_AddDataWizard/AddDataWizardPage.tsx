@@ -19,7 +19,7 @@ import { useApp } from '../../store/AppContext';
 import { useNavigate } from 'react-router-dom';
 
 export const AddDataWizardPage: React.FC = () => {
-  const { resources, addSignal } = useApp();
+  const { resources, addSignal, currentPlant } = useApp();
   const navigate = useNavigate();
 
   const [step, setStep] = useState<number>(1);
@@ -33,18 +33,53 @@ export const AddDataWizardPage: React.FC = () => {
 
   // Step 3 Registers State
   const [registers, setRegisters] = useState([
-    { address: '40001', name: 'Spindle Temperature', type: 'Holding Register', dataType: 'Float32', unit: '°C' },
-    { address: '40003', name: 'Vibration RMS', type: 'Holding Register', dataType: 'Float32', unit: 'mm/s' },
-    { address: '40005', name: 'Active Motor Speed', type: 'Holding Register', dataType: 'Int32', unit: 'RPM' },
+    { address: '40001', name: 'Spindle Temperature', type: 'Holding Register', dataType: 'Float32', unit: '°C', defaultVal: 42.5 },
+    { address: '40003', name: 'Vibration RMS', type: 'Holding Register', dataType: 'Float32', unit: 'mm/s', defaultVal: 1.45 },
+    { address: '40005', name: 'Active Motor Speed', type: 'Holding Register', dataType: 'Int32', unit: 'RPM', defaultVal: 1480 },
   ]);
 
-  // Step 4 Test State
+  // Step 4 Test State (Review FX-04: multi-stage simulated pipeline)
   const [isTesting, setIsTesting] = useState(false);
+  const [testStages, setTestStages] = useState<Array<{ name: string; status: 'pending' | 'testing' | 'pass'; latency?: number }>>([
+    { name: 'TCP Socket Connect (Port 502)', status: 'pending' },
+    { name: 'Modbus Protocol Session (Unit ID 1)', status: 'pending' },
+    { name: 'Register Read Validation (40001-40005)', status: 'pending' },
+  ]);
   const [testSuccess, setTestSuccess] = useState(false);
 
   const handleRunTest = async () => {
     setIsTesting(true);
-    await new Promise((r) => setTimeout(r, 800));
+    setTestSuccess(false);
+
+    // Stage 1
+    setTestStages((prev) => [
+      { ...prev[0], status: 'testing' },
+      prev[1],
+      prev[2],
+    ]);
+    await new Promise((r) => setTimeout(r, 250));
+    setTestStages((prev) => [
+      { ...prev[0], status: 'pass', latency: 8 },
+      { ...prev[1], status: 'testing' },
+      prev[2],
+    ]);
+
+    // Stage 2
+    await new Promise((r) => setTimeout(r, 250));
+    setTestStages((prev) => [
+      prev[0],
+      { ...prev[1], status: 'pass', latency: 12 },
+      { ...prev[2], status: 'testing' },
+    ]);
+
+    // Stage 3
+    await new Promise((r) => setTimeout(r, 300));
+    setTestStages((prev) => [
+      prev[0],
+      prev[1],
+      { ...prev[2], status: 'pass', latency: 15 },
+    ]);
+
     setIsTesting(false);
     setTestSuccess(true);
   };
@@ -55,8 +90,14 @@ export const AddDataWizardPage: React.FC = () => {
         name: reg.name,
         tag: `LINE01.CNC01.${reg.name.toUpperCase().replace(/\s+/g, '_')}`,
         unit: reg.unit,
-        dataType: 'analog',
-        currentValue: 42.8,
+        dataType: reg.dataType === 'Int32' ? 'integer' : 'analog',
+        currentValue: reg.defaultVal,
+        sourceConnectionId: 'conn-modbus-01',
+        sourceConnectionName: 'Modbus TCP Line01 Gateway',
+        bindingType: 'modbus_register',
+        bindingAddress: reg.address,
+        plantId: currentPlant.id,
+        quality: 'GOOD',
       });
     });
     navigate('/signals');
@@ -256,7 +297,7 @@ export const AddDataWizardPage: React.FC = () => {
               onClick={() => {
                 setRegisters((prev) => [
                   ...prev,
-                  { address: '40007', name: 'Hydraulic Pressure', type: 'Holding Register', dataType: 'Float32', unit: 'bar' },
+                  { address: '40007', name: 'Hydraulic Pressure', type: 'Holding Register', dataType: 'Float32', unit: 'bar', defaultVal: 28.5 },
                 ]);
               }}
             >
@@ -344,12 +385,22 @@ export const AddDataWizardPage: React.FC = () => {
                 <span className="text-[#657794]">Unit ID:</span>
                 <span className="font-mono font-bold text-[#111B37]">{unitId}</span>
               </div>
-              {testSuccess && (
-                <div className="flex justify-between text-[13px] text-[#0DBA67] font-bold">
-                  <span>Handshake:</span>
-                  <span>SUCCESS (14ms)</span>
-                </div>
-              )}
+              <div className="space-y-1.5 pt-2 border-t border-[#E3EAF3]">
+                {testStages.map((stg, idx) => (
+                  <div key={idx} className="flex justify-between items-center text-[12px]">
+                    <span className="text-slate-600">{stg.name}</span>
+                    {stg.status === 'pass' ? (
+                      <span className="text-[#0DBA67] font-bold flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Pass ({stg.latency}ms)
+                      </span>
+                    ) : stg.status === 'testing' ? (
+                      <span className="text-[#2A82E7] font-semibold animate-pulse">Testing...</span>
+                    ) : (
+                      <span className="text-slate-400">Ready</span>
+                    )}
+                  </div>
+                ))}
+              </div>
             </div>
             <Button
               variant="secondary"

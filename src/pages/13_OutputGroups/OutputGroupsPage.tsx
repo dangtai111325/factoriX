@@ -18,19 +18,71 @@ import { useApp } from '../../store/AppContext';
 import { OutputGroup } from '../../types';
 
 export const OutputGroupsPage: React.FC = () => {
-  const { outputGroups } = useApp();
+  const { outputGroups, signals, saveOutputGroup } = useApp();
   const [selectedGroupId, setSelectedGroupId] = useState<string>('grp-uns-cnc01');
   const [copied, setCopied] = useState<boolean>(false);
+  const [dispatchToast, setDispatchToast] = useState<string | null>(null);
 
   const selectedGroup =
     outputGroups.find((g) => g.id === selectedGroupId) || outputGroups[0];
 
   const [topic, setTopic] = useState<string>(selectedGroup.topicTemplate);
 
+  // Dynamic projection from actual signals in state (Review FX-11)
+  const projectedPayload = JSON.stringify(
+    {
+      timestamp: new Date().toISOString(),
+      topic,
+      qos: 1,
+      source: 'FactoriX-UNS-Publisher-v1',
+      metrics: selectedGroup.assignedSignals.reduce((acc, sigId) => {
+        const found = signals.find((s) => s.id === sigId);
+        if (found) {
+          acc[found.tag] = {
+            value: found.currentValue,
+            unit: found.unit,
+            quality: found.quality,
+            timestamp: found.lastUpdated,
+          };
+        } else {
+          acc[sigId] = { value: 0, status: 'NOT_FOUND' };
+        }
+        return acc;
+      }, {} as Record<string, any>),
+    },
+    null,
+    2
+  );
+
   const handleCopy = () => {
-    navigator.clipboard.writeText(selectedGroup.samplePayload);
+    navigator.clipboard.writeText(projectedPayload);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleSave = () => {
+    saveOutputGroup({
+      ...selectedGroup,
+      topicTemplate: topic,
+      samplePayload: projectedPayload,
+    });
+    setDispatchToast(`Saved output group "${selectedGroup.name}"`);
+    setTimeout(() => setDispatchToast(null), 3000);
+  };
+
+  const handleTestDispatch = () => {
+    setDispatchToast(
+      `[Simulated Dispatch] Published message to "${topic}" (${selectedGroup.assignedSignals.length} metrics bundled)`
+    );
+    setTimeout(() => setDispatchToast(null), 4000);
+  };
+
+  const handleRemoveSignal = (sigId: string) => {
+    const updated = selectedGroup.assignedSignals.filter((id) => id !== sigId);
+    saveOutputGroup({
+      ...selectedGroup,
+      assignedSignals: updated,
+    });
   };
 
   return (
@@ -44,14 +96,24 @@ export const OutputGroupsPage: React.FC = () => {
           </p>
         </div>
         <div className="flex items-center gap-2.5">
-          <Button variant="secondary" icon={<Play className="w-4 h-4 text-[#0DBA67]" />}>
-            Test Dispatch
+          <Button
+            variant="secondary"
+            icon={<Play className="w-4 h-4 text-[#0DBA67]" />}
+            onClick={handleTestDispatch}
+          >
+            Test Dispatch (Simulated)
           </Button>
-          <Button variant="primary" icon={<Save className="w-4 h-4" />}>
+          <Button variant="primary" icon={<Save className="w-4 h-4" />} onClick={handleSave}>
             Save Output Group
           </Button>
         </div>
       </div>
+
+      {dispatchToast && (
+        <div className="p-3 bg-slate-900 text-white rounded-xl text-xs font-semibold shadow-lg flex items-center justify-between animate-in fade-in">
+          <span>{dispatchToast}</span>
+        </div>
+      )}
 
       {/* Main Grid: Groups List (Reg 3) - Topic & Mapping (Reg 4, 5, 7) - JSON Preview (Reg 6) */}
       <div className="grid grid-cols-12 gap-3.5">
@@ -148,7 +210,12 @@ export const OutputGroupsPage: React.FC = () => {
                     <span className="w-1.5 h-1.5 rounded-full bg-[#0DBA67]" />
                     <span className="font-mono text-[#111B37] font-semibold">{sigId}</span>
                   </div>
-                  <button type="button" className="text-[#94A3B8] hover:text-[#F2343B]">
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveSignal(sigId)}
+                    className="text-[#94A3B8] hover:text-[#F2343B] p-1 rounded"
+                    title="Remove signal from output group"
+                  >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
                 </div>
@@ -175,7 +242,7 @@ export const OutputGroupsPage: React.FC = () => {
         <div className="col-span-12 lg:col-span-4 space-y-3.5">
           <Card
             title="Northbound JSON Payload"
-            subtitle="Live projected message output:"
+            subtitle="Simulated live projected message output (Demo Mode):"
             action={
               <Button
                 size="sm"
@@ -190,10 +257,10 @@ export const OutputGroupsPage: React.FC = () => {
             <div className="rounded-xl bg-[#111B2E] overflow-hidden">
               <div className="px-3 py-1.5 bg-[#1A253C] flex justify-between text-[11px] text-[#94A3B8] font-mono">
                 <span>payload.json</span>
-                <span className="text-[#0DBA67]">Valid Schema</span>
+                <span className="text-[#0DBA67]">Live State Projection</span>
               </div>
               <pre className="p-4 text-[#0DBA67] font-mono text-[11px] leading-relaxed overflow-x-auto max-h-[580px]">
-                {selectedGroup.samplePayload}
+                {projectedPayload}
               </pre>
             </div>
           </Card>

@@ -30,9 +30,10 @@ import { AddResourceModal } from '../../components/modals/AddResourceModal';
 import { MoveResourceModal } from '../../components/modals/MoveResourceModal';
 
 export const FactoryStructurePage: React.FC = () => {
-  const { resources, selectedResourceId, setSelectedResourceId, addResource } = useApp();
+  const { resources, selectedResourceId, setSelectedResourceId, addResource, moveResource } = useApp();
   const [searchParams] = useSearchParams();
   const [searchTerm, setSearchTerm] = useState('');
+  const [moveToast, setMoveToast] = useState<{ message: string; undoParentId?: string } | null>(null);
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({
     'res-ent-01': true,
     'res-site-01': true,
@@ -85,8 +86,26 @@ export const FactoryStructurePage: React.FC = () => {
     });
   };
 
-  const handleMoveResource = (name: string, targetPath: string) => {
-    alert(`Resource "${name}" moved successfully to "${targetPath}"`);
+  const handleMoveResource = (targetParentId: string) => {
+    const oldParentId = selectedResource.parentId;
+    const res = moveResource(selectedResource.id, targetParentId);
+    if (!res.success) {
+      alert(`Cannot move resource: ${res.error}`);
+    } else {
+      setExpandedNodes((prev) => ({ ...prev, [targetParentId]: true }));
+      setMoveToast({
+        message: `Successfully moved "${selectedResource.name}"`,
+        undoParentId: oldParentId,
+      });
+      setTimeout(() => setMoveToast(null), 5000);
+    }
+  };
+
+  const handleUndoMove = () => {
+    if (moveToast?.undoParentId) {
+      moveResource(selectedResource.id, moveToast.undoParentId);
+      setMoveToast(null);
+    }
   };
 
   const filteredResources = resources.filter((r) =>
@@ -411,10 +430,26 @@ export const FactoryStructurePage: React.FC = () => {
       <MoveResourceModal
         isOpen={isMoveModalOpen}
         onClose={() => setIsMoveModalOpen(false)}
-        resourceName={selectedResource.name}
-        currentPath={`FactoriX Corporation > East Manufacturing > Plant 01 > ${selectedResource.name}`}
+        selectedResource={selectedResource}
+        allResources={resources}
         onMoveResource={handleMoveResource}
       />
+
+      {/* Undo Toast Notification (Review FX-03) */}
+      {moveToast && (
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-900 text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
+          <span className="text-xs font-semibold">{moveToast.message}</span>
+          {moveToast.undoParentId && (
+            <button
+              type="button"
+              onClick={handleUndoMove}
+              className="text-xs font-bold text-amber-400 hover:text-amber-300 underline ml-2"
+            >
+              Undo
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 };

@@ -192,10 +192,11 @@ export const LiveOperationsPage: React.FC = () => {
         <div className="flex items-center gap-2.5">
           <Button
             variant={isStreaming ? 'danger' : 'primary'}
-            icon={isStreaming ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+            icon={isStreaming ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 text-[#0DBA67]" />}
             onClick={() => setIsStreaming(!isStreaming)}
+            title={isStreaming ? 'Pause live visualization telemetry rendering' : 'Resume live visualization rendering'}
           >
-            {isStreaming ? 'Pause Acquisition' : 'Start Acquisition'}
+            {isStreaming ? 'Pause Visualization' : 'Resume Visualization'}
           </Button>
           <Button variant="secondary" icon={<Download className="w-4 h-4" />}>
             Export CSV

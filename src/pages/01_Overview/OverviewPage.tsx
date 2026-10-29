@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import {
   Play,
+  Pause,
   Square,
   Plus,
   RefreshCw,
@@ -11,6 +12,7 @@ import {
   Activity,
   ArrowUpRight,
 } from 'lucide-react';
+import { useApp } from '../../store/AppContext';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { KPICard } from '../../components/common/KPICard';
@@ -28,7 +30,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 
 export const OverviewPage: React.FC = () => {
-  const [isRunning, setIsRunning] = useState(true);
+  const { isStreaming, setIsStreaming, currentPlant } = useApp();
   const navigate = useNavigate();
 
   return (
@@ -36,18 +38,24 @@ export const OverviewPage: React.FC = () => {
       {/* Region 1 & 2: Page Heading & Actions */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="fx-page-title">Operations Overview</h1>
+          <div className="flex items-center gap-2">
+            <h1 className="fx-page-title">Operations Overview</h1>
+            <span className="px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold border border-amber-200">
+              SIMULATED TELEMETRY
+            </span>
+          </div>
           <p className="fx-page-subtitle">
-            Global factory telemetry acquisition, connection health, and real-time data ingestion.
+            Telemetry acquisition for <strong className="text-slate-800">{currentPlant.name}</strong>, connection health, and real-time ingestion.
           </p>
         </div>
         <div className="flex items-center gap-3">
           <Button
-            variant={isRunning ? 'danger' : 'primary'}
-            icon={isRunning ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-            onClick={() => setIsRunning(!isRunning)}
+            variant={isStreaming ? 'danger' : 'primary'}
+            icon={isStreaming ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+            onClick={() => setIsStreaming(!isStreaming)}
+            title={isStreaming ? 'Pause live visualization telemetry rendering' : 'Resume live visualization'}
           >
-            {isRunning ? 'Stop Collector' : 'Start Collector'}
+            {isStreaming ? 'Pause Visualization' : 'Resume Visualization'}
           </Button>
           <Button
             variant="secondary"

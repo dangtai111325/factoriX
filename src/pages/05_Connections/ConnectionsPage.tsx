@@ -311,6 +311,7 @@ export const ConnectionsPage: React.FC = () => {
       <ConnectionTestModal
         isOpen={isTestModalOpen}
         onClose={() => setIsTestModalOpen(false)}
+        connectionId={selectedConn.id}
         connectionName={selectedConn.name}
         protocol={selectedConn.protocol.toUpperCase()}
         endpoint={selectedConn.endpoint}

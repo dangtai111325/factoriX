@@ -19,19 +19,74 @@ import { Badge } from '../../components/common/Badge';
 import { knowledgeGraphData, GraphNode } from '../../fixtures/graphData';
 import { initialSignals } from '../../fixtures/signalsData';
 
+import { useApp } from '../../store/AppContext';
+
 export const KnowledgeGraphPage: React.FC = () => {
+  const { resources, signals, selectedResourceId, setSelectedResourceId, currentPlant } = useApp();
   const [selectedNodeId, setSelectedNodeId] = useState<string>('node-center');
   const [depth, setDepth] = useState<'1-hop' | '2-hop'>('1-hop');
   const [activeFilter, setActiveFilter] = useState<string>('all');
 
-  const centerNode = knowledgeGraphData.nodes.find((n) => n.id === 'node-center')!;
-  const selectedNode = knowledgeGraphData.nodes.find((n) => n.id === selectedNodeId) || centerNode;
+  const currentResource =
+    resources.find((r) => r.id === selectedResourceId) ||
+    resources.find((r) => r.type === 'machine') ||
+    resources[0];
 
-  const incomingNodes = knowledgeGraphData.nodes.filter((n) => n.category === 'incoming');
-  const outgoingNodes = knowledgeGraphData.nodes.filter((n) => n.category === 'outgoing');
+  // Dynamic incoming nodes (Parent Line / Plant / Gateway)
+  const parentResource = resources.find((r) => r.id === currentResource.parentId);
+  const incomingNodes = [
+    {
+      id: 'node-parent',
+      name: parentResource?.name || `${currentPlant.name}`,
+      type: parentResource?.type?.toUpperCase() || 'PLANT',
+      category: 'incoming',
+      code: parentResource?.code || 'PLT-01',
+      status: 'active',
+    },
+    {
+      id: 'node-gateway',
+      name: 'OPC-UA Primary Gateway',
+      type: 'PROTOCOL_GATEWAY',
+      category: 'incoming',
+      code: 'CONN-OPCUA',
+      status: 'active',
+    },
+  ];
 
-  // Related signals for CNC Center 01
-  const relatedSignals = initialSignals.slice(0, 5);
+  // Dynamic outgoing nodes (Signals bound to this resource)
+  const machineSignals = signals.filter(
+    (s) => s.resourceId === currentResource.id || s.resourcePath.includes(currentResource.name)
+  );
+  const outgoingNodes = (machineSignals.length > 0 ? machineSignals : signals.slice(0, 4)).map(
+    (s) => ({
+      id: `node-${s.id}`,
+      name: s.name,
+      type: 'TELEMETRY_SIGNAL',
+      category: 'outgoing',
+      code: s.tag,
+      status: 'active',
+      value: `${s.currentValue} ${s.unit || ''}`,
+    })
+  );
+
+  const centerNode = {
+    id: 'node-center',
+    name: currentResource.name,
+    type: currentResource.type.toUpperCase(),
+    category: 'center',
+    code: currentResource.code,
+    status: currentResource.status,
+  };
+
+  const selectedNode =
+    selectedNodeId === 'node-center'
+      ? centerNode
+      : incomingNodes.find((n) => n.id === selectedNodeId) ||
+        outgoingNodes.find((n) => n.id === selectedNodeId) ||
+        centerNode;
+
+  // Related signals for inspector
+  const relatedSignals = machineSignals.length > 0 ? machineSignals : signals.slice(0, 4);
 
   return (
     <div className="space-y-4 animate-in fade-in duration-200">
