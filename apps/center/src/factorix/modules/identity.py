@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Any
@@ -15,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from factorix.domain.catalog import CONTAINS_PAIRS, RELATION_TYPES, SYSTEM_TYPES
 from factorix.domain.passwords import PasswordPolicyError, validate_email, validate_login, validate_password
 from factorix.platform.mail import ResetMailer
-from factorix.modules.common import as_uuid, audit, execute, fetch_one, utcnow
+from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, utcnow
 from factorix.platform.errors import AppError
 from factorix.platform.security import hash_password, hash_token, new_token, tokens_equal, verify_password
 from factorix.platform.settings import Settings
@@ -35,9 +36,10 @@ class BootstrapIn(BaseModel):
     login: str
     email: str
     password: str
-    display_name: str = Field(min_length=1, max_length=120)
-    tenant_code: str = Field(min_length=2, max_length=64)
-    locale: str = "vi"
+    full_name: str = Field(default="", max_length=120)
+    display_name: str = Field(default="My Workspace", max_length=120)
+    tenant_code: str | None = Field(default=None, max_length=64)
+    locale: str = "en"
     timezone: str = "Asia/Ho_Chi_Minh"
 
 
@@ -98,6 +100,17 @@ async def bootstrap_admin(session: AsyncSession, body: BootstrapIn, *, actor_ip_
     validate_password(body.password, login)
     if body.locale not in {"vi", "en"}:
         raise AppError(422, "INVALID_LOCALE", "Locale chỉ hỗ trợ vi hoặc en.")
+    full_name = (body.full_name or "").strip() or login
+    if len(full_name) > 120:
+        raise AppError(422, "INVALID_NAME", "Full name must be at most 120 characters.")
+    workspace_name = (body.display_name or "My Workspace").strip() or "My Workspace"
+    raw_code = (body.tenant_code or "").strip().lower()
+    if raw_code:
+        if len(raw_code) < 2 or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", raw_code):
+            raise AppError(422, "INVALID_TENANT", "Tenant code is invalid.")
+        tenant_code = raw_code
+    else:
+        tenant_code = f"ws-{secrets.token_hex(4)}"
     tenant_id = uuid4()
     admin_id = uuid4()
     now = utcnow()
@@ -107,13 +120,17 @@ async def bootstrap_admin(session: AsyncSession, body: BootstrapIn, *, actor_ip_
         INSERT INTO tenants (id, code, display_name, status, created_at)
         VALUES (:id, :code, :name, 'ACTIVE', :now)
         """,
-        {"id": tenant_id, "code": body.tenant_code.strip().lower(), "name": body.display_name.strip(), "now": now},
+        {"id": tenant_id, "code": tenant_code, "name": workspace_name, "now": now},
     )
     await execute(
         session,
         """
-        INSERT INTO admin_accounts (id, tenant_id, login, email, password_hash, locale, timezone, created_at)
-        VALUES (:id, :tenant_id, :login, :email, :password_hash, :locale, :timezone, :now)
+        INSERT INTO admin_accounts (
+            id, tenant_id, login, email, password_hash, locale, timezone, full_name, created_at
+        )
+        VALUES (
+            :id, :tenant_id, :login, :email, :password_hash, :locale, :timezone, :full_name, :now
+        )
         """,
         {
             "id": admin_id,
@@ -123,6 +140,7 @@ async def bootstrap_admin(session: AsyncSession, body: BootstrapIn, *, actor_ip_
             "password_hash": hash_password(body.password),
             "locale": body.locale,
             "timezone": body.timezone,
+            "full_name": full_name,
             "now": now,
         },
     )
@@ -306,7 +324,8 @@ async def principal_from_token(session: AsyncSession, token: str | None) -> dict
         session,
         """
         SELECT s.id AS session_id, s.csrf_hash, s.expires_at, s.revoked_at,
-               a.id AS admin_id, a.tenant_id, a.login, a.email, a.locale, a.timezone, a.disabled_at
+               a.id AS admin_id, a.tenant_id, a.login, a.email, a.locale, a.timezone,
+               a.full_name, a.disabled_at
         FROM sessions s
         JOIN admin_accounts a ON a.id = s.admin_id
         WHERE s.token_hash = :token_hash
@@ -344,6 +363,7 @@ async def touch_me(row: dict[str, Any]) -> dict[str, Any]:
         "tenant_id": row["tenant_id"],
         "login": row["login"],
         "email": row.get("email") or "",
+        "full_name": row.get("full_name") or row["login"],
         "locale": row["locale"],
         "timezone": row["timezone"],
         "role": "admin",
@@ -521,3 +541,21 @@ def require_bootstrap_token(settings: Settings, presented: str | None) -> None:
 
 def safe_settings_view() -> dict[str, Any]:
     return {"users_roles_editor": False, "ot_writes": False, "demo_seed": False}
+
+
+async def revert_to_zero(session: AsyncSession) -> int:
+    """Delete every tenant row, including the administrator. Schema and migrations stay."""
+    names = await fetch_all(
+        session,
+        """
+        SELECT tablename FROM pg_tables
+        WHERE schemaname = 'public' AND tablename <> 'alembic_version'
+        ORDER BY tablename
+        """,
+        {},
+    )
+    if not names:
+        return 0
+    quoted = ", ".join(f'"{row["tablename"]}"' for row in names)
+    await execute(session, f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE", {})
+    return len(names)

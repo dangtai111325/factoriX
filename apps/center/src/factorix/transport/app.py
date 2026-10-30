@@ -46,7 +46,9 @@ from factorix.modules.identity import (
     require_bootstrap_token,
     touch_me,
 )
+from factorix.modules.protocols import public_protocol
 from factorix.platform.mail import SmtpMailer
+from factorix.platform.security import hash_token
 from factorix.modules.resources import (
     HierarchyIn,
     ImportIn,
@@ -140,7 +142,7 @@ async def request_context(request: Request, call_next):  # type: ignore[no-untyp
     response.headers["X-Correlation-Id"] = request.state.correlation_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; frame-ancestors 'none'; base-uri 'self'"
     return response
 
 
@@ -210,11 +212,63 @@ async def reset_password(body: ResetIn, session: AsyncSession = Depends(db_sessi
     return await confirm_password_reset(session, body)
 
 
+class ResetLinkIn(BaseModel):
+    token: str
+    new_password: str
+
+
+@app.post("/api/v1/auth/reset-password")
+async def reset_password_link(body: ResetLinkIn, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
+    row = await fetch_one(
+        session,
+        """
+        SELECT a.email
+        FROM password_reset_codes c
+        JOIN admin_accounts a ON a.id = c.admin_id
+        WHERE c.code_hash = :code_hash AND c.consumed_at IS NULL
+        ORDER BY c.created_at DESC
+        LIMIT 1
+        """,
+        {"code_hash": hash_token(body.token.strip())},
+    )
+    if row is None or not row.get("email"):
+        raise AppError(401, "INVALID_CODE", "Mã không đúng hoặc đã hết hạn.")
+    return await confirm_password_reset(session, ResetIn(email=str(row["email"]), code=body.token.strip(), new_password=body.new_password))
+
+
 @app.post("/api/v1/auth/logout")
 async def logout(response: Response, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     await identity.execute_logout(session, as_uuid(principal["session_id"]))
     clear_cookies(response, settings)
     return {"status": "signed_out"}
+
+
+class RevertIn(BaseModel):
+    confirm: str
+
+
+@app.post("/api/v1/admin/revert-to-zero")
+async def revert_zero(body: RevertIn, response: Response, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
+    del principal
+    if body.confirm != "REVERT":
+        raise AppError(422, "CONFIRM", "Gõ đúng REVERT để xóa toàn bộ cài đặt.")
+    await identity.revert_to_zero(session)
+    if settings.data_dir:
+        root = Path(settings.data_dir)
+        for name in (
+            "enrollment",
+            "edge-credential",
+            "outbox.sqlite",
+            "outbox.sqlite-wal",
+            "outbox.sqlite-shm",
+            "active-config.json",
+            "edge-health.json",
+        ):
+            target = root / name
+            if target.is_file():
+                target.unlink()
+    clear_cookies(response, settings)
+    return {"status": "empty"}
 
 
 @app.get("/api/v1/auth/status")
@@ -451,7 +505,15 @@ async def commission_job(job_id: str, principal: dict[str, Any] = Depends(admin)
     row = await fetch_one(session, "SELECT id, connection_id, stages_json, status, error_code, diagnostic, started_at, completed_at FROM commissioning_jobs WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(job_id), "tenant_id": tenant_id})
     if row is None:
         raise AppError(404, "NOT_FOUND", "Không tìm thấy phiên kiểm thử.")
-    return row
+    status = "COMPLETED" if row["status"] == "PASSED" else row["status"]
+    stages = list(row.get("stages_json") or [])
+    by_stage = {item.get("stage"): item for item in stages if isinstance(item, dict)}
+    aliases = {"NETWORK": "transport", "READ_OR_SUBSCRIBE": "read_sample", "DECODE": "decode_quality"}
+    for source, alias in aliases.items():
+        found = by_stage.get(source)
+        if isinstance(found, dict):
+            stages.append({**found, "stage": alias})
+    return {**row, "status": status, "stages_json": stages}
 
 
 @app.get("/api/v1/signals")
@@ -810,7 +872,10 @@ async def search(q: str, principal: dict[str, Any] = Depends(admin), session: As
     pattern = f"%{q.strip()}%"
     return {
         "resources": await fetch_all(session, "SELECT id, code, name FROM resources WHERE tenant_id = :tenant_id AND (name ILIKE :q OR code ILIKE :q) ORDER BY code LIMIT 8", {"tenant_id": tenant_id, "q": pattern}),
-        "connections": await fetch_all(session, "SELECT id, name, protocol FROM connections WHERE tenant_id = :tenant_id AND name ILIKE :q ORDER BY name LIMIT 8", {"tenant_id": tenant_id, "q": pattern}),
+        "connections": [
+            {**row, "protocol": public_protocol(str(row["protocol"]))}
+            for row in await fetch_all(session, "SELECT id, name, protocol FROM connections WHERE tenant_id = :tenant_id AND name ILIKE :q ORDER BY name LIMIT 8", {"tenant_id": tenant_id, "q": pattern})
+        ],
         "signals": await fetch_all(session, "SELECT id, key, display_name FROM signal_definitions WHERE tenant_id = :tenant_id AND (key ILIKE :q OR display_name ILIKE :q) ORDER BY key LIMIT 8", {"tenant_id": tenant_id, "q": pattern}),
     }
 

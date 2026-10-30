@@ -1,0 +1,250 @@
+import React, { useState } from 'react';
+import {
+  Play,
+  Pause,
+  Square,
+  Plus,
+  RefreshCw,
+  CheckCircle2,
+  Cpu,
+  HardDrive,
+  Database,
+  Activity,
+  ArrowUpRight,
+} from 'lucide-react';
+import { useApp } from '../../store/AppContext';
+import { Button } from '../../components/common/Button';
+import { Card } from '../../components/common/Card';
+import { KPICard } from '../../components/common/KPICard';
+import { Badge } from '../../components/common/Badge';
+import { DonutChart } from '../../components/charts/DonutChart';
+import { LineChart } from '../../components/charts/LineChart';
+import { useNavigate } from 'react-router-dom';
+
+export const OverviewPage: React.FC = () => {
+  const { isStreaming, setIsStreaming, currentPlant, resources, connections, signals, activities, refresh } = useApp();
+  const navigate = useNavigate();
+  const connected = connections.filter((item) => item.status === 'connected').length;
+  const degraded = connections.filter((item) => item.status === 'warning').length;
+  const offline = connections.length - connected - degraded;
+  const good = signals.filter((item) => item.quality === 'GOOD').length;
+  const stale = signals.filter((item) => item.quality === 'STALE' || item.quality === 'UNCERTAIN').length;
+  const bad = signals.filter((item) => item.quality === 'BAD').length;
+  const machines = resources.filter((item) => item.type === 'machine').length;
+
+  return (
+    <div className="space-y-5 animate-in fade-in duration-200">
+      {/* Region 1 & 2: Page Heading & Actions */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <h1 className="fx-page-title">Operations Overview</h1>
+            <span className="px-2 py-0.5 rounded-full bg-[#E9FBF1] text-[#0A9855] text-[10px] font-bold border border-[#B6F0D1]">
+              LIVE MODEL
+            </span>
+          </div>
+          <p className="fx-page-subtitle">
+            Telemetry acquisition for <strong className="text-slate-800">{currentPlant.name}</strong>, connection health, and real-time ingestion.
+          </p>
+        </div>
+        <div className="flex items-center gap-3">
+          <Button
+            variant={isStreaming ? 'danger' : 'primary'}
+            icon={isStreaming ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+            onClick={() => setIsStreaming(!isStreaming)}
+            title={isStreaming ? 'Pause live visualization telemetry rendering' : 'Resume live visualization'}
+          >
+            {isStreaming ? 'Pause Visualization' : 'Resume Visualization'}
+          </Button>
+          <Button
+            variant="secondary"
+            icon={<Plus className="w-4 h-4 text-[#EF1B24]" />}
+            onClick={() => navigate('/acquisition/add-data')}
+          >
+            Add Connection
+          </Button>
+          <Button variant="secondary" icon={<RefreshCw className="w-4 h-4 text-[#657794]" />} onClick={() => void refresh()}>
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      {/* Region 3: KPI Summary Cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+        <KPICard
+          title="Resources"
+          value={resources.length}
+          change="From the factory model"
+          changeType="positive"
+          icon={<Database className="w-5 h-5 text-[#EF1B24]" />}
+          iconBg="bg-[#FFF0F1]"
+        />
+        <KPICard
+          title="Signals"
+          value={signals.length}
+          change={`${good} good`}
+          changeType="positive"
+          icon={<Activity className="w-5 h-5 text-[#0DBA67]" />}
+          iconBg="bg-[#E9FBF1]"
+        />
+        <KPICard
+          title="Connections"
+          value={connections.length}
+          change={`${connected} healthy`}
+          icon={<ArrowUpRight className="w-5 h-5 text-[#2A82E7]" />}
+          iconBg="bg-[#EEF5FF]"
+        />
+        <KPICard
+          title="Machines"
+          value={machines}
+          change="Declared assets"
+          icon={<HardDrive className="w-5 h-5 text-[#8858EA]" />}
+          iconBg="bg-[#F5F0FF]"
+        />
+      </div>
+
+      {/* Middle Row: Region 4, 5, 6 */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3.5">
+        {/* Region 4: System Health Panel */}
+        <Card className="h-[230px]">
+          <div className="flex flex-col h-full justify-between">
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <span className="text-[13px] font-bold text-[#111B37]">Collector Engine Health</span>
+                <Badge variant="good">NORMAL</Badge>
+              </div>
+              <div className="flex items-center gap-3 p-3 rounded-lg bg-[#E9FBF1]/60 border border-[#B6F0D1] mb-3">
+                <CheckCircle2 className="w-7 h-7 text-[#0DBA67] flex-shrink-0" />
+                <div>
+                  <div className="text-[13px] font-bold text-[#111B37]">{connections.length ? `${connected} connections reporting` : 'No collector connection yet'}</div>
+                  <div className="text-[11px] text-[#0A9855]">Health comes from the edge, not from a sample</div>
+                </div>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[12px] pt-2 border-t border-[#E3EAF3]">
+              <div className="flex items-center gap-2">
+                <Cpu className="w-4 h-4 text-[#657794]" />
+                <span className="text-[#657794]">Machines:</span>
+                <span className="font-bold text-[#111B37]">{machines}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <HardDrive className="w-4 h-4 text-[#657794]" />
+                <span className="text-[#657794]">Signals:</span>
+                <span className="font-bold text-[#111B37]">{signals.length}</span>
+              </div>
+            </div>
+          </div>
+        </Card>
+
+        {/* Region 5: Connection Health Donut */}
+        <Card className="h-[230px]">
+          <DonutChart
+            title="Connection Status"
+            total={connections.length}
+            centerLabel="Total Conns"
+            segments={[
+              { label: 'Connected', value: connected, color: '#0DBA67' },
+              { label: 'Degraded', value: degraded, color: '#FFAA23' },
+              { label: 'Offline', value: offline, color: '#F2343B' },
+            ]}
+          />
+        </Card>
+
+        {/* Region 6: Signal Status Donut */}
+        <Card className="h-[230px]">
+          <DonutChart
+            title="Signal Quality Index"
+            total={signals.length}
+            centerLabel="Signals"
+            segments={[
+              { label: 'Good Quality', value: good, color: '#0DBA67' },
+              { label: 'Stale (>10s)', value: stale, color: '#FFAA23' },
+              { label: 'Bad / Error', value: bad, color: '#F2343B' },
+            ]}
+          />
+        </Card>
+      </div>
+
+      {/* Row 3: Region 7 & 8 */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3.5">
+        {/* Region 7: Data Throughput Line Chart */}
+        <Card title="Acquisition Throughput (msg/sec)" className="lg:col-span-2">
+          <div className="h-[170px] flex items-center">
+            <LineChart data={[]} height={150} />
+          </div>
+        </Card>
+
+        {/* Region 8: Recent System Events */}
+        <Card
+          title="Recent Operational Events"
+          action={
+            <button
+              type="button"
+              onClick={() => navigate('/live/activity')}
+              className="text-[12px] font-semibold text-[#EF1B24] hover:underline"
+            >
+              View all
+            </button>
+          }
+        >
+          <div className="space-y-2.5">
+            {activities.slice(0, 5).map((evt) => (
+              <div key={evt.id} className="flex items-start gap-2.5 text-[12px] pb-2 border-b border-[#F1F5FA] last:border-0 last:pb-0">
+                <span className="font-mono text-[#94A3B8] text-[11px] pt-0.5">{evt.timestamp}</span>
+                <div className="flex-1 min-w-0">
+                  <div className="font-semibold text-[#111B37] truncate">{evt.source}</div>
+                  <div className="text-[#657794] text-[11px] truncate">{evt.message}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+
+      {/* Region 9: Live Recent Data Table */}
+      <Card
+        title="Live Signal Telemetry Samples"
+        action={
+          <button
+            type="button"
+            onClick={() => navigate('/live/monitor')}
+            className="text-[12px] font-semibold text-[#EF1B24] hover:underline"
+          >
+            Open Live Monitor →
+          </button>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="fx-table">
+            <thead>
+              <tr>
+                <th>Signal Tag</th>
+                <th>Parameter Name</th>
+                <th>Factory Resource</th>
+                <th>Live Value</th>
+                <th>Quality</th>
+                <th>Freshness</th>
+              </tr>
+            </thead>
+            <tbody>
+              {signals.slice(0, 8).map((row) => (
+                <tr key={row.id}>
+                  <td className="font-mono font-semibold text-[#111B37] text-[12px]">{row.tag}</td>
+                  <td className="font-medium text-[#334568]">{row.name}</td>
+                  <td className="text-[#657794] text-[12px]">{row.resourcePath}</td>
+                  <td className="font-extrabold text-[#111B37] tabular-nums text-[13px]">
+                    {String(row.currentValue)} <span className="font-normal text-[#657794] text-[11px]">{row.unit}</span>
+                  </td>
+                  <td>
+                    <Badge variant={row.quality === 'GOOD' ? 'good' : 'warning'}>{row.quality}</Badge>
+                  </td>
+                  <td className="text-[#94A3B8] text-[11px] font-mono">{row.lastUpdated || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+};

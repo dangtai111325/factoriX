@@ -23,6 +23,7 @@ WIDGETS = {
     "kpi",
     "gauge",
     "timeseries",
+    "chart",
     "machine_status",
     "energy",
     "latest_table",
@@ -961,6 +962,7 @@ async def _dashboard(session: AsyncSession, tenant_id: UUID, dashboard_id: UUID)
     )
     if row is None:
         raise AppError(404, "NOT_FOUND", "Không tìm thấy dashboard.")
+    row["draft"] = row.get("draft_json") or {"widgets": []}
     return row
 
 

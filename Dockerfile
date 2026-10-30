@@ -1,10 +1,10 @@
 # One appliance: the web build, Postgres 17, Center, and the edge on port 8080.
 FROM node:22-bookworm-slim AS web
 WORKDIR /src
-COPY apps/web/package.json apps/web/pnpm-lock.yaml ./
-RUN corepack enable && corepack prepare pnpm@9.15.9 --activate && pnpm install --frozen-lockfile
+COPY apps/web/package.json apps/web/package-lock.json ./
+RUN npm ci
 COPY apps/web/ ./
-RUN pnpm build
+RUN npm run build
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update \
