@@ -29,6 +29,14 @@ export interface AcquisitionField {
   address: string
   dataType: string
   unit: string
+  /** Per-field MQTT topic filter (CR-Q01). Falls back to draft.extra when empty. */
+  topic?: string
+  qos?: number
+  /** Modbus register area: holding | input | coil | discrete */
+  registerArea?: string
+  wordOrder?: 'big' | 'little'
+  scale?: number
+  offset?: number
 }
 
 export interface AcquisitionDraft {
@@ -46,8 +54,27 @@ export interface AcquisitionDraft {
   mqttVersion?: string
   mqttKeepalive?: number
   mqttTls?: boolean
+  mqttTlsVerify?: boolean
+  mqttTlsCa?: string
+  mqttTlsClientCert?: string
   mqttAnonymous?: boolean
+  mqttUsername?: string
+  mqttPassword?: string
+  /** JSONPath for event time; default $.source_timestamp (CR-Q04). */
+  timestampJsonpath?: string
+  modbusTimeoutMs?: number
+  modbusRetries?: number
+  opcSecurityMode?: string
+  opcSecurityPolicy?: string
+  opcUsername?: string
+  opcPassword?: string
+  opcTrustAll?: boolean
   httpMethod?: string
+  httpAuth?: string
+  httpHeaders?: string
+  httpTimeoutMs?: number
+  httpUsername?: string
+  httpPassword?: string
 }
 
 interface PreparedConnection {
@@ -57,7 +84,7 @@ interface PreparedConnection {
 }
 
 interface AppContextType {
-  revertToZero: (confirm: string) => Promise<void>
+  revertToZero: (confirm: string, password: string) => Promise<void>
   refresh: () => Promise<void>
   isDemoMode: boolean
   demoScenario: 'healthy'
@@ -66,6 +93,8 @@ interface AppContextType {
   currentPlant: PlantScope
   setCurrentPlant: (plant: PlantScope) => void
   resources: ResourceNode[]
+  allResources: ResourceNode[]
+  siteNameById: Record<string, string>
   connections: ConnectionItem[]
   edges: EdgeItem[]
   signals: SignalItem[]
@@ -89,24 +118,71 @@ interface AppContextType {
   searchQuery: string
   setSearchQuery: (query: string) => void
   collectorLabel: string
+  layoutDragging: boolean
+  setLayoutDragging: (dragging: boolean) => void
+  publishLayout: () => Promise<void>
   resetToReference: () => void
-  addResource: (resource: Partial<ResourceNode>) => Promise<{ edgeCreated?: boolean; edgeId?: string; edgeName?: string }>
+  addResource: (
+    resource: Partial<ResourceNode> & { force?: boolean },
+  ) => Promise<{ edgeCreated?: boolean; edgeId?: string; edgeName?: string }>
+  updateResource: (
+    resourceId: string,
+    patch: { name?: string; code?: string; description?: string; properties?: Record<string, string> },
+  ) => Promise<{ success: boolean; error?: string }>
   moveResource: (resourceId: string, newParentId: string) => Promise<{ success: boolean; error?: string }>
   archiveResource: (resourceId: string) => Promise<{ success: boolean; error?: string }>
+  restoreResource: (resourceId: string) => Promise<{ success: boolean; error?: string }>
+  importResources: (rows: Array<Record<string, string>>, opts?: { dryRun?: boolean; siteId?: string }) => Promise<{
+    success: boolean
+    created?: number
+    error?: string
+  }>
+  showArchivedResources: boolean
+  setShowArchivedResources: (value: boolean) => void
   updateLayoutNode: (id: string, updates: Partial<LayoutMachineNode>) => void
   testConnection: (id: string) => Promise<{ success: boolean; latency: number }>
   runDeterministicConnectionTest: (id: string, scenario?: string) => Promise<{ overallStatus: TestExecutionState; latency: number; steps: TestStepResult[] }>
   prepareAcquisition: (draft: AcquisitionDraft) => Promise<PreparedConnection>
-  commissionAcquisition: (connectionId: string) => Promise<{ passed: boolean; stages: Array<{ name: string; status: string; latency?: number }>; errorCode?: string }>
+  commissionAcquisition: (connectionId: string) => Promise<{
+    passed: boolean
+    stages: Array<{ name: string; status: string; latency?: number; detail?: string; sample?: unknown }>
+    errorCode?: string
+    diagnostic?: string
+  }>
   activateAcquisition: (prepared: PreparedConnection, draft: AcquisitionDraft) => Promise<void>
   deleteConnection: (connectionId: string) => Promise<void>
+  pauseConnection: (connectionId: string) => Promise<void>
+  resumeConnection: (connectionId: string) => Promise<void>
+  updateConnection: (
+    connectionId: string,
+    patch: { name?: string; config?: Record<string, unknown> },
+  ) => Promise<void>
+  duplicateConnection: (connectionId: string) => Promise<string>
   issueEnrollmentToken: (edgeId: string) => Promise<{ enrollment_token: string; expires_at: string; expires_in_seconds: number; edge_id: string }>
   queueApplianceEnroll: (edgeId: string) => Promise<{ status: string }>
   addSignal: (signal: Partial<SignalItem>) => void
-  bulkDeleteSignals: (signalIds: string[]) => { count: number; undo: () => void }
-  bulkAssignOutputGroup: (signalIds: string[], groupId: string) => void
+  updateSignal: (
+    signalId: string,
+    patch: {
+      display_name?: string
+      unit?: string
+      description?: string
+      expected_interval_ms?: number
+      status?: string
+      data_type?: string
+    },
+  ) => Promise<{ success: boolean; error?: string }>
+  bulkDeleteSignals: (signalIds: string[]) => Promise<{ count: number }>
+  bulkAssignOutputGroup: (signalIds: string[], groupId: string) => Promise<void>
   saveCalculatedSignal: (signal: Partial<SignalItem>) => void
-  saveOutputGroup: (group: OutputGroup) => void
+  saveOutputGroup: (group: OutputGroup) => Promise<string>
+  createResourceType: (input: {
+    key: string
+    name: string
+    category?: string
+    parent_type_keys?: string[]
+    child_type_keys?: string[]
+  }) => Promise<void>
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined)
@@ -141,9 +217,69 @@ function storedProtocol(value: AcquisitionDraft['protocol']): string {
 function signalType(value: string): SignalItem['dataType'] {
   const name = value.toLowerCase()
   if (name.includes('bool')) return 'boolean'
+  if (name === 'text' || name.includes('string')) return 'text'
   if (name.includes('int')) return 'integer'
-  if (name.includes('string')) return 'string'
-  return 'analog'
+  if (name === 'number' || name.includes('float') || name.includes('double')) return 'number'
+  if (name.includes('calc')) return 'calculated'
+  return 'number'
+}
+
+function connectionPresentation(row: Record<string, unknown>): ConnectionItem['status'] {
+  const lifecycle = text(row.status).toUpperCase()
+  if (lifecycle === 'DRAFT') return 'draft'
+  if (lifecycle === 'PAUSED') return 'paused'
+  const health = text(row.health).toUpperCase()
+  if (health === 'HEALTHY') return 'connected'
+  if (health === 'DEGRADED' || health === 'PAUSED') return 'warning'
+  if (lifecycle === 'ACTIVE' && (health === 'UNKNOWN' || !health)) return 'warning'
+  return 'disconnected'
+}
+
+function describeAuditEvent(row: Record<string, unknown>): string {
+  const eventType = text(row.event_type)
+  const after = (row.after_json as Record<string, unknown>) || {}
+  const before = (row.before_json as Record<string, unknown>) || {}
+  const code = text(after.code || before.code)
+  const name = text(after.name || after.display_name || before.name || before.display_name)
+  switch (eventType) {
+    case 'RESOURCE_CREATE':
+      return code ? `Created resource ${code}` : 'Created a resource'
+    case 'RESOURCE_UPDATE':
+      return name || code ? `Updated resource ${name || code}` : 'Updated a resource'
+    case 'RESOURCE_ARCHIVE':
+      return 'Archived a resource'
+    case 'RESOURCE_RESTORE':
+      return 'Restored a resource'
+    case 'RESOURCE_MOVE':
+      return 'Moved a resource in the hierarchy'
+    case 'CONNECTION_CREATE':
+      return name ? `Created connection ${name}` : 'Created a connection'
+    case 'CONNECTION_UPDATE':
+      return name ? `Updated connection ${name}` : 'Updated a connection'
+    case 'CONNECTION_PAUSE':
+      return 'Paused a connection'
+    case 'CONNECTION_RESUME':
+      return 'Resumed a connection'
+    case 'CONNECTION_ARCHIVE':
+      return 'Archived a connection'
+    case 'SIGNAL_BULK': {
+      const created = text(after.created) || 'new'
+      const where = code || name
+      return where ? `${created} signals created on ${where}` : `Added ${created} signals`
+    }
+    case 'SIGNAL_UPDATE':
+    case 'SIGNAL_RENAME':
+      return name ? `Updated signal ${name}` : 'Updated a signal'
+    case 'OUTPUT_GROUP_DRAFT':
+    case 'OUTPUT_GROUP_UPDATE':
+      return 'Saved an output group'
+    case 'AUTH_LOGIN':
+    case 'AUTH_LOGOUT':
+      return ''
+    default:
+      if (eventType.startsWith('AUTH_')) return ''
+      return eventType.replace(/_/g, ' ').toLowerCase().replace(/^\w/, (c) => c.toUpperCase())
+  }
 }
 
 function descendants(all: ResourceNode[], rootId: string): Set<string> {
@@ -175,6 +311,30 @@ function scopeToPlant(all: ResourceNode[], plantId: string): ResourceNode[] {
   return all.filter((item) => keep.has(item.id))
 }
 
+function describeAudit(
+  eventType: string,
+  entityType: string,
+  after?: Record<string, unknown>,
+): string {
+  const name = after?.name ? String(after.name) : after?.login ? String(after.login) : ''
+  const label = name || entityType || 'item'
+  if (/REVERT/i.test(eventType)) return 'Installation reverted to zero'
+  if (/AUTH_LOGIN/i.test(eventType)) return `${label} signed in`
+  if (/AUTH_LOGOUT/i.test(eventType)) return `${label} signed out`
+  if (/SITE_CREATE/i.test(eventType)) return `Site “${label}” was created`
+  if (/RESOURCE_CREATE|CREATE/i.test(eventType) && /resource/i.test(entityType)) {
+    return `Resource “${label}” was created`
+  }
+  if (/LAYOUT_DRAFT/i.test(eventType)) return 'Layout draft was saved'
+  if (/LAYOUT_PUBLISH/i.test(eventType)) return 'Layout revision was published'
+  if (/CONFIG_PUBLISH/i.test(eventType)) return 'Configuration was published to an edge'
+  if (/EDGE/i.test(eventType)) return `Edge update: ${eventType.replace(/_/g, ' ').toLowerCase()}`
+  if (/CONNECTION/i.test(eventType)) return `Connection “${label}”: ${eventType.replace(/_/g, ' ').toLowerCase()}`
+  if (/SIGNAL/i.test(eventType)) return `Signals updated (${eventType.replace(/_/g, ' ').toLowerCase()})`
+  if (/PASSWORD|RESET/i.test(eventType)) return 'Password was changed'
+  return `${eventType.replace(/_/g, ' ')} on ${entityType}`.trim()
+}
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [allResources, setAllResources] = useState<ResourceNode[]>([])
   const [connections, setConnections] = useState<ConnectionItem[]>([])
@@ -194,6 +354,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [searchQuery, setSearchQuery] = useState('')
   const [collectorLabel, setCollectorLabel] = useState('Collector: not enrolled')
   const [layoutMeta, setLayoutMeta] = useState<{ id: string; version: number } | null>(null)
+  const [siteNameById, setSiteNameById] = useState<Record<string, string>>({})
+  const [layoutDragging, setLayoutDragging] = useState(false)
+  const [showArchivedResources, setShowArchivedResources] = useState(false)
+  const layoutDraggingRef = React.useRef(false)
 
   const resources = useMemo(
     () => scopeToPlant(allResources, currentPlant.id),
@@ -210,27 +374,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const scopedSignals = signals.filter((item) => !currentPlant.id || resourceIds.has(item.resourceId))
 
   const refresh = useCallback(async () => {
-    const [resourcePage, connectionPage, signalPage, layoutPage, groupPage, auditPage, edgePage] = await Promise.all([
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/resources?view=all&limit=200'),
+    const archivedQuery = showArchivedResources ? '&include_archived=true' : ''
+    const [resourcePage, connectionPage, signalPage, layoutPage, groupPage, auditPage, edgePage, sitePage] = await Promise.all([
+      api<{ items: Array<Record<string, unknown>> }>(`/api/v1/resources?view=all&limit=200${archivedQuery}`),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/connections'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/signals?limit=500'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/layouts'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/output-groups'),
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/audit-events?limit=50'),
+      api<{ items: Array<Record<string, unknown>> }>('/api/v1/audit-events?limit=200'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/edges'),
+      api<{ items: Array<Record<string, unknown>> }>('/api/v1/sites').catch(() => ({ items: [] })),
     ])
-    const mappedResources: ResourceNode[] = (resourcePage.items || []).map((row) => ({
-      id: text(row.id),
-      name: text(row.name),
-      type: text(row.type_key) as ResourceNode['type'],
-      code: text(row.code),
-      status: 'idle',
-      parentId: row.parent_id ? text(row.parent_id) : undefined,
-      attributes: {
+    const mappedResources: ResourceNode[] = (resourcePage.items || []).map((row) => {
+      const archived = Boolean(row.archived_at) || text(row.status) === 'ARCHIVED'
+      const props = (row.properties_json as Record<string, unknown>) || {}
+      const attrs: Record<string, string> = {
         siteId: text(row.site_id),
         version: text(row.version || 1),
-      },
-    }))
+      }
+      for (const [key, value] of Object.entries(props)) {
+        if (key === 'siteId' || key === 'version') continue
+        attrs[key] = text(value)
+      }
+      return {
+        id: text(row.id),
+        name: text(row.name),
+        type: text(row.type_key) as ResourceNode['type'],
+        code: text(row.code),
+        status: archived ? 'archived' : 'idle',
+        parentId: row.parent_id ? text(row.parent_id) : undefined,
+        description: text(row.description) || undefined,
+        archivedAt: row.archived_at ? text(row.archived_at) : undefined,
+        attributes: attrs,
+      }
+    })
     const plantRows = mappedResources.filter((item) => item.type === 'plant')
     const nextPlants = plantRows.map((item) => ({
       id: item.id,
@@ -252,22 +429,48 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       )
       latest = new Map((page.items || []).map((row) => [text(row.signal_id), row]))
     }
-    const connectionName = new Map((connectionPage.items || []).map((row) => [text(row.id), text(row.name)]))
+    const edgeNameById = new Map((edgePage.items || []).map((row) => [text(row.id), text(row.name)]))
+    const connectionMeta = new Map(
+      (connectionPage.items || []).map((row) => [
+        text(row.id),
+        {
+          name: text(row.name),
+          edgeId: text(row.edge_id),
+          lastError: text(row.last_error),
+        },
+      ]),
+    )
     setConnections(
       (connectionPage.items || []).map((row) => {
-        const health = text(row.health)
-        const status = health === 'HEALTHY' ? 'connected' : health === 'DEGRADED' ? 'warning' : 'disconnected'
+        const lifecycle = (text(row.status).toUpperCase() || 'DRAFT') as ConnectionItem['lifecycle']
+        const signalCount =
+          row.signal_count == null || row.signal_count === ''
+            ? null
+            : Number(row.signal_count)
+        const latency =
+          row.latency_ms == null || row.latency_ms === '' ? null : Number(row.latency_ms)
+        const throughput =
+          row.throughput_per_sec == null || row.throughput_per_sec === ''
+            ? null
+            : Number(row.throughput_per_sec)
         return {
           id: text(row.id),
           name: text(row.name),
           protocol: protocolOf(text(row.protocol)),
           endpoint: text(row.endpoint_redacted),
-          status,
+          status: connectionPresentation(row),
+          lifecycle,
+          health: text(row.health) || 'UNKNOWN',
           plantId: text(row.site_id),
-          latencyMs: 0,
+          siteId: text(row.site_id),
+          edgeId: text(row.edge_id) || undefined,
+          lastError: text(row.last_error) || undefined,
+          version: Number(row.version || 1),
+          secretConfigured: Boolean(row.secret_configured),
+          latencyMs: Number.isFinite(latency as number) ? latency : null,
           lastConnected: text(row.last_success_at),
-          signalsCount: 0,
-          throughputPerSec: 0,
+          signalsCount: Number.isFinite(signalCount as number) ? signalCount : null,
+          throughputPerSec: Number.isFinite(throughput as number) ? throughput : null,
           errorRate: 0,
           config: (row.config as Record<string, unknown>) || {},
         }
@@ -278,67 +481,166 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const state = latest.get(text(row.id))
         const value = (state?.value_json as { v?: unknown } | undefined)?.v
         const dataType = text(row.data_type)
+        const connectionId = text(row.connection_id)
+        const meta = connectionMeta.get(connectionId)
+        const storedQuality = text(state?.quality || 'UNKNOWN')
+        const freshness = text(state?.freshness)
+        const quality = (
+          freshness === 'STALE' && storedQuality !== 'BAD' ? 'STALE' : storedQuality || 'UNKNOWN'
+        ) as SignalItem['quality']
+        const explicitReason = text(state?.reason || state?.diagnostic)
+        let qualityReason = explicitReason || undefined
+        if (!qualityReason && quality === 'BAD') {
+          qualityReason =
+            meta?.lastError ||
+            (value == null
+              ? 'No value in the latest observation'
+              : 'Quality BAD — no diagnostic was recorded')
+        } else if (!qualityReason && quality === 'STALE') {
+          qualityReason = 'Last sample is older than the expected interval'
+        }
+        const goodJson = state?.last_good_value_json as { v?: unknown } | null | undefined
+        const goodValue = goodJson && typeof goodJson === 'object' && 'v' in goodJson ? goodJson.v : undefined
+        const intervalRaw = row.expected_interval_ms
         return {
           id: text(row.id),
           name: text(row.display_name || row.key),
           tag: text(row.key),
-          sourceConnectionId: '',
-          sourceConnectionName: connectionName.get(text(row.connection_id)) || 'Collector',
+          sourceConnectionId: connectionId,
+          sourceConnectionName: meta?.name || text(row.connection_name) || '—',
           resourceId: text(row.resource_id),
           resourcePath: text(row.resource_name || row.resource_code),
-          dataType: dataType === 'boolean' || dataType === 'bool' ? 'boolean' : signalType(dataType),
+          dataType: signalType(dataType),
           unit: text(row.unit),
           currentValue: value == null ? '—' : (value as string | number | boolean),
-          quality: (text(state?.quality || 'UNKNOWN') as SignalItem['quality']) || 'UNKNOWN',
-          lastUpdated: text(state?.event_time),
-          sampleIntervalMs: Number(row.expected_interval_ms || 1000),
+          quality,
+          qualityReason,
+          lastUpdated: text(state?.source_time || state?.event_time),
+          sourceTime: text(state?.source_time) || undefined,
+          receivedTime: text(state?.received_time || state?.event_time) || undefined,
+          sampleIntervalMs:
+            intervalRaw == null || intervalRaw === '' ? 0 : Number(intervalRaw),
+          version: Number(row.version || 1),
+          status: (text(row.status).toUpperCase() || 'ACTIVE') as SignalItem['status'],
+          description: text(row.description) || undefined,
+          edgeName: meta?.edgeId ? edgeNameById.get(meta.edgeId) || undefined : undefined,
+          lastGoodValue: goodValue == null || goodValue === '' ? undefined : String(goodValue),
+          lastGoodTime: text(state?.last_good_event_time) || undefined,
+          bindingType: text(row.binding_type) as SignalItem['bindingType'],
+          bindingAddress: text(row.binding_address || row.jsonpath),
+          topic: text(row.topic) || undefined,
+          jsonpath: text(row.jsonpath) || undefined,
         }
       }),
     )
     const layout = (layoutPage.items || [])[0]
     const saved = ((layout?.draft_json as { nodes?: Array<Record<string, unknown>> } | undefined)?.nodes || [])
     const savedByResource = new Map(saved.map((node) => [text(node.resourceId), node]))
-    const placeable = mappedResources.filter((item) => item.type === 'machine' || item.type === 'line')
+    const placeableById = new Map(
+      mappedResources
+        .filter((item) => item.type === 'machine' || item.type === 'line')
+        .map((item) => [item.id, item]),
+    )
     setLayoutMeta(layout ? { id: text(layout.id), version: Number(layout.version || 1) } : null)
-    setLayoutNodes(
-      placeable.map((item, index) => {
-        const node = savedByResource.get(item.id)
+    // CR-L01: only draft-placed nodes on the canvas; palette lists the rest. Skip remap while dragging.
+    if (!layoutDraggingRef.current) {
+      const fromDraft = saved
+        .map((node, index) => {
+          const resourceId = text(node.resourceId)
+          const item = placeableById.get(resourceId)
+          if (!item) return null
+          return {
+            id: resourceId,
+            resourceId,
+            name: item.name,
+            code: item.code,
+            x: Number(node.x ?? 40 + (index % 4) * 220),
+            y: Number(node.y ?? 40 + Math.floor(index / 4) * 150),
+            width: Number(node.width ?? 180),
+            height: Number(node.height ?? 100),
+            status: item.status,
+          }
+        })
+        .filter(Boolean) as LayoutMachineNode[]
+      setLayoutNodes(fromDraft)
+    }
+    setOutputGroups(
+      (groupPage.items || []).map((row) => {
+        const members = Array.isArray(row.members)
+          ? (row.members as Array<{ signal_id?: string; alias?: string }>)
+          : []
+        const policy = (row.projection_policy_json || {}) as { mode?: string }
         return {
-          id: item.id,
-          resourceId: item.id,
-          name: item.name,
-          code: item.code,
-          x: Number(node?.x ?? 40 + (index % 4) * 220),
-          y: Number(node?.y ?? 40 + Math.floor(index / 4) * 150),
-          width: Number(node?.width ?? 180),
-          height: Number(node?.height ?? 100),
-          status: item.status,
+          id: text(row.id),
+          name: text(row.display_name || row.key),
+          key: text(row.key),
+          topicTemplate:
+            text(row.topic_template) || '{enterprise}/{site}/{area}/{line}/{machine}/{group}',
+          enabled: text(row.status) !== 'ARCHIVED',
+          publishIntervalMs: 1000,
+          assignedSignals: members.map((m) => text(m.signal_id)).filter(Boolean),
+          resourceId: text(row.resource_id),
+          version: Number(row.version || 1),
+          payloadFormat: policy.mode === 'compact' ? 'flat' : 'uns',
+          lastPublished: '',
+          samplePayload: '',
+          members: members.map((m) => ({
+            signal_id: text(m.signal_id),
+            alias: text(m.alias),
+          })),
         }
       }),
     )
-    setOutputGroups(
-      (groupPage.items || []).map((row) => ({
-        id: text(row.id),
-        name: text(row.display_name || row.key),
-        topicTemplate: text(row.topic_template),
-        enabled: true,
-        publishIntervalMs: 1000,
-        assignedSignals: [],
-        lastPublished: '',
-        samplePayload: '',
-      })),
-    )
     setActivities(
-      (auditPage.items || []).map((row) => ({
-        id: text(row.id),
-        timestamp: text(row.occurred_at),
-        severity: 'info',
-        source: text(row.entity_type || 'Center'),
-        eventType: text(row.event_type),
-        message: `${text(row.event_type)} ${text(row.entity_type)}`.trim(),
-        details: (row.after_json as Record<string, unknown>) || {},
-      })),
+      (auditPage.items || [])
+        .filter((row) => {
+          const eventType = text(row.event_type)
+          return !/^AUTH_/i.test(eventType)
+        })
+        .map((row) => {
+          const eventType = text(row.event_type)
+          const entityType = text(row.entity_type || 'Center')
+          const actorName = text(row.actor_name || row.actor_login || '')
+          let severity: ActivityEvent['severity'] = 'info'
+          if (/FAIL|ERROR|DELETE|REVOKE|REVERT|LOCK|ARCHIVE/i.test(eventType)) severity = 'error'
+          else if (/WARN|DEGRAD|OFFLINE|TIMEOUT|PAUSE/i.test(eventType)) severity = 'warning'
+          else if (/CREATE|PUBLISH|PASS|ENROLL|SUCCESS|RESTORE|UPDATE/i.test(eventType)) {
+            severity = 'success'
+          }
+          const sentence =
+            describeAuditEvent(row) ||
+            describeAudit(eventType, entityType, row.after_json as Record<string, unknown> | undefined)
+          return {
+            id: text(row.id),
+            timestamp: text(row.occurred_at),
+            severity,
+            source: actorName || entityType,
+            eventType,
+            message: sentence,
+            entityId: text(row.entity_id) || undefined,
+            entityType,
+            actorName: actorName || undefined,
+            details: {
+              ...(typeof row.after_json === 'object' && row.after_json
+                ? (row.after_json as Record<string, unknown>)
+                : {}),
+              actor: actorName || undefined,
+              event_type: eventType,
+            },
+          }
+        })
+        .filter((item) => Boolean(item.message)),
     )
+    const siteMap: Record<string, string> = {}
+    for (const row of sitePage.items || []) {
+      siteMap[text(row.id)] = text(row.name) || text(row.code) || text(row.id)
+    }
+    for (const item of mappedResources.filter((r) => r.type === 'site')) {
+      const sid = item.attributes?.siteId || item.id
+      if (sid && !siteMap[sid]) siteMap[sid] = item.name
+      siteMap[item.id] = item.name
+    }
+    setSiteNameById(siteMap)
     const edgeItems = edgePage.items || []
     const mappedEdges: EdgeItem[] = edgeItems.map((row) => ({
       id: text(row.id),
@@ -350,6 +652,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       activeRevision: Number(row.active_revision || 0),
       lastHeartbeat: text(row.last_heartbeat),
       softwareVersion: text(row.software_version) || undefined,
+      outboxPending:
+        row.outbox_pending == null || row.outbox_pending === ''
+          ? null
+          : Number(row.outbox_pending),
     }))
     setEdges(mappedEdges)
     const enrolled = mappedEdges.filter((row) => row.enrollmentStatus === 'ENROLLED')
@@ -374,11 +680,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           status: text(row.health) === 'DEGRADED' ? 'degraded' : 'critical',
           uptimeSeconds: 0,
           messagesReceived: 0,
-          messagesDropped: 0,
+          messagesDropped: null,
           lastError: text(row.last_error),
         })),
     )
-  }, [])
+  }, [showArchivedResources])
 
   useEffect(() => {
     void refresh().catch(() => undefined)
@@ -392,10 +698,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => window.clearInterval(timer)
   }, [isStreaming, refresh])
 
-  const revertToZero = async (confirm: string) => {
+  const revertToZero = async (confirm: string, password: string) => {
     await api('/api/v1/admin/revert-to-zero', {
       method: 'POST',
-      body: JSON.stringify({ confirm }),
+      body: JSON.stringify({ confirm, password }),
     })
     setAllResources([])
     setConnections([])
@@ -410,7 +716,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     window.location.assign('/register')
   }
 
-  const addResource = async (resource: Partial<ResourceNode>) => {
+  const markLayoutDragging = (dragging: boolean) => {
+    layoutDraggingRef.current = dragging
+    setLayoutDragging(dragging)
+  }
+
+  const publishLayout = async () => {
+    let meta = layoutMeta
+    if (!meta) {
+      const created = await api<{ id: string; version: number }>('/api/v1/layouts', {
+        method: 'POST',
+        body: JSON.stringify({ name: 'Factory floor', scope_resource_id: currentPlant.id || null }),
+      })
+      meta = { id: created.id, version: Number(created.version || 1) }
+      setLayoutMeta(meta)
+    }
+    await api(`/api/v1/layouts/${meta.id}/publish`, { method: 'POST' })
+    await refresh()
+  }
+
+  const addResource = async (resource: Partial<ResourceNode> & { force?: boolean }) => {
     const typeKey = (resource.type || 'machine').toLowerCase()
     const name = resource.name || 'Resource'
     const code = codeFrom(resource.code || name)
@@ -435,6 +760,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         relation_code: 'CONTAINS',
         description: resource.description || '',
         properties: resource.attributes || {},
+        force: Boolean(resource.force),
       }),
     })
     if (typeKey === 'site') {
@@ -489,10 +815,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const archiveResource = async (resourceId: string) => {
     try {
+      const current = allResources.find((item) => item.id === resourceId)
+      const parentId = current?.parentId || ''
       await api(`/api/v1/resources/${resourceId}/archive`, { method: 'POST' })
       await refresh()
       if (selectedResourceId === resourceId) {
-        setSelectedResourceId('')
+        setSelectedResourceId(parentId)
       }
       return { success: true }
     } catch (error) {
@@ -500,9 +828,106 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }
 
+  const restoreResource = async (resourceId: string) => {
+    try {
+      await api(`/api/v1/resources/${resourceId}/restore`, { method: 'POST' })
+      await refresh()
+      setSelectedResourceId(resourceId)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Restore failed' }
+    }
+  }
+
+  const updateResource = async (
+    resourceId: string,
+    patch: { name?: string; code?: string; description?: string; properties?: Record<string, string> },
+  ) => {
+    const current = allResources.find((item) => item.id === resourceId)
+    if (!current) return { success: false, error: 'Resource was not found.' }
+    try {
+      await api(`/api/v1/resources/${resourceId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          version: Number(current.attributes?.version || 1),
+          name: patch.name,
+          code: patch.code,
+          description: patch.description,
+          properties: patch.properties,
+        }),
+      })
+      await refresh()
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Update failed' }
+    }
+  }
+
+  const importResources = async (
+    rows: Array<Record<string, string>>,
+    opts?: { dryRun?: boolean; siteId?: string },
+  ) => {
+    try {
+      const result = await api<{ created?: number; accepted?: number }>('/api/v1/resources/import', {
+        method: 'POST',
+        body: JSON.stringify({
+          site_id: opts?.siteId || null,
+          dry_run: Boolean(opts?.dryRun),
+          rows,
+        }),
+      })
+      if (!opts?.dryRun) await refresh()
+      return { success: true, created: Number(result.created || result.accepted || 0) }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Import failed' }
+    }
+  }
+
+  const createResourceType = async (input: {
+    key: string
+    name: string
+    category?: string
+    parent_type_keys?: string[]
+    child_type_keys?: string[]
+  }) => {
+    await api('/api/v1/resource-types', {
+      method: 'POST',
+      body: JSON.stringify({
+        key: input.key,
+        name: input.name,
+        category: input.category || 'CUSTOM',
+        parent_type_keys: input.parent_type_keys || [],
+        child_type_keys: input.child_type_keys || [],
+      }),
+    })
+  }
+
   const updateLayoutNode = (id: string, updates: Partial<LayoutMachineNode>) => {
     setLayoutNodes((current) => {
-      const next = current.map((node) => (node.id === id ? { ...node, ...updates } : node))
+      const existing = current.find((node) => node.id === id)
+      let next: LayoutMachineNode[]
+      if (existing) {
+        next = current.map((node) => (node.id === id ? { ...node, ...updates } : node))
+      } else {
+        const resource = allResources.find((item) => item.id === id)
+        if (!resource) return current
+        const index = current.length
+        next = [
+          ...current,
+          {
+            id,
+            resourceId: id,
+            name: resource.name,
+            code: resource.code,
+            x: Number(updates.x ?? 40 + (index % 4) * 200),
+            y: Number(updates.y ?? 40 + Math.floor(index / 4) * 140),
+            width: Number(updates.width ?? 180),
+            height: Number(updates.height ?? 100),
+            status: resource.status,
+            ...updates,
+          },
+        ]
+      }
       const draft = {
         nodes: next.map((node) => ({
           resourceId: node.resourceId,
@@ -513,20 +938,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         })),
       }
       void (async () => {
-        let meta = layoutMeta
-        if (!meta) {
-          const created = await api<{ id: string; version: number }>('/api/v1/layouts', {
-            method: 'POST',
-            body: JSON.stringify({ name: 'Factory floor', scope_resource_id: currentPlant.id || null }),
+        try {
+          let meta = layoutMeta
+          if (!meta) {
+            const created = await api<{ id: string; version: number }>('/api/v1/layouts', {
+              method: 'POST',
+              body: JSON.stringify({ name: 'Factory floor', scope_resource_id: currentPlant.id || null }),
+            })
+            meta = { id: created.id, version: Number(created.version || 1) }
+            setLayoutMeta(meta)
+          }
+          const saved = await api<{ version: number }>(`/api/v1/layouts/${meta.id}/draft`, {
+            method: 'PATCH',
+            body: JSON.stringify({ version: meta.version, draft }),
           })
-          meta = { id: created.id, version: Number(created.version || 1) }
-          setLayoutMeta(meta)
+          setLayoutMeta({ id: meta.id, version: Number(saved.version || meta.version + 1) })
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 409) {
+            try {
+              const page = await api<{ items: Array<Record<string, unknown>> }>('/api/v1/layouts')
+              const layout = (page.items || [])[0]
+              if (layout) {
+                setLayoutMeta({ id: text(layout.id), version: Number(layout.version || 1) })
+              }
+            } catch {
+              /* ignore refresh failure */
+            }
+          }
         }
-        const saved = await api<{ version: number }>(`/api/v1/layouts/${meta.id}/draft`, {
-          method: 'PATCH',
-          body: JSON.stringify({ version: meta.version, draft }),
-        })
-        setLayoutMeta({ id: meta.id, version: Number(saved.version || meta.version + 1) })
       })()
       return next
     })
@@ -536,34 +975,71 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const port = Number(draft.port)
     const interval_ms = draft.intervalMs
     if (draft.protocol === 'modbus') {
-      return { host: draft.host, port, unit_id: Number(draft.extra || 1), timeout_ms: 3000, retries: 1, interval_ms }
-    }
-    if (draft.protocol === 'opcua') {
-      const endpoint = draft.host.startsWith('opc.tcp://') ? draft.host : `opc.tcp://${draft.host}:${port}`
-      return { endpoint, security_mode: 'None', anonymous: true, interval_ms }
-    }
-    if (draft.protocol === 'mqtt') {
-      const topic = draft.extra.trim()
       return {
         host: draft.host,
         port,
-        anonymous: draft.mqttAnonymous !== false,
+        unit_id: Number(draft.extra || 1),
+        timeout_ms: draft.modbusTimeoutMs ?? 3000,
+        retries: draft.modbusRetries ?? 1,
+        interval_ms,
+      }
+    }
+    if (draft.protocol === 'opcua') {
+      const endpoint = draft.host.startsWith('opc.tcp://') ? draft.host : `opc.tcp://${draft.host}:${port}`
+      const security_mode = draft.opcSecurityMode || draft.extra || 'None'
+      const username = draft.opcUsername?.trim()
+      return {
+        endpoint,
+        security_mode,
+        security_policy: draft.opcSecurityPolicy || (security_mode === 'None' ? 'None' : 'Basic256Sha256'),
+        anonymous: !username,
+        username: username || undefined,
+        allow_insecure: security_mode === 'None',
+        trust_all: Boolean(draft.opcTrustAll),
+        interval_ms,
+      }
+    }
+    if (draft.protocol === 'mqtt') {
+      const topic = draft.extra.trim()
+      const username = draft.mqttUsername?.trim()
+      const anonymous = draft.mqttAnonymous !== false && !username
+      const qos = typeof draft.mqttQos === 'number' ? draft.mqttQos : 1
+      return {
+        host: draft.host,
+        port,
+        anonymous,
+        username: username || undefined,
         topics: topic ? [topic] : [],
-        qos: draft.mqttQos ?? 1,
-        protocol_version: draft.mqttVersion || '3.1.1',
+        qos,
+        protocol_version: draft.mqttVersion === '5' || draft.mqttVersion === '5.0' ? '5' : draft.mqttVersion || '3.1.1',
         client_id: draft.mqttClientId || undefined,
         keepalive: draft.mqttKeepalive ?? 60,
         clean_session: true,
         tls: Boolean(draft.mqttTls),
+        tls_verify: draft.mqttTlsVerify !== false,
+        tls_ca: draft.mqttTlsCa || undefined,
+        tls_client_cert: draft.mqttTlsClientCert || undefined,
+        timestamp_jsonpath: draft.timestampJsonpath || '$.source_timestamp',
         interval_ms,
       }
     }
     const url = draft.host.startsWith('http') ? new URL(draft.host) : null
+    let headers: Record<string, string> = {}
+    if (draft.httpHeaders?.trim()) {
+      try {
+        headers = JSON.parse(draft.httpHeaders) as Record<string, string>
+      } catch {
+        headers = {}
+      }
+    }
     return {
       base_url: url ? `${url.protocol}//${url.host}` : `http://${draft.host}:${port}`,
       path: url?.pathname || draft.extra || '/',
-      auth: 'none',
-      timeout_ms: 5000,
+      method: draft.httpMethod || 'GET',
+      auth: draft.httpAuth || 'none',
+      username: draft.httpUsername || undefined,
+      headers,
+      timeout_ms: draft.httpTimeoutMs ?? 5000,
       interval_ms,
     }
   }
@@ -587,6 +1063,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (draft.protocol === 'mqtt' && !draft.extra.trim()) throw new Error('MQTT needs one topic.')
     if (!draft.host.trim()) throw new Error('The endpoint is required.')
     const edgeId = await ensureEdge(siteId)
+    const secret =
+      draft.protocol === 'mqtt'
+        ? draft.mqttPassword
+        : draft.protocol === 'opcua'
+          ? draft.opcPassword
+          : draft.protocol === 'http'
+            ? draft.httpPassword
+            : undefined
     const created = await api<{ id: string; jobs?: Array<{ id: string }> }>('/api/v1/connections', {
       method: 'POST',
       body: JSON.stringify({
@@ -595,6 +1079,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         edge_id: edgeId,
         protocol: storedProtocol(draft.protocol),
         config: connectionConfig(draft),
+        secret_input: secret || undefined,
       }),
     })
     const jobId = created.jobs?.[0]?.id
@@ -629,9 +1114,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     let last: {
       status?: string
       error_code?: string
-      stages_json?: Array<{ stage: string; status: string; duration_ms?: number }>
+      diagnostic?: string
+      stages_json?: Array<{
+        stage: string
+        status: string
+        duration_ms?: number
+        detail?: string
+        sample?: unknown
+      }>
     } = {}
-    for (let attempt = 0; attempt < 8; attempt += 1) {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
       last = await api(`/api/v1/commissioning/${jobId}`)
       const status = text(last.status)
       const code = text(last.error_code)
@@ -645,16 +1137,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (['PASSED', 'FAILED', 'COMPLETED', 'ERROR'].includes(status)) break
       await new Promise((resolve) => window.setTimeout(resolve, 1000))
     }
+    const DUPLICATE_ALIASES = new Set(['transport', 'read_sample', 'decode_quality'])
+    const mapStage = (stage: {
+      stage: string
+      status: string
+      duration_ms?: number
+      detail?: string
+      sample?: unknown
+    }) => ({
+      name: stage.stage,
+      status: stage.status,
+      latency: stage.duration_ms && stage.duration_ms > 0 ? stage.duration_ms : undefined,
+      detail: stage.detail,
+      sample: stage.sample,
+    })
     const finalStatus = text(last.status)
     if (!['PASSED', 'FAILED', 'COMPLETED', 'ERROR'].includes(finalStatus)) {
       return {
         passed: false,
+        diagnostic: text(last.diagnostic) || undefined,
         stages: [
-          ...(last.stages_json || []).map((stage) => ({
-            name: stage.stage,
-            status: stage.status,
-            latency: stage.duration_ms,
-          })),
+          ...(last.stages_json || [])
+            .filter((stage) => !DUPLICATE_ALIASES.has(String(stage.stage || '').toLowerCase()))
+            .map(mapStage),
           {
             name: 'TIMEOUT',
             status: 'FAILED',
@@ -663,30 +1168,58 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ],
       }
     }
-    const stages = (last.stages_json || []).map((stage) => ({
-      name: stage.stage,
-      status: stage.status,
-      latency: stage.duration_ms,
-    }))
+    const stages = (last.stages_json || [])
+      .filter((stage) => !DUPLICATE_ALIASES.has(String(stage.stage || '').toLowerCase()))
+      .map(mapStage)
     const failed = stages.some((stage) => stage.status === 'FAILED')
-    const network = stages.find((stage) => stage.name === 'NETWORK')
-    const passed = !failed && (network?.status === 'PASSED' || network?.status === 'COMPLETED' || finalStatus === 'PASSED' || finalStatus === 'COMPLETED')
-    return { passed, stages }
+    // CR-Q06: NETWORK alone is never enough — Activate only when Map fields passes.
+    const mapFields = stages.find((stage) =>
+      ['MAPPING', 'MAP_FIELDS'].includes(String(stage.name).toUpperCase()),
+    )
+    const mapFieldsPassed =
+      mapFields?.status === 'PASSED' ||
+      mapFields?.status === 'COMPLETED' ||
+      // Protocols without a mapping stage (e.g. Modbus probe) may mark N/A after a real read.
+      (mapFields?.status === 'NOT_APPLICABLE' &&
+        stages.some(
+          (stage) =>
+            ['DECODE', 'READ_OR_SUBSCRIBE', 'VALIDATION'].includes(String(stage.name).toUpperCase()) &&
+            (stage.status === 'PASSED' || stage.status === 'COMPLETED'),
+        ))
+    const passed =
+      !failed &&
+      Boolean(mapFieldsPassed) &&
+      (finalStatus === 'PASSED' || finalStatus === 'COMPLETED')
+    return { passed, stages, diagnostic: text(last.diagnostic) || undefined }
   }
 
   const activateAcquisition = async (prepared: PreparedConnection, draft: AcquisitionDraft) => {
     const native = (value: string) => {
-      const name = value.toLowerCase()
-      if (name.includes('float')) return 'float32'
+      const name = value.toLowerCase().replace(/[\s_-]/g, '')
+      if (name === 'string' || name === 'text' || name === 'json' || name === 'timestamp') return 'string'
+      if (name === 'bool' || name === 'boolean') return 'bool'
+      if (name === 'int16') return 'int16'
+      if (name === 'uint16') return 'uint16'
+      if (name === 'int32') return 'int32'
+      if (name === 'uint32') return 'uint32'
+      if (name === 'int64' || name === 'integer' || name === 'int') return 'int64'
+      if (name === 'float32' || name === 'float') return 'float32'
+      if (name === 'float64' || name === 'number' || name === 'double') return 'float64'
+      if (name.includes('string') || name.includes('text')) return 'string'
       if (name.includes('bool')) return 'bool'
-      if (name.includes('int')) return 'uint16'
-      return 'float32'
+      if (name.includes('int')) return 'int64'
+      if (name.includes('float') || name.includes('number')) return 'float64'
+      return 'string'
     }
     const canonical = (value: string) => {
       const kind = native(value)
       if (kind === 'bool') return 'bool'
-      if (kind === 'uint16') return 'int64'
-      return 'float64'
+      if (kind === 'string') return 'string'
+      if (kind === 'int16' || kind === 'uint16' || kind === 'int32' || kind === 'uint32' || kind === 'int64') {
+        return 'int64'
+      }
+      if (kind === 'float32' || kind === 'float64') return 'float64'
+      return 'string'
     }
     await api('/api/v1/signals/bulk', {
       method: 'POST',
@@ -704,12 +1237,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             address_kind: draft.protocol === 'modbus' ? 'modbus_register' : draft.protocol,
             address:
               draft.protocol === 'modbus'
-                ? { offset: Number(field.address), register_area: 'holding', native_type: native(field.dataType), word_order: 'big' }
+                ? {
+                    offset: Number(field.address),
+                    register_area: field.registerArea || 'holding',
+                    native_type: native(field.dataType),
+                    word_order: field.wordOrder || 'big',
+                  }
                 : draft.protocol === 'opcua'
                   ? { node_id: field.address }
                   : draft.protocol === 'mqtt'
-                    ? { topic: draft.extra, jsonpath: field.address, qos: 1 }
+                    ? {
+                        topic: (field.topic || draft.extra || '').trim(),
+                        jsonpath: field.address || '$.source_timestamp',
+                        qos:
+                          typeof field.qos === 'number'
+                            ? field.qos
+                            : typeof draft.mqttQos === 'number'
+                              ? draft.mqttQos
+                              : 1,
+                      }
                     : { path: connectionConfig(draft).path, jsonpath: field.address },
+            scale: field.scale ?? 1,
+            offset: field.offset ?? 0,
           },
         })),
       }),
@@ -729,6 +1278,178 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const deleteConnection = async (connectionId: string) => {
     await api(`/api/v1/connections/${connectionId}`, { method: 'DELETE' })
     await refresh()
+  }
+
+  const pauseConnection = async (connectionId: string) => {
+    await api(`/api/v1/connections/${connectionId}/pause`, { method: 'POST' })
+    await refresh()
+  }
+
+  const resumeConnection = async (connectionId: string) => {
+    await api(`/api/v1/connections/${connectionId}/resume`, { method: 'POST' })
+    await refresh()
+  }
+
+  const updateConnection = async (
+    connectionId: string,
+    patch: { name?: string; config?: Record<string, unknown> },
+  ) => {
+    const current = connections.find((item) => item.id === connectionId)
+    if (!current) throw new Error('Connection was not found.')
+    await api(`/api/v1/connections/${connectionId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        version: Number(current.version || 1),
+        name: patch.name,
+        config: patch.config,
+      }),
+    })
+    await refresh()
+  }
+
+  const duplicateConnection = async (connectionId: string) => {
+    const detail = await api<Record<string, unknown>>(`/api/v1/connections/${connectionId}`)
+    if (detail.secret_configured) {
+      throw new Error('This connection cannot be duplicated because its secret is not copied.')
+    }
+    const created = await api<{ id: string }>('/api/v1/connections', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: `${text(detail.name)} (copy)`,
+        site_id: text(detail.site_id),
+        edge_id: text(detail.edge_id),
+        protocol: text(detail.protocol),
+        config: (detail.config as Record<string, unknown>) || {},
+      }),
+    })
+    await refresh()
+    return created.id
+  }
+
+  const updateSignal = async (
+    signalId: string,
+    patch: {
+      display_name?: string
+      unit?: string
+      description?: string
+      expected_interval_ms?: number
+      status?: string
+      data_type?: string
+    },
+  ) => {
+    const current = signals.find((item) => item.id === signalId)
+    if (!current) return { success: false, error: 'Signal was not found.' }
+    try {
+      await api(`/api/v1/signals/${signalId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          version: Number(current.version || 1),
+          display_name: patch.display_name,
+          unit: patch.unit,
+          description: patch.description,
+          expected_interval_ms: patch.expected_interval_ms,
+          status: patch.status,
+          data_type: patch.data_type,
+        }),
+      })
+      await refresh()
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Update failed' }
+    }
+  }
+
+  const bulkDeleteSignals = async (signalIds: string[]) => {
+    let count = 0
+    for (const signalId of signalIds) {
+      const current = signals.find((item) => item.id === signalId)
+      if (!current) continue
+      await api(`/api/v1/signals/${signalId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          version: Number(current.version || 1),
+          status: 'ARCHIVED',
+        }),
+      })
+      count += 1
+    }
+    await refresh()
+    return { count }
+  }
+
+  const bulkAssignOutputGroup = async (signalIds: string[], groupId: string) => {
+    const group = outputGroups.find((item) => item.id === groupId)
+    if (!group) throw new Error('Output group was not found.')
+    const existing = new Set(group.assignedSignals)
+    const members = [
+      ...group.assignedSignals.map((id) => ({
+        signal_id: id,
+        alias: signals.find((s) => s.id === id)?.tag || id.slice(0, 8),
+      })),
+      ...signalIds
+        .filter((id) => !existing.has(id))
+        .map((id) => ({
+          signal_id: id,
+          alias: signals.find((s) => s.id === id)?.tag || id.slice(0, 8),
+        })),
+    ]
+    await api(`/api/v1/output-groups/${groupId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        version: Number(group.version || 1),
+        members,
+      }),
+    })
+    await refresh()
+  }
+
+  const saveOutputGroup = async (group: OutputGroup) => {
+    const topic = (group.topicTemplate || '{enterprise}/{site}/{area}/{line}/{machine}/{group}')
+      .trim()
+      .replace(/^\/+/, '')
+      .replace(/\/{2,}/g, '/')
+    const usedAliases = new Set<string>()
+    const members = (group.assignedSignals || []).map((id) => {
+      let alias = signals.find((s) => s.id === id)?.tag || id.slice(0, 8)
+      if (usedAliases.has(alias)) alias = `${alias}-${id.slice(0, 4)}`
+      usedAliases.add(alias)
+      return { signal_id: id, alias }
+    })
+    const resourceId = group.resourceId || resources[0]?.id
+    if (!resourceId) throw new Error('Choose a scope resource before saving an output group.')
+    const projection = {
+      mode: group.payloadFormat === 'flat' ? 'compact' : 'rich',
+      missing: 'null',
+      format: group.payloadFormat === 'flat' ? 'flat' : 'uns',
+    }
+    if (group.id && !group.id.startsWith('grp-draft-') && outputGroups.some((g) => g.id === group.id)) {
+      await api(`/api/v1/output-groups/${group.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          version: Number(group.version || 1),
+          display_name: group.name,
+          topic_template: topic,
+          resource_id: resourceId,
+          members,
+          projection_policy: projection,
+        }),
+      })
+      await refresh()
+      return group.id
+    }
+    const created = await api<{ id: string }>('/api/v1/output-groups', {
+      method: 'POST',
+      body: JSON.stringify({
+        resource_id: resourceId,
+        key: codeFrom(group.key || group.name),
+        display_name: group.name,
+        topic_template: topic,
+        members,
+        projection_policy: projection,
+      }),
+    })
+    await refresh()
+    return created.id
   }
 
   const issueEnrollmentToken = async (edgeId: string) => {
@@ -757,6 +1478,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     currentPlant,
     setCurrentPlant,
     resources,
+    allResources,
+    siteNameById,
     connections: scopedConnections,
     edges,
     signals: scopedSignals,
@@ -780,10 +1503,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     searchQuery,
     setSearchQuery,
     collectorLabel,
+    layoutDragging,
+    setLayoutDragging: markLayoutDragging,
+    publishLayout,
     resetToReference: () => undefined,
     addResource,
+    updateResource,
     moveResource,
     archiveResource,
+    restoreResource,
+    importResources,
+    showArchivedResources,
+    setShowArchivedResources,
     updateLayoutNode,
     testConnection,
     runDeterministicConnectionTest: async (id, _scenario) => {
@@ -794,28 +1525,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     commissionAcquisition,
     activateAcquisition,
     deleteConnection,
+    pauseConnection,
+    resumeConnection,
+    updateConnection,
+    duplicateConnection,
     issueEnrollmentToken,
     queueApplianceEnroll,
     addSignal: () => undefined,
-    bulkDeleteSignals: () => ({
-      count: 0,
-      undo: () => undefined,
-    }),
-    bulkAssignOutputGroup: () => undefined,
+    updateSignal,
+    bulkDeleteSignals,
+    bulkAssignOutputGroup,
     saveCalculatedSignal: () => undefined,
-    saveOutputGroup: (group) => {
-      void api('/api/v1/output-groups', {
-        method: 'POST',
-        body: JSON.stringify({
-          resource_id: resources[0]?.id,
-          key: codeFrom(group.name),
-          display_name: group.name,
-          topic_template: group.topicTemplate,
-          members: [],
-          projection_policy: { mode: 'rich', missing: 'null' },
-        }),
-      }).then(() => refresh())
-    },
+    saveOutputGroup,
+    createResourceType,
   }
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>

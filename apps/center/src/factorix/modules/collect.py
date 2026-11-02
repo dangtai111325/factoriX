@@ -73,6 +73,17 @@ class SignalPatch(BaseModel):
     description: str | None = None
     unit: str | None = None
     expected_interval_ms: int | None = None
+    status: str | None = None  # ACTIVE | DISABLED | ARCHIVED
+    data_type: str | None = None
+
+
+class OutputGroupPatch(BaseModel):
+    version: int
+    display_name: str | None = None
+    topic_template: str | None = None
+    members: list[dict[str, Any]] | None = None
+    projection_policy: dict[str, Any] | None = None
+    resource_id: str | None = None
 
 
 class FormulaIn(BaseModel):
@@ -114,7 +125,7 @@ class OutputGroupIn(BaseModel):
     resource_id: str
     key: str
     display_name: str
-    topic_template: str = "fx/v1/{enterprise}/{site}/{plant}/{zone}/{line}/{resource}/{group}"
+    topic_template: str = "{enterprise}/{site}/{area}/{line}/{machine}/{group}"
     members: list[dict[str, Any]]
     projection_policy: dict[str, Any] = Field(default_factory=lambda: {"mode": "rich", "missing": "null"})
 
@@ -271,43 +282,161 @@ async def get_connection(session: AsyncSession, tenant_id: UUID, connection_id: 
 
 
 async def list_connections(session: AsyncSession, tenant_id: UUID, *, protocol: str | None, site_id: str | None, status: str | None) -> list[dict[str, Any]]:
-    where = ["tenant_id = :tenant_id", "status <> 'ARCHIVED'"]
+    where = ["c.tenant_id = :tenant_id", "c.status <> 'ARCHIVED'"]
     params: dict[str, Any] = {"tenant_id": tenant_id}
     if protocol:
         stored, _config, _interval = accept_connection(protocol, {})
-        where.append("protocol = :protocol")
+        where.append("c.protocol = :protocol")
         params["protocol"] = stored
     if site_id:
-        where.append("site_id = :site_id")
+        where.append("c.site_id = :site_id")
         params["site_id"] = parse_uuid(site_id)
     if status:
-        where.append("status = :status")
+        where.append("c.status = :status")
         params["status"] = status
     rows = await fetch_all(
         session,
         f"""
-        SELECT id, name, protocol, endpoint_redacted, edge_id, site_id, health, status, last_error, version, secret_ref IS NOT NULL AS secret_configured
-        FROM connections WHERE {' AND '.join(where)} ORDER BY name
+        SELECT c.id, c.name, c.protocol, c.endpoint_redacted, c.edge_id, c.site_id, c.health, c.status,
+               c.last_error, c.last_success_at, c.version, c.secret_ref IS NOT NULL AS secret_configured,
+               (
+                 SELECT count(*) FROM signal_bindings b
+                 JOIN source_fields f ON f.id = b.source_field_id
+                 JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+                 WHERE j.connection_id = c.id AND b.enabled = TRUE AND b.valid_to IS NULL
+               ) AS signal_count
+        FROM connections c WHERE {' AND '.join(where)} ORDER BY c.name
         """,
         params,
     )
     for row in rows:
         row["protocol"] = public_protocol(str(row["protocol"]))
+        # Throughput / latency are not measured on Center yet — leave null for UI "—".
+        row["throughput_per_sec"] = None
+        row["latency_ms"] = None
     return rows
 
 
 def _signal_type(value: str) -> str:
-    return "bool" if value == "boolean" else value
+    raw = value.strip().lower()
+    if raw in {"boolean", "bool"}:
+        return "bool"
+    if raw in {"number", "float", "float64", "double", "analog"}:
+        return "float64"
+    if raw in {"integer", "int", "int64"}:
+        return "int64"
+    if raw in {"text", "string"}:
+        return "string"
+    return raw
+
+
+async def patch_connection(
+    session: AsyncSession,
+    tenant_id: UUID,
+    actor: UUID,
+    connection_id: UUID,
+    body: ConnectionPatch,
+    *,
+    data_key: str,
+    correlation_id: str,
+) -> dict[str, Any]:
+    current = await get_connection(session, tenant_id, connection_id)
+    if int(current["version"]) != body.version:
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This connection was modified elsewhere.")
+    if current["status"] == "ARCHIVED":
+        raise AppError(409, "ARCHIVED", "Archived connections are read-only.")
+    name = body.name.strip() if body.name is not None else current["name"]
+    if not name:
+        raise AppError(422, "NAME", "Connection name is required.")
+    config = current.get("config") or current.get("config_json") or {}
+    if body.config is not None:
+        protocol, raw_config, _interval = accept_connection(str(current["protocol"]), body.config)
+        config = parse_config(protocol, raw_config)
+    secret_ref = None
+    if body.secret_input:
+        if len(body.secret_input) > 4096:
+            raise AppError(422, "SECRET", "Secret is too long.")
+        secret_ref = uuid4()
+        await execute(
+            session,
+            """
+            INSERT INTO secret_store (id, tenant_id, ciphertext, created_at)
+            VALUES (:id, :tenant_id, :ciphertext, :now)
+            """,
+            {"id": secret_ref, "tenant_id": tenant_id, "ciphertext": encrypt_secret(data_key, body.secret_input), "now": utcnow()},
+        )
+    await execute(
+        session,
+        """
+        UPDATE connections
+        SET name = :name,
+            config_json = CAST(:config AS jsonb),
+            endpoint_redacted = :endpoint,
+            secret_ref = COALESCE(:secret_ref, secret_ref),
+            version = version + 1,
+            updated_at = :now
+        WHERE id = :id AND tenant_id = :tenant_id AND version = :version
+        """,
+        {
+            "name": name,
+            "config": jsonb(config),
+            "endpoint": redacted_endpoint(str(current["protocol"]), config),
+            "secret_ref": secret_ref,
+            "now": utcnow(),
+            "id": connection_id,
+            "tenant_id": tenant_id,
+            "version": body.version,
+        },
+    )
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="CONNECTION_UPDATE",
+        actor_id=actor,
+        entity_type="connection",
+        entity_id=connection_id,
+        before={"name": current["name"]},
+        after={"name": name},
+        correlation_id=correlation_id,
+    )
+    return await get_connection(session, tenant_id, connection_id)
 
 
 async def pause_connection(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str) -> dict[str, Any]:
     current = await get_connection(session, tenant_id, connection_id)
+    if current["status"] == "ARCHIVED":
+        raise AppError(409, "ARCHIVED", "Archived connections cannot be paused.")
     await execute(
         session,
         "UPDATE connections SET status = 'PAUSED', health = 'PAUSED', version = version + 1, updated_at = :now WHERE id = :id",
         {"now": utcnow(), "id": connection_id},
     )
     await audit(session, tenant_id=tenant_id, event_type="CONNECTION_PAUSE", actor_id=actor, entity_type="connection", entity_id=connection_id, before={"status": current["status"]}, after={"status": "PAUSED"}, correlation_id=correlation_id)
+    return await get_connection(session, tenant_id, connection_id)
+
+
+async def resume_connection(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str) -> dict[str, Any]:
+    current = await get_connection(session, tenant_id, connection_id)
+    if current["status"] == "ARCHIVED":
+        raise AppError(409, "ARCHIVED", "Archived connections cannot be resumed.")
+    if current["status"] != "PAUSED":
+        raise AppError(409, "NOT_PAUSED", "Only paused connections can be resumed.")
+    await execute(
+        session,
+        "UPDATE connections SET status = 'ACTIVE', health = 'UNKNOWN', version = version + 1, updated_at = :now WHERE id = :id",
+        {"now": utcnow(), "id": connection_id},
+    )
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="CONNECTION_RESUME",
+        actor_id=actor,
+        entity_type="connection",
+        entity_id=connection_id,
+        before={"status": current["status"]},
+        after={"status": "ACTIVE"},
+        correlation_id=correlation_id,
+    )
     return await get_connection(session, tenant_id, connection_id)
 
 
@@ -425,25 +554,51 @@ async def bulk_signals(
 async def patch_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, signal_id: UUID, body: SignalPatch, correlation_id: str) -> dict[str, Any]:
     current = await _signal(session, tenant_id, signal_id)
     if int(current["version"]) != body.version:
-        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "Tín hiệu đã được chỉnh sửa ở nơi khác.")
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This signal was modified elsewhere.")
+    display_name = body.display_name.strip() if body.display_name is not None else current["display_name"]
+    if body.display_name is not None and not display_name:
+        raise AppError(422, "NAME", "Signal name is required.")
+    status = current["status"]
+    if body.status is not None:
+        status = body.status.upper()
+        if status not in {"ACTIVE", "DISABLED", "ARCHIVED"}:
+            raise AppError(422, "STATUS", "Signal status must be ACTIVE, DISABLED, or ARCHIVED.")
+    data_type = current["data_type"]
+    if body.data_type is not None:
+        data_type = _signal_type(body.data_type)
+        if data_type not in {"bool", "int64", "float64", "string", "enum", "json"}:
+            raise AppError(422, "TYPE", "Unsupported signal data type.")
     await execute(
         session,
         """
         UPDATE signal_definitions
         SET display_name = :display_name, description = :description, unit = :unit,
-            expected_interval_ms = :interval, version = version + 1, updated_at = :now
+            expected_interval_ms = :interval, status = :status, data_type = :data_type,
+            version = version + 1, updated_at = :now
         WHERE id = :id
         """,
         {
-            "display_name": body.display_name or current["display_name"],
+            "display_name": display_name,
             "description": body.description if body.description is not None else current["description"],
             "unit": body.unit if body.unit is not None else current["unit"],
             "interval": body.expected_interval_ms if body.expected_interval_ms is not None else current["expected_interval_ms"],
+            "status": status,
+            "data_type": data_type,
             "now": utcnow(),
             "id": signal_id,
         },
     )
-    await audit(session, tenant_id=tenant_id, event_type="SIGNAL_RENAME", actor_id=actor, entity_type="signal", entity_id=signal_id, before={"display_name": current["display_name"]}, after={"display_name": body.display_name or current["display_name"]}, correlation_id=correlation_id)
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="SIGNAL_UPDATE",
+        actor_id=actor,
+        entity_type="signal",
+        entity_id=signal_id,
+        before={"display_name": current["display_name"], "status": current["status"]},
+        after={"display_name": display_name, "status": status},
+        correlation_id=correlation_id,
+    )
     return await _signal(session, tenant_id, signal_id)
 
 
@@ -460,7 +615,7 @@ async def _signal(session: AsyncSession, tenant_id: UUID, signal_id: UUID) -> di
 
 async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: str | None, query: str | None, limit: int) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"tenant_id": tenant_id, "limit": min(max(limit, 1), 1000)}
-    where = ["s.tenant_id = :tenant_id", "s.status = 'ACTIVE'"]
+    where = ["s.tenant_id = :tenant_id", "s.status IN ('ACTIVE', 'DISABLED')"]
     if resource_id:
         where.append("s.resource_id = :resource_id")
         params["resource_id"] = parse_uuid(resource_id)
@@ -470,9 +625,17 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
     rows = await fetch_all(
         session,
         f"""
-        SELECT s.id, s.key, s.display_name, s.data_type, s.unit, s.category, s.resource_id, s.version, s.expected_interval_ms,
-               r.code AS resource_code, r.name AS resource_name
-        FROM signal_definitions s JOIN resources r ON r.id = s.resource_id
+        SELECT s.id, s.key, s.display_name, s.data_type, s.unit, s.category, s.resource_id, s.version,
+               s.expected_interval_ms, s.status, s.description,
+               r.code AS resource_code, r.name AS resource_name,
+               c.id AS connection_id, c.name AS connection_name,
+               f.address_json, f.address_kind
+        FROM signal_definitions s
+        JOIN resources r ON r.id = s.resource_id
+        LEFT JOIN signal_bindings b ON b.signal_id = s.id AND b.enabled = TRUE AND b.valid_to IS NULL
+        LEFT JOIN source_fields f ON f.id = b.source_field_id
+        LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+        LEFT JOIN connections c ON c.id = j.connection_id
         WHERE {' AND '.join(where)}
         ORDER BY r.code, s.key
         LIMIT :limit
@@ -482,6 +645,23 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
     for row in rows:
         if row.get("data_type") == "bool":
             row["data_type"] = "boolean"
+        elif row.get("data_type") == "float64":
+            row["data_type"] = "number"
+        elif row.get("data_type") == "int64":
+            row["data_type"] = "integer"
+        elif row.get("data_type") == "string":
+            row["data_type"] = "text"
+        address = row.get("address_json") or {}
+        if isinstance(address, dict):
+            row["topic"] = address.get("topic")
+            row["jsonpath"] = address.get("jsonpath") or address.get("path") or address.get("node_id")
+            if address.get("offset") is not None:
+                row["binding_address"] = f"offset:{address.get('offset')}"
+            elif row.get("jsonpath"):
+                row["binding_address"] = row["jsonpath"]
+            elif address.get("node_id"):
+                row["binding_address"] = address.get("node_id")
+        row["binding_type"] = row.get("address_kind")
     return rows
 
 
@@ -663,7 +843,21 @@ async def create_output_group(session: AsyncSession, tenant_id: UUID, actor: UUI
     if len(aliases) != len(set(aliases)):
         raise AppError(422, "ALIAS", "Duplicate alias in the output group.")
     try:
-        render_topic(body.topic_template, {"enterprise": "e", "site": "s", "plant": "p", "zone": None, "line": None, "resource": resource["code"], "group": body.key})
+        render_topic(
+            body.topic_template,
+            {
+                "enterprise": "e",
+                "site": "s",
+                "area": "a",
+                "plant": "p",
+                "zone": None,
+                "cell": None,
+                "line": None,
+                "machine": resource["code"],
+                "resource": resource["code"],
+                "group": body.key,
+            },
+        )
     except TopicError as exc:
         raise AppError(422, exc.code, str(exc)) from exc
     group_id = uuid4()
@@ -697,7 +891,101 @@ async def create_output_group(session: AsyncSession, tenant_id: UUID, actor: UUI
             {"group_id": group_id, "signal_id": as_uuid(signal["id"]), "alias": member["alias"], "ordinal": ordinal},
         )
     await audit(session, tenant_id=tenant_id, event_type="OUTPUT_GROUP_DRAFT", actor_id=actor, entity_type="output_group", entity_id=group_id, before=None, after={"key": body.key}, correlation_id=correlation_id)
-    return {"id": str(group_id), "status": "DRAFT"}
+    return {"id": str(group_id), "status": "DRAFT", "version": 1}
+
+
+async def patch_output_group(
+    session: AsyncSession,
+    tenant_id: UUID,
+    actor: UUID,
+    group_id: UUID,
+    body: OutputGroupPatch,
+    correlation_id: str,
+) -> dict[str, Any]:
+    group = await fetch_one(
+        session,
+        "SELECT * FROM output_groups WHERE id = :id AND tenant_id = :tenant_id",
+        {"id": group_id, "tenant_id": tenant_id},
+    )
+    if group is None:
+        raise AppError(404, "NOT_FOUND", "Output group not found.")
+    if int(group["version"]) != body.version:
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This output group was modified elsewhere.")
+    display_name = body.display_name.strip() if body.display_name is not None else group["display_name"]
+    if body.display_name is not None and not display_name:
+        raise AppError(422, "NAME", "Output group name is required.")
+    topic = body.topic_template if body.topic_template is not None else group["topic_template"]
+    policy = body.projection_policy if body.projection_policy is not None else group["projection_policy_json"]
+    resource_id = parse_uuid(body.resource_id) if body.resource_id else as_uuid(group["resource_id"])
+    resource = await fetch_one(
+        session,
+        "SELECT id, code, name FROM resources WHERE id = :id AND tenant_id = :tenant_id",
+        {"id": resource_id, "tenant_id": tenant_id},
+    )
+    if resource is None:
+        raise AppError(404, "NOT_FOUND", "Resource not found.")
+    try:
+        render_topic(
+            topic,
+            {
+                "enterprise": "e",
+                "site": "s",
+                "area": "a",
+                "plant": "p",
+                "zone": None,
+                "cell": None,
+                "line": None,
+                "machine": resource["code"],
+                "resource": resource["code"],
+                "group": group["key"],
+            },
+        )
+    except TopicError as exc:
+        raise AppError(422, exc.code, str(exc)) from exc
+    await execute(
+        session,
+        """
+        UPDATE output_groups
+        SET display_name = :name, topic_template = :topic, resource_id = :resource_id,
+            projection_policy_json = CAST(:policy AS jsonb), version = version + 1
+        WHERE id = :id AND version = :version
+        """,
+        {
+            "name": display_name,
+            "topic": topic,
+            "resource_id": resource_id,
+            "policy": jsonb(policy),
+            "id": group_id,
+            "version": body.version,
+        },
+    )
+    if body.members is not None:
+        aliases = [str(member["alias"]) for member in body.members]
+        if len(aliases) != len(set(aliases)):
+            raise AppError(422, "ALIAS", "Duplicate alias in the output group.")
+        await execute(session, "DELETE FROM output_group_members WHERE output_group_id = :id", {"id": group_id})
+        for ordinal, member in enumerate(body.members):
+            signal = await _signal(session, tenant_id, parse_uuid(str(member["signal_id"])))
+            await execute(
+                session,
+                """
+                INSERT INTO output_group_members (output_group_id, signal_id, output_alias, ordinal)
+                VALUES (:group_id, :signal_id, :alias, :ordinal)
+                """,
+                {"group_id": group_id, "signal_id": as_uuid(signal["id"]), "alias": member["alias"], "ordinal": ordinal},
+            )
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="OUTPUT_GROUP_UPDATE",
+        actor_id=actor,
+        entity_type="output_group",
+        entity_id=group_id,
+        before={"display_name": group["display_name"]},
+        after={"display_name": display_name, "topic": topic},
+        correlation_id=correlation_id,
+    )
+    return await preview_output_group(session, tenant_id, group_id)
 
 
 async def preview_output_group(session: AsyncSession, tenant_id: UUID, group_id: UUID) -> dict[str, Any]:
@@ -757,7 +1045,7 @@ async def _resource_path(session: AsyncSession, tenant_id: UUID, resource_id: UU
     from factorix.modules.resources import breadcrumb
 
     chain = await breadcrumb(session, tenant_id, resource_id)
-    roles = ["enterprise", "site", "plant", "zone", "line"]
+    roles = ["enterprise", "site", "area", "plant", "zone", "cell", "line", "machine", "resource"]
     context: dict[str, str | None] = {role: None for role in roles}
     detailed = await fetch_all(
         session,
@@ -772,6 +1060,14 @@ async def _resource_path(session: AsyncSession, tenant_id: UUID, resource_id: UU
         key = by_id.get(item["id"])
         if key in context:
             context[key] = item["code"]
+        if key == "plant" and not context.get("area"):
+            context["area"] = item["code"]
+        if key == "machine":
+            context["machine"] = item["code"]
+            context["resource"] = item["code"]
+    if not context.get("resource") and chain:
+        context["resource"] = chain[-1]["code"]
+        context["machine"] = context.get("machine") or chain[-1]["code"]
     return context
 
 

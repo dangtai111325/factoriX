@@ -94,10 +94,11 @@ CREATE TABLE resources (
     archived_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
-    UNIQUE (tenant_id, code),
     CONSTRAINT resources_status CHECK (status IN ('ACTIVE', 'ARCHIVED'))
 );
 
+-- Codes are unique among siblings under the same CONTAINS parent (enforced in app).
+CREATE INDEX resources_tenant_code_idx ON resources (tenant_id, code);
 CREATE INDEX resources_tenant_type ON resources (tenant_id, type_id);
 CREATE INDEX resources_site ON resources (tenant_id, site_id);
 

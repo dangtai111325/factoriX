@@ -20,10 +20,11 @@ export const Button: React.FC<ButtonProps> = ({
   const baseClasses =
     'inline-flex items-center justify-center font-semibold rounded-lg transition-all duration-150 select-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed';
 
+  // CR-DS01: single control height 36px
   const sizeClasses = {
-    sm: 'h-8 px-2.5 text-[12px] gap-1.5',
+    sm: 'h-9 px-2.5 text-[12px] gap-1.5',
     md: 'h-9 px-4 text-[13px] gap-2',
-    lg: 'h-10 px-5 text-[14px] gap-2.5',
+    lg: 'h-9 px-5 text-[14px] gap-2.5',
   };
 
   const variantClasses = {

@@ -1,11 +1,18 @@
 export class ApiError extends Error {
   status: number
   code: string
+  fieldErrors: Array<{ path: string; code: string; message?: string }>
 
-  constructor(status: number, message: string, code = '') {
+  constructor(
+    status: number,
+    message: string,
+    code = '',
+    fieldErrors: Array<{ path: string; code: string; message?: string }> = [],
+  ) {
     super(message)
     this.status = status
     this.code = code
+    this.fieldErrors = fieldErrors
   }
 }
 
@@ -23,9 +30,15 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (response.status === 204) return undefined as T
   const body = await response.json().catch(() => null)
   if (!response.ok) {
-    const message = body?.error?.message || body?.message || response.statusText
-    const code = body?.error?.code || body?.code || ''
-    throw new ApiError(response.status, message, code)
+    const error = body?.error || body || {}
+    const message = error.message || body?.message || response.statusText
+    const code = error.code || body?.code || ''
+    const fieldErrors = Array.isArray(error.field_errors)
+      ? error.field_errors
+      : Array.isArray(body?.field_errors)
+        ? body.field_errors
+        : []
+    throw new ApiError(response.status, message, code, fieldErrors)
   }
   return body as T
 }

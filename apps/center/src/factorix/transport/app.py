@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +20,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from factorix.modules import collect, edge_sync, identity, resources, telemetry
 from factorix.modules.collect import (
     ConnectionIn,
+    ConnectionPatch,
     EdgeIn,
     FormulaIn,
     MappingPreviewIn,
     OutputGroupIn,
+    OutputGroupPatch,
     PreviewIn,
     ReleaseIn,
     SignalBulkIn,
     SignalPatch,
 )
-from factorix.modules.common import as_uuid, fetch_all, fetch_one, parse_uuid
+from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, parse_uuid, utcnow
 from factorix.platform.after_commit import listen
 from factorix.modules.identity import (
     SESSION_COOKIE,
@@ -114,6 +118,7 @@ class Hub:
 
 
 hub = Hub()
+_background: set[asyncio.Task[None]] = set()
 
 
 async def _publish_committed(events: list[dict[str, Any]]) -> None:
@@ -123,7 +128,42 @@ async def _publish_committed(events: list[dict[str, Any]]) -> None:
         await hub.publish(str(event["tenant_id"]), str(event["signal_id"]), event["payload"])
 
 
+async def _password_reset_mail(events: list[dict[str, Any]]) -> None:
+    for event in events:
+        if event.get("kind") != "password_reset_mail":
+            continue
+        task = asyncio.create_task(_deliver_reset_mail(event))
+        _background.add(task)
+        task.add_done_callback(_background.discard)
+
+
+async def _deliver_reset_mail(event: dict[str, Any]) -> None:
+    from factorix.platform.db import session_factory
+    from factorix.platform.errors import AppError
+    from factorix.platform.mail import SmtpMailer
+
+    mailer = getattr(app.state, "mailer", None) or SmtpMailer(settings)
+    try:
+        await asyncio.to_thread(mailer.send_code, str(event["email"]), str(event["code"]))
+    except AppError:
+        factory = session_factory()
+        async with factory() as extra:
+            await audit(
+                extra,
+                tenant_id=as_uuid(event["tenant_id"]),
+                event_type="AUTH_RESET_MAIL_WARN",
+                actor_id=as_uuid(event["admin_id"]) if event.get("admin_id") else None,
+                entity_type="admin",
+                entity_id=as_uuid(event["admin_id"]) if event.get("admin_id") else None,
+                before=None,
+                after={"channel": "email", "result": "failed"},
+                correlation_id=uuid.uuid4().hex,
+            )
+            await extra.commit()
+
+
 listen(_publish_committed)
+listen(_password_reset_mail)
 
 app = FastAPI(title="FactoriX IIoT Center", version="1.0.0", openapi_url="/api/openapi.json")
 app.add_middleware(
@@ -133,6 +173,19 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["content-type", "x-csrf-token", "x-bootstrap-token"],
 )
+
+# CR-A05: print setup code once at boot when required (never log the raw token elsewhere).
+if settings.bootstrap_token:
+    print(
+        f"[FactoriX] Setup code required for first administrator. "
+        f"Present it via X-Bootstrap-Token. Length={len(settings.bootstrap_token)}",
+        flush=True,
+    )
+elif settings.environment == "production" and settings.appliance:
+    print(
+        "[FactoriX] WARNING: FACTORIX_BOOTSTRAP_TOKEN is empty on a production appliance.",
+        flush=True,
+    )
 
 
 @app.middleware("http")
@@ -165,7 +218,20 @@ async def app_error(request: Request, exc: AppError) -> JSONResponse:
 
 @app.get("/health/live")
 async def live() -> dict[str, str]:
-    return {"status": "live"}
+    return {
+        "status": "live",
+        "version": app.version or "1.0.0",
+        "build": os.environ.get("FACTORIX_BUILD", app.version or "1.0.0"),
+    }
+
+
+@app.get("/api/v1/health")
+async def api_health() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "version": app.version or "1.0.0",
+        "build": os.environ.get("FACTORIX_BUILD", app.version or "1.0.0"),
+    }
 
 
 @app.get("/health/ready")
@@ -195,9 +261,21 @@ async def bootstrap(request: Request, body: BootstrapIn, session: AsyncSession =
 
 
 @app.post("/api/v1/auth/login")
-async def login(body: LoginIn, response: Response, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
-    tokens = await login_admin(session, settings, body)
-    identity._cookies(response, settings, tokens["session_token"], tokens["csrf_token"])
+async def login(
+    body: LoginIn,
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, str]:
+    client_ip = request.client.host if request.client else None
+    tokens = await login_admin(session, settings, body, client_ip=client_ip)
+    identity._cookies(
+        response,
+        settings,
+        tokens["session_token"],
+        tokens["csrf_token"],
+        max_age=int(tokens.get("ttl_seconds") or settings.session_ttl_minutes * 60),
+    )
     return {"status": "authenticated"}
 
 
@@ -245,13 +323,34 @@ async def logout(response: Response, request: Request, principal: dict[str, Any]
 
 class RevertIn(BaseModel):
     confirm: str
+    password: str = ""
 
 
 @app.post("/api/v1/admin/revert-to-zero")
 async def revert_zero(body: RevertIn, response: Response, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
-    del principal
     if body.confirm != "REVERT":
         raise AppError(422, "CONFIRM", "Type REVERT exactly to wipe this installation.")
+    if not body.password:
+        raise AppError(422, "PASSWORD", "Administrator password is required to revert.")
+    account = await fetch_one(
+        session,
+        "SELECT id, login, password_hash FROM admin_accounts WHERE id = :id",
+        {"id": as_uuid(principal["admin_id"])},
+    )
+    if account is None or not verify_password(account["password_hash"], body.password):
+        raise AppError(403, "PASSWORD", "Password is incorrect.")
+    # Log outside the database before truncate (CR-X01).
+    log_root = Path(settings.data_dir) if settings.data_dir else Path("/var/log/factorix")
+    try:
+        log_root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        log_path = log_root / f"revert-to-zero-{stamp}.log"
+        log_path.write_text(
+            f"revert_to_zero at={stamp} admin_id={account['id']} login={account['login']}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
     await identity.revert_to_zero(session)
     if settings.data_dir:
         root = Path(settings.data_dir)
@@ -275,17 +374,75 @@ async def revert_zero(body: RevertIn, response: Response, principal: dict[str, A
 async def auth_status(session: AsyncSession = Depends(db_session)) -> dict[str, bool]:
     existing = await fetch_one(session, "SELECT id FROM admin_accounts WHERE disabled_at IS NULL LIMIT 1", {})
     open_first_run = settings.environment == "development" and not settings.bootstrap_token
+    smtp_ok = settings.smtp_configured
     return {
         "admin_exists": existing is not None,
         "bootstrap_enabled": bool(settings.bootstrap_token) or open_first_run,
         "setup_code_required": bool(settings.bootstrap_token),
         "appliance": settings.appliance,
+        "smtp_configured": smtp_ok,
+        "password_recovery_enabled": smtp_ok,
     }
 
 
 @app.get("/api/v1/auth/me")
 async def me(principal: dict[str, Any] = Depends(admin)) -> dict[str, Any]:
     return await identity.touch_me(principal)
+
+
+@app.get("/api/v1/auth/sessions")
+async def list_sessions(
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
+    rows = await fetch_all(
+        session,
+        """
+        SELECT id, created_at, expires_at, revoked_at
+        FROM sessions
+        WHERE admin_id = :admin_id
+          AND revoked_at IS NULL
+          AND expires_at > :now
+        ORDER BY created_at DESC
+        """,
+        {"admin_id": as_uuid(principal["admin_id"]), "now": utcnow()},
+    )
+    current = str(principal.get("session_id") or "")
+    return {
+        "current_session_id": current,
+        "items": [
+            {
+                "id": str(row["id"]),
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "current": str(row["id"]) == current,
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.post("/api/v1/auth/sessions/{session_id}/revoke")
+async def revoke_session(
+    session_id: str,
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, str]:
+    target = parse_uuid(session_id)
+    if str(principal.get("session_id") or "") == str(target):
+        raise AppError(422, "CURRENT_SESSION", "Sign out to end the current session.")
+    owned = await fetch_one(
+        session,
+        """
+        SELECT id FROM sessions
+        WHERE id = :id AND admin_id = :admin_id AND revoked_at IS NULL
+        """,
+        {"id": target, "admin_id": as_uuid(principal["admin_id"])},
+    )
+    if owned is None:
+        raise AppError(404, "NOT_FOUND", "Session not found.")
+    await identity.execute_logout(session, target)
+    return {"status": "revoked"}
 
 
 @app.post("/api/v1/auth/password")
@@ -296,10 +453,214 @@ async def change_password(body: PasswordIn, principal: dict[str, Any] = Depends(
     if account is None or not verify_password(account["password_hash"], body.current_password):
         raise AppError(401, "INVALID_CREDENTIALS", "Current password is incorrect.")
     validate_password(body.new_password, account["login"])
-    from factorix.modules.common import execute
-
-    await execute(session, "UPDATE admin_accounts SET password_hash = :password_hash WHERE id = :id", {"password_hash": hash_password(body.new_password), "id": as_uuid(principal["admin_id"])})
+    await execute(
+        session,
+        "UPDATE admin_accounts SET password_hash = :password_hash WHERE id = :id",
+        {"password_hash": hash_password(body.new_password), "id": as_uuid(principal["admin_id"])},
+    )
+    # CR-A09: revoking this admin's sessions after password change.
+    await execute(
+        session,
+        "UPDATE sessions SET revoked_at = :now WHERE admin_id = :admin_id AND revoked_at IS NULL",
+        {"now": utcnow(), "admin_id": as_uuid(principal["admin_id"])},
+    )
     return {"status": "updated"}
+
+
+class UnlockIn(BaseModel):
+    login: str = ""
+
+
+class EmailSettingsIn(BaseModel):
+    host: str = ""
+    port: int = 587
+    tls: bool = True
+    user: str = ""
+    password: str = ""
+    from_address: str = ""
+
+
+class EmailTestIn(BaseModel):
+    to: str
+
+
+def _smtp_override_path() -> Path | None:
+    if not settings.data_dir:
+        return None
+    return Path(settings.data_dir) / "smtp.json"
+
+
+def _load_smtp_override() -> dict[str, Any]:
+    path = _smtp_override_path()
+    if path is None or not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _apply_smtp_override() -> None:
+    """Merge data_dir/smtp.json into runtime settings for Administration edits."""
+    data = _load_smtp_override()
+    if not data:
+        return
+    if "host" in data:
+        settings.smtp_host = str(data.get("host") or "")
+    if "port" in data:
+        try:
+            settings.smtp_port = int(data.get("port") or 587)
+        except (TypeError, ValueError):
+            settings.smtp_port = 587
+    if "user" in data:
+        settings.smtp_user = str(data.get("user") or "")
+    if "password" in data and data.get("password"):
+        settings.smtp_password = str(data.get("password") or "")
+    if "from_address" in data:
+        settings.smtp_from = str(data.get("from_address") or "")
+    if "tls" in data:
+        settings.smtp_tls = bool(data.get("tls"))
+
+
+_apply_smtp_override()
+
+
+@app.get("/api/v1/admin/email")
+async def get_email_settings(principal: dict[str, Any] = Depends(admin)) -> dict[str, Any]:
+    del principal
+    return {
+        "host": settings.smtp_host,
+        "port": settings.smtp_port,
+        "tls": settings.smtp_tls,
+        "user": settings.smtp_user,
+        "from_address": settings.smtp_from,
+        "password_set": bool(settings.smtp_password),
+        "configured": settings.smtp_configured,
+    }
+
+
+@app.put("/api/v1/admin/email")
+async def put_email_settings(
+    body: EmailSettingsIn,
+    principal: dict[str, Any] = Depends(admin),
+) -> dict[str, Any]:
+    del principal
+    path = _smtp_override_path()
+    if path is None:
+        raise AppError(503, "NO_DATA_DIR", "Appliance data directory is not configured.")
+    current = _load_smtp_override()
+    password = body.password if body.password else str(current.get("password") or settings.smtp_password)
+    payload = {
+        "host": body.host.strip(),
+        "port": body.port,
+        "tls": body.tls,
+        "user": body.user.strip(),
+        "password": password,
+        "from_address": body.from_address.strip(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _apply_smtp_override()
+    app.state.mailer = SmtpMailer(settings)
+    return {
+        "status": "saved",
+        "configured": settings.smtp_configured,
+        "host": settings.smtp_host,
+        "port": settings.smtp_port,
+        "tls": settings.smtp_tls,
+        "user": settings.smtp_user,
+        "from_address": settings.smtp_from,
+        "password_set": bool(settings.smtp_password),
+    }
+
+
+@app.post("/api/v1/admin/email/test")
+async def test_email(
+    body: EmailTestIn,
+    request: Request,
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, str]:
+    tenant_id, actor = _ids(principal)
+    mailer = getattr(app.state, "mailer", None) or SmtpMailer(settings)
+    try:
+        await asyncio.to_thread(mailer.send_code, body.to.strip().lower(), "000000")
+        status = "sent"
+    except AppError as err:
+        await audit(
+            session,
+            tenant_id=tenant_id,
+            event_type="AUTH_SMTP_TEST_WARN",
+            actor_id=actor,
+            entity_type="admin",
+            entity_id=actor,
+            before=None,
+            after={"result": "failed", "code": err.code},
+            correlation_id=correlation_id(request),
+        )
+        raise AppError(503, "MAIL_UNAVAILABLE", "Could not send test email. Check SMTP settings.") from err
+    return {"status": status}
+
+
+@app.get("/api/v1/admin/locks")
+async def list_locks(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    del principal
+    rows = await fetch_all(
+        session,
+        """
+        SELECT login, failed_count, window_started, locked_until
+        FROM login_throttle
+        WHERE locked_until IS NOT NULL AND locked_until > :now
+        ORDER BY locked_until DESC
+        """,
+        {"now": utcnow()},
+    )
+    items = []
+    for row in rows:
+        key = str(row["login"] or "")
+        login, _, ip = key.partition("|")
+        items.append(
+            {
+                "key": key,
+                "login": login or key,
+                "ip": ip or "—",
+                "failed_count": row["failed_count"],
+                "locked_until": row["locked_until"],
+            }
+        )
+    return {"items": items}
+
+
+@app.post("/api/v1/admin/unlock")
+async def unlock_login(
+    body: UnlockIn,
+    request: Request,
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, str]:
+    tenant_id, actor = _ids(principal)
+    target = body.login.strip()
+    if not target:
+        raise AppError(422, "LOGIN", "Login is required.")
+    # Match exact throttle key or any IP for that login.
+    await execute(session, "DELETE FROM login_throttle WHERE login = :login", {"login": target})
+    await execute(
+        session,
+        "DELETE FROM login_throttle WHERE login LIKE :prefix",
+        {"prefix": f"{target}|%"},
+    )
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="AUTH_UNLOCK",
+        actor_id=actor,
+        entity_type="admin",
+        entity_id=actor,
+        before=None,
+        after={"login": target},
+        correlation_id=correlation_id(request),
+    )
+    return {"status": "unlocked"}
 
 
 class _Sites:
@@ -374,6 +735,12 @@ async def patch_resource(resource_id: str, body: ResourcePatch, request: Request
 async def archive_resource(resource_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await resources.archive_resource(session, tenant_id, actor, parse_uuid(resource_id), correlation_id(request))
+
+
+@app.post("/api/v1/resources/{resource_id}/restore")
+async def restore_resource(resource_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await resources.restore_resource(session, tenant_id, actor, parse_uuid(resource_id), correlation_id(request))
 
 
 @app.post("/api/v1/resources/{resource_id}/move")
@@ -487,10 +854,36 @@ async def connection_detail(connection_id: str, principal: dict[str, Any] = Depe
     return await collect.get_connection(session, tenant_id, parse_uuid(connection_id))
 
 
+@app.patch("/api/v1/connections/{connection_id}")
+async def patch_connection(
+    connection_id: str,
+    body: ConnectionPatch,
+    request: Request,
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.patch_connection(
+        session,
+        tenant_id,
+        actor,
+        parse_uuid(connection_id),
+        body,
+        data_key=settings.data_key,
+        correlation_id=correlation_id(request),
+    )
+
+
 @app.post("/api/v1/connections/{connection_id}/pause")
 async def pause_connection(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await collect.pause_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
+
+
+@app.post("/api/v1/connections/{connection_id}/resume")
+async def resume_connection(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.resume_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
 
 
 @app.delete("/api/v1/connections/{connection_id}")
@@ -592,6 +985,12 @@ async def create_group(body: OutputGroupIn, request: Request, principal: dict[st
     return await collect.create_output_group(session, tenant_id, actor, body, correlation_id(request))
 
 
+@app.patch("/api/v1/output-groups/{group_id}")
+async def patch_group(group_id: str, body: OutputGroupPatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.patch_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
+
+
 @app.get("/api/v1/output-groups/{group_id}/preview")
 async def group_preview(group_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
@@ -620,7 +1019,34 @@ async def create_edge(body: EdgeIn, request: Request, principal: dict[str, Any] 
 async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
     items = await fetch_all(session, "SELECT id, name, site_id, enrollment_status, desired_revision, active_revision, last_heartbeat, health, software_version, outbox_pending FROM edge_nodes WHERE tenant_id = :tenant_id ORDER BY name", {"tenant_id": tenant_id})
-    return {"items": items}
+    # CR-E02: missed heartbeat > 3× 30s interval → OFFLINE + audit WARN.
+    now = utcnow()
+    stale_after = timedelta(seconds=90)
+    refreshed: list[dict[str, Any]] = []
+    for row in items:
+        item = dict(row)
+        hb = item.get("last_heartbeat")
+        enrolled = str(item.get("enrollment_status") or "") == "ENROLLED"
+        if enrolled and hb is not None:
+            hb_dt = datetime.fromisoformat(hb.replace("Z", "+00:00")) if isinstance(hb, str) else hb
+            if hb_dt is not None and getattr(hb_dt, "tzinfo", None) is None:
+                hb_dt = hb_dt.replace(tzinfo=timezone.utc)
+            if hb_dt is not None and now - hb_dt > stale_after and str(item.get("health") or "").upper() != "OFFLINE":
+                await execute(session, "UPDATE edge_nodes SET health = 'OFFLINE' WHERE id = :id", {"id": item["id"]})
+                await audit(
+                    session,
+                    tenant_id=tenant_id,
+                    event_type="EDGE_HEARTBEAT_STALE",
+                    actor_id=None,
+                    entity_type="edge",
+                    entity_id=item["id"],
+                    before={"health": item.get("health")},
+                    after={"health": "OFFLINE"},
+                    correlation_id=uuid.uuid4().hex,
+                )
+                item["health"] = "OFFLINE"
+        refreshed.append(item)
+    return {"items": refreshed}
 
 
 @app.get("/api/v1/edges/{edge_id}")
@@ -759,7 +1185,8 @@ async def output_groups(principal: dict[str, Any] = Depends(admin), session: Asy
     items = await fetch_all(
         session,
         """
-        SELECT g.id, g.resource_id, g.key, g.display_name, g.topic_template, g.status, g.version, r.code AS resource_code,
+        SELECT g.id, g.resource_id, g.key, g.display_name, g.topic_template, g.status, g.version, g.projection_policy_json,
+               r.code AS resource_code, r.name AS resource_name,
                (SELECT count(*) FROM output_group_members m WHERE m.output_group_id = g.id) AS member_count
         FROM output_groups g
         JOIN resources r ON r.id = g.resource_id
@@ -768,6 +1195,18 @@ async def output_groups(principal: dict[str, Any] = Depends(admin), session: Asy
         """,
         {"tenant_id": tenant_id},
     )
+    for item in items:
+        members = await fetch_all(
+            session,
+            """
+            SELECT signal_id, output_alias AS alias, ordinal
+            FROM output_group_members
+            WHERE output_group_id = :id
+            ORDER BY ordinal
+            """,
+            {"id": item["id"]},
+        )
+        item["members"] = members
     return {"items": items}
 
 
@@ -844,9 +1283,36 @@ async def publish_dashboard(dashboard_id: str, request: Request, principal: dict
 
 
 @app.get("/api/v1/audit-events")
-async def audit_events(limit: int = 100, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+async def audit_events(
+    limit: int = 100,
+    entity_id: str | None = None,
+    entity_type: str | None = None,
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
-    items = await fetch_all(session, "SELECT id, event_type, actor_id, entity_type, entity_id, before_json, after_json, correlation_id, occurred_at FROM audit_events WHERE tenant_id = :tenant_id ORDER BY occurred_at DESC LIMIT :limit", {"tenant_id": tenant_id, "limit": min(limit, 500)})
+    where = ["a.tenant_id = :tenant_id"]
+    params: dict[str, Any] = {"tenant_id": tenant_id, "limit": min(limit, 500)}
+    if entity_id:
+        where.append("a.entity_id = :entity_id")
+        params["entity_id"] = parse_uuid(entity_id)
+    if entity_type:
+        where.append("a.entity_type = :entity_type")
+        params["entity_type"] = entity_type
+    items = await fetch_all(
+        session,
+        f"""
+        SELECT a.id, a.event_type, a.actor_id, a.entity_type, a.entity_id, a.before_json, a.after_json,
+               a.correlation_id, a.occurred_at,
+               COALESCE(NULLIF(TRIM(aa.full_name), ''), aa.email, 'System') AS actor_name
+        FROM audit_events a
+        LEFT JOIN admin_accounts aa ON aa.id = a.actor_id
+        WHERE {' AND '.join(where)}
+        ORDER BY a.occurred_at DESC
+        LIMIT :limit
+        """,
+        params,
+    )
     return {"items": items}
 
 

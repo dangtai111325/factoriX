@@ -46,8 +46,8 @@ def render_topic(template: str, context: dict[str, str | None]) -> str:
 
 
 def default_factory_topic(parts: dict[str, str | None], group: str) -> str:
-    ordered = ["enterprise", "site", "plant", "zone", "line", "resource"]
+    ordered = ["enterprise", "site", "area", "zone", "cell", "line", "machine", "resource"]
     context = {key: parts.get(key) for key in ordered}
     context["group"] = group
-    template = "fx/v1/{enterprise}/{site}/{plant}/{zone}/{line}/{resource}/{group}"
+    template = "{enterprise}/{site}/{area}/{line}/{machine}/{group}"
     return render_topic(template, context)

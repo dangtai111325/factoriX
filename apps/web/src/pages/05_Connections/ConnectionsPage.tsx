@@ -6,36 +6,72 @@ import {
   Cable,
   RadioTower,
   Cloud,
-  CheckCircle2,
-  RefreshCw,
   Edit2,
   Trash2,
-  ExternalLink,
-  ShieldCheck,
-  Zap,
+  Pause,
+  Play,
+  Copy,
+  MoreHorizontal,
   Activity,
-  FileDown,
-  Cpu,
 } from 'lucide-react';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { Badge } from '../../components/common/Badge';
-import { Tabs } from '../../components/common/Tabs';
+import { ConfirmDialog } from '../../components/common/ConfirmDialog';
 import { useApp } from '../../store/AppContext';
 import { ConnectionItem, ProtocolType } from '../../types';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ConnectionTestModal } from '../../components/modals/ConnectionTestModal';
+import { translateApiError } from '../../utils/apiErrors';
+
+function formatMetric(value: number | null | undefined, suffix: string): string {
+  if (value == null || Number.isNaN(value) || value === 0) return '—';
+  return `${value}${suffix}`;
+}
+
+function signalCountLabel(count: number | null | undefined): string {
+  if (count == null || Number.isNaN(count)) return '—';
+  return count === 1 ? '1 signal' : `${count} signals`;
+}
+
+function canArchiveConnection(conn: ConnectionItem): boolean {
+  return conn.lifecycle === 'PAUSED' || conn.lifecycle === 'DRAFT';
+}
+
+function statusBadge(conn: ConnectionItem): { label: string; variant: 'good' | 'warning' | 'error' | 'neutral' } {
+  if (conn.lifecycle === 'ACTIVE') return { label: 'ACTIVE', variant: 'good' };
+  if (conn.lifecycle === 'PAUSED') return { label: 'PAUSED', variant: 'warning' };
+  if (conn.lifecycle === 'ARCHIVED') return { label: 'ARCHIVED', variant: 'neutral' };
+  return { label: 'DRAFT', variant: 'neutral' };
+}
+
+function healthLabel(conn: ConnectionItem): string {
+  const health = (conn.health || '').toUpperCase();
+  if (!health || health === 'UNKNOWN') return '—';
+  return health;
+}
 
 export const ConnectionsPage: React.FC = () => {
-  const { connections, selectedConnectionId, setSelectedConnectionId, testConnection, deleteConnection } = useApp();
+  const {
+    connections,
+    selectedConnectionId,
+    setSelectedConnectionId,
+    testConnection,
+    deleteConnection,
+    pauseConnection,
+    resumeConnection,
+    duplicateConnection,
+    resources,
+  } = useApp();
   const [searchParams] = useSearchParams();
   const [filterProtocol, setFilterProtocol] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<string>('config');
   const [testingId, setTestingId] = useState<string | null>(null);
-
-  // Modals (supports query param deep-linking)
+  const [menuId, setMenuId] = useState<string | null>(null);
+  const [archiveTarget, setArchiveTarget] = useState<ConnectionItem | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
   const [isTestModalOpen, setIsTestModalOpen] = useState(searchParams.get('modal') === 'test');
+  const [testConnectionId, setTestConnectionId] = useState<string | null>(null);
 
   const navigate = useNavigate();
 
@@ -70,17 +106,46 @@ export const ConnectionsPage: React.FC = () => {
     }
   };
 
-  const handleTest = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const machineForEdit = (conn: ConnectionItem) => {
+    // Never pass site_id as machine — find a machine on this site, else leave blank.
+    const siteId = conn.siteId || conn.plantId;
+    const machine = resources.find(
+      (r) => r.type === 'machine' && r.attributes?.siteId === siteId,
+    );
+    return machine?.id || '';
+  };
+
+  const handleTest = async (id: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
     setTestingId(id);
+    setTestConnectionId(id);
+    setSelectedConnectionId(id);
     await testConnection(id);
     setTestingId(null);
     setIsTestModalOpen(true);
+    setMenuId(null);
   };
+
+  const handleArchive = async () => {
+    if (!archiveTarget) return;
+    if (!canArchiveConnection(archiveTarget)) {
+      setPageError('Pause the connection before archiving. Draft connections can be archived directly.');
+      setArchiveTarget(null);
+      return;
+    }
+    try {
+      await deleteConnection(archiveTarget.id);
+      setArchiveTarget(null);
+    } catch (error) {
+      setPageError(translateApiError(error));
+    }
+  };
+
+  const testedConn =
+    connections.find((c) => c.id === testConnectionId) || selectedConn;
 
   return (
     <div className="space-y-4 animate-in fade-in duration-200">
-      {/* Region 1: Heading & Action Bar */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="fx-page-title">Industrial Connections</h1>
@@ -96,72 +161,30 @@ export const ConnectionsPage: React.FC = () => {
           >
             New Connection
           </Button>
-          <Button
-            variant="secondary"
-            icon={<FileDown className="w-4 h-4" />}
-            disabled
-            title="Connection templates are not available yet"
-          >
-            Import Template
-          </Button>
-          <Button
-            variant="secondary"
-            icon={<Activity className="w-4 h-4" />}
-            onClick={() => setIsTestModalOpen(true)}
-          >
-            Test Diagnostics
-          </Button>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+      {pageError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{pageError}</div>
+      )}
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">Total Connections</span>
+          <span className="text-xs font-semibold text-slate-500 block">Total</span>
           <span className="text-2xl font-black text-slate-900 mt-1 block">{connections.length}</span>
-          <span className="text-[11px] text-emerald-600 font-semibold mt-0.5 block">
-            {connections.filter((item) => item.status === 'connected').length} healthy
-          </span>
         </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">Modbus TCP</span>
-          <span className="text-2xl font-black text-[#1D63BD] mt-1 block">
-            {connections.filter((item) => item.protocol === 'modbus').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">From the model</span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">OPC UA</span>
-          <span className="text-2xl font-black text-[#7B3AE0] mt-1 block">
-            {connections.filter((item) => item.protocol === 'opcua').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">From the model</span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">MQTT / Sparkplug</span>
-          <span className="text-2xl font-black text-[#149580] mt-1 block">
-            {connections.filter((item) => item.protocol === 'mqtt').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">From the model</span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">HTTP / REST</span>
-          <span className="text-2xl font-black text-[#C76114] mt-1 block">
-            {connections.filter((item) => item.protocol === 'http').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">From the model</span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">Warnings</span>
-          <span className="text-2xl font-black text-[#EF1B24] mt-1 block">
-            {connections.filter((item) => item.status !== 'connected').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">Need attention</span>
-        </div>
+        {(['modbus', 'opcua', 'mqtt', 'http'] as ProtocolType[]).map((proto) => (
+          <div key={proto} className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
+            <span className="text-xs font-semibold text-slate-500 block uppercase">{proto === 'mqtt' ? 'MQTT' : proto}</span>
+            <span className="text-2xl font-black text-slate-900 mt-1 block">
+              {connections.filter((item) => item.protocol === proto).length}
+            </span>
+          </div>
+        ))}
       </div>
 
-      {/* Region 2 & 3: Protocol Filter Tabs and Search Toolbar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-[#E3EAF3]">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {[
             { id: 'all', label: 'All Protocols' },
             { id: 'opcua', label: 'OPC UA' },
@@ -183,7 +206,6 @@ export const ConnectionsPage: React.FC = () => {
             </button>
           ))}
         </div>
-
         <div className="relative w-64">
           <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#94A3B8]" />
           <input
@@ -191,30 +213,31 @@ export const ConnectionsPage: React.FC = () => {
             placeholder="Search endpoint or name..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="fx-input pl-9 h-9 text-[13px]"
+            className="fx-input !pl-8 h-9 text-[13px]"
           />
         </div>
       </div>
 
-      {/* Region 4: Connection Table */}
       <Card className="p-0 overflow-hidden">
         <div className="overflow-x-auto">
           <table className="fx-table">
             <thead>
               <tr>
                 <th>Protocol</th>
-                <th>Gateway / Connection Name</th>
-                <th>Target Endpoint</th>
+                <th>Name</th>
+                <th>Endpoint</th>
                 <th>Signals</th>
                 <th>Latency</th>
                 <th>Throughput</th>
                 <th>Status</th>
+                <th>Health</th>
                 <th className="text-right">Actions</th>
               </tr>
             </thead>
             <tbody>
               {filteredConnections.map((conn) => {
-                const isSelected = conn.id === selectedConn.id;
+                const isSelected = conn.id === selectedConn?.id;
+                const badge = statusBadge(conn);
                 return (
                   <tr
                     key={conn.id}
@@ -223,42 +246,56 @@ export const ConnectionsPage: React.FC = () => {
                     className="cursor-pointer"
                   >
                     <td>
-                      <Badge variant={conn.protocol as any}>
-                        <div className="flex items-center gap-1.5">
-                          {getProtocolIcon(conn.protocol)}
-                          <span>{conn.protocol.toUpperCase()}</span>
-                        </div>
-                      </Badge>
+                      <div className="flex items-center gap-1.5 text-[12px] font-semibold">
+                        {getProtocolIcon(conn.protocol)}
+                        <span>{conn.protocol.toUpperCase()}</span>
+                      </div>
                     </td>
                     <td className="font-bold text-[#111B37] text-[13px]">{conn.name}</td>
                     <td className="font-mono text-[#657794] text-[12px]">{conn.endpoint}</td>
-                    <td className="font-semibold text-[#111B37]">{conn.signalsCount} tags</td>
-                    <td className="font-mono text-[12px] text-[#657794]">{conn.latencyMs} ms</td>
+                    <td className="font-semibold text-[#111B37]">{signalCountLabel(conn.signalsCount)}</td>
+                    <td className="font-mono text-[12px] text-[#657794]">
+                      {formatMetric(conn.latencyMs, ' ms')}
+                    </td>
                     <td className="font-mono text-[12px] text-[#111B37] font-semibold">
-                      {conn.throughputPerSec} msg/s
+                      {formatMetric(conn.throughputPerSec, ' msg/s')}
                     </td>
                     <td>
-                      <Badge
-                        variant={
-                          conn.status === 'connected'
-                            ? 'good'
-                            : conn.status === 'warning'
-                            ? 'warning'
-                            : conn.status === 'testing'
-                            ? 'info'
-                            : 'error'
-                        }
-                      >
-                        {conn.status.toUpperCase()}
-                      </Badge>
+                      <Badge variant={badge.variant}>{badge.label}</Badge>
                     </td>
-                    <td className="text-right">
+                    <td className="text-[11px] text-[#657794] font-mono">{healthLabel(conn)}</td>
+                    <td className="text-right relative">
                       <div className="flex items-center justify-end gap-1.5">
+                        {conn.lifecycle === 'PAUSED' ? (
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="text-[11px] h-7 px-2"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void resumeConnection(conn.id).catch((err) => setPageError(translateApiError(err)));
+                            }}
+                          >
+                            Resume
+                          </Button>
+                        ) : conn.lifecycle === 'ACTIVE' ? (
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="text-[11px] h-7 px-2"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void pauseConnection(conn.id).catch((err) => setPageError(translateApiError(err)));
+                            }}
+                          >
+                            Pause
+                          </Button>
+                        ) : null}
                         <Button
                           size="sm"
                           variant="secondary"
                           className="text-[11px] h-7 px-2"
-                          onClick={(e) => handleTest(conn.id, e)}
+                          onClick={(e) => void handleTest(conn.id, e)}
                           loading={testingId === conn.id}
                         >
                           Test
@@ -266,29 +303,115 @@ export const ConnectionsPage: React.FC = () => {
                         <button
                           type="button"
                           className="p-1 rounded text-[#94A3B8] hover:text-[#111B37]"
-                          title="Edit connection settings in Add Data wizard"
                           onClick={(e) => {
                             e.stopPropagation();
-                            navigate(`/acquisition/add-data?resourceId=${encodeURIComponent(conn.plantId || '')}`);
+                            setMenuId(menuId === conn.id ? null : conn.id);
                           }}
+                          aria-label="Connection menu"
                         >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          className="p-1 rounded text-[#94A3B8] hover:text-[#F2343B]"
-                          title="Archive / delete draft connection"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (!window.confirm(`Archive connection "${conn.name}"?`)) return;
-                            void deleteConnection(conn.id).catch((err) => {
-                              window.alert(err instanceof Error ? err.message : 'Delete failed');
-                            });
-                          }}
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
+                          <MoreHorizontal className="w-4 h-4" />
                         </button>
                       </div>
+                      {menuId === conn.id && (
+                        <div
+                          className="absolute right-2 top-9 z-20 w-44 rounded-lg border border-slate-200 bg-white shadow-xl py-1 text-left"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <button
+                            type="button"
+                            className="w-full px-3 py-2 text-xs text-left hover:bg-slate-50 flex items-center gap-2"
+                            onClick={() => {
+                              const machineId = machineForEdit(conn);
+                              navigate(
+                                `/acquisition/add-data?connectionId=${encodeURIComponent(conn.id)}${
+                                  machineId ? `&resourceId=${encodeURIComponent(machineId)}` : ''
+                                }`,
+                              );
+                              setMenuId(null);
+                            }}
+                          >
+                            <Edit2 className="w-3.5 h-3.5" /> Edit
+                          </button>
+                          <button
+                            type="button"
+                            className="w-full px-3 py-2 text-xs text-left hover:bg-slate-50 flex items-center gap-2"
+                            onClick={() => void handleTest(conn.id)}
+                          >
+                            <Activity className="w-3.5 h-3.5" /> Test
+                          </button>
+                          {conn.lifecycle === 'PAUSED' ? (
+                            <button
+                              type="button"
+                              className="w-full px-3 py-2 text-xs text-left hover:bg-slate-50 flex items-center gap-2"
+                              onClick={() => {
+                                void resumeConnection(conn.id).catch((err) =>
+                                  setPageError(translateApiError(err)),
+                                );
+                                setMenuId(null);
+                              }}
+                            >
+                              <Play className="w-3.5 h-3.5" /> Resume
+                            </button>
+                          ) : conn.lifecycle === 'ACTIVE' ? (
+                            <button
+                              type="button"
+                              className="w-full px-3 py-2 text-xs text-left hover:bg-slate-50 flex items-center gap-2"
+                              onClick={() => {
+                                void pauseConnection(conn.id).catch((err) =>
+                                  setPageError(translateApiError(err)),
+                                );
+                                setMenuId(null);
+                              }}
+                            >
+                              <Pause className="w-3.5 h-3.5" /> Pause
+                            </button>
+                          ) : null}
+                          <span
+                            className="block"
+                            title={
+                              conn.secretConfigured
+                                ? 'Duplicate is unavailable because the connection secret is not copied'
+                                : undefined
+                            }
+                          >
+                            <button
+                              type="button"
+                              disabled={conn.secretConfigured}
+                              className="w-full px-3 py-2 text-xs text-left hover:bg-slate-50 flex items-center gap-2 disabled:opacity-40 disabled:hover:bg-transparent"
+                              onClick={() => {
+                                if (conn.secretConfigured) return;
+                                void duplicateConnection(conn.id)
+                                  .then((id) => setSelectedConnectionId(id))
+                                  .catch((err) => setPageError(translateApiError(err)));
+                                setMenuId(null);
+                              }}
+                            >
+                              <Copy className="w-3.5 h-3.5" /> Duplicate
+                            </button>
+                          </span>
+                          <span
+                            className="block"
+                            title={
+                              canArchiveConnection(conn)
+                                ? 'Archive this connection'
+                                : 'Pause the connection before archiving'
+                            }
+                          >
+                            <button
+                              type="button"
+                              disabled={!canArchiveConnection(conn)}
+                              className="w-full px-3 py-2 text-xs text-left hover:bg-red-50 text-red-600 flex items-center gap-2 disabled:opacity-40 disabled:hover:bg-transparent disabled:text-slate-400"
+                              onClick={() => {
+                                if (!canArchiveConnection(conn)) return;
+                                setArchiveTarget(conn);
+                                setMenuId(null);
+                              }}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" /> Archive
+                            </button>
+                          </span>
+                        </div>
+                      )}
                     </td>
                   </tr>
                 );
@@ -299,50 +422,47 @@ export const ConnectionsPage: React.FC = () => {
       </Card>
 
       {selectedConn ? (
-        <Card title={`Connection Profile: ${selectedConn.name}`}>
+        <Card title={`Connection: ${selectedConn.name}`}>
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
             <div>
-              <span className="text-slate-500 block mb-1">Target Endpoint</span>
+              <span className="text-slate-500 block mb-1">Endpoint</span>
               <span className="font-mono font-bold text-slate-800 text-sm">{selectedConn.endpoint}</span>
             </div>
             <div>
-              <span className="text-slate-500 block mb-1">Polling / Keep-Alive</span>
-              <span className="font-mono text-slate-800">
-                {selectedConn.config?.interval_ms ? `Interval: ${selectedConn.config.interval_ms}ms` : 'Interval not recorded'}
-              </span>
+              <span className="text-slate-500 block mb-1">Lifecycle</span>
+              <span className="font-semibold text-slate-800">{selectedConn.lifecycle}</span>
             </div>
             <div>
-              <span className="text-slate-500 block mb-1">Telemetry Throughput</span>
-              <span className="font-semibold text-slate-400">Not measured</span>
+              <span className="text-slate-500 block mb-1">Health</span>
+              <span className="font-semibold text-slate-800">{healthLabel(selectedConn)}</span>
             </div>
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="secondary"
-                className="w-full text-xs"
-                icon={<Activity className="w-3.5 h-3.5" />}
-                onClick={() => setIsTestModalOpen(true)}
-              >
-                Run Handshake Test
-              </Button>
+            <div>
+              <span className="text-slate-500 block mb-1">Last received</span>
+              <span className="font-mono text-slate-800">
+                {selectedConn.lastConnected || '—'}
+              </span>
             </div>
           </div>
         </Card>
-      ) : (
-        <Card title="Connection Profile">
-          <p className="py-8 text-center text-sm text-slate-500">
-            No connection yet. Use Add Data after you create a machine in the factory model.
-          </p>
-        </Card>
-      )}
+      ) : null}
+
+      <ConfirmDialog
+        isOpen={Boolean(archiveTarget)}
+        title="Archive connection?"
+        message={`Archive connection “${archiveTarget?.name}”? It stays archived and stops collecting.`}
+        confirmLabel="Archive"
+        danger
+        onCancel={() => setArchiveTarget(null)}
+        onConfirm={handleArchive}
+      />
 
       <ConnectionTestModal
         isOpen={isTestModalOpen}
         onClose={() => setIsTestModalOpen(false)}
-        connectionId={selectedConn?.id}
-        connectionName={selectedConn?.name}
-        protocol={selectedConn?.protocol?.toUpperCase()}
-        endpoint={selectedConn?.endpoint}
+        connectionId={testedConn?.id}
+        connectionName={testedConn?.name}
+        protocol={testedConn?.protocol?.toUpperCase()}
+        endpoint={testedConn?.endpoint}
       />
     </div>
   );

@@ -54,12 +54,26 @@ export const ConnectionTestModal: React.FC<ConnectionTestModalProps> = ({
     setTestError('');
     try {
       const result = await commissionAcquisition(connectionId);
-      setTestSteps(result.stages.map((stage) => ({
-        stage: stage.name,
-        status: stage.status === 'FAILED' ? 'FAIL' : stage.status === 'PASSED' || stage.status === 'COMPLETED' ? 'PASS' : 'TIMEOUT',
-        latencyMs: stage.latency || 0,
-        message: stage.status,
-      })));
+      const aliases = new Set(['transport', 'read_sample', 'decode_quality']);
+      setTestSteps(
+        result.stages
+          .filter((stage) => !aliases.has(String(stage.name).toLowerCase()))
+          .map((stage) => {
+            const upper = String(stage.status).toUpperCase();
+            const status =
+              upper === 'FAILED' || upper === 'ERROR'
+                ? 'FAIL'
+                : upper === 'PASSED' || upper === 'COMPLETED' || upper === 'NOT_APPLICABLE'
+                  ? 'PASS'
+                  : 'TIMEOUT';
+            return {
+              stage: stage.name,
+              status: status as 'PASS' | 'FAIL' | 'TIMEOUT',
+              latencyMs: stage.latency && stage.latency > 0 ? stage.latency : 0,
+              message: stage.status,
+            };
+          }),
+      );
       setOverallStatus(result.passed ? 'PASS' : 'FAIL');
     } catch (caught) {
       setTestError(caught instanceof Error ? caught.message : 'The handshake did not finish.');

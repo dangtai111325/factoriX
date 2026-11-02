@@ -1,42 +1,61 @@
-import React, { useEffect, useState } from 'react';
-import {
-  Search,
-  Plus,
-  Filter,
-  Activity,
-  Edit2,
-  Trash2,
-  ArrowUpDown,
-  Download,
-  X,
-  Sigma,
-  Zap,
-} from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Search, Plus, Download, X, Zap, Edit2, Trash2, Ban } from 'lucide-react';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
-import { Badge } from '../../components/common/Badge';
+import { Badge, type BadgeVariant } from '../../components/common/Badge';
+import { ConfirmDialog } from '../../components/common/ConfirmDialog';
 import { useApp } from '../../store/AppContext';
-import { SignalItem, SignalDataType } from '../../types';
+import { SignalItem } from '../../types';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { translateApiError } from '../../utils/apiErrors';
+import { api } from '../../api/client';
+import { absoluteUtc7, relativeAge } from '../../utils/relativeTime';
 
-const MicroSparkline: React.FC<{ value: number; quality: string }> = ({ quality }) => {
-  const strokeColor = quality === 'GOOD' ? '#0DBA67' : '#94A3B8';
-  const pointsStr = '0,9 80,9';
+function qualityVariant(quality: string): BadgeVariant {
+  if (quality === 'GOOD') return 'good';
+  if (quality === 'BAD') return 'error';
+  if (quality === 'STALE' || quality === 'UNCERTAIN') return 'warning';
+  return 'neutral';
+}
 
+function typeLabel(dataType: string): string {
+  switch (dataType) {
+    case 'boolean':
+      return 'Boolean';
+    case 'integer':
+      return 'Integer';
+    case 'text':
+    case 'string':
+      return 'Text';
+    case 'number':
+    case 'analog':
+      return 'Number';
+    default:
+      return dataType || '—';
+  }
+}
+
+function MicroSparkline({ history, quality }: { history?: number[]; quality: string }) {
+  if (!history || history.length < 2) {
+    return <span className="text-[11px] text-[#94A3B8]">—</span>;
+  }
+  const min = Math.min(...history);
+  const max = Math.max(...history);
+  const span = max - min || 1;
+  const points = history
+    .map((v, i) => {
+      const x = (i / (history.length - 1)) * 80;
+      const y = 16 - ((v - min) / span) * 14;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+  const stroke = quality === 'GOOD' ? '#0DBA67' : quality === 'BAD' ? '#F2343B' : '#94A3B8';
   return (
-    <svg className="w-20 h-4 overflow-visible" viewBox="0 0 80 18" aria-label="No history yet">
-      <polyline
-        fill="none"
-        stroke={strokeColor}
-        strokeWidth="1.6"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        points={pointsStr}
-      />
-      <circle cx={80} cy={9} r="2" fill={strokeColor} />
+    <svg className="w-20 h-4 overflow-visible" viewBox="0 0 80 18" aria-label="Recent history">
+      <polyline fill="none" stroke={stroke} strokeWidth="1.6" points={points} />
     </svg>
   );
-};
+}
 
 export const SignalsCatalogPage: React.FC = () => {
   const {
@@ -44,16 +63,28 @@ export const SignalsCatalogPage: React.FC = () => {
     selectedSignalId,
     setSelectedSignalId,
     outputGroups,
+    updateSignal,
+    bulkDeleteSignals,
+    bulkAssignOutputGroup,
   } = useApp();
   const [searchParams] = useSearchParams();
   const [filterType, setFilterType] = useState<string>('all');
-  const [searchTerm, setSearchTerm] = useState<string>('');
-  const [drawerOpen, setDrawerOpen] = useState<boolean>(true);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [drawerOpen, setDrawerOpen] = useState(true);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [assignModalOpen, setAssignModalOpen] = useState<boolean>(false);
-  const [selectedGroupId, setSelectedGroupId] = useState<string>('');
-  const [undoDelete, setUndoDelete] = useState<(() => void) | null>(null);
+  const [assignModalOpen, setAssignModalOpen] = useState(false);
+  const [selectedGroupId, setSelectedGroupId] = useState('');
+  const [editOpen, setEditOpen] = useState(false);
+  const [editName, setEditName] = useState('');
+  const [editUnit, setEditUnit] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+  const [editInterval, setEditInterval] = useState('');
+  const [editType, setEditType] = useState('number');
+  const [confirmAction, setConfirmAction] = useState<'delete' | 'disable' | null>(null);
+  const [disableIds, setDisableIds] = useState<string[]>([]);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [historyById, setHistoryById] = useState<Record<string, number[]>>({});
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -64,17 +95,82 @@ export const SignalsCatalogPage: React.FC = () => {
     }
   }, [searchParams, setSelectedSignalId, signals]);
 
+  const catalogSignals = useMemo(
+    () => signals.filter((s) => s.dataType !== 'calculated'),
+    [signals],
+  );
+
+  const selectedSignal =
+    catalogSignals.find((s) => s.id === selectedSignalId) || catalogSignals[0] || null;
+
+  const filteredSignals = useMemo(() => {
+    return catalogSignals.filter((s) => {
+      const matchesType =
+        filterType === 'all' ||
+        (filterType === 'number' && (s.dataType === 'number' || s.dataType === 'analog')) ||
+        (filterType === 'text' && (s.dataType === 'text' || s.dataType === 'string')) ||
+        s.dataType === filterType;
+      const haystack = `${s.name} ${s.tag} ${s.resourcePath}`.toLowerCase();
+      const matchesSearch = !searchTerm.trim() || haystack.includes(searchTerm.toLowerCase());
+      return matchesType && matchesSearch;
+    });
+  }, [catalogSignals, filterType, searchTerm]);
+
+  const historyKey = filteredSignals
+    .filter((s) => s.dataType === 'number' || s.dataType === 'integer' || s.dataType === 'analog')
+    .slice(0, 12)
+    .map((s) => s.id)
+    .join(',');
+
+  useEffect(() => {
+    if (!historyKey) {
+      setHistoryById({});
+      return;
+    }
+    const ids = historyKey.split(',');
+    let cancelled = false;
+    const end = new Date();
+    const start = new Date(end.getTime() - 60_000);
+    void Promise.all(
+      ids.map(async (id) => {
+        try {
+          const hist = await api<{
+            items?: Array<{ value?: unknown; value_json?: { v?: unknown } }>;
+          }>(
+            `/api/v1/observations/history?signal_id=${id}&start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}&limit=30`,
+          );
+          const points = (hist.items || [])
+            .map((row) => {
+              const raw = row.value_json?.v ?? row.value;
+              const n = typeof raw === 'number' ? raw : Number(raw);
+              return Number.isFinite(n) ? n : null;
+            })
+            .filter((n): n is number => n != null);
+          return [id, points] as const;
+        } catch {
+          return [id, [] as number[]] as const;
+        }
+      }),
+    ).then((rows) => {
+      if (!cancelled) setHistoryById(Object.fromEntries(rows));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [historyKey]);
+
   const handleExportCSV = (signalsToExport: SignalItem[]) => {
-    const headers = ['Tag', 'Parameter Name', 'Resource Path', 'Data Type', 'Live Value', 'Unit', 'Quality', 'Last Updated'];
+    const headers = ['Tag', 'Name', 'Resource', 'Type', 'Value', 'Unit', 'Quality', 'Source time', 'Age'];
     const rows = signalsToExport.map((s) => [
       `"${s.tag}"`,
       `"${s.name}"`,
       `"${s.resourcePath}"`,
-      `"${s.dataType}"`,
+      `"${typeLabel(s.dataType)}"`,
       `"${s.currentValue}"`,
       `"${s.unit || ''}"`,
       `"${s.quality}"`,
-      `"${s.lastUpdated}"`,
+      `"${s.sourceTime || s.lastUpdated || ''}"`,
+      `"${relativeAge(s.sourceTime || s.lastUpdated)}"`,
     ]);
     const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -85,94 +181,143 @@ export const SignalsCatalogPage: React.FC = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
     setToastMsg(`Downloaded CSV with ${signalsToExport.length} signals`);
     setTimeout(() => setToastMsg(null), 4000);
   };
 
-  const handleDeleteSelected = () => {
-    setToastMsg('Signal delete is not available in this appliance build. Archive the parent connection or resource instead.');
-    setTimeout(() => setToastMsg(null), 5000);
-  };
-
-  const handleConfirmAssign = () => {
-    setAssignModalOpen(false);
-    setToastMsg('Assign to output group from the Output Groups page. Bulk assign is not wired yet.');
-    setTimeout(() => setToastMsg(null), 5000);
-  };
-
-  const selectedSignal =
-    signals.find((s) => s.id === selectedSignalId) || signals[0] || null;
-
-  const filteredSignals = signals.filter((s) => {
-    const matchesType = filterType === 'all' || s.dataType === filterType;
-    const matchesSearch =
-      s.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      s.tag.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      s.resourcePath.toLowerCase().includes(searchTerm.toLowerCase());
-    return matchesType && matchesSearch;
-  });
-
-  const toggleSelectAll = () => {
-    if (selectedIds.length === filteredSignals.length) {
+  const handleDeleteSelected = async () => {
+    try {
+      const result = await bulkDeleteSignals(
+        selectedIds.length ? selectedIds : selectedSignal ? [selectedSignal.id] : [],
+      );
       setSelectedIds([]);
-    } else {
-      setSelectedIds(filteredSignals.map((s) => s.id));
+      setConfirmAction(null);
+      setToastMsg(`Archived ${result.count} signal(s)`);
+      setTimeout(() => setToastMsg(null), 4000);
+    } catch (error) {
+      setConfirmAction(null);
+      setPageError(translateApiError(error));
     }
   };
 
-  const toggleSelectOne = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setSelectedIds((prev) =>
-      prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]
-    );
+  const handleDisable = async () => {
+    const ids = disableIds.length ? disableIds : selectedSignal ? [selectedSignal.id] : [];
+    setConfirmAction(null);
+    for (const id of ids) {
+      const res = await updateSignal(id, { status: 'DISABLED' });
+      if (!res.success) {
+        setPageError(translateApiError(res.error || 'Disable failed'));
+        return;
+      }
+    }
+    setSelectedIds((prev) => prev.filter((id) => !ids.includes(id)));
+    setToastMsg(`Disabled ${ids.length} signal(s)`);
+    setTimeout(() => setToastMsg(null), 4000);
+  };
+
+  const askDisable = (ids: string[]) => {
+    setDisableIds(ids);
+    setConfirmAction('disable');
+  };
+
+  const handleConfirmAssign = async () => {
+    const groupId = selectedGroupId || outputGroups[0]?.id;
+    if (!groupId) {
+      setPageError('Create an output group first.');
+      return;
+    }
+    try {
+      await bulkAssignOutputGroup(selectedIds, groupId);
+      setAssignModalOpen(false);
+      setToastMsg(`Assigned ${selectedIds.length} signal(s) to output group`);
+      setTimeout(() => setToastMsg(null), 4000);
+    } catch (error) {
+      setPageError(translateApiError(error));
+    }
+  };
+
+  const openEdit = () => {
+    if (!selectedSignal) return;
+    setEditName(selectedSignal.name);
+    setEditUnit(selectedSignal.unit || '');
+    setEditDescription(selectedSignal.description || '');
+    setEditInterval(selectedSignal.sampleIntervalMs > 0 ? String(selectedSignal.sampleIntervalMs) : '');
+    const currentType =
+      selectedSignal.dataType === 'analog'
+        ? 'number'
+        : selectedSignal.dataType === 'string'
+          ? 'text'
+          : selectedSignal.dataType;
+    setEditType(currentType === 'calculated' ? 'number' : currentType);
+    setEditOpen(true);
+  };
+
+  const saveEdit = async () => {
+    if (!selectedSignal) return;
+    const interval = Number(editInterval);
+    const res = await updateSignal(selectedSignal.id, {
+      display_name: editName.trim() || selectedSignal.tag,
+      unit: editUnit,
+      description: editDescription,
+      data_type: editType,
+      expected_interval_ms: Number.isFinite(interval) && interval > 0 ? Math.round(interval) : undefined,
+    });
+    if (!res.success) {
+      setPageError(translateApiError(res.error || 'Update failed'));
+      return;
+    }
+    setEditOpen(false);
+    setToastMsg('Signal saved');
+    setTimeout(() => setToastMsg(null), 3000);
   };
 
   if (!selectedSignal) {
     return (
       <div className="space-y-3">
         <h1 className="fx-page-title">Signals Catalog</h1>
-        <p className="fx-page-subtitle">No signals yet. Activate a connection from Add Data and they will be listed here.</p>
+        <p className="fx-page-subtitle">
+          No signals yet. Activate a connection from Add Data and they will be listed here.
+        </p>
       </div>
     );
   }
 
+  const lastGood = [selectedSignal.lastGoodValue, relativeAge(selectedSignal.lastGoodTime)]
+    .filter((part) => part && part !== '—')
+    .join(' · ');
+
   return (
     <div className="space-y-4 animate-in fade-in duration-200">
-      {/* Region 1: Heading */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="fx-page-title">Signals Catalog</h1>
           <p className="fx-page-subtitle">
-            Central tag inventory, real-time measurements, engineering units, and signal bindings.
+            Signals, live values, engineering units, and bindings.
           </p>
         </div>
         <div className="flex items-center gap-2.5">
-          <Button
-            variant="primary"
-            icon={<Plus className="w-4 h-4" />}
-            onClick={() => navigate('/acquisition/add-data')}
-          >
+          <Button variant="primary" icon={<Plus className="w-4 h-4" />} onClick={() => navigate('/acquisition/add-data')}>
             Create Signal
           </Button>
-          <Button
-            variant="secondary"
-            icon={<Download className="w-4 h-4" />}
-            onClick={() => handleExportCSV(filteredSignals)}
-          >
+          <Button variant="secondary" icon={<Download className="w-4 h-4" />} onClick={() => handleExportCSV(filteredSignals)}>
             Export CSV
           </Button>
         </div>
       </div>
 
-      {/* Region 2: Filter Toolbar */}
+      {pageError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{pageError}</div>
+      )}
+
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-[#E3EAF3]">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {[
-            { id: 'all', label: 'All Signals' },
-            { id: 'analog', label: 'Analog' },
-            { id: 'boolean', label: 'Discrete' },
+            { id: 'all', label: 'All' },
+            { id: 'number', label: 'Number' },
             { id: 'integer', label: 'Integer' },
-            { id: 'calculated', label: 'Calculated' },
+            { id: 'boolean', label: 'Boolean' },
+            { id: 'text', label: 'Text' },
           ].map((t) => (
             <button
               key={t.id}
@@ -188,20 +333,18 @@ export const SignalsCatalogPage: React.FC = () => {
             </button>
           ))}
         </div>
-
         <div className="relative w-72">
-          <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#94A3B8]" />
+          <Search className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-[#94A3B8] pointer-events-none" />
           <input
             type="text"
-            placeholder="Search tags or parameters..."
+            placeholder="Search signals…"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="fx-input pl-9 h-9 text-[13px]"
+            className="fx-input !pl-8 h-9 text-[13px] w-full"
           />
         </div>
       </div>
 
-      {/* Main Grid: Signals Table (Reg 3) & Inspector Drawer (Reg 4) */}
       <div className="grid grid-cols-12 gap-3.5">
         <div className={drawerOpen ? 'col-span-12 lg:col-span-8' : 'col-span-12'}>
           <Card className="p-0 overflow-hidden">
@@ -213,24 +356,31 @@ export const SignalsCatalogPage: React.FC = () => {
                       <input
                         type="checkbox"
                         checked={selectedIds.length > 0 && selectedIds.length === filteredSignals.length}
-                        onChange={toggleSelectAll}
+                        onChange={() =>
+                          setSelectedIds(
+                            selectedIds.length === filteredSignals.length ? [] : filteredSignals.map((s) => s.id),
+                          )
+                        }
                         className="rounded text-[#EF1B24]"
                       />
                     </th>
-                    <th>Signal Tag</th>
-                    <th>Parameter Name</th>
-                    <th>Asset Location</th>
+                    <th>Name</th>
+                    <th>Asset</th>
                     <th>Type</th>
-                    <th>Live Value</th>
-                    <th className="w-24">Trend (60s)</th>
+                    <th>Live value</th>
+                    <th className="w-24">Trend</th>
                     <th>Quality</th>
-                    <th>Updated</th>
+                    <th className="min-w-[150px]">Source time</th>
+                    <th>Age</th>
                   </tr>
                 </thead>
                 <tbody>
                   {filteredSignals.map((sig) => {
                     const isSelected = sig.id === selectedSignal.id;
                     const isChecked = selectedIds.includes(sig.id);
+                    const displayName =
+                      sig.name && sig.name !== sig.tag ? `${sig.name} · ${sig.tag}` : sig.tag || sig.name;
+                    const source = sig.sourceTime || sig.lastUpdated;
                     return (
                       <tr
                         key={sig.id}
@@ -245,71 +395,53 @@ export const SignalsCatalogPage: React.FC = () => {
                           <input
                             type="checkbox"
                             checked={isChecked}
-                            onChange={(e) => toggleSelectOne(sig.id, e as any)}
+                            onChange={() =>
+                              setSelectedIds((prev) =>
+                                prev.includes(sig.id) ? prev.filter((i) => i !== sig.id) : [...prev, sig.id],
+                              )
+                            }
                             className="rounded text-[#EF1B24]"
                           />
                         </td>
-                        <td className="font-mono font-bold text-[#111B37] text-[12px]">{sig.tag}</td>
-                        <td className="font-semibold text-[#334568]">{sig.name}</td>
-                        <td className="text-[#657794] text-[12px] truncate max-w-[180px]">
+                        <td className="font-semibold text-[#111B37] text-[12px]" title={displayName}>
+                          {displayName}
+                        </td>
+                        <td className="text-[#657794] text-[12px] truncate max-w-[180px]" title={sig.resourcePath}>
                           {sig.resourcePath}
                         </td>
                         <td>
-                          <span
-                            className={`inline-block px-2 py-0.5 rounded text-[11px] font-bold uppercase ${
-                              sig.dataType === 'calculated'
-                                ? 'bg-[#F5F0FF] text-[#7B3AE0]'
-                                : 'bg-[#F1F5FA] text-[#657794]'
-                            }`}
-                          >
-                            {sig.dataType}
+                          <span className="inline-block px-2 py-0.5 rounded text-[11px] font-bold bg-[#F1F5FA] text-[#657794]">
+                            {typeLabel(sig.dataType)}
                           </span>
                         </td>
                         <td className="font-extrabold text-[#111B37] tabular-nums text-[13px]">
                           {String(sig.currentValue)}{' '}
                           <span className="font-normal text-[11px] text-[#657794]">{sig.unit}</span>
                         </td>
-                        <td className="w-24">
-                          <MicroSparkline
-                            value={Number.isFinite(Number(sig.currentValue)) ? Number(sig.currentValue) : 0}
-                            quality={sig.quality}
-                          />
+                        <td>
+                          <MicroSparkline history={historyById[sig.id]} quality={sig.quality} />
                         </td>
                         <td>
-                          <Badge variant={sig.quality === 'GOOD' ? 'good' : 'warning'}>{sig.quality}</Badge>
+                          <Badge variant={qualityVariant(sig.quality)}>{sig.quality || 'UNKNOWN'}</Badge>
                         </td>
-                        <td className="text-[#94A3B8] font-mono text-[11px]">{sig.lastUpdated}</td>
+                        <td
+                          className="text-[#94A3B8] font-mono text-[11px] whitespace-nowrap"
+                          title={absoluteUtc7(source)}
+                        >
+                          {absoluteUtc7(source) || '—'}
+                        </td>
+                        <td className="text-[#94A3B8] font-mono text-[11px] whitespace-nowrap">
+                          {relativeAge(source)}
+                        </td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
             </div>
-
-            {/* Region 5: Summary & Pagination */}
-            <div className="px-5 py-3 border-t border-[#E3EAF3] bg-[#F9FAFD] flex items-center justify-between text-[12px] text-[#657794]">
-              <span>
-                Showing <strong className="text-[#111B37]">{filteredSignals.length}</strong> of{' '}
-                <strong className="text-[#111B37]">{signals.length}</strong> collected signals
-              </span>
-              <div className="flex items-center gap-3">
-                <span className="text-[#0DBA67] font-bold">
-                  {signals.filter((s) => s.quality === 'GOOD').length} Good
-                </span>
-                <span>·</span>
-                <span className="text-[#FFAA23] font-bold">
-                  {signals.filter((s) => s.quality === 'STALE' || s.quality === 'UNCERTAIN').length} Stale
-                </span>
-                <span>·</span>
-                <span className="text-[#F2343B] font-bold">
-                  {signals.filter((s) => s.quality === 'BAD').length} Bad
-                </span>
-              </div>
-            </div>
           </Card>
         </div>
 
-        {/* Region 4: Selected Signal Inspector Drawer */}
         {drawerOpen && (
           <div className="col-span-12 lg:col-span-4">
             <Card className="h-full p-4 flex flex-col justify-between">
@@ -319,58 +451,66 @@ export const SignalsCatalogPage: React.FC = () => {
                     <h3 className="text-[16px] font-extrabold text-[#111B37]">{selectedSignal.name}</h3>
                     <p className="font-mono text-[12px] text-[#EF1B24] font-bold mt-0.5">{selectedSignal.tag}</p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setDrawerOpen(false)}
-                    className="p-1 rounded-md text-[#94A3B8] hover:text-[#111B37]"
-                  >
+                  <button type="button" onClick={() => setDrawerOpen(false)} className="p-1 rounded-md text-[#94A3B8]">
                     <X className="w-4 h-4" />
                   </button>
                 </div>
-
-                <div className="space-y-3 pt-3 text-[12px]">
+                <div className="space-y-2 pt-3 text-[12px]">
                   <div className="p-3 rounded-xl bg-[#F9FAFD] border border-[#E3EAF3]">
-                    <span className="text-[#657794] block text-[11px] uppercase font-bold">Current Measurement</span>
+                    <span className="text-[#657794] block text-[11px] uppercase font-bold">Current</span>
                     <div className="text-[28px] font-extrabold text-[#111B37] mt-1 tabular-nums">
                       {String(selectedSignal.currentValue)}{' '}
                       <span className="text-[14px] font-bold text-[#657794]">{selectedSignal.unit}</span>
                     </div>
-                    <div className="flex items-center gap-2 mt-1">
-                      <Badge variant="good">{selectedSignal.quality}</Badge>
-                      <span className="text-[#94A3B8] font-mono text-[11px]">Updated {selectedSignal.lastUpdated}</span>
+                    <div className="mt-1">
+                      <Badge variant={qualityVariant(selectedSignal.quality)}>
+                        {selectedSignal.quality || 'UNKNOWN'}
+                      </Badge>
                     </div>
                   </div>
-
-                  <div className="space-y-2 pt-2 border-t border-[#E3EAF3]">
-                    <div className="flex justify-between">
-                      <span className="text-[#657794]">Source Gateway:</span>
-                      <span className="font-semibold text-[#111B37]">{selectedSignal.sourceConnectionName}</span>
+                  {[
+                    ['Connection', selectedSignal.sourceConnectionName || '—'],
+                    ['Topic', selectedSignal.topic || '—'],
+                    ['JSONPath', selectedSignal.jsonpath || selectedSignal.bindingAddress || '—'],
+                    ['Type', typeLabel(selectedSignal.dataType)],
+                    ['Unit', selectedSignal.unit || '—'],
+                    ['Edge', selectedSignal.edgeName || '—'],
+                    ['Last good', lastGood || '—'],
+                    [
+                      'BAD reason',
+                      selectedSignal.quality === 'BAD' || selectedSignal.quality === 'STALE'
+                        ? selectedSignal.qualityReason || '—'
+                        : '—',
+                    ],
+                  ].map(([label, value]) => (
+                    <div key={label} className="flex justify-between gap-3">
+                      <span className="text-[#657794]">{label}</span>
+                      <span className="font-semibold text-[#111B37] text-right break-all">{value}</span>
                     </div>
-                    <div className="flex justify-between">
-                      <span className="text-[#657794]">Resource Binding:</span>
-                      <span className="font-semibold text-[#111B37]">{selectedSignal.resourcePath}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-[#657794]">Sample Rate:</span>
-                      <span className="font-mono font-bold text-[#111B37]">{selectedSignal.sampleIntervalMs} ms</span>
-                    </div>
-                    {selectedSignal.formula && (
-                      <div className="pt-2">
-                        <span className="text-[#657794] block mb-1">AST Expression:</span>
-                        <code className="block p-2 rounded bg-[#111B2E] text-[#0DBA67] font-mono text-[11px] overflow-x-auto">
-                          {selectedSignal.formula}
-                        </code>
-                      </div>
-                    )}
-                  </div>
+                  ))}
                 </div>
               </div>
-
               <div className="pt-4 border-t border-[#E3EAF3] flex gap-2">
-                <Button size="sm" variant="secondary" className="w-full" icon={<Edit2 className="w-3.5 h-3.5" />}>
-                  Edit Signal
+                <Button size="sm" variant="secondary" className="w-full" icon={<Edit2 className="w-3.5 h-3.5" />} onClick={openEdit}>
+                  Edit
                 </Button>
-                <Button size="sm" variant="danger" icon={<Trash2 className="w-3.5 h-3.5" />}>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon={<Ban className="w-3.5 h-3.5" />}
+                  onClick={() => {
+                    if (selectedSignal.status === 'DISABLED') {
+                      void updateSignal(selectedSignal.id, { status: 'ACTIVE' }).then((res) => {
+                        if (!res.success) setPageError(translateApiError(res.error || 'Update failed'));
+                      });
+                      return;
+                    }
+                    askDisable([selectedSignal.id]);
+                  }}
+                >
+                  {selectedSignal.status === 'DISABLED' ? 'Enable' : 'Disable'}
+                </Button>
+                <Button size="sm" variant="danger" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => setConfirmAction('delete')}>
                   Delete
                 </Button>
               </div>
@@ -379,117 +519,155 @@ export const SignalsCatalogPage: React.FC = () => {
         )}
       </div>
 
-      {/* Floating Sticky Bulk Action Bar (From Images 27 & 39) */}
       {selectedIds.length > 0 && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-2xl bg-[#0F172A] text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
-          <span className="text-[13px] font-bold text-white flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-[#34D399] animate-pulse" />
-            {selectedIds.length} signal{selectedIds.length > 1 ? 's' : ''} selected
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-2xl bg-[#0F172A] text-white shadow-2xl border border-slate-700">
+          <span className="text-[13px] font-bold">
+            {selectedIds.length} signal{selectedIds.length === 1 ? '' : 's'} selected
           </span>
-          <div className="h-4 w-px bg-slate-700" />
+          {outputGroups.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setAssignModalOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1E293B] text-[12px] font-semibold"
+            >
+              <Zap className="w-3.5 h-3.5 text-[#38BDF8]" />
+              Assign output group
+            </button>
+          )}
           <button
             type="button"
-            onClick={() => setAssignModalOpen(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1E293B] hover:bg-[#334155] text-[12px] font-semibold text-slate-200 transition-colors"
+            onClick={() => askDisable(selectedIds)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1E293B] text-[12px] font-semibold"
           >
-            <Zap className="w-3.5 h-3.5 text-[#38BDF8]" />
-            Assign Output Group
+            <Ban className="w-3.5 h-3.5" />
+            Disable
           </button>
           <button
             type="button"
-            onClick={() => {
-              const selectedSigs = signals.filter((s) => selectedIds.includes(s.id));
-              handleExportCSV(selectedSigs);
-            }}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1E293B] hover:bg-[#334155] text-[12px] font-semibold text-slate-200 transition-colors"
-          >
-            <Download className="w-3.5 h-3.5 text-[#34D399]" />
-            Export CSV ({selectedIds.length})
-          </button>
-          <button
-            type="button"
-            onClick={handleDeleteSelected}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#EF1B24]/20 hover:bg-[#EF1B24]/30 text-[12px] font-semibold text-[#F87171] transition-colors"
+            onClick={() => setConfirmAction('delete')}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#EF1B24]/20 text-[12px] font-semibold text-[#F87171]"
           >
             <Trash2 className="w-3.5 h-3.5" />
-            Delete Selected
+            Delete
           </button>
-          <div className="h-4 w-px bg-slate-700" />
-          <button
-            type="button"
-            onClick={() => setSelectedIds([])}
-            className="p-1 rounded-md text-slate-400 hover:text-white"
-            title="Clear selection"
-          >
+          <button type="button" onClick={() => setSelectedIds([])} className="p-1 text-slate-400">
             <X className="w-4 h-4" />
           </button>
         </div>
       )}
 
-      {/* Assign Output Group Modal (Review FX-07, FX-11) */}
-      {assignModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-in fade-in duration-150">
+      {assignModalOpen && outputGroups.length > 0 && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
           <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-md p-5 space-y-4">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-100">
-              <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                <Zap className="w-4 h-4 text-[#2A82E7]" />
-                Assign Signals to Output Group
-              </h3>
-              <button
-                type="button"
-                onClick={() => setAssignModalOpen(false)}
-                className="text-slate-400 hover:text-slate-600"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <p className="text-xs text-slate-500">
-              Select an existing output group to bundle the <strong>{selectedIds.length}</strong> selected signals
-              for automated MQTT/Kafka publishing.
-            </p>
-            <div className="space-y-2">
-              <label className="block text-xs font-semibold text-slate-700">Target Output Group</label>
-              <select
-                value={selectedGroupId || outputGroups[0]?.id}
-                onChange={(e) => setSelectedGroupId(e.target.value)}
-                className="w-full text-xs p-2.5 rounded-lg border border-slate-300 bg-white text-slate-800 font-semibold"
-              >
-                {outputGroups.map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name} ({g.topicTemplate})
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+            <h3 className="text-base font-bold">Assign to output group</h3>
+            <select
+              value={selectedGroupId || outputGroups[0]?.id}
+              onChange={(e) => setSelectedGroupId(e.target.value)}
+              className="w-full text-xs p-2.5 rounded-lg border border-slate-300"
+            >
+              {outputGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+            <div className="flex justify-end gap-2">
               <Button size="sm" variant="secondary" onClick={() => setAssignModalOpen(false)}>
                 Cancel
               </Button>
-              <Button size="sm" variant="primary" onClick={handleConfirmAssign}>
-                Confirm Assignment
+              <Button size="sm" variant="primary" onClick={() => void handleConfirmAssign()}>
+                Confirm
               </Button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Undo Toast Notification (Review FX-07) */}
+      {editOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-md p-5 space-y-4">
+            <h3 className="text-base font-bold">Edit signal</h3>
+            <div>
+              <label className="block text-xs font-semibold mb-1">Display name</label>
+              <input
+                value={editName}
+                onChange={(e) => setEditName(e.target.value)}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+              <p className="text-[11px] text-slate-500 mt-1 font-mono">Signal key: {selectedSignal.tag}</p>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1">Unit</label>
+              <input
+                value={editUnit}
+                onChange={(e) => setEditUnit(e.target.value)}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1">Description</label>
+              <input
+                value={editDescription}
+                onChange={(e) => setEditDescription(e.target.value)}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1">Stale after (ms)</label>
+              <input
+                value={editInterval}
+                onChange={(e) => setEditInterval(e.target.value)}
+                inputMode="numeric"
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1">Type</label>
+              <select
+                value={editType}
+                onChange={(e) => setEditType(e.target.value)}
+                className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm"
+              >
+                <option value="number">Number</option>
+                <option value="integer">Integer</option>
+                <option value="boolean">Boolean</option>
+                <option value="text">Text</option>
+              </select>
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button size="sm" variant="secondary" onClick={() => setEditOpen(false)}>
+                Cancel
+              </Button>
+              <Button size="sm" variant="primary" onClick={() => void saveEdit()}>
+                Save
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ConfirmDialog
+        isOpen={confirmAction === 'delete'}
+        title="Delete signals?"
+        message={`Archive ${selectedIds.length || 1} signal(s)? They will be removed from the active catalog.`}
+        confirmLabel="Delete"
+        danger
+        onCancel={() => setConfirmAction(null)}
+        onConfirm={handleDeleteSelected}
+      />
+      <ConfirmDialog
+        isOpen={confirmAction === 'disable'}
+        title="Disable signals?"
+        message={`Disable ${disableIds.length || 1} signal(s)? They stay in the catalog and can be enabled again.`}
+        confirmLabel="Disable"
+        danger
+        onCancel={() => setConfirmAction(null)}
+        onConfirm={handleDisable}
+      />
+
       {toastMsg && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-900 text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
-          <span className="text-xs font-semibold">{toastMsg}</span>
-          {undoDelete && (
-            <button
-              type="button"
-              onClick={() => {
-                undoDelete();
-                setToastMsg('Deletion undone! Signals restored.');
-                setUndoDelete(null);
-              }}
-              className="text-xs font-bold text-amber-400 hover:text-amber-300 underline ml-2"
-            >
-              Undo
-            </button>
-          )}
+        <div className="fixed bottom-6 right-6 z-50 px-4 py-3 rounded-xl bg-slate-900 text-white text-xs font-semibold shadow-2xl">
+          {toastMsg}
         </div>
       )}
     </div>

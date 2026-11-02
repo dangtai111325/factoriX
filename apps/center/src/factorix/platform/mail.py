@@ -37,7 +37,8 @@ class SmtpMailer:
         mail = self.message(recipient, code)
         try:
             with smtplib.SMTP(self.settings.smtp_host, self.settings.smtp_port, timeout=20) as smtp:
-                smtp.starttls()
+                if getattr(self.settings, "smtp_tls", True):
+                    smtp.starttls()
                 smtp.login(self.settings.smtp_user, password)
                 smtp.send_message(mail)
         except AppError:

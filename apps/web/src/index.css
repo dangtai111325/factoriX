@@ -27,6 +27,23 @@
   --fx-info-soft: #EEF5FF;
   --fx-violet: #8858EA;
   --fx-teal: #21B5AE;
+  /* Commercial design tokens (CR-DS01) */
+  --color-status-good: var(--fx-success);
+  --color-status-bad: var(--fx-error);
+  --color-status-error: var(--fx-error);
+  --color-status-warning: var(--fx-warning);
+  --color-status-info: var(--fx-info);
+  --color-status-stale: var(--fx-warning);
+  --color-status-unknown: var(--fx-placeholder);
+  --color-text-primary: var(--fx-ink);
+  --color-text-body: var(--fx-body);
+  --color-text-secondary: var(--fx-body);
+  --color-text-muted: var(--fx-muted);
+  --color-surface-canvas: var(--fx-app-bg);
+  --color-surface-app: var(--fx-app-bg);
+  --color-surface-card: var(--fx-surface);
+  --color-surface-soft: var(--fx-bg-soft);
+  --color-surface-muted: var(--fx-bg-soft);
   --fx-sidebar-width: 276px;
   --fx-topbar-height: 62px;
   --fx-content-padding: 24px;
@@ -36,9 +53,31 @@
   --fx-radius-card: 12px;
   --fx-radius-lg: 16px;
   --fx-shadow-card: 0 3px 16px rgba(24,44,75,0.04);
-  --fx-font-ui: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --fx-font-ui: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --fx-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+  --fx-type-12: 12px;
+  --fx-type-13: 13px;
+  --fx-type-14: 14px;
+  --fx-type-16: 16px;
+  --fx-type-20: 20px;
+  --fx-type-28: 28px;
   color-scheme: light;
+}
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: local('Inter'), local('Inter Variable');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: local('JetBrains Mono'), local('JetBrainsMono');
 }
 
 * {
@@ -128,7 +167,7 @@ body {
 }
 
 .fx-page-title {
-  font-size: 30px;
+  font-size: var(--fx-type-28);
   font-weight: 800;
   letter-spacing: -0.025em;
   line-height: 1.2;
@@ -136,25 +175,99 @@ body {
 }
 
 .fx-page-subtitle {
-  font-size: 14px;
+  font-size: var(--fx-type-14);
   line-height: 1.5;
   margin-top: 4px;
   color: var(--fx-muted);
 }
 
 .fx-btn {
-  height: 38px;
+  height: 36px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
   border-radius: 8px;
   padding: 0 16px;
-  font-size: 13px;
+  font-size: var(--fx-type-13);
   font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
   transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@media (max-width: 1279px) {
+  :root {
+    --fx-sidebar-width: 72px;
+  }
+  .fx-sidebar .fx-nav-label,
+  .fx-sidebar .fx-nav-chevron,
+  .fx-sidebar .fx-nav-children,
+  .fx-sidebar .fx-brand-text,
+  .fx-sidebar .fx-sidebar-footer-text {
+    display: none;
+  }
+  .fx-sidebar .fx-nav-item {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+}
+
+@media (max-width: 767px) {
+  :root {
+    --fx-sidebar-width: 276px;
+  }
+  .fx-sidebar {
+    transform: translateX(-100%);
+    transition: transform 180ms ease;
+    box-shadow: none;
+  }
+  .fx-sidebar.fx-sidebar-open {
+    transform: translateX(0);
+    box-shadow: 8px 0 24px rgba(17, 27, 55, 0.18);
+  }
+  .fx-sidebar .fx-nav-label,
+  .fx-sidebar .fx-nav-chevron,
+  .fx-sidebar .fx-nav-children,
+  .fx-sidebar .fx-brand-text,
+  .fx-sidebar .fx-sidebar-footer-text {
+    display: initial;
+  }
+  .fx-sidebar .fx-nav-children {
+    display: block;
+  }
+  .fx-sidebar .fx-nav-item {
+    justify-content: flex-start;
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+  .fx-main,
+  .fx-topbar {
+    margin-left: 0;
+    left: 0;
+    width: 100%;
+  }
+  .fx-sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 35;
+    background: rgba(17, 27, 55, 0.35);
+  }
+}
+
+@media (max-width: 390px) {
+  body {
+    overflow-x: hidden;
+  }
+  .fx-content {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+  .fx-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+  }
 }
 
 .fx-btn-primary {

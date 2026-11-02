@@ -35,7 +35,7 @@ export const LoginPage: React.FC = () => {
     setPending(true)
     setServerError('')
     try {
-      await signIn(login.trim(), password)
+      await signIn(login.trim(), password, rememberDevice)
       const from = (location.state as { from?: string } | null)?.from
       navigate(from && from.startsWith('/') ? from : '/overview', { replace: true })
     } catch (error) {

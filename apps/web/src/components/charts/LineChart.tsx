@@ -30,8 +30,9 @@ export const LineChart: React.FC<LineChartProps> = ({
   const minVal = Math.min(...values) * 0.95;
   const maxVal = Math.max(...values) * 1.05 || 1;
 
+  const span = Math.max(1, data.length - 1);
   const getX = (index: number) =>
-    paddingX + (index / (data.length - 1)) * (width - paddingX * 2);
+    paddingX + (index / span) * (width - paddingX * 2);
 
   const getY = (val: number) =>
     height - paddingY - ((val - minVal) / (maxVal - minVal)) * (height - paddingY * 2);

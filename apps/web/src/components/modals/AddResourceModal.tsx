@@ -1,48 +1,74 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { X, Plus, FolderPlus, Trash2 } from 'lucide-react';
 import { translateApiError } from '../../utils/apiErrors';
-import { codePreviewFromName, validateResourceName } from '../../utils/resourceHierarchy';
+import {
+  ALL_RESOURCE_TYPE_KEYS,
+  codePreviewFromName,
+  ISA95_TYPE_GROUPS,
+  placeholderForType,
+  typeDisplayLabel,
+  validateResourceName,
+} from '../../utils/resourceHierarchy';
 
 export interface AddResourceModalProps {
   isOpen: boolean;
   onClose: () => void;
   parentPath?: string;
-  allowedTypes?: string[];
+  parentType?: string;
+  /** Recommended child type keys (lowercase). */
+  recommendedTypes?: string[];
   onAddResource?: (newResource: {
     name: string;
     type: string;
     parentPath: string;
     description: string;
     properties: Record<string, string>;
+    force?: boolean;
   }) => void | Promise<void>;
+  onCreateCustomType?: (input: {
+    key: string;
+    name: string;
+    parentType?: string;
+  }) => Promise<void>;
 }
 
 export const AddResourceModal: React.FC<AddResourceModalProps> = ({
   isOpen,
   onClose,
   parentPath = '(root)',
-  allowedTypes = ['Enterprise', 'Site', 'Plant', 'Zone', 'Line', 'Workshop', 'Machine', 'Sensor'],
+  parentType,
+  recommendedTypes = [],
   onAddResource,
+  onCreateCustomType,
 }) => {
+  const recommended = useMemo(
+    () => new Set(recommendedTypes.map((t) => t.toLowerCase())),
+    [recommendedTypes],
+  );
+  const defaultType = recommendedTypes[0] || 'machine';
   const [name, setName] = useState('');
-  const [type, setType] = useState(allowedTypes[0] || 'Machine');
-  const [currentPath, setCurrentPath] = useState(parentPath);
+  const [type, setType] = useState(defaultType);
   const [description, setDescription] = useState('');
   const [properties, setProperties] = useState<Array<{ key: string; value: string }>>([]);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const allowedKey = allowedTypes.join('|');
+  const [showCustom, setShowCustom] = useState(false);
+  const [customKey, setCustomKey] = useState('');
+  const [customName, setCustomName] = useState('');
+  const [extraTypes, setExtraTypes] = useState<string[]>([]);
 
   useEffect(() => {
     if (!isOpen) return;
     setName('');
-    setType(allowedTypes[0] || 'Machine');
-    setCurrentPath(parentPath);
+    setType(defaultType);
     setDescription('');
     setProperties([]);
     setError('');
     setSubmitting(false);
-  }, [isOpen, parentPath, allowedKey]);
+    setShowCustom(false);
+    setCustomKey('');
+    setCustomName('');
+  }, [isOpen, defaultType, parentPath]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -59,20 +85,12 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
   if (!isOpen) return null;
 
   const codePreview = codePreviewFromName(name);
-
-  const handleAddProperty = () => {
-    setProperties([...properties, { key: '', value: '' }]);
-  };
-
-  const handleRemoveProperty = (index: number) => {
-    setProperties(properties.filter((_, i) => i !== index));
-  };
-
-  const handlePropertyChange = (index: number, field: 'key' | 'value', val: string) => {
-    const next = [...properties];
-    next[index][field] = val;
-    setProperties(next);
-  };
+  const typeKey = type.toLowerCase();
+  const isRecommended = recommended.size === 0 || recommended.has(typeKey);
+  const softWarn =
+    !isRecommended && parentType
+      ? `"${typeDisplayLabel(typeKey)}" is not a recommended child of ${typeDisplayLabel(parentType)}. You can still create it.`
+      : null;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -81,25 +99,46 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
       setError(nameError);
       return;
     }
-    const chosen = allowedTypes.includes(type) ? type : allowedTypes[0];
-    if (!chosen) return;
-
-    const propsMap = properties.reduce<Record<string, string>>((acc, item) => {
-      if (item.key.trim()) acc[item.key.trim()] = item.value.trim();
-      return acc;
-    }, {});
-
     setSubmitting(true);
     setError('');
     try {
       await onAddResource?.({
         name: name.trim(),
-        type: chosen,
-        parentPath: currentPath,
+        type: typeKey,
+        parentPath,
         description: description.trim(),
-        properties: propsMap,
+        properties: properties.reduce<Record<string, string>>((acc, item) => {
+          if (item.key.trim()) acc[item.key.trim()] = item.value.trim();
+          return acc;
+        }, {}),
+        force: !isRecommended,
       });
       onClose();
+    } catch (caught) {
+      setError(translateApiError(caught));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleCreateCustom = async () => {
+    if (!onCreateCustomType) return;
+    const key = codePreviewFromName(customKey || customName).toLowerCase();
+    if (!key || !customName.trim()) {
+      setError('Custom type needs a key and name.');
+      return;
+    }
+    setSubmitting(true);
+    setError('');
+    try {
+      await onCreateCustomType({
+        key,
+        name: customName.trim(),
+        parentType: parentType?.toLowerCase(),
+      });
+      setExtraTypes((prev) => (prev.includes(key) ? prev : [...prev, key]));
+      setType(key);
+      setShowCustom(false);
     } catch (caught) {
       setError(translateApiError(caught));
     } finally {
@@ -115,7 +154,6 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
         aria-labelledby="add-resource-title"
         className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]"
       >
-        {/* Modal Header */}
         <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-red-50 text-[#EF1B24] flex items-center justify-center font-bold">
@@ -126,7 +164,7 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                 Add Factory Resource
               </h2>
               <p className="text-xs text-slate-500">
-                Define and insert a new entity into the factory hierarchy
+                Display name is separate from code. All ISA-95 types are listed.
               </p>
             </div>
           </div>
@@ -140,59 +178,122 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
           </button>
         </div>
 
-        {/* Modal Body */}
-        <form onSubmit={handleSubmit} className="p-6 space-y-5 overflow-y-auto flex-1 text-sm">
-          {/* Context Path */}
+        <form onSubmit={(e) => void handleSubmit(e)} className="p-6 space-y-5 overflow-y-auto flex-1 text-sm">
           <div>
             <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">
-              Context Path (Parent)
+              Parent
             </label>
             <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 break-all">
-              {currentPath}
+              {parentPath}
             </div>
           </div>
 
-          {/* Resource Name and Type */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Resource Name <span className="text-[#EF1B24]">*</span>
+                Display name <span className="text-[#EF1B24]">*</span>
               </label>
               <input
                 type="text"
                 required
+                maxLength={200}
                 value={name}
                 onChange={(e) => {
                   setName(e.target.value);
                   if (error) setError('');
                 }}
-                placeholder="e.g. CNC-03, Line 04, Packaging Line"
+                placeholder={placeholderForType(typeKey)}
                 className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
               />
-              <p className="mt-1.5 text-[11px] text-slate-500 font-mono">
-                Code preview:{' '}
-                <span className="text-slate-700 font-semibold">{codePreview || '—'}</span>
-              </p>
+              <div className="mt-1.5 flex justify-between text-[11px] text-slate-500">
+                <span className="font-mono">
+                  Code preview: <span className="text-slate-700 font-semibold">{codePreview || '—'}</span>
+                </span>
+                <span>{name.length}/200</span>
+              </div>
             </div>
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Resource Type <span className="text-[#EF1B24]">*</span>
+                Resource type <span className="text-[#EF1B24]">*</span>
               </label>
               <select
-                value={type}
+                value={typeKey}
                 onChange={(e) => setType(e.target.value)}
                 className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
               >
-                {allowedTypes.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
+                {ISA95_TYPE_GROUPS.map((group) => (
+                  <optgroup key={group.id} label={group.label}>
+                    {group.types.map((key) => (
+                      <option key={key} value={key}>
+                        {typeDisplayLabel(key)}
+                        {recommended.has(key) ? ' · Recommended' : ''}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+                {extraTypes.map((key) => (
+                  <option key={key} value={key}>
+                    {typeDisplayLabel(key)} (custom)
+                  </option>
+                ))}
+                {ALL_RESOURCE_TYPE_KEYS.filter(
+                  (key) => !ISA95_TYPE_GROUPS.some((g) => g.types.includes(key)),
+                ).map((key) => (
+                  <option key={key} value={key}>
+                    {typeDisplayLabel(key)}
                   </option>
                 ))}
               </select>
+              {onCreateCustomType && (
+                <button
+                  type="button"
+                  onClick={() => setShowCustom((v) => !v)}
+                  className="mt-1.5 text-[11px] font-semibold text-[#2A82E7]"
+                >
+                  {showCustom ? 'Hide custom type' : 'Create custom type…'}
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Description */}
+          {showCustom && (
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
+              <p className="text-[11px] text-slate-600">
+                Registers a custom type via POST /resource-types and selects it.
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="text"
+                  placeholder="Key (e.g. robot_cell)"
+                  value={customKey}
+                  onChange={(e) => setCustomKey(e.target.value)}
+                  className="px-2 py-1.5 border border-slate-200 rounded-md text-xs font-mono"
+                />
+                <input
+                  type="text"
+                  placeholder="Display name"
+                  value={customName}
+                  onChange={(e) => setCustomName(e.target.value)}
+                  className="px-2 py-1.5 border border-slate-200 rounded-md text-xs"
+                />
+              </div>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => void handleCreateCustom()}
+                className="text-xs font-semibold text-[#EF1B24]"
+              >
+                Save custom type
+              </button>
+            </div>
+          )}
+
+          {softWarn && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              {softWarn}
+            </div>
+          )}
+
           <div>
             <label className="block text-xs font-semibold text-slate-700 mb-1">Description</label>
             <textarea
@@ -204,15 +305,12 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
             />
           </div>
 
-          {/* Key-Value Properties */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <label className="text-xs font-semibold text-slate-700">
-                Resource Metadata & Technical Attributes
-              </label>
+              <label className="text-xs font-semibold text-slate-700">Properties</label>
               <button
                 type="button"
-                onClick={handleAddProperty}
+                onClick={() => setProperties([...properties, { key: '', value: '' }])}
                 className="text-xs font-medium text-[#EF1B24] hover:text-red-700 flex items-center gap-1"
               >
                 <Plus className="w-3.5 h-3.5" /> Add Property
@@ -223,21 +321,29 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                 <div key={idx} className="flex items-center gap-2">
                   <input
                     type="text"
-                    placeholder="Key (e.g. SerialNum)"
+                    placeholder="Key"
                     value={prop.key}
-                    onChange={(e) => handlePropertyChange(idx, 'key', e.target.value)}
-                    className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs text-slate-800 focus:outline-none focus:border-[#EF1B24]"
+                    onChange={(e) => {
+                      const next = [...properties];
+                      next[idx] = { ...next[idx], key: e.target.value };
+                      setProperties(next);
+                    }}
+                    className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs"
                   />
                   <input
                     type="text"
                     placeholder="Value"
                     value={prop.value}
-                    onChange={(e) => handlePropertyChange(idx, 'value', e.target.value)}
-                    className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs text-slate-800 focus:outline-none focus:border-[#EF1B24]"
+                    onChange={(e) => {
+                      const next = [...properties];
+                      next[idx] = { ...next[idx], value: e.target.value };
+                      setProperties(next);
+                    }}
+                    className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs"
                   />
                   <button
                     type="button"
-                    onClick={() => handleRemoveProperty(idx)}
+                    onClick={() => setProperties(properties.filter((_, i) => i !== idx))}
                     className="p-1.5 text-slate-400 hover:text-red-600 rounded"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -248,26 +354,25 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
           </div>
 
           {error && (
-            <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
               {error}
-            </p>
+            </div>
           )}
 
-          {/* Footer Actions */}
-          <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
+          <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+              className="px-4 py-2 rounded-lg border border-slate-200 text-slate-600 text-xs font-semibold"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={submitting}
-              className="px-5 py-2 text-xs font-semibold text-white bg-[#EF1B24] hover:bg-[#d0171f] rounded-lg shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50"
+              className="px-4 py-2 rounded-lg bg-[#EF1B24] text-white text-xs font-semibold disabled:opacity-50"
             >
-              <Plus className="w-4 h-4" /> {submitting ? 'Creating…' : 'Create Resource'}
+              {submitting ? 'Creating…' : 'Create resource'}
             </button>
           </div>
         </form>

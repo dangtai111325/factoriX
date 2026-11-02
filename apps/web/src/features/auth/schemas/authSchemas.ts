@@ -44,10 +44,44 @@ export function passwordChecks(password: string, username: string) {
   }
 }
 
+const BLOCKED = new Set([
+  'admin',
+  'adminadmin',
+  'password',
+  'password123',
+  'password1234',
+  'password12345',
+  'password123456',
+  'factorix',
+  'factorix123',
+  'changeme',
+  'changeme1234',
+  'qwerty12345',
+  'qwerty123456',
+  '123456789012',
+  'welcome12345',
+  'iloveyou1234',
+  'letmein12345',
+  'admin1234567',
+  'qwertyuiop12',
+  '1q2w3e4r5t6y',
+  'passw0rd1234',
+  'football1234',
+  'baseball1234',
+  'dragon123456',
+  'master123456',
+  'monkey123456',
+  'sunshine1234',
+  'princess1234',
+  'trustno12345',
+  'abc123456789',
+])
+
 export function validateNewPassword(password: string, username: string): string | null {
   if (!password) return 'Enter a password.'
   const checks = passwordChecks(password, username)
   if (!checks.length) return 'Password must be 12–128 characters.'
+  if (BLOCKED.has(password.toLowerCase())) return 'Password is too common.'
   if (!checks.classes) return 'Password needs at least 3 character groups (upper, lower, digit, symbol).'
   if (!checks.noUsername) return 'Password must not contain your username.'
   if (!checks.noEdgeSpace) return 'Password cannot start or end with spaces.'

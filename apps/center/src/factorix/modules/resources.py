@@ -29,11 +29,13 @@ class ResourceIn(BaseModel):
     tags: list[str] = Field(default_factory=list)
     properties: dict[str, Any] = Field(default_factory=dict)
     valid_from: datetime | None = None
+    # When true, skip ISA-95 adjacency rejection (UI soft-warn path).
+    force: bool = False
 
 
 class ResourcePatch(BaseModel):
     version: int
-    name: str | None = None
+    name: str | None = Field(default=None, max_length=200)
     description: str | None = None
     code: str | None = None
     properties: dict[str, Any] | None = None
@@ -145,6 +147,75 @@ async def _type_by_key(session: AsyncSession, tenant_id: UUID, key: str) -> dict
     return row
 
 
+async def _assert_sibling_code_unique(
+    session: AsyncSession,
+    tenant_id: UUID,
+    code: str,
+    *,
+    parent_id: UUID | None,
+    exclude_id: UUID | None = None,
+) -> None:
+    """Codes must be unique among siblings under the same CONTAINS parent (or among roots)."""
+    params: dict[str, Any] = {"tenant_id": tenant_id, "code": code}
+    exclude_sql = ""
+    if exclude_id is not None:
+        params["exclude_id"] = exclude_id
+        exclude_sql = "AND r.id <> :exclude_id"
+    if parent_id is None:
+        duplicate = await fetch_one(
+            session,
+            f"""
+            SELECT r.id FROM resources r
+            WHERE r.tenant_id = :tenant_id AND r.code = :code
+              {exclude_sql}
+              AND NOT EXISTS (
+                SELECT 1 FROM resource_relations rr
+                JOIN relation_types rt ON rt.id = rr.relation_type_id
+                WHERE rr.to_id = r.id AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL
+              )
+            LIMIT 1
+            """,
+            params,
+        )
+    else:
+        params["parent_id"] = parent_id
+        duplicate = await fetch_one(
+            session,
+            f"""
+            SELECT r.id FROM resources r
+            JOIN resource_relations rr ON rr.to_id = r.id
+            JOIN relation_types rt ON rt.id = rr.relation_type_id
+            WHERE r.tenant_id = :tenant_id AND r.code = :code
+              AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL AND rr.from_id = :parent_id
+              {exclude_sql}
+            LIMIT 1
+            """,
+            params,
+        )
+    if duplicate:
+        raise AppError(
+            409,
+            "DUPLICATE",
+            "A resource with this code already exists under the same parent.",
+            field_errors=[{"path": "code", "code": "DUPLICATE"}],
+        )
+
+
+async def _current_contains_parent(session: AsyncSession, tenant_id: UUID, resource_id: UUID) -> UUID | None:
+    row = await fetch_one(
+        session,
+        """
+        SELECT rr.from_id AS parent_id
+        FROM resource_relations rr
+        JOIN relation_types rt ON rt.id = rr.relation_type_id
+        WHERE rr.tenant_id = :tenant_id AND rr.to_id = :id AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL
+        LIMIT 1
+        """,
+        {"tenant_id": tenant_id, "id": resource_id},
+    )
+    return as_uuid(row["parent_id"]) if row else None
+
+
 async def create_resource(
     session: AsyncSession,
     tenant_id: UUID,
@@ -163,18 +234,22 @@ async def create_resource(
     if type_row["key"] != "enterprise" and site_id is None:
         raise AppError(422, "SITE_REQUIRED", "This resource requires a site.")
     parent = None
+    parent_uuid: UUID | None = None
     if body.parent_id:
         parent = await _resource(session, tenant_id, parse_uuid(body.parent_id))
-        await _assert_contains(session, tenant_id, parent["type_key"] if "type_key" in parent else await _type_key(session, parent), type_row["key"], parent, body.relation_code)
+        parent_uuid = as_uuid(parent["id"])
+        if not body.force:
+            await _assert_contains(
+                session,
+                tenant_id,
+                parent["type_key"] if "type_key" in parent else await _type_key(session, parent),
+                type_row["key"],
+                parent,
+                body.relation_code,
+            )
     now = utcnow()
     resource_id = uuid4()
-    duplicate = await fetch_one(
-        session,
-        "SELECT id FROM resources WHERE tenant_id = :tenant_id AND code = :code",
-        {"tenant_id": tenant_id, "code": code},
-    )
-    if duplicate:
-        raise AppError(409, "DUPLICATE", "A resource with this code already exists.", field_errors=[{"path": "code", "code": "DUPLICATE"}])
+    await _assert_sibling_code_unique(session, tenant_id, code, parent_id=parent_uuid)
     await execute(
         session,
         """
@@ -406,7 +481,7 @@ async def list_resources(
         params["cursor"] = cursor
         where.append("r.code > :cursor")
     sql = f"""
-        SELECT r.id, r.code, r.name, r.status, r.version, r.site_id, r.archived_at, t.key AS type_key, t.category AS type_category,
+        SELECT r.id, r.code, r.name, r.description, r.properties_json, r.status, r.version, r.site_id, r.archived_at, t.key AS type_key, t.category AS type_category,
                (
                  SELECT rr.from_id FROM resource_relations rr
                  JOIN relation_types rt ON rt.id = rr.relation_type_id
@@ -440,7 +515,14 @@ async def patch_resource(
         raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
     if current["archived_at"] is not None:
         raise AppError(409, "ARCHIVED", "Archived resources are read-only.")
-    name = body.name.strip() if body.name is not None else current["name"]
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise AppError(422, "NAME", "Resource name is required.")
+        if len(name) > 200:
+            raise AppError(422, "NAME", "Resource name must be 200 characters or fewer.")
+    else:
+        name = current["name"]
     description = body.description if body.description is not None else current["description"]
     code = current["code"]
     if body.code is not None:
@@ -448,6 +530,11 @@ async def patch_resource(
             code = validate_code(body.code)
         except ResourceInvariantError as exc:
             raise AppError(422, exc.code, str(exc)) from exc
+        if code != current["code"]:
+            parent_id = await _current_contains_parent(session, tenant_id, resource_id)
+            await _assert_sibling_code_unique(
+                session, tenant_id, code, parent_id=parent_id, exclude_id=resource_id
+            )
     properties = body.properties if body.properties is not None else current["properties_json"]
     tags = body.tags if body.tags is not None else current["tags_json"]
     await execute(
@@ -546,6 +633,41 @@ async def archive_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         {"now": now, "id": resource_id, "tenant_id": tenant_id},
     )
     await audit(session, tenant_id=tenant_id, event_type="RESOURCE_ARCHIVE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"status": current["status"]}, after={"status": "ARCHIVED"}, correlation_id=correlation_id)
+    return await get_resource(session, tenant_id, resource_id)
+
+
+async def restore_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID, correlation_id: str) -> dict[str, Any]:
+    current = await _resource(session, tenant_id, resource_id)
+    if current["archived_at"] is None and current.get("status") != "ARCHIVED":
+        raise AppError(409, "NOT_ARCHIVED", "Resource is not archived.")
+    parent_id = await _current_contains_parent(session, tenant_id, resource_id)
+    if parent_id is not None:
+        parent = await _resource(session, tenant_id, parent_id)
+        if parent.get("archived_at") is not None or parent.get("status") == "ARCHIVED":
+            raise AppError(409, "ARCHIVED_PARENT", "Restore the parent resource first.")
+    await _assert_sibling_code_unique(
+        session, tenant_id, str(current["code"]), parent_id=parent_id, exclude_id=resource_id
+    )
+    now = utcnow()
+    await execute(
+        session,
+        """
+        UPDATE resources SET status = 'ACTIVE', archived_at = NULL, version = version + 1, updated_at = :now
+        WHERE id = :id AND tenant_id = :tenant_id
+        """,
+        {"now": now, "id": resource_id, "tenant_id": tenant_id},
+    )
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="RESOURCE_RESTORE",
+        actor_id=actor,
+        entity_type="resource",
+        entity_id=resource_id,
+        before={"status": current["status"]},
+        after={"status": "ACTIVE"},
+        correlation_id=correlation_id,
+    )
     return await get_resource(session, tenant_id, resource_id)
 
 
@@ -821,7 +943,26 @@ def validate_levels(levels: list[dict[str, Any]]) -> list[str]:
     keys = [str(level.get("type_key", "")) for level in levels]
     if keys != list(dict.fromkeys(keys)):
         errors.append("Duplicate resource type in the template.")
-    rank = {key: index for index, key in enumerate(["enterprise", "site", "plant", "zone", "workshop", "line", "cell", "utility_system", "machine", "sensor", "physical_asset", "functional_position"])}
+    rank = {
+        key: index
+        for index, key in enumerate(
+            [
+                "enterprise",
+                "site",
+                "area",
+                "plant",
+                "zone",
+                "workshop",
+                "line",
+                "cell",
+                "utility_system",
+                "machine",
+                "sensor",
+                "physical_asset",
+                "functional_position",
+            ]
+        )
+    }
     previous = -1
     for key in keys:
         current = rank.get(key, previous + 1)

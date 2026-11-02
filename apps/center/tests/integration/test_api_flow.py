@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -362,6 +363,10 @@ async def test_password_reset_code_is_single_use() -> None:
             asked = await client.post("/api/v1/auth/forgot", json={"email": "FXADMIN@example.com"})
             assert asked.status_code == 200, asked.text
             assert "code" not in asked.json()
+            for _ in range(40):
+                if mailer.sent:
+                    break
+                await asyncio.sleep(0.05)
             assert len(mailer.sent) == 1
             code = mailer.sent[0][1]
             wrong = await client.post(

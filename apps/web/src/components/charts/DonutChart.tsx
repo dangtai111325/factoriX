@@ -45,28 +45,38 @@ export const DonutChart: React.FC<DonutChartProps> = ({
               strokeWidth={strokeWidth}
               fill="transparent"
             />
-            {segments.map((seg, idx) => {
-              const fraction = total > 0 ? seg.value / total : 0;
-              const strokeDasharray = `${fraction * circumference} ${circumference}`;
-              const strokeDashoffset = -accumulatedAngle * circumference;
-              accumulatedAngle += fraction;
+            {total === 0 ? (
+              <circle
+                cx={size / 2}
+                cy={size / 2}
+                r={radius}
+                stroke="#CBD5E1"
+                strokeWidth={strokeWidth}
+                fill="transparent"
+              />
+            ) : (
+              segments.map((seg, idx) => {
+                const fraction = seg.value / total;
+                const strokeDasharray = `${fraction * circumference} ${circumference}`;
+                const strokeDashoffset = -accumulatedAngle * circumference;
+                accumulatedAngle += fraction;
 
-              return (
-                <circle
-                  key={idx}
-                  cx={size / 2}
-                  cy={size / 2}
-                  r={radius}
-                  stroke={seg.color}
-                  strokeWidth={strokeWidth}
-                  strokeDasharray={strokeDasharray}
-                  strokeDashoffset={strokeDashoffset}
-                  fill="transparent"
-                  strokeLinecap="round"
-                  className="transition-all duration-300"
-                />
-              );
-            })}
+                return (
+                  <circle
+                    key={idx}
+                    cx={size / 2}
+                    cy={size / 2}
+                    r={radius}
+                    stroke={seg.value === 0 ? '#E2E8F0' : seg.color}
+                    strokeWidth={strokeWidth}
+                    strokeDasharray={strokeDasharray}
+                    strokeDashoffset={strokeDashoffset}
+                    fill="transparent"
+                    className="transition-all duration-300"
+                  />
+                );
+              })
+            )}
           </svg>
 
           {/* Center text */}
@@ -76,11 +86,14 @@ export const DonutChart: React.FC<DonutChartProps> = ({
           </div>
         </div>
 
-        {/* Legend */}
+        {/* Legend — CR-O03: 0 uses neutral color, not decorative segment hues */}
         <div className="space-y-1.5">
           {segments.map((seg, idx) => (
             <div key={idx} className="flex items-center gap-2 text-[12px]">
-              <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: seg.color }} />
+              <span
+                className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                style={{ backgroundColor: seg.value === 0 || total === 0 ? '#CBD5E1' : seg.color }}
+              />
               <span className="text-[#657794] min-w-[70px]">{seg.label}</span>
               <span className="font-bold text-[#111B37] tabular-nums">{seg.value}</span>
             </div>

@@ -21,12 +21,14 @@ class Settings(BaseSettings):
     session_ttl_minutes: int = Field(default=480, ge=15, le=1440)
     web_origin: str = "http://localhost:8080"
     cookie_secure: bool | None = None
+    allow_http: bool = False
     log_level: str = "INFO"
-    smtp_host: str = "smtp.gmail.com"
+    smtp_host: str = ""
     smtp_port: int = 587
-    smtp_user: str = "tai.dang@avenue-net.com"
+    smtp_user: str = ""
     smtp_password: str = ""
-    smtp_from: str = "tai.dang@avenue-net.com"
+    smtp_from: str = ""
+    smtp_tls: bool = True
     appliance: bool = False
     data_dir: str = ""
     web_dist: str = ""
@@ -46,9 +48,15 @@ class Settings(BaseSettings):
         return value
 
     @property
+    def smtp_configured(self) -> bool:
+        return bool(self.smtp_host and self.smtp_user and self.smtp_from and self.smtp_password)
+
+    @property
     def secure_cookies(self) -> bool:
         if self.cookie_secure is not None:
             return self.cookie_secure
+        if self.allow_http:
+            return False
         return self.environment == "production"
 
 

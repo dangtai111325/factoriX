@@ -27,7 +27,8 @@ test.describe('FactoriX platform sync', () => {
   test('P-001 overview shell and honest streaming badge', async ({ page }) => {
     await ensureSignedIn(page)
     await expect(page.getByText('Operations Overview')).toBeVisible()
-    await expect(page.getByText('LIVE REFRESH').or(page.getByText('PAUSED'))).toBeVisible()
+    await expect(page.getByText('LIVE REFRESH')).toHaveCount(0)
+    await expect(page.getByText('Pause Visualization')).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Revert To Zero' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible()
   })

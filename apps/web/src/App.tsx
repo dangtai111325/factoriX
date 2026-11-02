@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import {
   ForgotPasswordPage,
@@ -26,48 +26,57 @@ import { DiagnosticsPage } from './pages/11_Diagnostics/DiagnosticsPage';
 import { ActivityLogPage } from './pages/12_ActivityLog/ActivityLogPage';
 import { OutputGroupsPage } from './pages/13_OutputGroups/OutputGroupsPage';
 import { EdgesPage } from './pages/16_Edges/EdgesPage';
+import { ProfilePage } from './pages/17_Profile/ProfilePage';
+import { AboutPage } from './pages/18_About/AboutPage';
+import { AdministrationPage } from './pages/19_Administration/AdministrationPage';
+import { LegalPage } from './pages/legal/LegalPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
 
-const ProtectedAppShell: React.FC = () => (
-  <AppProvider>
-    <div className="fx-app-shell">
-      <Sidebar />
-      <div className="flex-1 min-w-0">
-        <Topbar />
-        <main className="fx-main">
-          <div className="fx-content">
-            <Routes>
-              <Route path="/" element={<Navigate to="/overview" replace />} />
-              <Route path="/overview" element={<OverviewPage />} />
-              <Route path="/factory/structure" element={<FactoryStructurePage />} />
-              <Route path="/factory/layout" element={<FactoryLayoutPage />} />
-              <Route path="/factory/graph" element={<KnowledgeGraphPage />} />
-              <Route path="/acquisition/connections" element={<ConnectionsPage />} />
-              <Route path="/acquisition/edges" element={<EdgesPage />} />
-              <Route path="/acquisition/add-data" element={<AddDataWizardPage />} />
-              <Route path="/acquisition/studio/opcua" element={<ComingSoonPage />} />
-              <Route path="/signals" element={<SignalsCatalogPage />} />
-              <Route path="/signals/calculated" element={<ComingSoonPage />} />
-              <Route path="/live/monitor" element={<LiveOperationsPage />} />
-              <Route path="/live/diagnostics" element={<DiagnosticsPage />} />
-              <Route path="/live/activity" element={<ActivityLogPage />} />
-              <Route path="/signals/output-groups" element={<OutputGroupsPage />} />
-              <Route path="/acquisition/studio/mqtt" element={<ComingSoonPage />} />
-              <Route path="/acquisition/studio/http" element={<ComingSoonPage />} />
-              <Route path="/dashboards" element={<ComingSoonPage />} />
-              <Route path="/storage" element={<ComingSoonPage />} />
-              <Route path="/alarms" element={<ComingSoonPage />} />
-              <Route path="/reports" element={<ComingSoonPage />} />
-              <Route path="/administration" element={<ComingSoonPage />} />
-              <Route path="*" element={<Navigate to="/overview" replace />} />
-            </Routes>
-          </div>
-        </main>
+const ProtectedAppShell: React.FC = () => {
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  return (
+    <AppProvider>
+      <div className="fx-app-shell">
+        <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+        <div className="flex-1 min-w-0">
+          <Topbar onMenuClick={() => setSidebarOpen(true)} />
+          <main className="fx-main">
+            <div className="fx-content">
+              <Routes>
+                <Route path="/" element={<Navigate to="/overview" replace />} />
+                <Route path="/overview" element={<OverviewPage />} />
+                <Route path="/factory/structure" element={<FactoryStructurePage />} />
+                <Route path="/factory/layout" element={<FactoryLayoutPage />} />
+                <Route path="/factory/graph" element={<KnowledgeGraphPage />} />
+                <Route path="/acquisition/connections" element={<ConnectionsPage />} />
+                <Route path="/acquisition/edges" element={<EdgesPage />} />
+                <Route path="/acquisition/add-data" element={<AddDataWizardPage />} />
+                <Route path="/acquisition/studio/opcua" element={<ComingSoonPage />} />
+                <Route path="/signals" element={<SignalsCatalogPage />} />
+                <Route path="/signals/calculated" element={<ComingSoonPage />} />
+                <Route path="/live/monitor" element={<LiveOperationsPage />} />
+                <Route path="/live/diagnostics" element={<DiagnosticsPage />} />
+                <Route path="/live/activity" element={<ActivityLogPage />} />
+                <Route path="/signals/output-groups" element={<OutputGroupsPage />} />
+                <Route path="/acquisition/studio/mqtt" element={<ComingSoonPage />} />
+                <Route path="/acquisition/studio/http" element={<ComingSoonPage />} />
+                <Route path="/dashboards" element={<ComingSoonPage />} />
+                <Route path="/storage" element={<ComingSoonPage />} />
+                <Route path="/alarms" element={<ComingSoonPage />} />
+                <Route path="/reports" element={<ComingSoonPage />} />
+                <Route path="/administration" element={<AdministrationPage />} />
+                <Route path="/profile" element={<ProfilePage />} />
+                <Route path="/about" element={<AboutPage />} />
+                <Route path="*" element={<Navigate to="/overview" replace />} />
+              </Routes>
+            </div>
+          </main>
+        </div>
+        <SearchModal />
       </div>
-      <SearchModal />
-    </div>
-  </AppProvider>
-);
+    </AppProvider>
+  );
+};
 
 const RootRedirect: React.FC = () => {
   const { state, isFirstRun } = useAuth();
@@ -88,6 +97,7 @@ export const App: React.FC = () => (
     <Route path="/register" element={<GuestOnly><RegisterPage /></GuestOnly>} />
     <Route path="/forgot-password" element={<GuestOnly><ForgotPasswordPage /></GuestOnly>} />
     <Route path="/reset-password" element={<GuestOnly><ResetPasswordPage /></GuestOnly>} />
+    <Route path="/legal/:doc" element={<LegalPage />} />
     <Route path="/" element={<RootRedirect />} />
     <Route
       path="/*"

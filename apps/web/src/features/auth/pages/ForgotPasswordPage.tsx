@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Mail } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { AuthAlert } from '../components/AuthAlert'
@@ -6,7 +6,7 @@ import { AuthField } from '../components/AuthField'
 import { AuthShell } from '../components/AuthShell'
 import { AuthStatusFooter } from '../components/AuthStatusFooter'
 import { BrandLogo } from '../components/BrandLogo'
-import { forgotPassword, mapAuthError } from '../services/authClient'
+import { forgotPassword, getAuthStatus, mapAuthError } from '../services/authClient'
 import { validateEmail } from '../schemas/authSchemas'
 
 export const ForgotPasswordPage: React.FC = () => {
@@ -15,6 +15,15 @@ export const ForgotPasswordPage: React.FC = () => {
   const [serverError, setServerError] = useState('')
   const [accepted, setAccepted] = useState(false)
   const [pending, setPending] = useState(false)
+  const [recoveryEnabled, setRecoveryEnabled] = useState(true)
+
+  useEffect(() => {
+    void getAuthStatus()
+      .then((status) => {
+        setRecoveryEnabled(Boolean(status.password_recovery_enabled ?? status.smtp_configured ?? true))
+      })
+      .catch(() => setRecoveryEnabled(true))
+  }, [])
 
   const onSubmit = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -41,13 +50,20 @@ export const ForgotPasswordPage: React.FC = () => {
         </div>
         <h1 className="mt-8 text-[34px] font-extrabold text-[#111B37]">Forgot password</h1>
         <p className="mt-2 text-[16px] text-[#657794]">
-          Enter your work email. If an account exists, you will receive reset instructions.
+          Enter the email on the account. If it matches, a reset code is sent. It expires in 10 minutes.
         </p>
       </div>
+      {!recoveryEnabled && (
+        <div className="mt-6">
+          <AuthAlert tone="info">
+            Password recovery is disabled until email is set up on this appliance.
+          </AuthAlert>
+        </div>
+      )}
       <form className="mt-8 space-y-5" onSubmit={onSubmit} noValidate>
         <AuthField
           id="forgot-email"
-          label="Work email"
+          label="Email"
           value={email}
           onChange={setEmail}
           type="email"
@@ -58,11 +74,15 @@ export const ForgotPasswordPage: React.FC = () => {
         />
         {accepted ? (
           <AuthAlert tone="info">
-            If an account exists for that email, reset instructions were accepted by the server.
+            If an account matches this email, we&apos;ve sent a 6-digit reset code. It expires in 10 minutes.
           </AuthAlert>
         ) : null}
         {serverError ? <AuthAlert>{serverError}</AuthAlert> : null}
-        <button type="submit" className="fx-auth-button-primary" disabled={pending || accepted}>
+        <button
+          type="submit"
+          className="fx-auth-button-primary"
+          disabled={pending || accepted || !recoveryEnabled}
+        >
           {pending ? 'Sending…' : 'Send reset instructions'}
         </button>
       </form>

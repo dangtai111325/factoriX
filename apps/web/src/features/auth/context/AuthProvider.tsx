@@ -21,7 +21,7 @@ type AuthContextValue = {
   isFirstRun: boolean
   setupCodeRequired: boolean
   refreshSession: () => Promise<void>
-  signIn: (login: string, password: string) => Promise<void>
+  signIn: (login: string, password: string, rememberDevice?: boolean) => Promise<void>
   signUp: (input: {
     fullName: string
     email: string
@@ -60,8 +60,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     })
   }, [refreshSession])
 
-  const signIn = useCallback(async (loginName: string, password: string) => {
-    await loginApi(loginName, password)
+  const signIn = useCallback(async (loginName: string, password: string, rememberDevice = false) => {
+    await loginApi(loginName, password, rememberDevice)
     await refreshSession()
   }, [refreshSession])
 

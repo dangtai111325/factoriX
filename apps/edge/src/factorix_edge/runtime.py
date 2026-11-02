@@ -192,7 +192,9 @@ class EdgeRuntime:
             except (ConnectorError, NetworkPolicyError, ModbusPlanError, OSError):
                 continue
             now = _stamp()
-            for field_id, value, quality in samples:
+            for sample in samples:
+                field_id, value, quality = sample[0], sample[1], sample[2]
+                source_time = sample[3] if len(sample) > 3 else None
                 binding = bindings[field_id]
                 coerced, data_quality = _coerce(binding.get("data_type") or "float64", value, quality)
                 event_uid = str(uuid4())
@@ -203,6 +205,8 @@ class EdgeRuntime:
                     "connection_id": str(connection["id"]),
                     "event_time": now,
                     "received_time": now,
+                    "source_time": source_time,
+                    "source_timestamp": source_time,
                     "value": coerced,
                     "data_type": str(binding.get("data_type") or "float64"),
                     "unit": binding.get("unit"),
@@ -301,31 +305,59 @@ class EdgeRuntime:
 
     async def _read_mqtt(self, connection: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str]]:
         topics: list[tuple[str, int]] = []
+        seen: set[str] = set()
         for field in fields:
             address = field.get("address_json") or {}
             topic = str(address.get("topic") or "")
             if not topic and config.get("topics"):
                 topic = str(config["topics"][0])
-            if topic:
-                topics.append((topic, int(address.get("qos") or config.get("qos") or 1)))
+            if topic and topic not in seen:
+                seen.add(topic)
+                qos_raw = address.get("qos")
+                if qos_raw is None:
+                    qos_raw = config.get("qos")
+                try:
+                    qos = int(qos_raw) if qos_raw is not None else 1
+                except (TypeError, ValueError):
+                    qos = 1
+                topics.append((topic, max(0, min(qos, 2))))
+        if not topics and config.get("topics"):
+            for topic in config["topics"]:
+                topics.append((str(topic), int(config.get("qos") or 1)))
         if not topics:
             raise ConnectorError("TOPIC", "Chưa có topic để thu thập.")
         key = str(connection["id"])
         connector = self._mqtt.get(key)
         if connector is None:
             password = await self._mqtt_secret(connection, config)
+            client_id = str(config.get("client_id") or "").strip() or f"fx-{key[:8]}"
             connector = MqttConnector(
                 str(config["host"]),
                 int(config["port"]),
                 self.allowlist,
-                f"fx-{key[:8]}",
+                client_id,
                 username=str(config.get("username") or "") or None,
                 password=password,
+                keepalive=int(config.get("keepalive") or 60),
             )
             connector.start(topics)
             self._mqtt[key] = connector
-        document = connector.next_json(timeout_s=max(int(config.get("timeout_ms") or 2000), 200) / 1000)
-        return _project_json(fields, document)
+        timeout_s = max(int(config.get("timeout_ms") or 2000), 200) / 1000
+        try:
+            messages = connector.drain_latest_by_topic()
+            if not messages:
+                messages = [connector.next_message(timeout_s=timeout_s)]
+        except ConnectorError:
+            return []
+        rows: list[tuple[str, Any, str]] = []
+        for item in messages:
+            topic = str(item.get("topic") or "")
+            document = item.get("payload")
+            source_time = _extract_source_time(document)
+            projected = _project_json_for_topic(fields, document, topic, config)
+            for field_id, value, quality in projected:
+                rows.append((field_id, value, quality, source_time))  # type: ignore[misc]
+        return rows  # type: ignore[return-value]
 
     async def _read_http(self, connection: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str]]:
         path = str((fields[0].get("address_json") or {}).get("path") or config.get("path") or "/")
@@ -440,21 +472,25 @@ class EdgeRuntime:
             by_name["NETWORK"]["status"] = "PASSED"
             password = await self._mqtt_secret(job, config)
             by_name["AUTH"]["status"] = "PASSED" if config.get("username") else "NOT_APPLICABLE"
+            client_id = str(config.get("client_id") or "").strip() or f"fx-test-{uuid4().hex[:8]}"
             connector = MqttConnector(
                 str(config["host"]),
                 int(config["port"]),
                 self.allowlist,
-                f"fx-test-{uuid4().hex[:8]}",
+                client_id,
                 username=str(config.get("username") or "") or None,
                 password=password,
+                keepalive=int(config.get("keepalive") or 60),
             )
-            connector.capture(str(topics[0]), timeout_s=8)
+            sample = connector.capture(str(topics[0]), timeout_s=8)
+            payload = sample.get("payload") if isinstance(sample, dict) else None
             by_name["PROTOCOL"]["status"] = "PASSED"
             by_name["READ_OR_SUBSCRIBE"]["status"] = "PASSED"
-            by_name["DECODE"]["status"] = "PASSED"
-            by_name["MAPPING"]["status"] = "NOT_TESTED"
-            by_name["VALIDATION"]["status"] = "NOT_TESTED"
-            return False
+            by_name["DECODE"]["status"] = "PASSED" if isinstance(payload, dict) else "FAILED"
+            by_name["MAPPING"]["status"] = "PASSED" if isinstance(payload, dict) and payload else "FAILED"
+            by_name["VALIDATION"]["status"] = by_name["MAPPING"]["status"]
+            by_name["DECODE"]["detail"] = f"topic={sample.get('topic') if isinstance(sample, dict) else ''}"
+            return by_name["MAPPING"]["status"] == "PASSED"
         if protocol == "http":
             by_name["NETWORK"]["status"] = "PASSED"
             headers: dict[str, str] = {}
@@ -484,6 +520,35 @@ class EdgeRuntime:
         return payload if isinstance(payload, dict) else {"items": payload}
 
 
+def _mqtt_topic_matches(filter_topic: str, message_topic: str) -> bool:
+    if not filter_topic:
+        return True
+    f_parts = filter_topic.split("/")
+    m_parts = message_topic.split("/")
+    fi = 0
+    mi = 0
+    while fi < len(f_parts):
+        if f_parts[fi] == "#":
+            return fi == len(f_parts) - 1
+        if mi >= len(m_parts):
+            return False
+        if f_parts[fi] != "+" and f_parts[fi] != m_parts[mi]:
+            return False
+        fi += 1
+        mi += 1
+    return mi == len(m_parts)
+
+
+def _extract_source_time(document: Any) -> str | None:
+    if not isinstance(document, dict):
+        return None
+    for key in ("source_timestamp", "timestamp", "source_time", "event_time"):
+        value = document.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _project_json(fields: list[dict[str, Any]], document: Any) -> list[tuple[str, Any, str]]:
     rows: list[tuple[str, Any, str]] = []
     for field in fields:
@@ -491,12 +556,41 @@ def _project_json(fields: list[dict[str, Any]], document: Any) -> list[tuple[str
         expression = str(address.get("jsonpath") or "$")
         try:
             matches = evaluate(expression, document)
-            mapped = apply_cardinality(matches, cardinality="REJECT_MULTI", missing="BAD")
+            mapped = apply_cardinality(matches, cardinality="REJECT_MULTI", missing="OMIT")
         except MappingError:
-            rows.append((str(field["id"]), None, "BAD"))
             continue
-        if mapped.quality_override == "BAD" or not mapped.present:
-            rows.append((str(field["id"]), None, "BAD"))
+        if not mapped.present or mapped.quality_override == "BAD":
+            continue
+        rows.append((str(field["id"]), mapped.value, "GOOD"))
+    return rows
+
+
+def _project_json_for_topic(
+    fields: list[dict[str, Any]],
+    document: Any,
+    message_topic: str,
+    config: dict[str, Any],
+) -> list[tuple[str, Any, str]]:
+    default_topic = ""
+    topics = config.get("topics") or []
+    if topics:
+        default_topic = str(topics[0])
+    rows: list[tuple[str, Any, str]] = []
+    for field in fields:
+        address = field.get("address_json") or {}
+        field_topic = str(address.get("topic") or default_topic or "")
+        if field_topic and not _mqtt_topic_matches(field_topic, message_topic):
+            continue
+        expression = str(address.get("jsonpath") or "$")
+        try:
+            matches = evaluate(expression, document)
+            # Missing field on a matching topic: skip (keep previous), do not emit BAD.
+            mapped = apply_cardinality(matches, cardinality="REJECT_MULTI", missing="OMIT")
+        except MappingError:
+            continue
+        if not mapped.present:
+            continue
+        if mapped.quality_override == "BAD":
             continue
         rows.append((str(field["id"]), mapped.value, "GOOD"))
     return rows

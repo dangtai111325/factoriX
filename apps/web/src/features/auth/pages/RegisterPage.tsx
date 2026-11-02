@@ -1,10 +1,9 @@
 import React, { useMemo, useState } from 'react'
-import { ArrowRight, Check, ChevronRight, Mail, UserRound } from 'lucide-react'
+import { ArrowRight, Check, Mail, UserRound } from 'lucide-react'
 import { Link, Navigate, useNavigate } from 'react-router-dom'
 import { AuthAlert } from '../components/AuthAlert'
 import { AuthField } from '../components/AuthField'
 import { AuthShell } from '../components/AuthShell'
-import { AuthStatusFooter } from '../components/AuthStatusFooter'
 import { PasswordField } from '../components/PasswordField'
 import { useAuth } from '../context/AuthProvider'
 import { mapAuthError } from '../services/authClient'
@@ -75,7 +74,7 @@ export const RegisterPage: React.FC = () => {
     <AuthShell variant="register">
       <div className="text-center">
         <h1 className="text-[28px] sm:text-[32px] font-extrabold text-[#111B37] tracking-tight">
-          Initial setup — create the administrator account
+          Set up this FactoriX appliance
         </h1>
         <p className="mt-2 text-[15px] sm:text-[16px] text-[#657794] max-w-[520px] mx-auto leading-normal">
           This FactoriX appliance has no administrator yet. The first account becomes the appliance administrator and
@@ -175,8 +174,14 @@ export const RegisterPage: React.FC = () => {
               className="w-4 h-4 rounded border-[#D4DFEC] text-[#EF1B24] accent-[#EF1B24] focus:ring-[#EF1B24] cursor-pointer"
             />
             <span>
-              I agree to the <span className="font-semibold text-[#EF1B24]">Terms of Use</span> and{' '}
-              <span className="font-semibold text-[#EF1B24]">Privacy Policy</span>
+              I agree to the{' '}
+              <Link to="/legal/terms" className="font-semibold text-[#EF1B24]">
+                Terms of Use
+              </Link>{' '}
+              and{' '}
+              <Link to="/legal/privacy" className="font-semibold text-[#EF1B24]">
+                Privacy Policy
+              </Link>
             </span>
           </label>
           {errors.terms && (
@@ -192,24 +197,12 @@ export const RegisterPage: React.FC = () => {
         </button>
       </form>
 
-      <div className="my-5 flex items-center gap-3 text-[#94A3B8] text-[13px]">
-        <div className="h-px flex-1 bg-[#E3EAF3]" />
-        or
-        <div className="h-px flex-1 bg-[#E3EAF3]" />
-      </div>
-
-      <Link
-        to="/login"
-        className="w-full min-h-[50px] rounded-[10px] border border-[#E3EAF3] bg-white hover:bg-[#F9FAFC] transition-colors flex items-center justify-center gap-1.5 text-[15px] text-[#334568] no-underline shadow-sm font-normal"
-      >
-        <span>Already have an account?</span>
-        <span className="font-bold text-[#EF1B24] inline-flex items-center gap-0.5">
-          Sign in now
-          <ChevronRight className="w-4 h-4" />
-        </span>
-      </Link>
-
-      <AuthStatusFooter variant="register" />
+      {/* CR-A04: first-run hides Sign in + marketing footer */}
+      <ol className="mt-6 text-[12px] text-[#657794] space-y-1 list-decimal list-inside">
+        <li>Create the administrator</li>
+        <li>Model your first site</li>
+        <li>Enroll the edge collector</li>
+      </ol>
     </AuthShell>
   )
 }

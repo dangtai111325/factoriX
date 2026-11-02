@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain.catalog import CONTAINS_PAIRS, RELATION_TYPES, SYSTEM_TYPES
 from factorix.domain.passwords import PasswordPolicyError, validate_email, validate_login, validate_password
+from factorix.platform.after_commit import queue
 from factorix.platform.mail import ResetMailer
 from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, utcnow
 from factorix.platform.errors import AppError
@@ -56,6 +57,7 @@ class ResetIn(BaseModel):
 class LoginIn(BaseModel):
     login: str
     password: str
+    remember_device: bool = False
 
 
 class PasswordIn(BaseModel):
@@ -63,12 +65,12 @@ class PasswordIn(BaseModel):
     new_password: str
 
 
-def _cookies(response: Response, settings: Settings, session_token: str, csrf_token: str) -> None:
-    max_age = settings.session_ttl_minutes * 60
+def _cookies(response: Response, settings: Settings, session_token: str, csrf_token: str, *, max_age: int | None = None) -> None:
+    age = max_age if max_age is not None else settings.session_ttl_minutes * 60
     response.set_cookie(
         SESSION_COOKIE,
         session_token,
-        max_age=max_age,
+        max_age=age,
         httponly=True,
         secure=settings.secure_cookies,
         samesite="lax",
@@ -77,7 +79,7 @@ def _cookies(response: Response, settings: Settings, session_token: str, csrf_to
     response.set_cookie(
         CSRF_COOKIE,
         csrf_token,
-        max_age=max_age,
+        max_age=age,
         httponly=False,
         secure=settings.secure_cookies,
         samesite="lax",
@@ -205,12 +207,25 @@ def _as_datetime(value: Any) -> datetime:
     return value
 
 
-async def login_admin(session: AsyncSession, settings: Settings, body: LoginIn) -> dict[str, str]:
+def throttle_key(login: str, client_ip: str | None) -> str:
+    """CR-A08: lock by username+IP (stored in login_throttle.login)."""
+    ip = (client_ip or "unknown").strip() or "unknown"
+    return f"{login}|{ip}"
+
+
+async def login_admin(
+    session: AsyncSession,
+    settings: Settings,
+    body: LoginIn,
+    *,
+    client_ip: str | None = None,
+) -> dict[str, str]:
     identifier = body.login.strip()
     by_email = "@" in identifier
     lookup = identifier.lower() if by_email else identifier
+    key = throttle_key(lookup, client_ip)
     now = utcnow()
-    throttle = await _lock_status(session, lookup)
+    throttle = await _lock_status(session, key)
     if throttle and throttle["locked_until"] is not None:
         locked = throttle["locked_until"]
         locked = _as_datetime(locked)
@@ -219,7 +234,7 @@ async def login_admin(session: AsyncSession, settings: Settings, body: LoginIn) 
             raise AppError(
                 429,
                 "LOCKED",
-                "Đăng nhập đang bị tạm khóa.",
+                "Try again in 15 minutes.",
                 retryable=True,
                 extra={"retry_after_seconds": max(seconds, 1)},
             )
@@ -243,12 +258,16 @@ async def login_admin(session: AsyncSession, settings: Settings, body: LoginIn) 
         )
     ok = bool(account and account["disabled_at"] is None and verify_password(account["password_hash"], body.password))
     if not ok:
-        await _record_failure(session, lookup, now)
+        await _record_failure(session, key, now)
         raise AppError(401, "INVALID_CREDENTIALS", "Đăng nhập không thành công.")
+    await execute(session, "DELETE FROM login_throttle WHERE login = :login", {"login": key})
+    # Clear legacy login-only keys from earlier builds.
     await execute(session, "DELETE FROM login_throttle WHERE login = :login", {"login": lookup})
     session_token = new_token()
     csrf_token = new_token()
     session_id = uuid4()
+    # CR-A07: remember device → 30 days; otherwise session TTL (default 8h).
+    ttl_minutes = 30 * 24 * 60 if body.remember_device else settings.session_ttl_minutes
     await execute(
         session,
         """
@@ -260,7 +279,7 @@ async def login_admin(session: AsyncSession, settings: Settings, body: LoginIn) 
             "admin_id": as_uuid(account["id"]),
             "token_hash": hash_token(session_token),
             "csrf_hash": hash_token(csrf_token),
-            "expires_at": now + timedelta(minutes=settings.session_ttl_minutes),
+            "expires_at": now + timedelta(minutes=ttl_minutes),
             "now": now,
         },
     )
@@ -275,7 +294,11 @@ async def login_admin(session: AsyncSession, settings: Settings, body: LoginIn) 
         after={"login": account["login"]},
         correlation_id=uuid4().hex,
     )
-    return {"session_token": session_token, "csrf_token": csrf_token}
+    return {
+        "session_token": session_token,
+        "csrf_token": csrf_token,
+        "ttl_seconds": ttl_minutes * 60,
+    }
 
 
 async def _record_failure(session: AsyncSession, login: str, now: Any) -> None:
@@ -439,11 +462,17 @@ async def request_password_reset(session: AsyncSession, body: ForgotIn, mailer: 
         after={"channel": "email"},
         correlation_id=uuid4().hex,
     )
-    try:
-        mailer.send_code(email, code)
-    except AppError:
-        await execute(session, "DELETE FROM password_reset_codes WHERE id = :id", {"id": code_id})
-        return dict(_ACCEPTED)
+    del mailer
+    queue(
+        session,
+        {
+            "kind": "password_reset_mail",
+            "email": email,
+            "code": code,
+            "admin_id": str(account["id"]),
+            "tenant_id": str(account["tenant_id"]),
+        },
+    )
     return dict(_ACCEPTED)
 
 
@@ -498,6 +527,12 @@ async def confirm_password_reset(session: AsyncSession, body: ResetIn) -> dict[s
         SET consumed_at = :now
         WHERE admin_id = :admin_id AND consumed_at IS NULL
         """,
+        {"now": now, "admin_id": as_uuid(account["id"])},
+    )
+    # CR-A09: password reset revokes that admin's sessions.
+    await execute(
+        session,
+        "UPDATE sessions SET revoked_at = :now WHERE admin_id = :admin_id AND revoked_at IS NULL",
         {"now": now, "admin_id": as_uuid(account["id"])},
     )
     await audit(

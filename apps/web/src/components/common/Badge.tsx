@@ -37,13 +37,18 @@ export const Badge: React.FC<BadgeProps> = ({
   };
 
   const style = variantStyles[variant] || variantStyles.neutral;
+  // CR-R02: badge always shows text (never a naked colored pill).
+  const label =
+    children === null || children === undefined || children === ''
+      ? '—'
+      : children;
 
   return (
     <span
       className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold tracking-wide ${style.bg} ${style.text} ${className}`}
     >
-      {dot && <span className={`w-1.5 h-1.5 rounded-full ${style.dotColor}`} />}
-      <span>{children}</span>
+      {dot && <span className={`w-1.5 h-1.5 rounded-full ${style.dotColor}`} aria-hidden="true" />}
+      <span>{label}</span>
     </span>
   );
 };

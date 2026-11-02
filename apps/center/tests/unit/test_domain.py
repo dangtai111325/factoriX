@@ -244,6 +244,8 @@ def test_sec_002_password_policy() -> None:
         validate_password("admin", "fxadmin")
     with pytest.raises(PasswordPolicyError):
         validate_password("short", "fxadmin")
+    with pytest.raises(PasswordPolicyError):
+        validate_password("Qwerty123456", "fxadmin")
 
 
 def test_arch_001_domain_modules_stay_pure() -> None:

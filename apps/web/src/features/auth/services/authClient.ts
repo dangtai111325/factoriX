@@ -28,6 +28,8 @@ export type AuthStatus = {
   bootstrap_enabled: boolean
   setup_code_required: boolean
   appliance: boolean
+  smtp_configured?: boolean
+  password_recovery_enabled?: boolean
 }
 
 async function authFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -72,10 +74,10 @@ async function authFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const getAuthStatus = () => authFetch<AuthStatus>('/auth/status')
 export const currentUser = () => authFetch<AuthUser>('/auth/me')
-export const login = (loginName: string, password: string) =>
+export const login = (loginName: string, password: string, rememberDevice = false) =>
   authFetch<{ status: string }>('/auth/login', {
     method: 'POST',
-    body: JSON.stringify({ login: loginName, password }),
+    body: JSON.stringify({ login: loginName, password, remember_device: rememberDevice }),
   })
 export const logout = () => authFetch<{ status: string }>('/auth/logout', { method: 'POST' })
 export const bootstrap = (body: {
@@ -119,9 +121,7 @@ export function mapAuthError(error: unknown, fallback: string): string {
     return 'The email/username or password is incorrect.'
   }
   if (item.code === 'LOCKED' || item.status === 429) {
-    return item.retryAfter
-      ? `Too many attempts. Please try again in ${item.retryAfter} seconds.`
-      : 'Too many attempts. Please try again later.'
+    return 'Try again in 15 minutes.'
   }
   if (item.code === 'ADMIN_EXISTS' || item.status === 409) {
     return 'Initial setup has already been completed. Sign in instead.'
