@@ -232,7 +232,7 @@ async def reset_password_link(body: ResetLinkIn, session: AsyncSession = Depends
         {"code_hash": hash_token(body.token.strip())},
     )
     if row is None or not row.get("email"):
-        raise AppError(401, "INVALID_CODE", "Mã không đúng hoặc đã hết hạn.")
+        raise AppError(401, "INVALID_CODE", "Code is incorrect or has expired.")
     return await confirm_password_reset(session, ResetIn(email=str(row["email"]), code=body.token.strip(), new_password=body.new_password))
 
 
@@ -251,7 +251,7 @@ class RevertIn(BaseModel):
 async def revert_zero(body: RevertIn, response: Response, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     del principal
     if body.confirm != "REVERT":
-        raise AppError(422, "CONFIRM", "Gõ đúng REVERT để xóa toàn bộ cài đặt.")
+        raise AppError(422, "CONFIRM", "Type REVERT exactly to wipe this installation.")
     await identity.revert_to_zero(session)
     if settings.data_dir:
         root = Path(settings.data_dir)
@@ -294,7 +294,7 @@ async def change_password(body: PasswordIn, principal: dict[str, Any] = Depends(
 
     account = await fetch_one(session, "SELECT password_hash, login FROM admin_accounts WHERE id = :id", {"id": as_uuid(principal["admin_id"])})
     if account is None or not verify_password(account["password_hash"], body.current_password):
-        raise AppError(401, "INVALID_CREDENTIALS", "Mật khẩu hiện tại không đúng.")
+        raise AppError(401, "INVALID_CREDENTIALS", "Current password is incorrect.")
     validate_password(body.new_password, account["login"])
     from factorix.modules.common import execute
 
@@ -418,7 +418,7 @@ async def validate_hierarchy(view_id: str, principal: dict[str, Any] = Depends(a
     tenant_id, _actor = _ids(principal)
     row = await fetch_one(session, "SELECT level_rules_json FROM hierarchy_views WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(view_id), "tenant_id": tenant_id})
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy mẫu phân cấp.")
+        raise AppError(404, "NOT_FOUND", "Hierarchy template not found.")
     errors = resources.validate_levels(row["level_rules_json"] or [])
     return {"valid": not errors, "errors": errors}
 
@@ -465,7 +465,7 @@ async def connector_types(principal: dict[str, Any] = Depends(admin)) -> dict[st
 async def connector_schema(protocol: str, principal: dict[str, Any] = Depends(admin)) -> dict[str, Any]:
     del principal
     if protocol not in collect.CAPABILITIES:
-        raise AppError(404, "NOT_FOUND", "Không có giao thức này.")
+        raise AppError(404, "NOT_FOUND", "Protocol not found.")
     return {"protocol": protocol, "capabilities": collect.CAPABILITIES[protocol], "can_write": False}
 
 
@@ -493,6 +493,12 @@ async def pause_connection(connection_id: str, request: Request, principal: dict
     return await collect.pause_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
 
 
+@app.delete("/api/v1/connections/{connection_id}")
+async def delete_connection(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.archive_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
+
+
 @app.post("/api/v1/connections/{connection_id}/tests", status_code=202)
 async def commission(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
@@ -504,7 +510,7 @@ async def commission_job(job_id: str, principal: dict[str, Any] = Depends(admin)
     tenant_id, _actor = _ids(principal)
     row = await fetch_one(session, "SELECT id, connection_id, stages_json, status, error_code, diagnostic, started_at, completed_at FROM commissioning_jobs WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(job_id), "tenant_id": tenant_id})
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy phiên kiểm thử.")
+        raise AppError(404, "NOT_FOUND", "Commissioning job not found.")
     status = "COMPLETED" if row["status"] == "PASSED" else row["status"]
     stages = list(row.get("stages_json") or [])
     by_stage = {item.get("stage"): item for item in stages if isinstance(item, dict)}
@@ -599,7 +605,7 @@ async def publish_group(group_id: str, principal: dict[str, Any] = Depends(admin
 
     row = await fetch_one(session, "SELECT id FROM output_groups WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(group_id), "tenant_id": tenant_id})
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy nhóm đầu ra.")
+        raise AppError(404, "NOT_FOUND", "Output group not found.")
     await execute(session, "UPDATE output_groups SET status = 'PUBLISHED', version = version + 1 WHERE id = :id", {"id": parse_uuid(group_id)})
     return {"id": group_id, "status": "PUBLISHED"}
 
@@ -632,7 +638,7 @@ async def enrollment(edge_id: str, request: Request, principal: dict[str, Any] =
 @app.post("/api/v1/edges/{edge_id}/appliance", status_code=201)
 async def appliance_enrollment(edge_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     if not settings.appliance or not settings.data_dir:
-        raise AppError(404, "NOT_FOUND", "Ghi danh trong appliance chưa được bật.")
+        raise AppError(404, "NOT_FOUND", "Appliance enrollment is not enabled.")
     tenant_id, actor = _ids(principal)
     issued = await collect.issue_enrollment(session, tenant_id, parse_uuid(edge_id), actor, correlation_id(request))
     directory = Path(settings.data_dir)
@@ -1015,5 +1021,5 @@ _mount_spa()
 def _time(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        raise AppError(422, "TIMEZONE", "Thời điểm phải có múi giờ.")
+        raise AppError(422, "TIMEZONE", "Timestamps must include a timezone.")
     return parsed.astimezone(timezone.utc)

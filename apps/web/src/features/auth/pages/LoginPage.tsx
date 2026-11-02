@@ -11,13 +11,13 @@ import { mapAuthError } from '../services/authClient'
 import { validateLoginIdentity, validatePasswordRequired } from '../schemas/authSchemas'
 
 export const LoginPage: React.FC = () => {
-  const { isAuthenticated, signIn } = useAuth()
+  const { isAuthenticated, isFirstRun, signIn } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
   const [params] = useSearchParams()
   const [login, setLogin] = useState('')
   const [password, setPassword] = useState('')
-  const [rememberDevice, setRememberDevice] = useState(true)
+  const [rememberDevice, setRememberDevice] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [serverError, setServerError] = useState('')
   const [pending, setPending] = useState(false)
@@ -59,6 +59,11 @@ export const LoginPage: React.FC = () => {
       {params.get('created') === '1' && (
         <div className="mt-6">
           <AuthAlert tone="success">Administrator created. Sign in with your username and password.</AuthAlert>
+        </div>
+      )}
+      {params.get('setup') === 'done' && (
+        <div className="mt-6">
+          <AuthAlert>Setup already completed. Sign in with an existing administrator account.</AuthAlert>
         </div>
       )}
       {params.get('reset') === 'success' && (
@@ -115,16 +120,26 @@ export const LoginPage: React.FC = () => {
         <div className="h-px flex-1 bg-[#E3EAF3]" />
       </div>
 
-      <Link
-        to="/register"
-        className="w-full min-h-[50px] rounded-[10px] border border-[#E3EAF3] bg-white hover:bg-[#F9FAFC] transition-colors flex items-center justify-center gap-1.5 text-[15px] text-[#334568] no-underline shadow-sm font-normal"
-      >
-        <span>Don’t have an account?</span>
-        <span className="font-bold text-[#EF1B24] inline-flex items-center gap-0.5">
-          Sign up now
-          <ChevronRight className="w-4 h-4" />
-        </span>
-      </Link>
+      {isFirstRun ? (
+        <Link
+          to="/register"
+          className="w-full min-h-[50px] rounded-[10px] border border-[#E3EAF3] bg-white hover:bg-[#F9FAFC] transition-colors flex items-center justify-center gap-1.5 text-[15px] text-[#334568] no-underline shadow-sm font-normal"
+        >
+          <span>Don’t have an account?</span>
+          <span className="font-bold text-[#EF1B24] inline-flex items-center gap-0.5">
+            Sign up now
+            <ChevronRight className="w-4 h-4" />
+          </span>
+        </Link>
+      ) : (
+        <div
+          className="w-full min-h-[50px] rounded-[10px] border border-[#E3EAF3] bg-[#F9FAFD] flex items-center justify-center gap-1.5 text-[15px] text-[#94A3B8] shadow-sm font-normal cursor-not-allowed"
+          aria-disabled="true"
+          title="Initial setup already completed"
+        >
+          <span>Setup already completed</span>
+        </div>
+      )}
 
       <AuthStatusFooter variant="login" />
     </AuthShell>

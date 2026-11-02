@@ -135,7 +135,7 @@ async def _owned_edge(session: AsyncSession, tenant_id: UUID, edge_id: UUID) -> 
         {"id": edge_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy Edge.")
+        raise AppError(404, "NOT_FOUND", "Edge not found.")
     row.pop("credential_hash", None)
     return row
 
@@ -193,11 +193,11 @@ async def create_connection(
     config = parse_config(protocol, raw_config)
     edge = await _owned_edge(session, tenant_id, parse_uuid(body.edge_id))
     if str(edge["site_id"]) != body.site_id:
-        raise AppError(422, "SCOPE", "Edge không thuộc site đã chọn.")
+        raise AppError(422, "SCOPE", "Edge does not belong to the selected site.")
     secret_ref = None
     if body.secret_input:
         if len(body.secret_input) > 4096:
-            raise AppError(422, "SECRET", "Bí mật quá dài.")
+            raise AppError(422, "SECRET", "Secret is too long.")
         secret_ref = uuid4()
         await execute(
             session,
@@ -259,7 +259,7 @@ async def get_connection(session: AsyncSession, tenant_id: UUID, connection_id: 
         {"id": connection_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy kết nối.")
+        raise AppError(404, "NOT_FOUND", "Connection not found.")
     row["jobs"] = await fetch_all(
         session,
         "SELECT id, mode, interval_ms, timeout_ms, enabled, version FROM acquisition_jobs WHERE connection_id = :id",
@@ -319,13 +319,13 @@ async def bulk_signals(
     correlation_id: str,
 ) -> dict[str, Any]:
     if not body.items or len(body.items) > 500:
-        raise AppError(422, "LIMIT", "Mỗi lần tạo từ 1 đến 500 tín hiệu.")
+        raise AppError(422, "LIMIT", "Create between 1 and 500 signals at a time.")
     resource_id = parse_uuid(body.resource_id)
     resource = await fetch_one(session, "SELECT id, archived_at FROM resources WHERE id = :id AND tenant_id = :tenant_id", {"id": resource_id, "tenant_id": tenant_id})
     if resource is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy tài nguyên.")
+        raise AppError(404, "NOT_FOUND", "Resource not found.")
     if resource["archived_at"] is not None:
-        raise AppError(409, "ARCHIVED", "Không thêm tín hiệu vào tài nguyên đã lưu trữ.")
+        raise AppError(409, "ARCHIVED", "Cannot add signals to an archived resource.")
     errors: list[dict[str, str]] = []
     prepared: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -351,7 +351,7 @@ async def bulk_signals(
         dumped["data_type"] = data_type
         prepared.append(dumped)
     if errors and body.atomic:
-        raise AppError(422, "BULK_REJECTED", "Không tạo tín hiệu nào vì có dòng lỗi.", field_errors=errors)
+        raise AppError(422, "BULK_REJECTED", "No signals were created because some rows have errors.", field_errors=errors)
     created: list[str] = []
     now = utcnow()
     for item in prepared:
@@ -454,7 +454,7 @@ async def _signal(session: AsyncSession, tenant_id: UUID, signal_id: UUID) -> di
         {"id": signal_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy tín hiệu.")
+        raise AppError(404, "NOT_FOUND", "Signal not found.")
     return row
 
 
@@ -525,7 +525,7 @@ async def save_formula(session: AsyncSession, tenant_id: UUID, actor: UUID, body
         await _signal(session, tenant_id, signal_id)
     else:
         if not body.resource_id or not body.key or not body.display_name:
-            raise AppError(422, "SIGNAL", "Cần resource, key và tên cho tín hiệu tính toán.")
+            raise AppError(422, "SIGNAL", "Calculated signals require a resource, key, and name.")
         signal_id = uuid4()
         now = utcnow()
         await execute(
@@ -600,7 +600,7 @@ async def publish_formula(session: AsyncSession, tenant_id: UUID, actor: UUID, f
         {"id": formula_id, "tenant_id": tenant_id},
     )
     if formula is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy công thức.")
+        raise AppError(404, "NOT_FOUND", "Formula not found.")
     graph = await _formula_graph(session, tenant_id)
     deps = await fetch_all(
         session,
@@ -658,10 +658,10 @@ def preview_formula(body: PreviewIn) -> dict[str, Any]:
 async def create_output_group(session: AsyncSession, tenant_id: UUID, actor: UUID, body: OutputGroupIn, correlation_id: str) -> dict[str, Any]:
     resource = await fetch_one(session, "SELECT id, code, name FROM resources WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(body.resource_id), "tenant_id": tenant_id})
     if resource is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy tài nguyên.")
+        raise AppError(404, "NOT_FOUND", "Resource not found.")
     aliases = [str(member["alias"]) for member in body.members]
     if len(aliases) != len(set(aliases)):
-        raise AppError(422, "ALIAS", "Alias trong nhóm bị trùng.")
+        raise AppError(422, "ALIAS", "Duplicate alias in the output group.")
     try:
         render_topic(body.topic_template, {"enterprise": "e", "site": "s", "plant": "p", "zone": None, "line": None, "resource": resource["code"], "group": body.key})
     except TopicError as exc:
@@ -711,7 +711,7 @@ async def preview_output_group(session: AsyncSession, tenant_id: UUID, group_id:
         {"id": group_id, "tenant_id": tenant_id},
     )
     if group is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy nhóm đầu ra.")
+        raise AppError(404, "NOT_FOUND", "Output group not found.")
     members = await fetch_all(
         session,
         """
@@ -874,6 +874,13 @@ async def publish_release(session: AsyncSession, tenant_id: UUID, actor: UUID, b
 
 async def request_commission(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str) -> dict[str, Any]:
     connection = await get_connection(session, tenant_id, connection_id)
+    edge = await _owned_edge(session, tenant_id, as_uuid(connection["edge_id"]))
+    if edge.get("enrollment_status") != "ENROLLED":
+        raise AppError(
+            409,
+            "EDGE_NOT_ENROLLED",
+            "No enrolled collector for this site. Enroll the Edge first.",
+        )
     stages = [
         {"stage": name, "status": "PENDING", "duration_ms": None, "detail": ""}
         for name in ("NETWORK", "AUTH", "PROTOCOL", "READ_OR_SUBSCRIBE", "DECODE", "MAPPING", "VALIDATION")
@@ -892,3 +899,32 @@ async def request_commission(session: AsyncSession, tenant_id: UUID, actor: UUID
     )
     await audit(session, tenant_id=tenant_id, event_type="COMMISSION_REQUEST", actor_id=actor, entity_type="connection", entity_id=connection_id, before=None, after={"job_id": str(job_id), "protocol": connection["protocol"]}, correlation_id=correlation_id)
     return {"job_id": str(job_id), "status": "PENDING"}
+
+
+async def archive_connection(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str) -> dict[str, Any]:
+    current = await get_connection(session, tenant_id, connection_id)
+    if current["status"] == "ARCHIVED":
+        raise AppError(409, "ARCHIVED", "Connection is already archived.")
+    if current["status"] not in {"DRAFT", "PAUSED"}:
+        raise AppError(
+            409,
+            "CONNECTION_IN_USE",
+            "Only draft or paused connections can be archived. Pause the connection first.",
+        )
+    await execute(
+        session,
+        "UPDATE connections SET status = 'ARCHIVED', health = 'UNKNOWN', version = version + 1, updated_at = :now WHERE id = :id",
+        {"now": utcnow(), "id": connection_id},
+    )
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="CONNECTION_ARCHIVE",
+        actor_id=actor,
+        entity_type="connection",
+        entity_id=connection_id,
+        before={"status": current["status"]},
+        after={"status": "ARCHIVED"},
+        correlation_id=correlation_id,
+    )
+    return {"id": str(connection_id), "status": "ARCHIVED"}

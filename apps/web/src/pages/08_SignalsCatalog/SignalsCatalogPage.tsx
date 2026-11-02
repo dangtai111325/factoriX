@@ -90,7 +90,7 @@ export const SignalsCatalogPage: React.FC = () => {
   };
 
   const handleDeleteSelected = () => {
-    setToastMsg('Signal delete is not available in this appliance build. Use Revert To Zero to clear the model.');
+    setToastMsg('Signal delete is not available in this appliance build. Archive the parent connection or resource instead.');
     setTimeout(() => setToastMsg(null), 5000);
   };
 
@@ -270,7 +270,10 @@ export const SignalsCatalogPage: React.FC = () => {
                           <span className="font-normal text-[11px] text-[#657794]">{sig.unit}</span>
                         </td>
                         <td className="w-24">
-                          <MicroSparkline value={Number(sig.currentValue) || 45} quality={sig.quality} />
+                          <MicroSparkline
+                            value={Number.isFinite(Number(sig.currentValue)) ? Number(sig.currentValue) : 0}
+                            quality={sig.quality}
+                          />
                         </td>
                         <td>
                           <Badge variant={sig.quality === 'GOOD' ? 'good' : 'warning'}>{sig.quality}</Badge>
@@ -287,14 +290,20 @@ export const SignalsCatalogPage: React.FC = () => {
             <div className="px-5 py-3 border-t border-[#E3EAF3] bg-[#F9FAFD] flex items-center justify-between text-[12px] text-[#657794]">
               <span>
                 Showing <strong className="text-[#111B37]">{filteredSignals.length}</strong> of{' '}
-                <strong className="text-[#111B37]">1,428</strong> collected signals
+                <strong className="text-[#111B37]">{signals.length}</strong> collected signals
               </span>
               <div className="flex items-center gap-3">
-                <span className="text-[#0DBA67] font-bold">1,406 Good</span>
+                <span className="text-[#0DBA67] font-bold">
+                  {signals.filter((s) => s.quality === 'GOOD').length} Good
+                </span>
                 <span>·</span>
-                <span className="text-[#FFAA23] font-bold">18 Stale</span>
+                <span className="text-[#FFAA23] font-bold">
+                  {signals.filter((s) => s.quality === 'STALE' || s.quality === 'UNCERTAIN').length} Stale
+                </span>
                 <span>·</span>
-                <span className="text-[#F2343B] font-bold">4 Bad</span>
+                <span className="text-[#F2343B] font-bold">
+                  {signals.filter((s) => s.quality === 'BAD').length} Bad
+                </span>
               </div>
             </div>
           </Card>

@@ -94,7 +94,7 @@ async def bootstrap_admin(session: AsyncSession, body: BootstrapIn, *, actor_ip_
     del actor_ip_note
     existing = await fetch_one(session, "SELECT id FROM admin_accounts WHERE disabled_at IS NULL LIMIT 1", {})
     if existing:
-        raise AppError(409, "ADMIN_EXISTS", "Đã có quản trị viên. Không khởi tạo lại.")
+        raise AppError(409, "ADMIN_EXISTS", "An administrator already exists. Bootstrap cannot run again.")
     login = validate_login(body.login)
     email = validate_email(body.email)
     validate_password(body.password, login)
@@ -346,7 +346,7 @@ async def principal_from_token(session: AsyncSession, token: str | None) -> dict
 
 def assert_csrf(header_token: str | None, csrf_hash: str) -> None:
     if not header_token or not tokens_equal(csrf_hash, header_token):
-        raise AppError(403, "CSRF", "Thiếu hoặc sai mã CSRF.")
+        raise AppError(403, "CSRF", "Missing or invalid CSRF token.")
 
 
 async def execute_logout(session: AsyncSession, session_id: UUID) -> None:
@@ -451,7 +451,7 @@ async def confirm_password_reset(session: AsyncSession, body: ResetIn) -> dict[s
     try:
         email = validate_email(body.email)
     except PasswordPolicyError as exc:
-        raise AppError(401, "INVALID_CODE", "Mã không đúng hoặc đã hết hạn.") from exc
+        raise AppError(401, "INVALID_CODE", "Code is incorrect or has expired.") from exc
     account = await fetch_one(
         session,
         """
@@ -461,7 +461,7 @@ async def confirm_password_reset(session: AsyncSession, body: ResetIn) -> dict[s
         {"email": email},
     )
     if account is None or account["disabled_at"] is not None:
-        raise AppError(401, "INVALID_CODE", "Mã không đúng hoặc đã hết hạn.")
+        raise AppError(401, "INVALID_CODE", "Code is incorrect or has expired.")
     now = utcnow()
     row = await fetch_one(
         session,
@@ -481,7 +481,7 @@ async def confirm_password_reset(session: AsyncSession, body: ResetIn) -> dict[s
     if not matched:
         if row is not None and not expired and not exhausted and code.isdigit() and len(code) == 6:
             await _note_reset_failure(as_uuid(row["id"]))
-        raise AppError(401, "INVALID_CODE", "Mã không đúng hoặc đã hết hạn.")
+        raise AppError(401, "INVALID_CODE", "Code is incorrect or has expired.")
     try:
         validate_password(body.new_password, str(account["login"]))
     except PasswordPolicyError as exc:
@@ -536,7 +536,7 @@ def require_bootstrap_token(settings: Settings, presented: str | None) -> None:
     import hmac
 
     if not hmac.compare_digest(expected, presented):
-        raise AppError(403, "BOOTSTRAP_DENIED", "Mã khởi tạo không đúng.")
+        raise AppError(403, "BOOTSTRAP_DENIED", "Setup code is incorrect.")
 
 
 def safe_settings_view() -> dict[str, Any]:

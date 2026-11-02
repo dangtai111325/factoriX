@@ -110,7 +110,7 @@ export const ActivityLogPage: React.FC = () => {
             placeholder="Search events, sources, codes..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            className="fx-input pl-9 h-9 text-[13px]"
+            className="fx-input !pl-9 h-9 text-[13px]"
           />
         </div>
       </div>

@@ -33,7 +33,7 @@ class SmtpMailer:
     def send_code(self, recipient: str, code: str) -> None:
         password = self.settings.smtp_password.replace(" ", "")
         if not password or not self.settings.smtp_from or not self.settings.smtp_user:
-            raise AppError(503, "MAIL_UNAVAILABLE", "Không gửi được mã.")
+            raise AppError(503, "MAIL_UNAVAILABLE", "Could not send the code.")
         mail = self.message(recipient, code)
         try:
             with smtplib.SMTP(self.settings.smtp_host, self.settings.smtp_port, timeout=20) as smtp:
@@ -43,4 +43,4 @@ class SmtpMailer:
         except AppError:
             raise
         except Exception:
-            raise AppError(503, "MAIL_UNAVAILABLE", "Không gửi được mã.") from None
+            raise AppError(503, "MAIL_UNAVAILABLE", "Could not send the code.") from None

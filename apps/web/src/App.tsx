@@ -25,6 +25,7 @@ import { LiveOperationsPage } from './pages/10_LiveOperations/LiveOperationsPage
 import { DiagnosticsPage } from './pages/11_Diagnostics/DiagnosticsPage';
 import { ActivityLogPage } from './pages/12_ActivityLog/ActivityLogPage';
 import { OutputGroupsPage } from './pages/13_OutputGroups/OutputGroupsPage';
+import { EdgesPage } from './pages/16_Edges/EdgesPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
 
 const ProtectedAppShell: React.FC = () => (
@@ -42,6 +43,7 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/factory/layout" element={<FactoryLayoutPage />} />
               <Route path="/factory/graph" element={<KnowledgeGraphPage />} />
               <Route path="/acquisition/connections" element={<ConnectionsPage />} />
+              <Route path="/acquisition/edges" element={<EdgesPage />} />
               <Route path="/acquisition/add-data" element={<AddDataWizardPage />} />
               <Route path="/acquisition/studio/opcua" element={<ComingSoonPage />} />
               <Route path="/signals" element={<SignalsCatalogPage />} />

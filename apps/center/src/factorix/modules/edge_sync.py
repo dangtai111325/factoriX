@@ -25,7 +25,7 @@ async def enroll(session: AsyncSession, enrollment_token: str) -> dict[str, str]
         {"token_hash": hash_token(enrollment_token)},
     )
     if row is None or row["used_at"] is not None or row["expires_at"] <= utcnow():
-        raise AppError(401, "ENROLLMENT", "Mã tham gia Edge không hợp lệ hoặc đã dùng.")
+        raise AppError(401, "ENROLLMENT", "Edge enrollment token is invalid or already used.")
     credential = new_token()
     await execute(
         session,
@@ -46,7 +46,7 @@ async def enroll(session: AsyncSession, enrollment_token: str) -> dict[str, str]
 
 async def edge_principal(session: AsyncSession, credential: str | None) -> dict[str, Any]:
     if not credential:
-        raise AppError(401, "UNAUTHENTICATED", "Thiếu credential Edge.")
+        raise AppError(401, "UNAUTHENTICATED", "Missing Edge credential.")
     row = await fetch_one(
         session,
         """
@@ -56,7 +56,7 @@ async def edge_principal(session: AsyncSession, credential: str | None) -> dict[
         {"credential_hash": hash_token(credential)},
     )
     if row is None or row["enrollment_status"] != "ENROLLED":
-        raise AppError(401, "UNAUTHENTICATED", "Credential Edge không hợp lệ.")
+        raise AppError(401, "UNAUTHENTICATED", "Invalid Edge credential.")
     return row
 
 
@@ -188,7 +188,7 @@ async def finish_command(session: AsyncSession, edge: dict[str, Any], job_id: UU
         {"id": job_id, "edge_id": as_uuid(edge["id"])},
     )
     if job is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy lệnh kiểm thử.")
+        raise AppError(404, "NOT_FOUND", "Commissioning command not found.")
     status = body.get("status")
     if status not in {"PASSED", "FAILED", "CANCELLED"}:
         raise AppError(422, "STATE", "Kết quả kiểm thử không hợp lệ.")
@@ -223,5 +223,5 @@ async def read_secret(session: AsyncSession, edge: dict[str, Any], secret_id: UU
         {"id": secret_id, "edge_id": as_uuid(edge["id"]), "tenant_id": as_uuid(edge["tenant_id"])},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy bí mật của Edge này.")
+        raise AppError(404, "NOT_FOUND", "Secret for this Edge was not found.")
     return {"secret": decrypt_secret(data_key, row["ciphertext"])}

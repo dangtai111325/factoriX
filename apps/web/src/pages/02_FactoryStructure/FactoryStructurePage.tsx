@@ -1,24 +1,18 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Plus,
-  Upload,
-  Download,
   Search,
   Building2,
-  Building,
   Factory,
   Boxes,
   Cpu,
   ChevronRight,
   ChevronDown,
   Activity,
-  Edit2,
-  Trash2,
   ArrowRightLeft,
   Copy,
   Archive,
   Layers,
-  FolderTree,
 } from 'lucide-react';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
@@ -28,56 +22,284 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ResourceNode } from '../../types';
 import { AddResourceModal } from '../../components/modals/AddResourceModal';
 import { MoveResourceModal } from '../../components/modals/MoveResourceModal';
+import { translateApiError } from '../../utils/apiErrors';
+import {
+  allowedChildTypes,
+  ancestorPath,
+  buildResourceTree,
+  childrenOf,
+  filterResourcesWithAncestors,
+  hasChildren,
+  HierarchyTreeNode,
+} from '../../utils/resourceHierarchy';
+
+function titleCaseType(type: string): string {
+  return type.charAt(0).toUpperCase() + type.slice(1);
+}
+
+function getIconForType(type: string) {
+  switch (type.toLowerCase()) {
+    case 'enterprise':
+    case 'site':
+      return <Building2 className="w-4 h-4 text-[#2A82E7]" />;
+    case 'plant':
+      return <Factory className="w-4 h-4 text-[#8858EA]" />;
+    case 'line':
+    case 'zone':
+    case 'workshop':
+      return <Boxes className="w-4 h-4 text-[#FFAA23]" />;
+    default:
+      return <Cpu className="w-4 h-4 text-[#EF1B24]" />;
+  }
+}
+
+function statusPresentation(status?: string): {
+  label: string;
+  variant: 'good' | 'warning' | 'error' | 'neutral';
+} {
+  switch (status) {
+    case 'running':
+      return { label: 'RUNNING', variant: 'good' };
+    case 'offline':
+      return { label: 'OFFLINE', variant: 'error' };
+    case 'warning':
+      return { label: 'WARNING', variant: 'warning' };
+    default:
+      return { label: 'NO DATA', variant: 'neutral' };
+  }
+}
+
+/** Fill missing childrenCount / signalsCount from the live graph. */
+function enrichResourceCounts(
+  resources: ResourceNode[],
+  signals: Array<{ resourceId: string }>,
+): ResourceNode[] {
+  const childCounts = new Map<string, number>();
+  const signalCounts = new Map<string, number>();
+
+  for (const resource of resources) {
+    if (!resource.parentId) continue;
+    childCounts.set(resource.parentId, (childCounts.get(resource.parentId) || 0) + 1);
+  }
+  for (const signal of signals) {
+    if (!signal.resourceId) continue;
+    signalCounts.set(signal.resourceId, (signalCounts.get(signal.resourceId) || 0) + 1);
+  }
+
+  return resources.map((resource) => ({
+    ...resource,
+    childrenCount: resource.childrenCount ?? childCounts.get(resource.id) ?? 0,
+    signalsCount: resource.signalsCount ?? signalCounts.get(resource.id) ?? 0,
+  }));
+}
+
+interface TreeRowProps {
+  node: HierarchyTreeNode;
+  depth: number;
+  selectedId: string;
+  expandedNodes: Record<string, boolean>;
+  onToggle: (id: string) => void;
+  onSelect: (id: string) => void;
+  onKeyNavigate: (event: React.KeyboardEvent, node: HierarchyTreeNode) => void;
+}
+
+const TreeRow: React.FC<TreeRowProps> = ({
+  node,
+  depth,
+  selectedId,
+  expandedNodes,
+  onToggle,
+  onSelect,
+  onKeyNavigate,
+}) => {
+  const { resource, children } = node;
+  const isSelected = resource.id === selectedId;
+  const hasKids = children.length > 0;
+  const isExpanded = expandedNodes[resource.id] ?? true;
+  const signalCount = resource.signalsCount ?? 0;
+
+  return (
+    <>
+      <div
+        role="treeitem"
+        aria-label={`${resource.name}, ${signalCount} bound signals`}
+        aria-expanded={hasKids ? isExpanded : undefined}
+        aria-selected={isSelected}
+        tabIndex={isSelected ? 0 : -1}
+        style={{ paddingLeft: `${depth * 14 + 8}px` }}
+        className={`flex items-center justify-between py-1.5 px-2 rounded-lg cursor-pointer text-[13px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[#EF1B24]/40 ${
+          isSelected
+            ? 'bg-[#FFF0F1] text-[#EF1B24] font-bold border-l-2 border-[#EF1B24]'
+            : 'text-[#334568] hover:bg-[#F1F5FA]'
+        }`}
+        onClick={() => onSelect(resource.id)}
+        onKeyDown={(event) => onKeyNavigate(event, node)}
+      >
+        <div className="flex items-center gap-2 truncate min-w-0">
+          {hasKids ? (
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-label={isExpanded ? 'Collapse' : 'Expand'}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggle(resource.id);
+              }}
+              className="p-0.5 text-[#94A3B8] hover:text-[#111B37] flex-shrink-0"
+            >
+              {isExpanded ? (
+                <ChevronDown className="w-3.5 h-3.5" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5" />
+              )}
+            </button>
+          ) : (
+            <span className="w-4 flex-shrink-0" />
+          )}
+          {getIconForType(resource.type)}
+          <span className="truncate">{resource.name}</span>
+        </div>
+        <span className="text-[11px] font-mono text-[#94A3B8] ml-2 flex-shrink-0" aria-hidden="true">
+          {signalCount}
+        </span>
+      </div>
+      {children.length > 0 && isExpanded ? (
+        <div role="group">
+          {children.map((child) => (
+            <TreeRow
+              key={child.resource.id}
+              node={child}
+              depth={depth + 1}
+              selectedId={selectedId}
+              expandedNodes={expandedNodes}
+              onToggle={onToggle}
+              onSelect={onSelect}
+              onKeyNavigate={onKeyNavigate}
+            />
+          ))}
+        </div>
+      ) : null}
+    </>
+  );
+};
 
 export const FactoryStructurePage: React.FC = () => {
-  const { resources, activities, selectedResourceId, setSelectedResourceId, addResource, moveResource } = useApp();
+  const {
+    resources: rawResources,
+    signals,
+    activities,
+    selectedResourceId,
+    setSelectedResourceId,
+    addResource,
+    moveResource,
+    archiveResource,
+  } = useApp();
   const [searchParams] = useSearchParams();
   const [searchTerm, setSearchTerm] = useState('');
-  const [moveToast, setMoveToast] = useState<{ message: string; undoParentId?: string } | null>(null);
-  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({
-    'res-ent-01': true,
-    'res-site-01': true,
-    'res-plant-01': true,
-    'res-line-01': true,
-  });
+  const [moveToast, setMoveToast] = useState<{
+    message: string;
+    undoParentId?: string;
+    linkTo?: string;
+  } | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
+  const [expandedInitialized, setExpandedInitialized] = useState(false);
 
-  // Modal states (supports query param deep-linking)
   const [isAddModalOpen, setIsAddModalOpen] = useState(searchParams.get('modal') === 'add');
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
 
   const navigate = useNavigate();
 
+  const resources = useMemo(
+    () => enrichResourceCounts(rawResources, signals),
+    [rawResources, signals],
+  );
+
+  const visibleResources = useMemo(
+    () => filterResourcesWithAncestors(resources, searchTerm),
+    [resources, searchTerm],
+  );
+
+  const tree = useMemo(() => buildResourceTree(visibleResources), [visibleResources]);
+
+  const flatVisibleOrder = useMemo(() => {
+    const order: HierarchyTreeNode[] = [];
+    const walk = (nodes: HierarchyTreeNode[]) => {
+      for (const node of nodes) {
+        order.push(node);
+        const expanded = expandedNodes[node.resource.id] ?? true;
+        if (expanded && node.children.length) walk(node.children);
+      }
+    };
+    walk(tree);
+    return order;
+  }, [tree, expandedNodes]);
+
+  // Default-expand all parents once resources load
+  useEffect(() => {
+    if (!resources.length || expandedInitialized) return;
+    const next: Record<string, boolean> = {};
+    for (const r of resources) {
+      if (hasChildren(resources, r.id)) next[r.id] = true;
+    }
+    setExpandedNodes(next);
+    setExpandedInitialized(true);
+  }, [resources, expandedInitialized]);
+
+  // Expand path to deep-linked resource
   useEffect(() => {
     const resourceId = searchParams.get('resourceId');
     if (resourceId && resources.some((item) => item.id === resourceId)) {
       setSelectedResourceId(resourceId);
-      setExpandedNodes((prev) => ({ ...prev, [resourceId]: true }));
     }
   }, [resources, searchParams, setSelectedResourceId]);
 
-  const toggleExpand = (id: string) => {
-    setExpandedNodes((prev) => ({ ...prev, [id]: !prev[id] }));
-  };
+  // Keep ancestors of the selected node expanded so it stays visible
+  useEffect(() => {
+    const focusId = selectedResourceId || resources[0]?.id;
+    if (!focusId) return;
+    const path = ancestorPath(resources, focusId);
+    if (path.length < 2) return;
+    setExpandedNodes((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const id of path.slice(0, -1)) {
+        if (next[id] !== true) {
+          next[id] = true;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [selectedResourceId, resources]);
+
+  // While filtering, keep ancestors expanded
+  useEffect(() => {
+    if (!searchTerm.trim()) return;
+    setExpandedNodes((prev) => {
+      const next = { ...prev };
+      for (const r of visibleResources) {
+        if (hasChildren(visibleResources, r.id)) next[r.id] = true;
+      }
+      return next;
+    });
+  }, [searchTerm, visibleResources]);
+
+  const toggleExpand = useCallback((id: string) => {
+    setExpandedNodes((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
+  }, []);
 
   const selectedResource =
     resources.find((r) => r.id === selectedResourceId) || resources[0];
+  const selectedStatus = statusPresentation(selectedResource?.status);
 
-  const getIconForType = (type: string) => {
-    switch (type.toLowerCase()) {
-      case 'enterprise':
-      case 'site':
-        return <Building2 className="w-4 h-4 text-[#2A82E7]" />;
-      case 'plant':
-        return <Factory className="w-4 h-4 text-[#8858EA]" />;
-      case 'line':
-      case 'zone':
-        return <Boxes className="w-4 h-4 text-[#FFAA23]" />;
-      default:
-        return <Cpu className="w-4 h-4 text-[#EF1B24]" />;
-    }
-  };
+  const childResources = selectedResource
+    ? childrenOf(resources, selectedResource.id)
+    : [];
 
-  const childResources = selectedResource ? resources.filter((r) => r.parentId === selectedResource.id) : [];
+  const canArchive = selectedResource
+    ? !hasChildren(resources, selectedResource.id)
+    : false;
 
   const canonicalPath = (() => {
     if (!selectedResource) return '';
@@ -96,6 +318,10 @@ export const FactoryStructurePage: React.FC = () => {
     ([key]) => key !== 'siteId' && key !== 'version',
   );
 
+  const allowedTypesForSelected = selectedResource
+    ? allowedChildTypes(selectedResource.type).map(titleCaseType)
+    : ['Enterprise'];
+
   const handleCreateResource = async (data: {
     name: string;
     type: string;
@@ -103,48 +329,128 @@ export const FactoryStructurePage: React.FC = () => {
     description: string;
     properties: Record<string, string>;
   }) => {
-    await addResource({
-      name: data.name,
-      parentId: selectedResource?.id,
-      type: (data.type.toLowerCase() || 'enterprise') as ResourceNode['type'],
-      description: data.description,
-      attributes: data.properties,
-    });
-  };
-
-  const handleMoveResource = async (targetParentId: string) => {
-    if (!selectedResource) return;
-    const oldParentId = selectedResource.parentId;
-    const res = await moveResource(selectedResource.id, targetParentId);
-    if (!res.success) {
-      alert(`Cannot move resource: ${res.error}`);
-    } else {
-      setExpandedNodes((prev) => ({ ...prev, [targetParentId]: true }));
-      setMoveToast({
-        message: `Successfully moved "${selectedResource.name}"`,
-        undoParentId: oldParentId,
+    setPageError(null);
+    try {
+      const result = await addResource({
+        name: data.name,
+        parentId: selectedResource?.id,
+        type: (data.type.toLowerCase() || 'enterprise') as ResourceNode['type'],
+        description: data.description,
+        attributes: data.properties,
       });
-      setTimeout(() => setMoveToast(null), 5000);
+      if (result?.edgeCreated) {
+        setMoveToast({
+          message: `Edge "${result.edgeName || 'collector'}" was created and needs enrollment before commissioning.`,
+          linkTo: '/acquisition/edges',
+        });
+        setTimeout(() => setMoveToast(null), 8000);
+      }
+    } catch (caught) {
+      throw new Error(translateApiError(caught));
     }
   };
 
+  const handleMoveResource = async (targetParentId: string) => {
+    if (!selectedResource) return { success: false, error: 'No resource selected.' };
+    const oldParentId = selectedResource.parentId;
+    const res = await moveResource(selectedResource.id, targetParentId);
+    if (!res.success) {
+      return { success: false, error: translateApiError(res.error || 'Move failed') };
+    }
+    setExpandedNodes((prev) => ({ ...prev, [targetParentId]: true }));
+    setMoveToast({
+      message: `Successfully moved "${selectedResource.name}"`,
+      undoParentId: oldParentId,
+    });
+    setTimeout(() => setMoveToast(null), 5000);
+    setPageError(null);
+    return { success: true };
+  };
+
   const handleUndoMove = () => {
-    if (moveToast?.undoParentId) {
-      moveResource(selectedResource.id, moveToast.undoParentId);
+    if (moveToast?.undoParentId && selectedResource) {
+      void moveResource(selectedResource.id, moveToast.undoParentId);
       setMoveToast(null);
     }
   };
 
-  const filteredResources = resources.filter((r) =>
-    r.name.toLowerCase().includes(searchTerm.toLowerCase())
+  const handleArchive = async () => {
+    if (!selectedResource) return;
+    if (!canArchive) {
+      setPageError('Archive child resources first.');
+      return;
+    }
+    setPageError(null);
+    const res = await archiveResource(selectedResource.id);
+    if (!res.success) {
+      setPageError(translateApiError(res.error || 'Archive failed'));
+    }
+  };
+
+  const handleTreeKeyNavigate = useCallback(
+    (event: React.KeyboardEvent, node: HierarchyTreeNode) => {
+      const { resource, children } = node;
+      const expanded = expandedNodes[resource.id] ?? true;
+      const index = flatVisibleOrder.findIndex((n) => n.resource.id === resource.id);
+
+      if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        if (children.length && !expanded) {
+          toggleExpand(resource.id);
+        } else if (children.length && expanded) {
+          setSelectedResourceId(children[0].resource.id);
+        }
+        return;
+      }
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        if (children.length && expanded) {
+          toggleExpand(resource.id);
+        } else if (resource.parentId) {
+          setSelectedResourceId(resource.parentId);
+        }
+        return;
+      }
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        const next = flatVisibleOrder[index + 1];
+        if (next) setSelectedResourceId(next.resource.id);
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        const prev = flatVisibleOrder[index - 1];
+        if (prev) setSelectedResourceId(prev.resource.id);
+        return;
+      }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        setSelectedResourceId(resource.id);
+      }
+    },
+    [expandedNodes, flatVisibleOrder, setSelectedResourceId, toggleExpand],
   );
 
   if (!selectedResource) {
     return (
       <div className="space-y-4">
         <h1 className="fx-page-title">Factory Structure</h1>
-        <p className="fx-page-subtitle">The model is empty. Create an enterprise, then a site, plant, line and machine. Each step is checked by the server.</p>
-        <Button variant="primary" icon={<Plus className="w-4 h-4" />} onClick={() => setIsAddModalOpen(true)}>Create enterprise</Button>
+        <p className="fx-page-subtitle">
+          The model is empty. Create an enterprise, then a site, plant, line and machine. Each step
+          is checked by the server.
+        </p>
+        {pageError && (
+          <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            {pageError}
+          </p>
+        )}
+        <Button
+          variant="primary"
+          icon={<Plus className="w-4 h-4" />}
+          onClick={() => setIsAddModalOpen(true)}
+        >
+          Create enterprise
+        </Button>
         <AddResourceModal
           isOpen={isAddModalOpen}
           onClose={() => setIsAddModalOpen(false)}
@@ -174,13 +480,14 @@ export const FactoryStructurePage: React.FC = () => {
               placeholder="Filter hierarchy..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="fx-input pl-9 h-9 text-[13px]"
+              className="fx-input !pl-9 h-9 text-[13px]"
             />
           </div>
           <Button
             variant="primary"
             icon={<Plus className="w-4 h-4" />}
             onClick={() => setIsAddModalOpen(true)}
+            disabled={allowedTypesForSelected.length === 0}
           >
             Add Resource
           </Button>
@@ -202,13 +509,24 @@ export const FactoryStructurePage: React.FC = () => {
           <Button
             variant="secondary"
             icon={<Archive className="w-4 h-4" />}
-            disabled
-            title="Archive is not available in this appliance build"
+            onClick={() => void handleArchive()}
+            disabled={!canArchive}
+            title={
+              canArchive
+                ? 'Archive this resource'
+                : 'Archive child resources first before archiving this node'
+            }
           >
             Archive
           </Button>
         </div>
       </div>
+
+      {pageError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {pageError}
+        </div>
+      )}
 
       {/* 3-Column Layout: Hierarchy Tree, Child Units, and Detail Inspector */}
       <div className="grid grid-cols-12 gap-3.5">
@@ -220,65 +538,26 @@ export const FactoryStructurePage: React.FC = () => {
                 Hierarchy Tree
               </span>
               <span className="text-[11px] font-semibold text-[#657794]">
-                {filteredResources.length} nodes
+                {visibleResources.length} nodes
               </span>
             </div>
-            <div className="p-3 overflow-y-auto flex-1 space-y-1">
-              {filteredResources.map((res) => {
-                const isSelected = res.id === selectedResourceId;
-                const isExpanded = expandedNodes[res.id] ?? false;
-                const depth =
-                  res.type === 'enterprise'
-                    ? 0
-                    : res.type === 'site'
-                    ? 1
-                    : res.type === 'plant'
-                    ? 2
-                    : res.type === 'line'
-                    ? 3
-                    : 4;
-
-                return (
-                  <div
-                    key={res.id}
-                    style={{ paddingLeft: `${depth * 14}px` }}
-                    className={`flex items-center justify-between py-1.5 px-2 rounded-lg cursor-pointer text-[13px] transition-colors ${
-                      isSelected
-                        ? 'bg-[#FFF0F1] text-[#EF1B24] font-bold border-l-2 border-[#EF1B24]'
-                        : 'text-[#334568] hover:bg-[#F1F5FA]'
-                    }`}
-                    onClick={() => setSelectedResourceId(res.id)}
-                  >
-                    <div className="flex items-center gap-2 truncate">
-                      {res.childrenCount ? (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleExpand(res.id);
-                          }}
-                          className="p-0.5 text-[#94A3B8] hover:text-[#111B37]"
-                        >
-                          {isExpanded ? (
-                            <ChevronDown className="w-3.5 h-3.5" />
-                          ) : (
-                            <ChevronRight className="w-3.5 h-3.5" />
-                          )}
-                        </button>
-                      ) : (
-                        <span className="w-4" />
-                      )}
-                      {getIconForType(res.type)}
-                      <span className="truncate">{res.name}</span>
-                    </div>
-                    {res.signalsCount !== undefined && (
-                      <span className="text-[11px] font-mono text-[#94A3B8]">
-                        {res.signalsCount}
-                      </span>
-                    )}
-                  </div>
-                );
-              })}
+            <div className="p-3 overflow-y-auto flex-1" role="tree" aria-label="Factory hierarchy">
+              {tree.length === 0 ? (
+                <div className="text-center py-8 text-[#94A3B8] text-[13px]">No matching resources.</div>
+              ) : (
+                tree.map((node) => (
+                  <TreeRow
+                    key={node.resource.id}
+                    node={node}
+                    depth={0}
+                    selectedId={selectedResource.id}
+                    expandedNodes={expandedNodes}
+                    onToggle={toggleExpand}
+                    onSelect={setSelectedResourceId}
+                    onKeyNavigate={handleTreeKeyNavigate}
+                  />
+                ))
+              )}
             </div>
           </Card>
         </div>
@@ -295,6 +574,7 @@ export const FactoryStructurePage: React.FC = () => {
                 variant="ghost"
                 icon={<Plus className="w-3.5 h-3.5" />}
                 onClick={() => setIsAddModalOpen(true)}
+                disabled={allowedTypesForSelected.length === 0}
               >
                 Add Child
               </Button>
@@ -305,27 +585,28 @@ export const FactoryStructurePage: React.FC = () => {
                   No sub-resources configured under this unit.
                 </div>
               ) : (
-                childResources.map((child) => (
-                  <div
-                    key={child.id}
-                    onClick={() => setSelectedResourceId(child.id)}
-                    className="p-3 rounded-xl border border-[#E3EAF3] hover:border-[#EF1B24] cursor-pointer bg-white transition-all shadow-sm"
-                  >
-                    <div className="flex items-center justify-between mb-1.5">
-                      <div className="flex items-center gap-2">
-                        {getIconForType(child.type)}
-                        <span className="text-[13px] font-bold text-[#111B37]">{child.name}</span>
+                childResources.map((child) => {
+                  const childStatus = statusPresentation(child.status);
+                  return (
+                    <div
+                      key={child.id}
+                      onClick={() => setSelectedResourceId(child.id)}
+                      className="p-3 rounded-xl border border-[#E3EAF3] hover:border-[#EF1B24] cursor-pointer bg-white transition-all shadow-sm"
+                    >
+                      <div className="flex items-center justify-between mb-1.5">
+                        <div className="flex items-center gap-2">
+                          {getIconForType(child.type)}
+                          <span className="text-[13px] font-bold text-[#111B37]">{child.name}</span>
+                        </div>
+                        <Badge variant={childStatus.variant}>{childStatus.label}</Badge>
                       </div>
-                      <Badge variant={child.status === 'running' ? 'good' : 'warning'}>
-                        {child.status ? child.status.toUpperCase() : 'ONLINE'}
-                      </Badge>
+                      <div className="flex items-center justify-between text-[11px] text-[#657794] font-mono">
+                        <span>{child.code || 'ASSET-NODE'}</span>
+                        <span>{child.signalsCount ?? 0} signals linked</span>
+                      </div>
                     </div>
-                    <div className="flex items-center justify-between text-[11px] text-[#657794] font-mono">
-                      <span>{child.code || 'ASSET-NODE'}</span>
-                      <span>{child.signalsCount || 0} signals linked</span>
-                    </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </Card>
@@ -333,7 +614,6 @@ export const FactoryStructurePage: React.FC = () => {
 
         {/* Right Inspector: Details, Specification, Topology, Activity */}
         <div className="col-span-12 lg:col-span-5 space-y-3.5">
-          {/* Selected Resource Header */}
           <Card className="p-4">
             <div className="flex items-start justify-between">
               <div>
@@ -341,13 +621,15 @@ export const FactoryStructurePage: React.FC = () => {
                   <h2 className="text-[18px] font-extrabold text-[#111B37]">
                     {selectedResource.name}
                   </h2>
-                  <Badge variant={selectedResource.status === 'running' ? 'good' : 'warning'}>
-                    {selectedResource.status ? selectedResource.status.toUpperCase() : 'ONLINE'}
-                  </Badge>
+                  <Badge variant={selectedStatus.variant}>{selectedStatus.label}</Badge>
                 </div>
                 <div className="text-[12px] font-mono text-[#657794] mt-1">
-                  ID: <span className="text-[#111B37] font-semibold">{selectedResource.code || 'RES-01'}</span> ·
-                  Type: <span className="uppercase text-[#2A82E7] font-bold">{selectedResource.type}</span>
+                  ID:{' '}
+                  <span className="text-[#111B37] font-semibold">
+                    {selectedResource.code || 'RES-01'}
+                  </span>{' '}
+                  · Type:{' '}
+                  <span className="uppercase text-[#2A82E7] font-bold">{selectedResource.type}</span>
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -363,7 +645,9 @@ export const FactoryStructurePage: React.FC = () => {
                   size="sm"
                   variant="primary"
                   icon={<Activity className="w-3.5 h-3.5" />}
-                  onClick={() => navigate(`/acquisition/add-data?resourceId=${selectedResource.id}`)}
+                  onClick={() =>
+                    navigate(`/acquisition/add-data?resourceId=${selectedResource.id}`)
+                  }
                 >
                   Add Signals
                 </Button>
@@ -371,7 +655,6 @@ export const FactoryStructurePage: React.FC = () => {
             </div>
           </Card>
 
-          {/* Specification & Connectivity & Topology Context */}
           <div className="grid grid-cols-2 gap-3.5">
             <Card title="Specification & Attributes" className="h-[240px]">
               <div className="space-y-2 text-[12px]">
@@ -383,7 +666,9 @@ export const FactoryStructurePage: React.FC = () => {
                     </div>
                   ))
                 ) : (
-                  <p className="py-6 text-center text-[12px] text-[#94A3B8]">No attributes declared for this resource.</p>
+                  <p className="py-6 text-center text-[12px] text-[#94A3B8]">
+                    No attributes declared for this resource.
+                  </p>
                 )}
               </div>
             </Card>
@@ -404,7 +689,7 @@ export const FactoryStructurePage: React.FC = () => {
                   </span>
                   <div className="flex items-baseline gap-2 mt-1">
                     <span className="text-[20px] font-extrabold text-[#111B37]">
-                      {selectedResource.signalsCount || 4}
+                      {selectedResource.signalsCount ?? 0}
                     </span>
                     <span className="text-[#657794]">active collector tags</span>
                   </div>
@@ -424,7 +709,6 @@ export const FactoryStructurePage: React.FC = () => {
             </Card>
           </div>
 
-          {/* Recent Activities Table */}
           <Card title="Asset Change & Synchronization Log">
             <div className="overflow-x-auto">
               <table className="fx-table">
@@ -452,21 +736,17 @@ export const FactoryStructurePage: React.FC = () => {
         </div>
       </div>
 
-      {/* Interactive Modals */}
       <AddResourceModal
         isOpen={isAddModalOpen}
         onClose={() => setIsAddModalOpen(false)}
-        parentPath={selectedResource ? `${selectedResource.code} · ${selectedResource.name}` : '(root)'}
-        allowedTypes={(
-          {
-            enterprise: ['Site'],
-            site: ['Plant'],
-            plant: ['Zone', 'Line', 'Workshop', 'Machine'],
-            zone: ['Line', 'Workshop', 'Machine'],
-            line: ['Machine', 'Sensor'],
-            workshop: ['Machine'],
-          } as Record<string, string[]>
-        )[selectedResource.type] || ['Machine']}
+        parentPath={
+          selectedResource ? `${selectedResource.code} · ${selectedResource.name}` : '(root)'
+        }
+        allowedTypes={
+          allowedTypesForSelected.length
+            ? allowedTypesForSelected
+            : ['Machine']
+        }
         onAddResource={handleCreateResource}
       />
 
@@ -478,10 +758,21 @@ export const FactoryStructurePage: React.FC = () => {
         onMoveResource={handleMoveResource}
       />
 
-      {/* Undo Toast Notification (Review FX-03) */}
       {moveToast && (
         <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-900 text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
           <span className="text-xs font-semibold">{moveToast.message}</span>
+          {moveToast.linkTo && (
+            <button
+              type="button"
+              onClick={() => {
+                setMoveToast(null);
+                navigate(moveToast.linkTo!);
+              }}
+              className="text-xs font-bold text-sky-300 hover:text-sky-200 underline ml-2"
+            >
+              Open Edges
+            </button>
+          )}
           {moveToast.undoParentId && (
             <button
               type="button"

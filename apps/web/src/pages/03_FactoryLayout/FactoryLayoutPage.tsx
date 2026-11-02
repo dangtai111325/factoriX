@@ -299,7 +299,11 @@ export const FactoryLayoutPage: React.FC = () => {
                     <span className="text-[12px] font-bold text-[#111B37] truncate">{node.name}</span>
                     <span
                       className={`w-2 h-2 rounded-full ${
-                        node.status === 'running' ? 'bg-[#0DBA67]' : 'bg-[#FFAA23]'
+                        node.status === 'running'
+                          ? 'bg-[#0DBA67]'
+                          : node.status === 'offline'
+                          ? 'bg-[#F2343B]'
+                          : 'bg-[#94A3B8]'
                       }`}
                     />
                   </div>
@@ -401,8 +405,24 @@ export const FactoryLayoutPage: React.FC = () => {
                 <div className="p-3 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3] space-y-1.5 text-[12px]">
                   <div className="flex justify-between">
                     <span className="text-[#657794]">Running Status:</span>
-                    <Badge variant={selectedNode.status === 'running' ? 'good' : 'warning'}>
-                      {selectedNode.status.toUpperCase()}
+                    <Badge
+                      variant={
+                        selectedNode.status === 'running'
+                          ? 'good'
+                          : selectedNode.status === 'offline'
+                          ? 'error'
+                          : selectedNode.status === 'idle' || !selectedNode.status
+                          ? 'neutral'
+                          : 'warning'
+                      }
+                    >
+                      {selectedNode.status === 'running'
+                        ? 'RUNNING'
+                        : selectedNode.status === 'offline'
+                        ? 'OFFLINE'
+                        : selectedNode.status === 'warning'
+                        ? 'WARNING'
+                        : 'NO DATA'}
                     </Badge>
                   </div>
                   <div className="flex justify-between">

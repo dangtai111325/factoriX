@@ -18,7 +18,7 @@ import {
 } from '../schemas/authSchemas'
 
 export const RegisterPage: React.FC = () => {
-  const { isAuthenticated, setupCodeRequired, signUp } = useAuth()
+  const { isAuthenticated, isFirstRun, setupCodeRequired, signUp, state } = useAuth()
   const navigate = useNavigate()
   const [fullName, setFullName] = useState('')
   const [email, setEmail] = useState('')
@@ -26,15 +26,19 @@ export const RegisterPage: React.FC = () => {
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [setupCode, setSetupCode] = useState('')
-  const [agreeTerms, setAgreeTerms] = useState(true)
+  const [agreeTerms, setAgreeTerms] = useState(false)
   const [showHints, setShowHints] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [serverError, setServerError] = useState('')
   const [pending, setPending] = useState(false)
 
   const checks = useMemo(() => passwordChecks(password, username), [password, username])
+  const statusReady = state.status !== 'checking'
 
   if (isAuthenticated) return <Navigate to="/overview" replace />
+  if (statusReady && !isFirstRun) {
+    return <Navigate to="/login?setup=done" replace />
+  }
 
   const onSubmit = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -70,11 +74,12 @@ export const RegisterPage: React.FC = () => {
   return (
     <AuthShell variant="register">
       <div className="text-center">
-        <h1 className="text-[30px] sm:text-[34px] font-extrabold text-[#111B37] tracking-tight">
-          Create your FactoriX account
+        <h1 className="text-[28px] sm:text-[32px] font-extrabold text-[#111B37] tracking-tight">
+          Initial setup — create the administrator account
         </h1>
         <p className="mt-2 text-[15px] sm:text-[16px] text-[#657794] max-w-[520px] mx-auto leading-normal">
-          Create your account to start using the FactoriX IIoT platform for industrial data collection, signal monitoring, and plant operations.
+          This FactoriX appliance has no administrator yet. The first account becomes the appliance administrator and
+          owns bootstrap configuration.
         </p>
       </div>
 
@@ -182,7 +187,7 @@ export const RegisterPage: React.FC = () => {
         {serverError ? <AuthAlert>{serverError}</AuthAlert> : null}
 
         <button type="submit" className="fx-auth-button-primary mt-2" disabled={pending} aria-busy={pending}>
-          {pending ? 'Creating account…' : 'Create account'}
+          {pending ? 'Creating administrator…' : 'Create administrator'}
           {!pending && <ArrowRight className="w-5 h-5 ml-1" aria-hidden="true" />}
         </button>
       </form>

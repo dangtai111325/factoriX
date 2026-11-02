@@ -167,9 +167,9 @@ def parse_expression(source: str) -> FormulaProgram:
 
 def _check_call(node: ast.Call, depth: int, walk: Any) -> None:
     if node.keywords:
-        raise FormulaError("FORBIDDEN", "Không hỗ trợ đối số đặt tên.")
+        raise FormulaError("FORBIDDEN", "Named arguments are not supported.")
     if not isinstance(node.func, ast.Name):
-        raise FormulaError("FORBIDDEN", "Chỉ được gọi hàm trong allowlist.")
+        raise FormulaError("FORBIDDEN", "Only allowlisted functions may be called.")
     name = node.func.id
     if name in WINDOW_FUNCTIONS:
         if len(node.args) != 2 or not isinstance(node.args[0], ast.Name):
@@ -288,8 +288,8 @@ def evaluate(program: FormulaProgram, values: dict[str, Any], *, windows: dict[s
             try:
                 return _num(FUNCTIONS[node.func.id](*args))
             except (ValueError, OverflowError, ZeroDivisionError) as exc:
-                raise FormulaError("EVAL", "Không tính được biểu thức.") from exc
-        raise FormulaError("FORBIDDEN", "Không thực thi được nút này.")
+                raise FormulaError("EVAL", "Expression could not be evaluated.") from exc
+        raise FormulaError("FORBIDDEN", "This expression node cannot be executed.")
 
     return ev(program.tree)
 

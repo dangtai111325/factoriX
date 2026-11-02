@@ -135,3 +135,15 @@ export interface DiagnosticItem {
   lastError?: string;
   lastErrorTimestamp?: string;
 }
+
+export interface EdgeItem {
+  id: string;
+  name: string;
+  siteId: string;
+  enrollmentStatus: string;
+  health: string;
+  desiredRevision: number;
+  activeRevision: number;
+  lastHeartbeat: string;
+  softwareVersion?: string;
+}

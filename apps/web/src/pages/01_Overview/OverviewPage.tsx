@@ -2,10 +2,12 @@ import React, { useState } from 'react';
 import {
   Play,
   Pause,
-  Square,
   Plus,
   RefreshCw,
   CheckCircle2,
+  AlertTriangle,
+  HelpCircle,
+  XCircle,
   Cpu,
   HardDrive,
   Database,
@@ -17,12 +19,81 @@ import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { KPICard } from '../../components/common/KPICard';
 import { Badge } from '../../components/common/Badge';
+import type { BadgeVariant } from '../../components/common/Badge';
 import { DonutChart } from '../../components/charts/DonutChart';
 import { LineChart } from '../../components/charts/LineChart';
 import { useNavigate } from 'react-router-dom';
 
+function deriveCollectorHealth(collectorLabel: string): {
+  badge: string;
+  variant: BadgeVariant;
+  tone: 'healthy' | 'offline' | 'degraded' | 'unknown';
+  summary: string;
+  detail: string;
+} {
+  const lower = collectorLabel.toLowerCase();
+  if (
+    lower.includes('waiting') ||
+    lower.includes('not enrolled') ||
+    lower.includes('no edge') ||
+    lower.includes('no site')
+  ) {
+    return {
+      badge: 'NOT ENROLLED',
+      variant: 'neutral',
+      tone: 'unknown',
+      summary: 'No collector enrolled yet',
+      detail: 'Enroll an edge appliance for a site before treating health as normal',
+    };
+  }
+  if (lower.includes('offline') || lower.includes('unreachable') || lower.includes('down')) {
+    return {
+      badge: 'OFFLINE',
+      variant: 'error',
+      tone: 'offline',
+      summary: 'Collector is offline',
+      detail: collectorLabel,
+    };
+  }
+  if (lower.includes('degraded') || lower.includes('warning')) {
+    return {
+      badge: 'DEGRADED',
+      variant: 'warning',
+      tone: 'degraded',
+      summary: 'Collector reporting degraded health',
+      detail: collectorLabel,
+    };
+  }
+  if (lower.includes('healthy') || lower.includes('normal')) {
+    return {
+      badge: 'HEALTHY',
+      variant: 'good',
+      tone: 'healthy',
+      summary: 'Collector engine healthy',
+      detail: collectorLabel,
+    };
+  }
+  return {
+    badge: 'UNKNOWN',
+    variant: 'warning',
+    tone: 'unknown',
+    summary: 'Collector state unknown',
+    detail: collectorLabel || 'Waiting for edge health',
+  };
+}
+
 export const OverviewPage: React.FC = () => {
-  const { isStreaming, setIsStreaming, currentPlant, resources, connections, signals, activities, refresh } = useApp();
+  const {
+    isStreaming,
+    setIsStreaming,
+    currentPlant,
+    resources,
+    connections,
+    signals,
+    activities,
+    refresh,
+    collectorLabel,
+  } = useApp();
   const navigate = useNavigate();
   const connected = connections.filter((item) => item.status === 'connected').length;
   const degraded = connections.filter((item) => item.status === 'warning').length;
@@ -31,6 +102,7 @@ export const OverviewPage: React.FC = () => {
   const stale = signals.filter((item) => item.quality === 'STALE' || item.quality === 'UNCERTAIN').length;
   const bad = signals.filter((item) => item.quality === 'BAD').length;
   const machines = resources.filter((item) => item.type === 'machine').length;
+  const collectorHealth = deriveCollectorHealth(collectorLabel);
 
   return (
     <div className="space-y-5 animate-in fade-in duration-200">
@@ -111,13 +183,47 @@ export const OverviewPage: React.FC = () => {
             <div>
               <div className="flex items-center justify-between mb-3">
                 <span className="text-[13px] font-bold text-[#111B37]">Collector Engine Health</span>
-                <Badge variant="good">NORMAL</Badge>
+                <Badge variant={collectorHealth.variant}>{collectorHealth.badge}</Badge>
               </div>
-              <div className="flex items-center gap-3 p-3 rounded-lg bg-[#E9FBF1]/60 border border-[#B6F0D1] mb-3">
-                <CheckCircle2 className="w-7 h-7 text-[#0DBA67] flex-shrink-0" />
+              <div
+                className={`flex items-center gap-3 p-3 rounded-lg mb-3 border ${
+                  collectorHealth.tone === 'healthy'
+                    ? 'bg-[#E9FBF1]/60 border-[#B6F0D1]'
+                    : collectorHealth.tone === 'offline'
+                    ? 'bg-[#FFF5F5] border-[#FAC6C9]'
+                    : collectorHealth.tone === 'degraded'
+                    ? 'bg-[#FFF8E7] border-[#FFE2A4]'
+                    : 'bg-[#F1F5FA] border-[#D4DFEC]'
+                }`}
+              >
+                {collectorHealth.tone === 'healthy' ? (
+                  <CheckCircle2 className="w-7 h-7 text-[#0DBA67] flex-shrink-0" />
+                ) : collectorHealth.tone === 'offline' ? (
+                  <XCircle className="w-7 h-7 text-[#F2343B] flex-shrink-0" />
+                ) : collectorHealth.tone === 'degraded' ? (
+                  <AlertTriangle className="w-7 h-7 text-[#B96B00] flex-shrink-0" />
+                ) : (
+                  <HelpCircle className="w-7 h-7 text-[#94A3B8] flex-shrink-0" />
+                )}
                 <div>
-                  <div className="text-[13px] font-bold text-[#111B37]">{connections.length ? `${connected} connections reporting` : 'No collector connection yet'}</div>
-                  <div className="text-[11px] text-[#0A9855]">Health comes from the edge, not from a sample</div>
+                  <div className="text-[13px] font-bold text-[#111B37]">
+                    {connections.length
+                      ? `${connected} connections reporting`
+                      : collectorHealth.summary}
+                  </div>
+                  <div
+                    className={`text-[11px] ${
+                      collectorHealth.tone === 'healthy'
+                        ? 'text-[#0A9855]'
+                        : collectorHealth.tone === 'offline'
+                        ? 'text-[#DB2028]'
+                        : collectorHealth.tone === 'degraded'
+                        ? 'text-[#B96B00]'
+                        : 'text-[#657794]'
+                    }`}
+                  >
+                    {collectorHealth.detail}
+                  </div>
                 </div>
               </div>
             </div>

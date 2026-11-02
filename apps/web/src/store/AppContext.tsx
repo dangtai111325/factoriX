@@ -1,9 +1,10 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
-import { api } from '../api/client'
+import { ApiError, api } from '../api/client'
 import {
   ActivityEvent,
   ConnectionItem,
   DiagnosticItem,
+  EdgeItem,
   LayoutMachineNode,
   OutputGroup,
   PlantScope,
@@ -35,10 +36,18 @@ export interface AcquisitionDraft {
   name: string
   host: string
   port: string
+  /** Modbus unit id, MQTT topic filter, or HTTP path depending on protocol */
   extra: string
   intervalMs: number
   resourceId: string
   fields: AcquisitionField[]
+  mqttQos?: number
+  mqttClientId?: string
+  mqttVersion?: string
+  mqttKeepalive?: number
+  mqttTls?: boolean
+  mqttAnonymous?: boolean
+  httpMethod?: string
 }
 
 interface PreparedConnection {
@@ -58,6 +67,7 @@ interface AppContextType {
   setCurrentPlant: (plant: PlantScope) => void
   resources: ResourceNode[]
   connections: ConnectionItem[]
+  edges: EdgeItem[]
   signals: SignalItem[]
   layoutNodes: LayoutMachineNode[]
   outputGroups: OutputGroup[]
@@ -80,14 +90,18 @@ interface AppContextType {
   setSearchQuery: (query: string) => void
   collectorLabel: string
   resetToReference: () => void
-  addResource: (resource: Partial<ResourceNode>) => Promise<void>
+  addResource: (resource: Partial<ResourceNode>) => Promise<{ edgeCreated?: boolean; edgeId?: string; edgeName?: string }>
   moveResource: (resourceId: string, newParentId: string) => Promise<{ success: boolean; error?: string }>
+  archiveResource: (resourceId: string) => Promise<{ success: boolean; error?: string }>
   updateLayoutNode: (id: string, updates: Partial<LayoutMachineNode>) => void
   testConnection: (id: string) => Promise<{ success: boolean; latency: number }>
   runDeterministicConnectionTest: (id: string, scenario?: string) => Promise<{ overallStatus: TestExecutionState; latency: number; steps: TestStepResult[] }>
   prepareAcquisition: (draft: AcquisitionDraft) => Promise<PreparedConnection>
-  commissionAcquisition: (connectionId: string) => Promise<{ passed: boolean; stages: Array<{ name: string; status: string; latency?: number }> }>
+  commissionAcquisition: (connectionId: string) => Promise<{ passed: boolean; stages: Array<{ name: string; status: string; latency?: number }>; errorCode?: string }>
   activateAcquisition: (prepared: PreparedConnection, draft: AcquisitionDraft) => Promise<void>
+  deleteConnection: (connectionId: string) => Promise<void>
+  issueEnrollmentToken: (edgeId: string) => Promise<{ enrollment_token: string; expires_at: string; expires_in_seconds: number; edge_id: string }>
+  queueApplianceEnroll: (edgeId: string) => Promise<{ status: string }>
   addSignal: (signal: Partial<SignalItem>) => void
   bulkDeleteSignals: (signalIds: string[]) => { count: number; undo: () => void }
   bulkAssignOutputGroup: (signalIds: string[], groupId: string) => void
@@ -164,6 +178,7 @@ function scopeToPlant(all: ResourceNode[], plantId: string): ResourceNode[] {
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [allResources, setAllResources] = useState<ResourceNode[]>([])
   const [connections, setConnections] = useState<ConnectionItem[]>([])
+  const [edges, setEdges] = useState<EdgeItem[]>([])
   const [signals, setSignals] = useState<SignalItem[]>([])
   const [layoutNodes, setLayoutNodes] = useState<LayoutMachineNode[]>([])
   const [outputGroups, setOutputGroups] = useState<OutputGroup[]>([])
@@ -324,8 +339,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         details: (row.after_json as Record<string, unknown>) || {},
       })),
     )
-    const enrolled = (edgePage.items || []).filter((row) => text(row.enrollment_status) === 'ENROLLED')
-    setCollectorLabel(enrolled.length ? `Collector: ${text(enrolled[0].health || 'ENROLLED')}` : 'Collector: waiting for a site')
+    const edgeItems = edgePage.items || []
+    const mappedEdges: EdgeItem[] = edgeItems.map((row) => ({
+      id: text(row.id),
+      name: text(row.name),
+      siteId: text(row.site_id),
+      enrollmentStatus: text(row.enrollment_status),
+      health: text(row.health),
+      desiredRevision: Number(row.desired_revision || 0),
+      activeRevision: Number(row.active_revision || 0),
+      lastHeartbeat: text(row.last_heartbeat),
+      softwareVersion: text(row.software_version) || undefined,
+    }))
+    setEdges(mappedEdges)
+    const enrolled = mappedEdges.filter((row) => row.enrollmentStatus === 'ENROLLED')
+    const siteCount = mappedResources.filter((item) => item.type === 'site').length
+    if (enrolled.length) {
+      setCollectorLabel(`Collector: ${enrolled[0].health || 'ENROLLED'}`)
+    } else if (mappedEdges.length) {
+      setCollectorLabel(`Collector: not enrolled (${mappedEdges[0].name || 'Edge'})`)
+    } else if (siteCount === 0 && mappedEdges.length === 0) {
+      setCollectorLabel('Collector: waiting for a site')
+    } else {
+      setCollectorLabel('Collector: not enrolled')
+    }
     setDiagnostics(
       (connectionPage.items || [])
         .filter((row) => text(row.health) === 'DEGRADED' || text(row.last_error))
@@ -362,6 +399,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
     setAllResources([])
     setConnections([])
+    setEdges([])
     setSignals([])
     setLayoutNodes([])
     setOutputGroups([])
@@ -378,6 +416,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const code = codeFrom(resource.code || name)
     const parent = allResources.find((item) => item.id === resource.parentId)
     let siteId = parent?.attributes?.siteId || ''
+    let edgeCreated: { id: string; name: string } | null = null
     if (typeKey === 'site') {
       const site = await api<{ id: string }>('/api/v1/sites', {
         method: 'POST',
@@ -399,11 +438,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }),
     })
     if (typeKey === 'site') {
+      const edgeName = `Edge ${name}`
       const edge = await api<{ id: string }>('/api/v1/edges', {
         method: 'POST',
-        body: JSON.stringify({ site_id: siteId, name: `Edge ${name}` }),
+        body: JSON.stringify({ site_id: siteId, name: edgeName }),
       })
-      await api(`/api/v1/edges/${edge.id}/appliance`, { method: 'POST' })
+      try {
+        await api(`/api/v1/edges/${edge.id}/appliance`, { method: 'POST' })
+      } catch {
+        // Appliance mode may be off; Edge still needs manual enrollment.
+      }
+      edgeCreated = { id: edge.id, name: edgeName }
     }
     await refresh()
     setSelectedResourceId(created.id)
@@ -417,6 +462,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         assetsCount: 1,
       })
     }
+    if (edgeCreated) {
+      return { edgeCreated: true, edgeId: edgeCreated.id, edgeName: edgeCreated.name }
+    }
+    return {}
   }
 
   const moveResource = async (resourceId: string, newParentId: string) => {
@@ -435,6 +484,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: true }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Move failed' }
+    }
+  }
+
+  const archiveResource = async (resourceId: string) => {
+    try {
+      await api(`/api/v1/resources/${resourceId}/archive`, { method: 'POST' })
+      await refresh()
+      if (selectedResourceId === resourceId) {
+        setSelectedResourceId('')
+      }
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Archive failed' }
     }
   }
 
@@ -481,7 +543,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { endpoint, security_mode: 'None', anonymous: true, interval_ms }
     }
     if (draft.protocol === 'mqtt') {
-      return { host: draft.host, port, anonymous: true, topics: [draft.extra], qos: 1, protocol_version: '3.1.1', tls: false, interval_ms }
+      const topic = draft.extra.trim()
+      return {
+        host: draft.host,
+        port,
+        anonymous: draft.mqttAnonymous !== false,
+        topics: topic ? [topic] : [],
+        qos: draft.mqttQos ?? 1,
+        protocol_version: draft.mqttVersion || '3.1.1',
+        client_id: draft.mqttClientId || undefined,
+        keepalive: draft.mqttKeepalive ?? 60,
+        clean_session: true,
+        tls: Boolean(draft.mqttTls),
+        interval_ms,
+      }
     }
     const url = draft.host.startsWith('http') ? new URL(draft.host) : null
     return {
@@ -529,13 +604,64 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }
 
   const commissionAcquisition = async (connectionId: string) => {
-    const queued = await api<{ job_id: string }>(`/api/v1/connections/${connectionId}/tests`, { method: 'POST' })
-    let last: { status?: string; stages_json?: Array<{ stage: string; status: string; duration_ms?: number }> } = {}
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      last = await api(`/api/v1/commissioning/${queued.job_id}`)
+    let queued: { job_id?: string; error_code?: string; message?: string; status?: string }
+    try {
+      queued = await api(`/api/v1/connections/${connectionId}/tests`, { method: 'POST' })
+    } catch (error) {
+      if (error instanceof ApiError && (error.code === 'EDGE_NOT_ENROLLED' || /not enrolled/i.test(error.message))) {
+        return {
+          passed: false,
+          errorCode: 'EDGE_NOT_ENROLLED',
+          stages: [{ name: 'EDGE_ENROLLMENT', status: 'FAILED', latency: undefined }],
+        }
+      }
+      throw error
+    }
+    if (text(queued.error_code) === 'EDGE_NOT_ENROLLED') {
+      return {
+        passed: false,
+        errorCode: 'EDGE_NOT_ENROLLED',
+        stages: [{ name: 'EDGE_ENROLLMENT', status: 'FAILED', latency: undefined }],
+      }
+    }
+    const jobId = text(queued.job_id)
+    if (!jobId) throw new Error('Commission job was not created.')
+    let last: {
+      status?: string
+      error_code?: string
+      stages_json?: Array<{ stage: string; status: string; duration_ms?: number }>
+    } = {}
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      last = await api(`/api/v1/commissioning/${jobId}`)
       const status = text(last.status)
+      const code = text(last.error_code)
+      if (code === 'EDGE_NOT_ENROLLED') {
+        return {
+          passed: false,
+          errorCode: 'EDGE_NOT_ENROLLED',
+          stages: [{ name: 'EDGE_ENROLLMENT', status: 'FAILED', latency: undefined }],
+        }
+      }
       if (['PASSED', 'FAILED', 'COMPLETED', 'ERROR'].includes(status)) break
       await new Promise((resolve) => window.setTimeout(resolve, 1000))
+    }
+    const finalStatus = text(last.status)
+    if (!['PASSED', 'FAILED', 'COMPLETED', 'ERROR'].includes(finalStatus)) {
+      return {
+        passed: false,
+        stages: [
+          ...(last.stages_json || []).map((stage) => ({
+            name: stage.stage,
+            status: stage.status,
+            latency: stage.duration_ms,
+          })),
+          {
+            name: 'TIMEOUT',
+            status: 'FAILED',
+            latency: undefined,
+          },
+        ],
+      }
     }
     const stages = (last.stages_json || []).map((stage) => ({
       name: stage.stage,
@@ -544,7 +670,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }))
     const failed = stages.some((stage) => stage.status === 'FAILED')
     const network = stages.find((stage) => stage.name === 'NETWORK')
-    const passed = !failed && (network?.status === 'PASSED' || network?.status === 'COMPLETED')
+    const passed = !failed && (network?.status === 'PASSED' || network?.status === 'COMPLETED' || finalStatus === 'PASSED' || finalStatus === 'COMPLETED')
     return { passed, stages }
   }
 
@@ -600,6 +726,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return { success: result.passed, latency: result.stages.find((stage) => stage.latency)?.latency || 0 }
   }
 
+  const deleteConnection = async (connectionId: string) => {
+    await api(`/api/v1/connections/${connectionId}`, { method: 'DELETE' })
+    await refresh()
+  }
+
+  const issueEnrollmentToken = async (edgeId: string) => {
+    const issued = await api<{
+      enrollment_token: string
+      expires_at: string
+      expires_in_seconds: number
+      edge_id: string
+    }>(`/api/v1/edges/${edgeId}/enrollment-token`, { method: 'POST' })
+    return issued
+  }
+
+  const queueApplianceEnroll = async (edgeId: string) => {
+    const result = await api<{ status: string }>(`/api/v1/edges/${edgeId}/appliance`, { method: 'POST' })
+    await refresh()
+    return result
+  }
+
   const value: AppContextType = {
     revertToZero,
     refresh,
@@ -611,6 +758,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCurrentPlant,
     resources,
     connections: scopedConnections,
+    edges,
     signals: scopedSignals,
     layoutNodes,
     outputGroups,
@@ -635,6 +783,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     resetToReference: () => undefined,
     addResource,
     moveResource,
+    archiveResource,
     updateLayoutNode,
     testConnection,
     runDeterministicConnectionTest: async (id, _scenario) => {
@@ -644,6 +793,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     prepareAcquisition,
     commissionAcquisition,
     activateAcquisition,
+    deleteConnection,
+    issueEnrollmentToken,
+    queueApplianceEnroll,
     addSignal: () => undefined,
     bulkDeleteSignals: () => ({
       count: 0,

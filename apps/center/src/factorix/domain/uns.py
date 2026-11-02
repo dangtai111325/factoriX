@@ -32,7 +32,7 @@ def render_topic(template: str, context: dict[str, str | None]) -> str:
     def replace(match: re.Match[str]) -> str:
         key = match.group(1)
         if key not in context:
-            raise TopicError("UNKNOWN_PLACEHOLDER", f"Thiếu biến {key}.")
+            raise TopicError("UNKNOWN_PLACEHOLDER", f"Missing variable {key}.")
         raw = context[key]
         if raw is None or raw == "":
             return ""

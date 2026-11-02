@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { X, Plus, FolderPlus, Cpu, Layers, Building2, Factory, Trash2 } from 'lucide-react';
+import { X, Plus, FolderPlus, Trash2 } from 'lucide-react';
+import { translateApiError } from '../../utils/apiErrors';
+import { codePreviewFromName, validateResourceName } from '../../utils/resourceHierarchy';
 
 export interface AddResourceModalProps {
   isOpen: boolean;
@@ -12,7 +14,7 @@ export interface AddResourceModalProps {
     parentPath: string;
     description: string;
     properties: Record<string, string>;
-  }) => void;
+  }) => void | Promise<void>;
 }
 
 export const AddResourceModal: React.FC<AddResourceModalProps> = ({
@@ -28,6 +30,7 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
   const [description, setDescription] = useState('');
   const [properties, setProperties] = useState<Array<{ key: string; value: string }>>([]);
   const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
   const allowedKey = allowedTypes.join('|');
 
   useEffect(() => {
@@ -38,9 +41,24 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
     setDescription('');
     setProperties([]);
     setError('');
+    setSubmitting(false);
   }, [isOpen, parentPath, allowedKey]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
+
+  const codePreview = codePreviewFromName(name);
 
   const handleAddProperty = () => {
     setProperties([...properties, { key: '', value: '' }]);
@@ -58,7 +76,11 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) return;
+    const nameError = validateResourceName(name);
+    if (nameError) {
+      setError(nameError);
+      return;
+    }
     const chosen = allowedTypes.includes(type) ? type : allowedTypes[0];
     if (!chosen) return;
 
@@ -67,6 +89,8 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
       return acc;
     }, {});
 
+    setSubmitting(true);
+    setError('');
     try {
       await onAddResource?.({
         name: name.trim(),
@@ -77,13 +101,20 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
       });
       onClose();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'The server rejected this resource.');
+      setError(translateApiError(caught));
+    } finally {
+      setSubmitting(false);
     }
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-fadeIn">
-      <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="add-resource-title"
+        className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]"
+      >
         {/* Modal Header */}
         <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
           <div className="flex items-center gap-3">
@@ -91,13 +122,19 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
               <FolderPlus className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-lg font-bold text-slate-900">Add Factory Resource</h2>
-              <p className="text-xs text-slate-500">Define and insert a new entity into the factory hierarchy</p>
+              <h2 id="add-resource-title" className="text-lg font-bold text-slate-900">
+                Add Factory Resource
+              </h2>
+              <p className="text-xs text-slate-500">
+                Define and insert a new entity into the factory hierarchy
+              </p>
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 transition-colors"
+            aria-label="Close"
           >
             <X className="w-5 h-5" />
           </button>
@@ -125,10 +162,17 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                 type="text"
                 required
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  if (error) setError('');
+                }}
                 placeholder="e.g. CNC-03, Line 04, Packaging Line"
                 className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
               />
+              <p className="mt-1.5 text-[11px] text-slate-500 font-mono">
+                Code preview:{' '}
+                <span className="text-slate-700 font-semibold">{codePreview || '—'}</span>
+              </p>
             </div>
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1">
@@ -140,7 +184,9 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                 className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
               >
                 {allowedTypes.map((item) => (
-                  <option key={item} value={item}>{item}</option>
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
                 ))}
               </select>
             </div>
@@ -148,9 +194,7 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
 
           {/* Description */}
           <div>
-            <label className="block text-xs font-semibold text-slate-700 mb-1">
-              Description
-            </label>
+            <label className="block text-xs font-semibold text-slate-700 mb-1">Description</label>
             <textarea
               rows={2}
               value={description}
@@ -204,7 +248,9 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
           </div>
 
           {error && (
-            <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</p>
+            <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+              {error}
+            </p>
           )}
 
           {/* Footer Actions */}
@@ -218,9 +264,10 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
             </button>
             <button
               type="submit"
-              className="px-5 py-2 text-xs font-semibold text-white bg-[#EF1B24] hover:bg-[#d0171f] rounded-lg shadow-sm transition-all flex items-center gap-1.5"
+              disabled={submitting}
+              className="px-5 py-2 text-xs font-semibold text-white bg-[#EF1B24] hover:bg-[#d0171f] rounded-lg shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50"
             >
-              <Plus className="w-4 h-4" /> Create Resource
+              <Plus className="w-4 h-4" /> {submitting ? 'Creating…' : 'Create Resource'}
             </button>
           </div>
         </form>

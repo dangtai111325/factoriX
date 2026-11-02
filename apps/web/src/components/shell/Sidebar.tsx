@@ -53,6 +53,7 @@ const navConfig: NavGroup[] = [
     icon: Database,
     children: [
       { label: 'Connections', path: '/acquisition/connections' },
+      { label: 'Edges', path: '/acquisition/edges' },
       { label: 'Add Data', path: '/acquisition/add-data' },
       { label: 'Protocol Studio Later', path: '/acquisition/studio/opcua' },
     ],
@@ -87,6 +88,15 @@ const futureNavs: NavGroup[] = [
   { id: 'admin', label: 'Administration', icon: Settings, path: '/administration', isFuture: true },
 ];
 
+function showDevTools(): boolean {
+  if (import.meta.env.DEV) return true;
+  try {
+    return window.localStorage.getItem('factorix_dev_tools') === '1';
+  } catch {
+    return false;
+  }
+}
+
 export const Sidebar: React.FC = () => {
   const location = useLocation();
   const { revertToZero } = useApp();
@@ -97,6 +107,7 @@ export const Sidebar: React.FC = () => {
     signals: true,
     live: true,
   });
+  const [devToolsVisible] = useState(() => showDevTools());
 
   const toggleGroup = (id: string) => {
     setOpenGroups((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -250,20 +261,24 @@ export const Sidebar: React.FC = () => {
 
       {/* Footer Reset & Operator Info */}
       <div className="p-3 border-t border-[#E3EAF3] bg-[#F9FAFD]/60">
-        <button
-          type="button"
-          onClick={() => {
-            const confirmText = window.prompt('Revert to zero deletes every user, model and sample. Type REVERT to continue.');
-            if (confirmText === 'REVERT') {
-              void revertToZero('REVERT');
-            }
-          }}
-          className="w-full mb-2 flex items-center justify-center gap-2 py-1.5 px-3 rounded-lg text-[12px] font-medium text-[#F2343B] border border-[#FAC6C9] hover:bg-white transition-colors"
-          title="Debug control. Deletes the installation, including the administrator."
-        >
-          <RotateCcw className="w-3.5 h-3.5" />
-          <span>Revert To Zero</span>
-        </button>
+        {devToolsVisible && (
+          <button
+            type="button"
+            onClick={() => {
+              const confirmText = window.prompt(
+                'Revert to zero deletes every user, model and sample. Type REVERT to continue.',
+              );
+              if (confirmText === 'REVERT') {
+                void revertToZero('REVERT');
+              }
+            }}
+            className="w-full mb-2 flex items-center justify-center gap-2 py-1.5 px-3 rounded-lg text-[12px] font-medium text-[#F2343B] border border-[#FAC6C9] hover:bg-white transition-colors"
+            title="Debug control. Deletes the installation, including the administrator."
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Revert To Zero</span>
+          </button>
+        )}
         <button
           type="button"
           onClick={() => {

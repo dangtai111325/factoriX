@@ -44,10 +44,28 @@ export const Topbar: React.FC = () => {
 
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const [daemonPopoverOpen, setDaemonPopoverOpen] = useState(false);
+  const [browserOnline, setBrowserOnline] = useState(
+    typeof navigator === 'undefined' ? true : navigator.onLine,
+  );
+  const [lastOnlineAt, setLastOnlineAt] = useState(() => new Date());
 
   const siteDropdownRef = useRef<HTMLDivElement>(null);
   const daemonRef = useRef<HTMLDivElement>(null);
   const navigate = useNavigate();
+
+  const collectorLower = collectorLabel.toLowerCase();
+  const collectorEnrolled =
+    !collectorLower.includes('waiting') &&
+    !collectorLower.includes('not enrolled') &&
+    !collectorLower.includes('no site');
+  const collectorOffline =
+    collectorLower.includes('offline') ||
+    collectorLower.includes('unreachable') ||
+    collectorLower.includes('down');
+  const collectorHealthy =
+    collectorEnrolled &&
+    (collectorLower.includes('healthy') || collectorLower.includes('normal'));
+  const collectorPidLabel = collectorEnrolled ? 'ENROLLED' : 'NOT ENROLLED';
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -63,7 +81,28 @@ export const Topbar: React.FC = () => {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  useEffect(() => {
+    const goOffline = () => setBrowserOnline(false);
+    const goOnline = () => {
+      setBrowserOnline(true);
+      setLastOnlineAt(new Date());
+    };
+    window.addEventListener('offline', goOffline);
+    window.addEventListener('online', goOnline);
+    return () => {
+      window.removeEventListener('offline', goOffline);
+      window.removeEventListener('online', goOnline);
+    };
+  }, []);
+
   return (
+    <>
+    {!browserOnline && (
+      <div className="bg-[#111B37] text-white text-[12px] font-semibold px-4 py-2 text-center">
+        Connection to appliance lost — data may be stale (last update{' '}
+        {lastOnlineAt.toLocaleTimeString()})
+      </div>
+    )}
     <header className="fx-topbar select-none relative z-30">
       {/* Left: Breadcrumbs / Interactive Plant Switcher */}
       <div className="flex items-center gap-3">
@@ -168,13 +207,26 @@ export const Topbar: React.FC = () => {
         <div className="flex items-center gap-2 pl-2 border-l border-[#E2E8F0]">
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide ${
-              isStreaming
+              !isStreaming
+                ? 'bg-[#FFF3DA] text-[#B96B00] border border-[#FFE2A4]'
+                : collectorHealthy
                 ? 'bg-[#E9FBF1] text-[#0DBA67] border border-[#B6F0D1]'
-                : 'bg-[#FFF3DA] text-[#B96B00] border border-[#FFE2A4]'
+                : 'bg-[#F1F5FA] text-[#657794] border border-[#D4DFEC]'
             }`}
+            title={
+              !isStreaming
+                ? 'Visualization paused'
+                : collectorHealthy
+                ? 'UI refresh active with enrolled collector'
+                : 'UI refresh active — collector not confirmed healthy'
+            }
           >
-            <Radio className={`w-3.5 h-3.5 ${isStreaming ? 'animate-pulse text-[#0DBA67]' : ''}`} />
-            {isStreaming ? 'LIVE REFRESH' : 'PAUSED'}
+            <Radio
+              className={`w-3.5 h-3.5 ${
+                isStreaming && collectorHealthy ? 'animate-pulse text-[#0DBA67]' : ''
+              }`}
+            />
+            {!browserOnline ? 'OFFLINE' : isStreaming ? 'LIVE REFRESH' : 'PAUSED'}
           </span>
 
           <button
@@ -193,15 +245,19 @@ export const Topbar: React.FC = () => {
             type="button"
             onClick={() => setDaemonPopoverOpen(!daemonPopoverOpen)}
             className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-[11px] transition-colors border ${
-              demoScenario === 'healthy'
-                ? 'bg-[#F6F8FC] hover:bg-[#EDF2F7] border-[#D4DFEC] text-[#334568]'
-                : 'bg-[#FFF5F5] hover:bg-[#FFEBEB] border-[#FAC6C9] text-[#EF1B24]'
+              collectorOffline
+                ? 'bg-[#FFF5F5] hover:bg-[#FFEBEB] border-[#FAC6C9] text-[#EF1B24]'
+                : 'bg-[#F6F8FC] hover:bg-[#EDF2F7] border-[#D4DFEC] text-[#334568]'
             }`}
-            title="Click to view Edge Collector Daemon health and simulate scenarios"
+            title="Click to view Edge Collector Daemon health"
           >
             <span
               className={`w-2 h-2 rounded-full ${
-                demoScenario === 'healthy' ? 'bg-[#0DBA67] animate-pulse' : 'bg-[#EF1B24]'
+                collectorHealthy
+                  ? 'bg-[#0DBA67] animate-pulse'
+                  : collectorOffline
+                  ? 'bg-[#EF1B24]'
+                  : 'bg-[#94A3B8]'
               }`}
             />
             <span className="font-semibold text-[#111B37]">{collectorLabel}</span>
@@ -212,11 +268,19 @@ export const Topbar: React.FC = () => {
             <div className="absolute left-0 top-full mt-2 w-88 rounded-xl bg-white border border-[#D4DFEC] shadow-2xl p-4 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
               <div className="flex items-center justify-between pb-2 border-b border-[#E3EAF3]">
                 <div className="flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-[#0DBA67]" />
+                  <Activity
+                    className={`w-4 h-4 ${collectorHealthy ? 'text-[#0DBA67]' : 'text-[#94A3B8]'}`}
+                  />
                   <span className="text-[13px] font-bold text-[#111B37]">Collector</span>
                 </div>
-                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#E9FBF1] text-[#0DBA67]">
-                  PID 4102
+                <span
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                    collectorEnrolled
+                      ? 'bg-[#E9FBF1] text-[#0DBA67]'
+                      : 'bg-[#F1F5FA] text-[#657794]'
+                  }`}
+                >
+                  {collectorPidLabel}
                 </span>
               </div>
 
@@ -329,5 +393,6 @@ export const Topbar: React.FC = () => {
         </div>
       </div>
     </header>
+    </>
   );
 };

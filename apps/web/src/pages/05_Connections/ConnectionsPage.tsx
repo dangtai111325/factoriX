@@ -27,7 +27,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ConnectionTestModal } from '../../components/modals/ConnectionTestModal';
 
 export const ConnectionsPage: React.FC = () => {
-  const { connections, selectedConnectionId, setSelectedConnectionId, testConnection } = useApp();
+  const { connections, selectedConnectionId, setSelectedConnectionId, testConnection, deleteConnection } = useApp();
   const [searchParams] = useSearchParams();
   const [filterProtocol, setFilterProtocol] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState<string>('');
@@ -266,18 +266,27 @@ export const ConnectionsPage: React.FC = () => {
                         <button
                           type="button"
                           className="p-1 rounded text-[#94A3B8] hover:text-[#111B37]"
+                          title="Edit connection settings in Add Data wizard"
                           onClick={(e) => {
                             e.stopPropagation();
-                            navigate(
-                              conn.protocol === 'modbus'
-                                ? '/acquisition/add-data'
-                                : conn.protocol === 'opcua'
-                                ? '/acquisition/studio/opcua'
-                                : '/acquisition/studio/mqtt'
-                            );
+                            navigate(`/acquisition/add-data?resourceId=${encodeURIComponent(conn.plantId || '')}`);
                           }}
                         >
                           <Edit2 className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          className="p-1 rounded text-[#94A3B8] hover:text-[#F2343B]"
+                          title="Archive / delete draft connection"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (!window.confirm(`Archive connection "${conn.name}"?`)) return;
+                            void deleteConnection(conn.id).catch((err) => {
+                              window.alert(err instanceof Error ? err.message : 'Delete failed');
+                            });
+                          }}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     </td>
