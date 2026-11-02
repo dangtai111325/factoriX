@@ -28,14 +28,7 @@ test.describe('FactoriX platform sync', () => {
     await ensureSignedIn(page)
     await expect(page.getByText('Operations Overview')).toBeVisible()
     await expect(page.getByText('LIVE REFRESH').or(page.getByText('PAUSED'))).toBeVisible()
-    // Revert To Zero is DEV / factorix_dev_tools only — not shown in production UI
-    const revert = page.getByRole('button', { name: 'Revert To Zero' })
-    const isDevUi = await revert.count()
-    if (isDevUi > 0) {
-      await expect(revert).toBeVisible()
-    } else {
-      await expect(revert).toHaveCount(0)
-    }
+    await expect(page.getByRole('button', { name: 'Revert To Zero' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible()
   })
 

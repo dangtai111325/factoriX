@@ -117,7 +117,7 @@ try {
   body = await page.locator('body').innerText();
   ok('FX-0002-diag', !/Reactor 1|Packaging PLC|temperature_1/i.test(body), 'no fixture names');
 
-  ok('FX-0008-rtz', (await page.getByRole('button', { name: 'Revert To Zero' }).count()) === 0, 'RTZ hidden');
+  ok('FX-0008-rtz', (await page.getByRole('button', { name: 'Revert To Zero' }).count()) === 1, 'RTZ available with REVERT prompt');
 
   await page.goto(base + '/acquisition/edges', { waitUntil: 'networkidle' });
   body = await page.locator('body').innerText();

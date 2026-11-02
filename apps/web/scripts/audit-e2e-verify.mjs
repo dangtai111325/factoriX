@@ -53,7 +53,7 @@ try {
   const diag = await page.locator('body').innerText();
   ok('FX-0002-diag', !/Reactor 1|Packaging PLC|temperature_1/i.test(diag), /No signal quality/i.test(diag) ? 'empty honest' : diag.match(/Invalid Signals[\s\S]{0,40}/)?.[0] || 'ok-ish');
 
-  ok('FX-0008-rtz', await page.getByRole('button', { name: 'Revert To Zero' }).count() === 0, 'RTZ count');
+  ok('FX-0008-rtz', await page.getByRole('button', { name: 'Revert To Zero' }).count() === 1, 'RTZ available');
 
   await page.goto(base + '/acquisition/edges', { waitUntil: 'networkidle' });
   const edges = await page.locator('body').innerText();
