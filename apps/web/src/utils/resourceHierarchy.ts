@@ -152,6 +152,7 @@ export function ancestorPath(resources: ResourceNode[], resourceId: string): str
 /** Generate a code preview from a display name (mirrors AppContext codeFrom). */
 export function codePreviewFromName(name: string): string {
   const raw = name
+    .replace(/Đ/g, 'D').replace(/đ/g, 'd')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^A-Za-z0-9._-]+/g, '-')
@@ -161,13 +162,9 @@ export function codePreviewFromName(name: string): string {
   return /^[A-Za-z0-9]/.test(raw) ? raw : `R-${raw}`.slice(0, 64)
 }
 
-export const FORBIDDEN_NAME_CHARS = /[/#+$]/
-
 export function validateResourceName(name: string): string | null {
   const trimmed = name.trim()
   if (!trimmed) return 'Resource name is required.'
-  if (FORBIDDEN_NAME_CHARS.test(trimmed)) {
-    return 'Resource names cannot contain /, #, +, or $.'
-  }
+  if (trimmed.length > 200) return 'Resource name must be at most 200 characters.'
   return null
 }

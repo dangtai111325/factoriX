@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain.catalog import HIERARCHY_PRESETS
@@ -29,6 +30,9 @@ class ResourceIn(BaseModel):
     tags: list[str] = Field(default_factory=list)
     properties: dict[str, Any] = Field(default_factory=dict)
     valid_from: datetime | None = None
+    hierarchy_mode: Literal["guided", "strict"] = "guided"
+    timezone: str = "Asia/Ho_Chi_Minh"
+    create_edge: bool = False
 
 
 class ResourcePatch(BaseModel):
@@ -40,10 +44,15 @@ class ResourcePatch(BaseModel):
     tags: list[str] | None = None
 
 
+class ResourceLifecycleIn(BaseModel):
+    version: int = Field(ge=1)
+
+
 class MoveIn(BaseModel):
     version: int
-    parent_id: str
+    parent_id: str | None
     at: datetime | None = None
+    hierarchy_mode: Literal["guided", "strict"] = "guided"
 
 
 class TypeIn(BaseModel):
@@ -89,7 +98,22 @@ class HierarchyIn(BaseModel):
 class ImportIn(BaseModel):
     site_id: str | None = None
     dry_run: bool = True
-    rows: list[dict[str, str]]
+    rows: list[dict[str, Any]] = Field(min_length=1, max_length=2000)
+    default_parent_id: str | None = None
+    hierarchy_mode: Literal["guided", "strict"] = "guided"
+    plan_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("rows")
+    @classmethod
+    def bounded_json_rows(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        try:
+            payload = json.dumps(rows, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            size = len(payload.encode("utf-8"))
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("Import rows must contain valid JSON with finite numbers.") from exc
+        if size > 2_000_000:
+            raise ValueError("Import rows are limited to 2 MB.")
+        return rows
 
 
 def _aware(value: datetime | None) -> datetime:
@@ -101,22 +125,22 @@ def _aware(value: datetime | None) -> datetime:
 
 
 async def create_site(session: AsyncSession, tenant_id: UUID, actor: UUID, body: SiteIn, correlation_id: str) -> dict[str, Any]:
-    code = validate_code(body.code)
-    if not body.timezone or len(body.timezone) > 64:
-        raise AppError(422, "TIMEZONE", "Invalid timezone.")
+    code = _validated_code(body.code)
+    name = _validated_name(body.name)
+    try:
+        ZoneInfo(body.timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise AppError(422, "TIMEZONE", "Select a valid IANA timezone.") from exc
     row_id = uuid4()
     now = utcnow()
-    try:
-        await execute(
-            session,
-            """
-            INSERT INTO sites (id, tenant_id, code, name, timezone, created_at)
-            VALUES (:id, :tenant_id, :code, :name, :timezone, :now)
-            """,
-            {"id": row_id, "tenant_id": tenant_id, "code": code, "name": body.name.strip(), "timezone": body.timezone, "now": now},
-        )
-    except Exception as exc:
-        raise AppError(409, "DUPLICATE", "A site with this code already exists.") from exc
+    await execute(
+        session,
+        """
+        INSERT INTO sites (id, tenant_id, code, name, timezone, created_at)
+        VALUES (:id, :tenant_id, :code, :name, :timezone, :now)
+        """,
+        {"id": row_id, "tenant_id": tenant_id, "code": code, "name": name, "timezone": body.timezone, "now": now},
+    )
     created = await fetch_one(session, "SELECT * FROM sites WHERE id = :id", {"id": row_id})
     await audit(session, tenant_id=tenant_id, event_type="SITE_CREATE", actor_id=actor, entity_type="site", entity_id=row_id, before=None, after=created, correlation_id=correlation_id)
     assert created is not None
@@ -145,6 +169,46 @@ async def _type_by_key(session: AsyncSession, tenant_id: UUID, key: str) -> dict
     return row
 
 
+def _validated_code(value: str) -> str:
+    try:
+        return validate_code(value)
+    except ResourceInvariantError as exc:
+        raise AppError(422, exc.code, str(exc)) from exc
+
+
+def _validated_name(value: str) -> str:
+    name = value.strip()
+    if not name or len(name) > 200:
+        raise AppError(422, "NAME", "Name must contain between 1 and 200 characters.")
+    return name
+
+
+def _root_warnings(type_key: str, *, strict: bool) -> list[dict[str, str]]:
+    if type_key == "enterprise":
+        return []
+    if strict:
+        raise AppError(422, "ADJACENCY", "Enterprise is the recommended type at the root level.")
+    return [{"code": "NOT_RECOMMENDED", "message": "Enterprise is the recommended type at the root level."}]
+
+
+async def _model_lock(session: AsyncSession, tenant_id: UUID) -> None:
+    # Serializes hierarchy mutations, including empty sibling sets and cycle checks.
+    # Collector ingestion does not take this lock.
+    await execute(session, "SELECT pg_advisory_xact_lock(hashtextextended(:tenant, 0))", {"tenant": str(tenant_id)})
+
+
+async def _assert_unique_code(
+    session: AsyncSession, tenant_id: UUID, parent_id: UUID | None, code: str, resource_id: UUID,
+) -> None:
+    duplicate = await fetch_one(session, """
+        SELECT id FROM resources WHERE tenant_id = :tenant_id AND code = :code AND id <> :id
+          AND parent_id IS NOT DISTINCT FROM CAST(:parent_id AS uuid)
+    """, {"tenant_id": tenant_id, "parent_id": parent_id, "code": code, "id": resource_id})
+    if duplicate:
+        raise AppError(409, "DUPLICATE", "A resource with this code already exists under this parent.",
+                       field_errors=[{"path": "code", "code": "DUPLICATE"}])
+
+
 async def create_resource(
     session: AsyncSession,
     tenant_id: UUID,
@@ -152,37 +216,51 @@ async def create_resource(
     body: ResourceIn,
     correlation_id: str,
 ) -> dict[str, Any]:
-    try:
-        code = validate_code(body.code)
-    except ResourceInvariantError as exc:
-        raise AppError(422, exc.code, str(exc)) from exc
+    code = _validated_code(body.code)
+    name = _validated_name(body.name)
+    await _model_lock(session, tenant_id)
     type_row = await _type_by_key(session, tenant_id, body.type_key)
     site_id = parse_uuid(body.site_id) if body.site_id else None
-    if site_id is not None:
-        await get_site(session, tenant_id, site_id)
-    if type_row["key"] != "enterprise" and site_id is None:
-        raise AppError(422, "SITE_REQUIRED", "This resource requires a site.")
     parent = None
+    warnings: list[dict[str, str]] = []
     if body.parent_id:
         parent = await _resource(session, tenant_id, parse_uuid(body.parent_id))
-        await _assert_contains(session, tenant_id, parent["type_key"] if "type_key" in parent else await _type_key(session, parent), type_row["key"], parent, body.relation_code)
+        warnings = await _assert_contains(session, tenant_id, parent["type_key"], type_row["key"], parent,
+                                          body.relation_code, strict=body.hierarchy_mode == "strict")
+        if type_row["key"] == "site" and parent["site_id"] is not None:
+            raise AppError(422, "SITE_SCOPE", "A physical Site cannot be nested inside another Site scope.")
+        if type_row["key"] != "site" and parent["site_id"] is not None:
+            if site_id is not None and site_id != as_uuid(parent["site_id"]):
+                raise AppError(422, "SITE_SCOPE", "The resource must use its parent's Site scope.")
+            site_id = as_uuid(parent["site_id"])
+    elif body.relation_code == "CONTAINS":
+        warnings = _root_warnings(type_row["key"], strict=body.hierarchy_mode == "strict")
+    parent_id = as_uuid(parent["id"]) if parent is not None and body.relation_code == "CONTAINS" else None
     now = utcnow()
+    moment = _aware(body.valid_from)
+    if body.relation_code == "CONTAINS" and moment > utcnow():
+        raise AppError(422, "FUTURE_HIERARCHY", "Scheduled hierarchy changes are not supported; apply this placement now.")
     resource_id = uuid4()
-    duplicate = await fetch_one(
-        session,
-        "SELECT id FROM resources WHERE tenant_id = :tenant_id AND code = :code",
-        {"tenant_id": tenant_id, "code": code},
-    )
-    if duplicate:
-        raise AppError(409, "DUPLICATE", "A resource with this code already exists.", field_errors=[{"path": "code", "code": "DUPLICATE"}])
+    await _assert_unique_code(session, tenant_id, parent_id, code, resource_id)
+    if body.create_edge and type_row["key"] != "site":
+        raise AppError(422, "SITE_SCOPE", "Automatic Edge creation is available only when creating a Site.")
+    if type_row["key"] == "site" and site_id is None:
+        scope = await create_site(session, tenant_id, actor, SiteIn(code=code, name=name, timezone=body.timezone), correlation_id)
+        site_id = as_uuid(scope["id"])
+    elif site_id is not None:
+        scope = await get_site(session, tenant_id, site_id)
+        if type_row["key"] == "site" and scope["resource_id"] is not None:
+            raise AppError(409, "SITE_ANCHORED", "This Site scope already has a resource in the model.")
+    if site_id is None and type_row["key"] != "enterprise":
+        warnings.append({"code": "SITE_UNASSIGNED", "message": "Assign this resource to a Site before mapping a data source."})
     await execute(
         session,
         """
         INSERT INTO resources (
-            id, tenant_id, site_id, type_id, code, name, description, properties_json, tags_json,
+            id, tenant_id, site_id, parent_id, type_id, code, name, description, properties_json, tags_json,
             status, version, created_at, updated_at
         ) VALUES (
-            :id, :tenant_id, :site_id, :type_id, :code, :name, :description,
+            :id, :tenant_id, :site_id, :parent_id, :type_id, :code, :name, :description,
             CAST(:properties AS jsonb), CAST(:tags AS jsonb), 'ACTIVE', 1, :now, :now
         )
         """,
@@ -190,9 +268,10 @@ async def create_resource(
             "id": resource_id,
             "tenant_id": tenant_id,
             "site_id": site_id,
+            "parent_id": parent_id,
             "type_id": as_uuid(type_row["id"]),
             "code": code,
-            "name": body.name.strip(),
+            "name": name,
             "description": body.description,
             "properties": jsonb(body.properties),
             "tags": jsonb(body.tags[:32]),
@@ -200,14 +279,24 @@ async def create_resource(
         },
     )
     if parent is not None:
-        moment = _aware(body.valid_from)
         if body.relation_code == "INSTALLED_AT":
             if type_row["key"] != "physical_asset":
                 raise AppError(422, "DOMAIN", "Only physical assets can be installed at a functional position.")
             await _link(session, tenant_id, resource_id, as_uuid(parent["id"]), "INSTALLED_AT", moment)
         else:
             await _link(session, tenant_id, as_uuid(parent["id"]), resource_id, body.relation_code, moment)
+    edge = None
+    if type_row["key"] == "site":
+        await execute(session, "UPDATE sites SET resource_id = :id WHERE id = :site_id AND tenant_id = :tenant_id",
+                      {"id": resource_id, "site_id": site_id, "tenant_id": tenant_id})
+        if body.create_edge:
+            from factorix.modules.collect import EdgeIn, create_edge
+
+            edge = await create_edge(session, tenant_id, actor, EdgeIn(name=f"{name} Edge", site_id=str(site_id)), correlation_id)
     created = await get_resource(session, tenant_id, resource_id)
+    created["warnings"] = warnings
+    if edge is not None:
+        created["edge"] = edge
     await audit(session, tenant_id=tenant_id, event_type="RESOURCE_CREATE", actor_id=actor, entity_type="resource", entity_id=resource_id, before=None, after={"id": str(resource_id), "code": code}, correlation_id=correlation_id)
     return created
 
@@ -227,13 +316,17 @@ async def _assert_contains(
     child_key: str,
     parent: dict[str, Any],
     relation_code: str,
-) -> None:
+    *,
+    strict: bool = False,
+) -> list[dict[str, str]]:
+    if parent.get("status") == "ARCHIVED" or parent.get("archived_at"):
+        raise AppError(409, "ARCHIVED_PARENT", "Cannot add children under an archived resource.")
     if relation_code == "INSTALLED_AT":
         if parent_key != "functional_position":
             raise AppError(422, "DOMAIN", "INSTALLED_AT links a physical asset to a functional position.")
-        return
+        return []
     if relation_code != "CONTAINS":
-        return
+        return []
     allowed = await fetch_one(
         session,
         """
@@ -244,9 +337,10 @@ async def _assert_contains(
         {"tenant_id": tenant_id, "parent": parent_key, "child": child_key},
     )
     if allowed is None:
-        raise AppError(422, "ADJACENCY", "This resource type cannot be placed under the selected parent.")
-    if parent.get("status") == "ARCHIVED" or parent.get("archived_at"):
-        raise AppError(409, "ARCHIVED_PARENT", "Cannot add children under an archived resource.")
+        if strict:
+            raise AppError(422, "ADJACENCY", "This placement is outside the recommended type hierarchy.")
+        return [{"code": "NOT_RECOMMENDED", "message": "This placement is outside the recommended type hierarchy."}]
+    return []
 
 
 async def _link(session: AsyncSession, tenant_id: UUID, parent_id: UUID, child_id: UUID, relation_code: str, valid_from: datetime) -> None:
@@ -313,9 +407,7 @@ async def get_resource(session: AsyncSession, tenant_id: UUID, resource_id: UUID
     children = await fetch_one(
         session,
         """
-        SELECT count(*) AS count FROM resource_relations rr
-        JOIN relation_types rt ON rt.id = rr.relation_type_id
-        WHERE rr.tenant_id = :tenant_id AND rr.from_id = :id AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL
+        SELECT count(*) AS count FROM resources WHERE tenant_id = :tenant_id AND parent_id = :id
         """,
         {"tenant_id": tenant_id, "id": resource_id},
     )
@@ -331,31 +423,16 @@ async def get_resource(session: AsyncSession, tenant_id: UUID, resource_id: UUID
 
 
 async def breadcrumb(session: AsyncSession, tenant_id: UUID, resource_id: UUID) -> list[dict[str, str]]:
-    chain: list[dict[str, str]] = []
-    current: UUID | None = resource_id
-    guard = 0
-    while current is not None and guard < 32:
-        guard += 1
-        row = await fetch_one(
-            session,
-            "SELECT id, code, name FROM resources WHERE id = :id AND tenant_id = :tenant_id",
-            {"id": current, "tenant_id": tenant_id},
-        )
-        if row is None:
-            break
-        chain.append({"id": row["id"], "code": row["code"], "name": row["name"]})
-        parent = await fetch_one(
-            session,
-            """
-            SELECT rr.from_id FROM resource_relations rr
-            JOIN relation_types rt ON rt.id = rr.relation_type_id
-            WHERE rr.tenant_id = :tenant_id AND rr.to_id = :id AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL
-            """,
-            {"tenant_id": tenant_id, "id": current},
-        )
-        current = as_uuid(parent["from_id"]) if parent else None
-    chain.reverse()
-    return chain
+    return await fetch_all(session, """
+        WITH RECURSIVE ancestors AS (
+            SELECT id, parent_id, code, name, 0 AS depth, ARRAY[id] AS path FROM resources
+            WHERE id = :id AND tenant_id = :tenant_id
+            UNION ALL
+            SELECT p.id, p.parent_id, p.code, p.name, c.depth + 1, c.path || p.id
+            FROM resources p JOIN ancestors c ON p.id = c.parent_id
+            WHERE p.tenant_id = :tenant_id AND NOT p.id = ANY(c.path)
+        ) SELECT id, code, name FROM ancestors ORDER BY depth DESC
+    """, {"id": resource_id, "tenant_id": tenant_id})
 
 
 async def list_resources(
@@ -382,47 +459,36 @@ async def list_resources(
         where.append("(r.name ILIKE :q OR r.code ILIKE :q)")
         params["q"] = f"%{query.strip()}%"
     if parent_id:
-        where.append(
-            """
-            EXISTS (
-                SELECT 1 FROM resource_relations rr
-                JOIN relation_types rt ON rt.id = rr.relation_type_id
-                WHERE rr.to_id = r.id AND rr.from_id = :parent_id AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL
-            )
-            """
-        )
+        where.append("r.parent_id = :parent_id")
         params["parent_id"] = parse_uuid(parent_id)
     elif view != "all" and parent_id is None and not query and not type_key:
-        where.append(
-            """
-            NOT EXISTS (
-                SELECT 1 FROM resource_relations rr
-                JOIN relation_types rt ON rt.id = rr.relation_type_id
-                WHERE rr.to_id = r.id AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL
-            )
-            """
-        )
+        where.append("r.parent_id IS NULL")
     if cursor:
-        params["cursor"] = cursor
-        where.append("r.code > :cursor")
+        if cursor.startswith("r1:"):
+            parts = cursor.split(":", 2)
+            if len(parts) != 3:
+                raise AppError(422, "CURSOR", "Invalid resource cursor.")
+            params["cursor_id"] = parse_uuid(parts[1])
+            params["cursor_code"] = _validated_code(parts[2])
+            where.append("(r.code, r.id) > (:cursor_code, :cursor_id)")
+        else:
+            # Legacy code-only cursors remain accepted; new pages always use the unique pair.
+            params["cursor"] = cursor
+            where.append("r.code > :cursor")
     sql = f"""
-        SELECT r.id, r.code, r.name, r.status, r.version, r.site_id, r.archived_at, t.key AS type_key, t.category AS type_category,
-               (
-                 SELECT rr.from_id FROM resource_relations rr
-                 JOIN relation_types rt ON rt.id = rr.relation_type_id
-                 WHERE rr.to_id = r.id AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL
-                 ORDER BY rr.valid_from DESC
-                 LIMIT 1
-               ) AS parent_id
+        SELECT r.id, r.code, r.name, r.status, r.version, r.site_id, r.archived_at, r.parent_id,
+               r.description, r.properties_json, r.tags_json, r.created_at, r.updated_at,
+               t.key AS type_key, t.category AS type_category
         FROM resources r JOIN resource_types t ON t.id = r.type_id
         WHERE {' AND '.join(where)}
-        ORDER BY r.code
+        ORDER BY r.code, r.id
         LIMIT :limit
     """
     items = await fetch_all(session, sql, params)
     next_cursor = None
     if len(items) > limit:
-        next_cursor = items[limit - 1]["code"]
+        last = items[limit - 1]
+        next_cursor = f"r1:{last['id']}:{last['code']}"
         items = items[:limit]
     return {"items": items, "next_cursor": next_cursor}
 
@@ -435,22 +501,21 @@ async def patch_resource(
     body: ResourcePatch,
     correlation_id: str,
 ) -> dict[str, Any]:
+    await _model_lock(session, tenant_id)
     current = await _resource(session, tenant_id, resource_id)
     if int(current["version"]) != body.version:
         raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
     if current["archived_at"] is not None:
         raise AppError(409, "ARCHIVED", "Archived resources are read-only.")
-    name = body.name.strip() if body.name is not None else current["name"]
+    name = _validated_name(body.name) if body.name is not None else current["name"]
     description = body.description if body.description is not None else current["description"]
     code = current["code"]
     if body.code is not None:
-        try:
-            code = validate_code(body.code)
-        except ResourceInvariantError as exc:
-            raise AppError(422, exc.code, str(exc)) from exc
+        code = _validated_code(body.code)
+    await _assert_unique_code(session, tenant_id, current["parent_id"], code, resource_id)
     properties = body.properties if body.properties is not None else current["properties_json"]
     tags = body.tags if body.tags is not None else current["tags_json"]
-    await execute(
+    written = await fetch_one(
         session,
         """
         UPDATE resources
@@ -458,6 +523,7 @@ async def patch_resource(
             properties_json = CAST(:properties AS jsonb), tags_json = CAST(:tags AS jsonb),
             version = version + 1, updated_at = :now
         WHERE id = :id AND tenant_id = :tenant_id AND version = :version
+        RETURNING id
         """,
         {
             "name": name,
@@ -471,17 +537,25 @@ async def patch_resource(
             "version": body.version,
         },
     )
+    if written is None:
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
+    if current["type_key"] == "site":
+        await execute(session, "UPDATE sites SET name = :name, code = :code WHERE resource_id = :id AND tenant_id = :tenant_id",
+                      {"name": name, "code": code, "id": resource_id, "tenant_id": tenant_id})
     updated = await get_resource(session, tenant_id, resource_id)
     await audit(session, tenant_id=tenant_id, event_type="RESOURCE_UPDATE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"name": current["name"], "code": current["code"]}, after={"name": name, "code": code}, correlation_id=correlation_id)
     return updated
 
 
 async def move_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID, body: MoveIn, correlation_id: str) -> dict[str, Any]:
+    await _model_lock(session, tenant_id)
     current = await _resource(session, tenant_id, resource_id)
     if int(current["version"]) != body.version:
         raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
-    parent = await _resource(session, tenant_id, parse_uuid(body.parent_id))
-    await _assert_contains(session, tenant_id, parent["type_key"], current["type_key"], parent, "CONTAINS")
+    if current["archived_at"] is not None:
+        raise AppError(409, "ARCHIVED", "Archived resources are read-only.")
+    parent = await _resource(session, tenant_id, parse_uuid(body.parent_id)) if body.parent_id is not None else None
+    new_parent_id = as_uuid(parent["id"]) if parent else None
     moment = _aware(body.at)
     relation = await fetch_one(
         session,
@@ -492,17 +566,63 @@ async def move_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, res
     edges = await fetch_all(
         session,
         """
-        SELECT to_id AS child_id, from_id AS parent_id
-        FROM resource_relations
-        WHERE tenant_id = :tenant_id AND relation_type_id = :relation_type_id AND valid_to IS NULL AND to_id <> :self
+        SELECT id AS child_id, parent_id FROM resources
+        WHERE tenant_id = :tenant_id AND parent_id IS NOT NULL AND id <> :self
         """,
-        {"tenant_id": tenant_id, "relation_type_id": as_uuid(relation["id"]), "self": resource_id},
+        {"tenant_id": tenant_id, "self": resource_id},
     )
     pairs = [(as_uuid(item["child_id"]), as_uuid(item["parent_id"])) for item in edges]
     try:
-        assert_no_cycle(pairs, resource_id, as_uuid(parent["id"]))
+        if new_parent_id is not None:
+            assert_no_cycle(pairs, resource_id, new_parent_id)
     except ResourceInvariantError as exc:
         raise AppError(422, exc.code, str(exc)) from exc
+    warnings = await _assert_contains(session, tenant_id, parent["type_key"], current["type_key"], parent,
+                                      "CONTAINS", strict=body.hierarchy_mode == "strict") if parent else _root_warnings(current["type_key"], strict=body.hierarchy_mode == "strict")
+    await _assert_unique_code(session, tenant_id, new_parent_id, current["code"], resource_id)
+    if moment > utcnow():
+        raise AppError(422, "FUTURE_HIERARCHY", "Scheduled hierarchy changes are not supported; apply this move now.")
+    later = await fetch_one(session, """
+        SELECT id FROM resource_relations WHERE tenant_id = :tenant_id AND to_id = :id
+          AND relation_type_id = :relation_type AND valid_from >= :moment AND valid_to IS NULL
+    """, {"tenant_id": tenant_id, "id": resource_id, "relation_type": as_uuid(relation["id"]), "moment": moment})
+    if later:
+        raise AppError(422, "TEMPORAL_ORDER", "The move must occur after the current placement began.")
+    subtree = await fetch_all(session, """
+        WITH RECURSIVE tree AS (
+            SELECT r.id, r.site_id, t.key AS type_key FROM resources r
+            JOIN resource_types t ON t.id = r.type_id WHERE r.id = :id AND r.tenant_id = :tenant_id
+            UNION ALL
+            SELECT c.id, c.site_id, ct.key FROM resources c JOIN tree p ON c.parent_id = p.id
+            JOIN resource_types ct ON ct.id = c.type_id WHERE c.tenant_id = :tenant_id
+        ) SELECT * FROM tree
+    """, {"id": resource_id, "tenant_id": tenant_id})
+    if parent and parent["site_id"] is not None and any(node["type_key"] == "site" for node in subtree):
+        raise AppError(422, "SITE_SCOPE", "A subtree containing a physical Site cannot be nested inside another Site scope.")
+    new_site = current["site_id"] if current["type_key"] == "site" else parent["site_id"] if parent else None
+    if current["site_id"] != new_site:
+        # Site anchors below this node start their own scope and do not inherit the new one.
+        affected = await fetch_all(session, """
+            WITH RECURSIVE scoped AS (
+                SELECT id FROM resources WHERE id = :id AND tenant_id = :tenant_id
+                UNION ALL
+                SELECT c.id FROM resources c JOIN scoped p ON c.parent_id = p.id
+                JOIN resource_types t ON t.id = c.type_id WHERE c.tenant_id = :tenant_id AND t.key <> 'site'
+            ) SELECT id FROM scoped
+        """, {"id": resource_id, "tenant_id": tenant_id})
+        affected_ids = [as_uuid(node["id"]) for node in affected]
+        binding = await fetch_one(session, """
+            SELECT b.id FROM signal_bindings b JOIN signal_definitions s ON s.id = b.signal_id
+            WHERE s.tenant_id = :tenant_id AND s.resource_id = ANY(:ids) AND b.valid_to IS NULL LIMIT 1
+        """, {"tenant_id": tenant_id, "ids": affected_ids})
+        if binding:
+            raise AppError(409, "SOURCE_REASSIGNMENT_REQUIRED",
+                           "Reassign or detach source mappings in this subtree before moving it to another Site.")
+        await execute(session, """
+            UPDATE resources SET site_id = :site_id, updated_at = :now,
+                version = version + CASE WHEN id = :root_id THEN 0 ELSE 1 END
+            WHERE tenant_id = :tenant_id AND id = ANY(:ids)
+        """, {"site_id": new_site, "now": utcnow(), "root_id": resource_id, "tenant_id": tenant_id, "ids": affected_ids})
     await execute(
         session,
         """
@@ -512,27 +632,53 @@ async def move_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, res
         """,
         {"moment": moment, "tenant_id": tenant_id, "self": resource_id, "relation_type_id": as_uuid(relation["id"])},
     )
-    await _link(session, tenant_id, as_uuid(parent["id"]), resource_id, "CONTAINS", moment)
-    await execute(
+    if new_parent_id is not None:
+        await _link(session, tenant_id, new_parent_id, resource_id, "CONTAINS", moment)
+    written = await fetch_one(
         session,
-        "UPDATE resources SET version = version + 1, updated_at = :now WHERE id = :id",
-        {"now": utcnow(), "id": resource_id},
+        """UPDATE resources SET parent_id = :parent_id, version = version + 1, updated_at = :now
+           WHERE id = :id AND tenant_id = :tenant_id AND version = :version RETURNING id""",
+        {"now": utcnow(), "id": resource_id, "tenant_id": tenant_id, "version": body.version, "parent_id": new_parent_id},
     )
-    await audit(session, tenant_id=tenant_id, event_type="RESOURCE_MOVE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"parent": None}, after={"parent_id": parent["id"], "at": moment.isoformat()}, correlation_id=correlation_id)
-    return await get_resource(session, tenant_id, resource_id)
+    if written is None:
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
+    await audit(session, tenant_id=tenant_id, event_type="RESOURCE_MOVE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"parent_id": current["parent_id"]}, after={"parent_id": new_parent_id, "at": moment.isoformat()}, correlation_id=correlation_id)
+    updated = await get_resource(session, tenant_id, resource_id)
+    updated["warnings"] = warnings
+    return updated
 
 
-async def archive_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID, correlation_id: str) -> dict[str, Any]:
+async def _publish_asset_changes(session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID, correlation_id: str) -> list[dict[str, Any]]:
+    from factorix.modules.collect import ReleaseIn, publish_release
+
+    edges = await fetch_all(session, """
+        SELECT DISTINCT c.edge_id FROM signal_bindings b JOIN signal_definitions s ON s.id = b.signal_id
+        JOIN source_fields f ON f.id = b.source_field_id JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+        JOIN connections c ON c.id = j.connection_id
+        WHERE s.tenant_id = :tenant_id AND c.tenant_id = :tenant_id AND s.resource_id = :id
+          AND b.valid_to IS NULL AND c.status <> 'ARCHIVED' ORDER BY c.edge_id
+    """, {"tenant_id": tenant_id, "id": resource_id})
+    deployments = []
+    for edge in edges:
+        deployments.append(await publish_release(session, tenant_id, actor, ReleaseIn(edge_id=str(edge["edge_id"])), correlation_id))
+    return deployments
+
+
+async def archive_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID, correlation_id: str,
+                           version: int | None = None) -> dict[str, Any]:
+    await _model_lock(session, tenant_id)
     current = await _resource(session, tenant_id, resource_id)
+    if version is not None and current["version"] != version:
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
+    if current["archived_at"] is not None:
+        return await get_resource(session, tenant_id, resource_id)
     children = await fetch_one(
         session,
         """
-        SELECT count(*) AS count FROM resource_relations rr
-        JOIN resources child ON child.id = rr.to_id
-        JOIN relation_types rt ON rt.id = rr.relation_type_id
-        WHERE rr.from_id = :id AND rt.code = 'CONTAINS' AND rr.valid_to IS NULL AND child.archived_at IS NULL
+        SELECT count(*) AS count FROM resources
+        WHERE parent_id = :id AND tenant_id = :tenant_id AND archived_at IS NULL
         """,
-        {"id": resource_id},
+        {"id": resource_id, "tenant_id": tenant_id},
     )
     if children and int(children["count"]) > 0:
         raise AppError(409, "HAS_CHILDREN", "Archive child resources first.")
@@ -546,16 +692,49 @@ async def archive_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         {"now": now, "id": resource_id, "tenant_id": tenant_id},
     )
     await audit(session, tenant_id=tenant_id, event_type="RESOURCE_ARCHIVE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"status": current["status"]}, after={"status": "ARCHIVED"}, correlation_id=correlation_id)
-    return await get_resource(session, tenant_id, resource_id)
+    deployments = await _publish_asset_changes(session, tenant_id, actor, resource_id, correlation_id)
+    updated = await get_resource(session, tenant_id, resource_id)
+    updated["deployments"] = deployments
+    return updated
+
+
+async def restore_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID,
+                           body: ResourceLifecycleIn, correlation_id: str) -> dict[str, Any]:
+    await _model_lock(session, tenant_id)
+    current = await _resource(session, tenant_id, resource_id)
+    if current["version"] != body.version:
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
+    if current["archived_at"] is None:
+        return await get_resource(session, tenant_id, resource_id)
+    if current["parent_id"]:
+        parent = await _resource(session, tenant_id, as_uuid(current["parent_id"]))
+        if parent["archived_at"] is not None:
+            raise AppError(409, "ARCHIVED_PARENT", "Restore the parent resource first.")
+    await execute(session, """UPDATE resources SET status = 'ACTIVE', archived_at = NULL,
+        version = version + 1, updated_at = :now WHERE tenant_id = :tenant_id AND id = :id""",
+        {"now": utcnow(), "tenant_id": tenant_id, "id": resource_id})
+    deployments = await _publish_asset_changes(session, tenant_id, actor, resource_id, correlation_id)
+    await audit(session, tenant_id=tenant_id, event_type="RESOURCE_RESTORE", actor_id=actor, entity_type="resource",
+                entity_id=resource_id, before={"status": "ARCHIVED"}, after={"status": "ACTIVE"}, correlation_id=correlation_id)
+    updated = await get_resource(session, tenant_id, resource_id)
+    updated["deployments"] = deployments
+    return updated
 
 
 async def create_type(session: AsyncSession, tenant_id: UUID, actor: UUID, body: TypeIn, correlation_id: str) -> dict[str, Any]:
-    try:
-        key = validate_code(body.key).lower()
-    except ResourceInvariantError as exc:
-        raise AppError(422, exc.code, str(exc)) from exc
+    key = _validated_code(body.key).lower()
+    name = _validated_name(body.name)
+    await _model_lock(session, tenant_id)
+    existing = await fetch_one(session, "SELECT id FROM resource_types WHERE tenant_id = :tenant_id AND key = :key",
+                               {"tenant_id": tenant_id, "key": key})
+    if existing:
+        raise AppError(409, "DUPLICATE", "A resource type with this key already exists.")
     if body.category not in {"ENTERPRISE", "SITE", "AREA", "WORK_CENTER", "ASSET", "POSITION", "CUSTOM"}:
         raise AppError(422, "CATEGORY", "Invalid type category.")
+    parents = sorted({_validated_code(value).lower() for value in body.parent_type_keys})
+    children = sorted({_validated_code(value).lower() for value in body.child_type_keys})
+    for related in set(parents + children) - {key}:
+        await _type_by_key(session, tenant_id, related)
     type_id = uuid4()
     await execute(
         session,
@@ -563,9 +742,9 @@ async def create_type(session: AsyncSession, tenant_id: UUID, actor: UUID, body:
         INSERT INTO resource_types (id, tenant_id, key, name, category, schema_json, is_system, revision)
         VALUES (:id, :tenant_id, :key, :name, :category, CAST(:schema AS jsonb), FALSE, 1)
         """,
-        {"id": type_id, "tenant_id": tenant_id, "key": key, "name": body.name.strip(), "category": body.category, "schema": jsonb(body.properties_schema)},
+        {"id": type_id, "tenant_id": tenant_id, "key": key, "name": name, "category": body.category, "schema": jsonb(body.properties_schema)},
     )
-    for parent in body.parent_type_keys:
+    for parent in parents:
         await execute(
             session,
             """
@@ -575,7 +754,7 @@ async def create_type(session: AsyncSession, tenant_id: UUID, actor: UUID, body:
             """,
             {"tenant_id": tenant_id, "parent": parent, "child": key},
         )
-    for child in body.child_type_keys:
+    for child in children:
         await execute(
             session,
             """
@@ -588,11 +767,25 @@ async def create_type(session: AsyncSession, tenant_id: UUID, actor: UUID, body:
     created = await fetch_one(session, "SELECT * FROM resource_types WHERE id = :id", {"id": type_id})
     await audit(session, tenant_id=tenant_id, event_type="TYPE_CREATE", actor_id=actor, entity_type="resource_type", entity_id=type_id, before=None, after={"key": key}, correlation_id=correlation_id)
     assert created is not None
+    created["parent_type_keys"] = parents
+    created["child_type_keys"] = children
     return created
 
 
 async def list_types(session: AsyncSession, tenant_id: UUID) -> list[dict[str, Any]]:
-    return await fetch_all(session, "SELECT * FROM resource_types WHERE tenant_id = :tenant_id ORDER BY key", {"tenant_id": tenant_id})
+    catalog = await fetch_all(session, "SELECT * FROM resource_types WHERE tenant_id = :tenant_id ORDER BY key", {"tenant_id": tenant_id})
+    pairs = await fetch_all(session, """SELECT parent_type_key, child_type_key FROM type_adjacency
+        WHERE tenant_id = :tenant_id AND relation_code = 'CONTAINS' ORDER BY parent_type_key, child_type_key""",
+        {"tenant_id": tenant_id})
+    by_key = {row["key"]: row for row in catalog}
+    for row in catalog:
+        row["parent_type_keys"] = []
+        row["child_type_keys"] = []
+    for pair in pairs:
+        if pair["parent_type_key"] in by_key and pair["child_type_key"] in by_key:
+            by_key[pair["parent_type_key"]]["child_type_keys"].append(pair["child_type_key"])
+            by_key[pair["child_type_key"]]["parent_type_keys"].append(pair["parent_type_key"])
+    return catalog
 
 
 async def neighbors(
@@ -725,61 +918,9 @@ async def publish_layout(session: AsyncSession, tenant_id: UUID, actor: UUID, la
 
 
 async def import_resources(session: AsyncSession, tenant_id: UUID, actor: UUID, body: ImportIn, correlation_id: str) -> dict[str, Any]:
-    if len(body.rows) > 2000:
-        raise AppError(422, "LIMIT", "Import is limited to 2000 rows at a time.")
-    errors: list[dict[str, str]] = []
-    planned: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for index, row in enumerate(body.rows, start=1):
-        code = str(row.get("code", "")).strip()
-        name = str(row.get("name", "")).strip()
-        type_key = str(row.get("type_key", "")).strip()
-        parent_code = str(row.get("parent_code", "")).strip()
-        try:
-            validate_code(code)
-            if not name:
-                raise ResourceInvariantError("NAME", "Name is required.")
-            await _type_by_key(session, tenant_id, type_key)
-        except (ResourceInvariantError, AppError) as exc:
-            errors.append({"row": str(index), "code": getattr(exc, "code", "INVALID"), "message": str(exc)})
-            continue
-        if code in seen:
-            errors.append({"row": str(index), "code": "DUPLICATE", "message": "Duplicate code in the import file."})
-            continue
-        seen.add(code)
-        planned.append({"code": code, "name": name, "type_key": type_key, "parent_code": parent_code})
-    if errors:
-        raise AppError(422, "IMPORT_INVALID", "The import file has invalid rows.", extra={"row_errors": errors})
-    if body.dry_run:
-        return {"dry_run": True, "accepted": len(planned), "created": 0}
-    created = 0
-    for row in planned:
-        parent_id = None
-        if row["parent_code"]:
-            parent = await fetch_one(
-                session,
-                "SELECT id FROM resources WHERE tenant_id = :tenant_id AND code = :code",
-                {"tenant_id": tenant_id, "code": row["parent_code"]},
-            )
-            if parent is None:
-                raise AppError(422, "MISSING_PARENT", f"Parent not found: {row['parent_code']}.")
-            parent_id = parent["id"]
-        await create_resource(
-            session,
-            tenant_id,
-            actor,
-            ResourceIn(
-                type_key=row["type_key"],
-                code=row["code"],
-                name=row["name"],
-                site_id=body.site_id,
-                parent_id=parent_id,
-            ),
-            correlation_id,
-        )
-        created += 1
-    return {"dry_run": False, "accepted": created, "created": created}
+    from factorix.modules.resource_import import ResourceImporter
 
+    return await ResourceImporter(session, tenant_id, actor, correlation_id).run(body)
 
 def hierarchy_presets() -> dict[str, Any]:
     return {"items": [{"name": name, "levels": levels} for name, levels in HIERARCHY_PRESETS.items()]}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -17,6 +17,7 @@ from factorix.domain.units import add_units
 from factorix.domain.uns import TopicError, render_topic
 from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, jsonb, parse_uuid, utcnow
 from factorix.modules.protocols import accept_connection, parse_config, public_protocol, redacted_endpoint
+from factorix.modules.mqtt_mapping import validate_mqtt_address
 from factorix.platform.errors import AppError
 from factorix.platform.security import encrypt_secret, new_token, hash_token
 
@@ -42,6 +43,17 @@ class ConnectionPatch(BaseModel):
     name: str | None = None
     config: dict[str, Any] | None = None
     secret_input: str | None = None
+
+
+class CommissionField(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    data_type: Literal["bool", "int64", "float64", "string", "enum", "json"]
+    address: dict[str, Any]
+    decode: dict[str, Any] | None = None
+
+
+class CommissionIn(BaseModel):
+    fields: list[CommissionField] = Field(default_factory=list, max_length=1000)
 
 
 class JobIn(BaseModel):
@@ -318,10 +330,13 @@ async def bulk_signals(
     body: SignalBulkIn,
     correlation_id: str,
 ) -> dict[str, Any]:
+    from factorix.modules.resources import _model_lock
+
+    await _model_lock(session, tenant_id)
     if not body.items or len(body.items) > 500:
         raise AppError(422, "LIMIT", "Create between 1 and 500 signals at a time.")
     resource_id = parse_uuid(body.resource_id)
-    resource = await fetch_one(session, "SELECT id, archived_at FROM resources WHERE id = :id AND tenant_id = :tenant_id", {"id": resource_id, "tenant_id": tenant_id})
+    resource = await fetch_one(session, "SELECT id, site_id, archived_at FROM resources WHERE id = :id AND tenant_id = :tenant_id", {"id": resource_id, "tenant_id": tenant_id})
     if resource is None:
         raise AppError(404, "NOT_FOUND", "Resource not found.")
     if resource["archived_at"] is not None:
@@ -349,6 +364,7 @@ async def bulk_signals(
             continue
         dumped = item.model_dump()
         dumped["data_type"] = data_type
+        dumped['_input_index'] = index
         prepared.append(dumped)
     if errors and body.atomic:
         raise AppError(422, "BULK_REJECTED", "No signals were created because some rows have errors.", field_errors=errors)
@@ -385,7 +401,7 @@ async def bulk_signals(
             job = await fetch_one(
                 session,
                 """
-                SELECT j.id FROM acquisition_jobs j
+                SELECT j.id, c.site_id, c.protocol, c.config_json FROM acquisition_jobs j
                 JOIN connections c ON c.id = j.connection_id
                 WHERE j.id = :id AND c.tenant_id = :tenant_id
                 """,
@@ -393,6 +409,10 @@ async def bulk_signals(
             )
             if job is None:
                 raise AppError(422, "JOB", "Acquisition job không thuộc tenant.")
+            if resource["site_id"] is None or resource["site_id"] != job["site_id"]:
+                raise AppError(422, "SITE_SCOPE", "The source connection and resource must belong to the same Site.")
+            if job['protocol'] == 'mqtt':
+                source['address'] = validate_mqtt_address(job['config_json'], source.get('address'), f"items[{item['_input_index']}].source_field.address")
             field_id = uuid4()
             await execute(
                 session,
@@ -460,7 +480,7 @@ async def _signal(session: AsyncSession, tenant_id: UUID, signal_id: UUID) -> di
 
 async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: str | None, query: str | None, limit: int) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"tenant_id": tenant_id, "limit": min(max(limit, 1), 1000)}
-    where = ["s.tenant_id = :tenant_id", "s.status = 'ACTIVE'"]
+    where = ["s.tenant_id = :tenant_id", "s.status = 'ACTIVE'", "r.archived_at IS NULL"]
     if resource_id:
         where.append("s.resource_id = :resource_id")
         params["resource_id"] = parse_uuid(resource_id)
@@ -471,8 +491,18 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
         session,
         f"""
         SELECT s.id, s.key, s.display_name, s.data_type, s.unit, s.category, s.resource_id, s.version, s.expected_interval_ms,
-               r.code AS resource_code, r.name AS resource_name
+               r.code AS resource_code, r.name AS resource_name, r.site_id,
+               source.connection_id, source.connection_name, source.protocol, source.address_kind, source.address_json
         FROM signal_definitions s JOIN resources r ON r.id = s.resource_id
+        LEFT JOIN LATERAL (
+            SELECT c.id AS connection_id, c.name AS connection_name, c.protocol, f.address_kind, f.address_json
+            FROM signal_bindings b
+            JOIN source_fields f ON f.id = b.source_field_id
+            JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+            JOIN connections c ON c.id = j.connection_id AND c.tenant_id = s.tenant_id
+            WHERE b.signal_id = s.id AND b.enabled = TRUE AND b.valid_to IS NULL AND b.valid_from <= now()
+            ORDER BY b.valid_from DESC, b.id DESC LIMIT 1
+        ) source ON TRUE
         WHERE {' AND '.join(where)}
         ORDER BY r.code, s.key
         LIMIT :limit
@@ -776,6 +806,9 @@ async def _resource_path(session: AsyncSession, tenant_id: UUID, resource_id: UU
 
 
 async def publish_release(session: AsyncSession, tenant_id: UUID, actor: UUID, body: ReleaseIn, correlation_id: str) -> dict[str, Any]:
+    from factorix.modules.resources import _model_lock
+
+    await _model_lock(session, tenant_id)
     edge = await _owned_edge(session, tenant_id, parse_uuid(body.edge_id))
     connections = await fetch_all(
         session,
@@ -806,18 +839,26 @@ async def publish_release(session: AsyncSession, tenant_id: UUID, actor: UUID, b
         SELECT b.signal_id, b.source_field_id, b.transform_chain_json, s.key, s.resource_id, s.data_type, s.unit
         FROM signal_bindings b
         JOIN signal_definitions s ON s.id = b.signal_id
+        JOIN resources r ON r.id = s.resource_id
+        JOIN source_fields f ON f.id = b.source_field_id
+        JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+        JOIN connections c ON c.id = j.connection_id
         WHERE s.tenant_id = :tenant_id AND b.enabled = TRUE AND b.valid_to IS NULL
+          AND s.status = 'ACTIVE' AND r.archived_at IS NULL AND b.valid_from <= now()
+          AND c.edge_id = :edge_id AND c.tenant_id = :tenant_id AND r.site_id = c.site_id
         """,
-        {"tenant_id": tenant_id},
+        {"tenant_id": tenant_id, "edge_id": as_uuid(edge["id"])},
     )
     formulas = await fetch_all(
         session,
         """
         SELECT f.signal_id, f.expression_source, f.revision, f.temporal_policy_json
         FROM formula_definitions f JOIN signal_definitions s ON s.id = f.signal_id
+        JOIN resources r ON r.id = s.resource_id
         WHERE s.tenant_id = :tenant_id AND f.status = 'PUBLISHED'
+          AND r.site_id = :site_id AND r.archived_at IS NULL AND s.status = 'ACTIVE'
         """,
-        {"tenant_id": tenant_id},
+        {"tenant_id": tenant_id, "site_id": as_uuid(edge["site_id"])},
     )
     revision = int(edge["desired_revision"]) + 1
     payload = {
@@ -872,7 +913,7 @@ async def publish_release(session: AsyncSession, tenant_id: UUID, actor: UUID, b
     return {"edge_id": edge["id"], "revision": revision, "status": "PUBLISHED", "active_revision": edge["active_revision"], "checksum_sha256": digest}
 
 
-async def request_commission(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str) -> dict[str, Any]:
+async def request_commission(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str, body: CommissionIn | None = None) -> dict[str, Any]:
     connection = await get_connection(session, tenant_id, connection_id)
     edge = await _owned_edge(session, tenant_id, as_uuid(connection["edge_id"]))
     if edge.get("enrollment_status") != "ENROLLED":
@@ -886,16 +927,29 @@ async def request_commission(session: AsyncSession, tenant_id: UUID, actor: UUID
         for name in ("NETWORK", "AUTH", "PROTOCOL", "READ_OR_SUBSCRIBE", "DECODE", "MAPPING", "VALIDATION")
     ]
     job_id = uuid4()
+    fields = [field.model_dump(exclude_none=True) for field in body.fields] if body else []
+    if not fields:
+        fields = await fetch_all(session, """
+            SELECT s.display_name AS name, s.data_type, f.address_json AS address, f.decode_json AS decode
+            FROM source_fields f JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+            JOIN signal_bindings b ON b.source_field_id = f.id AND b.enabled AND b.valid_to IS NULL
+            JOIN signal_definitions s ON s.id = b.signal_id
+            WHERE j.connection_id = :id AND s.tenant_id = :tenant_id
+        """, {"id": connection_id, "tenant_id": tenant_id})
+    if connection['protocol'] in {'mqtt', 'mqtt_client'}:
+        for index, field in enumerate(fields):
+            field['address'] = validate_mqtt_address(connection['config_json'], field.get('address'), f'fields[{index}].address')
     await execute(
         session,
         """
         INSERT INTO commissioning_jobs (
-            id, tenant_id, connection_id, requested_by, stages_json, status, diagnostic
+            id, tenant_id, connection_id, requested_by, stages_json, status, diagnostic, request_json, connection_version
         ) VALUES (
-            :id, :tenant_id, :connection_id, :actor, CAST(:stages AS jsonb), 'PENDING', ''
+            :id, :tenant_id, :connection_id, :actor, CAST(:stages AS jsonb), 'PENDING', '', CAST(:request AS jsonb), :version
         )
         """,
-        {"id": job_id, "tenant_id": tenant_id, "connection_id": connection_id, "actor": actor, "stages": jsonb(stages)},
+        {"id": job_id, "tenant_id": tenant_id, "connection_id": connection_id, "actor": actor, "stages": jsonb(stages),
+         "request": jsonb({"fields": fields}), "version": connection["version"]},
     )
     await audit(session, tenant_id=tenant_id, event_type="COMMISSION_REQUEST", actor_id=actor, entity_type="connection", entity_id=connection_id, before=None, after={"job_id": str(job_id), "protocol": connection["protocol"]}, correlation_id=correlation_id)
     return {"job_id": str(job_id), "status": "PENDING"}

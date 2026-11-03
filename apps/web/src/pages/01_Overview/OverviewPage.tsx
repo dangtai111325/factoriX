@@ -131,7 +131,7 @@ export const OverviewPage: React.FC = () => {
           <Button
             variant="secondary"
             icon={<Plus className="w-4 h-4 text-[#EF1B24]" />}
-            onClick={() => navigate('/acquisition/add-data')}
+            onClick={() => navigate('/collector/add-data')}
           >
             Add Connection
           </Button>
@@ -286,7 +286,7 @@ export const OverviewPage: React.FC = () => {
           action={
             <button
               type="button"
-              onClick={() => navigate('/live/activity')}
+              onClick={() => navigate('/collector/diagnostics/activity')}
               className="text-[12px] font-semibold text-[#EF1B24] hover:underline"
             >
               View all
@@ -313,7 +313,7 @@ export const OverviewPage: React.FC = () => {
         action={
           <button
             type="button"
-            onClick={() => navigate('/live/monitor')}
+            onClick={() => navigate('/collector/signals/live')}
             className="text-[12px] font-semibold text-[#EF1B24] hover:underline"
           >
             Open Live Monitor →

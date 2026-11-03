@@ -15,8 +15,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factorix.modules import collect, edge_sync, identity, resources, telemetry
+from factorix.modules import collect, edge_sync, identity, resources, telemetry, topic_capture
 from factorix.modules.collect import (
+    CommissionIn,
     ConnectionIn,
     EdgeIn,
     FormulaIn,
@@ -28,7 +29,8 @@ from factorix.modules.collect import (
     SignalPatch,
 )
 from factorix.modules.common import as_uuid, fetch_all, fetch_one, parse_uuid
-from factorix.platform.after_commit import listen
+from factorix.modules.commissioning import expire_jobs
+from factorix.platform.after_commit import discard, flush, listen
 from factorix.modules.identity import (
     SESSION_COOKIE,
     BootstrapIn,
@@ -44,7 +46,6 @@ from factorix.modules.identity import (
     principal_from_token,
     request_password_reset,
     require_bootstrap_token,
-    touch_me,
 )
 from factorix.modules.protocols import public_protocol
 from factorix.platform.mail import SmtpMailer
@@ -58,11 +59,12 @@ from factorix.modules.resources import (
     RelationIn,
     ResourceIn,
     ResourcePatch,
+    ResourceLifecycleIn,
     SiteIn,
     TypeIn,
 )
 from factorix.modules.telemetry import DashboardIn, DashboardPatch, RetentionIn
-from factorix.platform.db import get_engine, session_factory
+from factorix.platform.db import session_factory
 from factorix.platform.errors import AppError
 from factorix.platform.http import correlation_id, json_error
 from factorix.platform.security import hash_password, verify_password
@@ -78,8 +80,10 @@ async def db_session() -> AsyncIterator[AsyncSession]:
             yield session
             await session.commit()
         except Exception:
+            discard(session)
             await session.rollback()
             raise
+        await flush(session)
 
 
 async def admin(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
@@ -371,9 +375,16 @@ async def patch_resource(resource_id: str, body: ResourcePatch, request: Request
 
 
 @app.post("/api/v1/resources/{resource_id}/archive")
-async def archive_resource(resource_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+async def archive_resource(resource_id: str, request: Request, body: ResourceLifecycleIn | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
-    return await resources.archive_resource(session, tenant_id, actor, parse_uuid(resource_id), correlation_id(request))
+    return await resources.archive_resource(session, tenant_id, actor, parse_uuid(resource_id), correlation_id(request),
+                                            version=body.version if body else None)
+
+
+@app.post("/api/v1/resources/{resource_id}/restore")
+async def restore_resource(resource_id: str, body: ResourceLifecycleIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await resources.restore_resource(session, tenant_id, actor, parse_uuid(resource_id), body, correlation_id(request))
 
 
 @app.post("/api/v1/resources/{resource_id}/move")
@@ -391,12 +402,12 @@ async def import_resources(body: ImportIn, request: Request, principal: dict[str
 @app.post("/api/v1/resource-relations", status_code=201)
 async def create_relation(body: RelationIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
+    if body.relation_code == "CONTAINS":
+        raise AppError(422, "USE_RESOURCE_MOVE", "Use the versioned resource Move operation to change the hierarchy.")
     from factorix.modules.resources import _aware, _link, _resource
 
     source = await _resource(session, tenant_id, parse_uuid(body.from_id))
     target = await _resource(session, tenant_id, parse_uuid(body.to_id))
-    if body.relation_code == "CONTAINS":
-        await resources._assert_contains(session, tenant_id, source["type_key"], target["type_key"], source, "CONTAINS")
     await _link(session, tenant_id, as_uuid(source["id"]), as_uuid(target["id"]), body.relation_code, _aware(body.valid_from))
     return {"status": "created", "from_id": source["id"], "to_id": target["id"], "relation_code": body.relation_code}
 
@@ -500,14 +511,15 @@ async def delete_connection(connection_id: str, request: Request, principal: dic
 
 
 @app.post("/api/v1/connections/{connection_id}/tests", status_code=202)
-async def commission(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+async def commission(connection_id: str, request: Request, body: CommissionIn | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
-    return await collect.request_commission(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
+    return await collect.request_commission(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request), body)
 
 
 @app.get("/api/v1/commissioning/{job_id}")
 async def commission_job(job_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
+    await expire_jobs(session, tenant_id=tenant_id)
     row = await fetch_one(session, "SELECT id, connection_id, stages_json, status, error_code, diagnostic, started_at, completed_at FROM commissioning_jobs WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(job_id), "tenant_id": tenant_id})
     if row is None:
         raise AppError(404, "NOT_FOUND", "Commissioning job not found.")
@@ -637,19 +649,18 @@ async def enrollment(edge_id: str, request: Request, principal: dict[str, Any] =
 
 @app.post("/api/v1/edges/{edge_id}/appliance", status_code=201)
 async def appliance_enrollment(edge_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
-    if not settings.appliance or not settings.data_dir:
-        raise AppError(404, "NOT_FOUND", "Appliance enrollment is not enabled.")
+    from factorix.modules.appliance import LocalAppliance
+
     tenant_id, actor = _ids(principal)
-    issued = await collect.issue_enrollment(session, tenant_id, parse_uuid(edge_id), actor, correlation_id(request))
-    directory = Path(settings.data_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / "enrollment"
-    target.write_text(str(issued["enrollment_token"]), encoding="utf-8")
-    try:
-        target.chmod(0o600)
-    except OSError:
-        pass
-    return {"status": "queued"}
+    return await LocalAppliance(session, settings).request(tenant_id, actor, parse_uuid(edge_id), correlation_id(request))
+
+
+@app.get("/api/v1/appliance")
+async def local_appliance(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    from factorix.modules.appliance import LocalAppliance
+
+    tenant_id, _actor = _ids(principal)
+    return await LocalAppliance(session, settings).status(tenant_id)
 
 
 @app.get("/api/v1/edges/{edge_id}/health")
@@ -774,6 +785,7 @@ async def output_groups(principal: dict[str, Any] = Depends(admin), session: Asy
 @app.get("/api/v1/commissioning")
 async def commissioning(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
+    await expire_jobs(session, tenant_id=tenant_id)
     items = await fetch_all(
         session,
         """
@@ -948,6 +960,44 @@ async def edge_observations(body: EdgeBatchIn, request: Request, session: AsyncS
 async def edge_commands(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     return await edge_sync.pull_commands(session, edge)
+
+
+@app.post('/api/v1/connections/{connection_id}/topic-captures', status_code=202)
+async def request_topic_capture(connection_id: str, body: topic_capture.CaptureIn, request: Request,
+                                principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    return await topic_capture.request_capture(session, as_uuid(principal['tenant_id']), as_uuid(principal['admin_id']),
+                                               parse_uuid(connection_id), body, correlation_id(request))
+
+
+@app.get('/api/v1/topic-captures/{job_id}')
+async def topic_capture_status(job_id: str, principal: dict[str, Any] = Depends(admin),
+                               session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    return await topic_capture.get_capture(session, parse_uuid(job_id), tenant_id=as_uuid(principal['tenant_id']))
+
+
+@app.post('/api/v1/topic-captures/{job_id}/cancel')
+async def cancel_topic_capture(job_id: str, principal: dict[str, Any] = Depends(admin),
+                               session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    return await topic_capture.cancel_capture(session, as_uuid(principal['tenant_id']), parse_uuid(job_id))
+
+
+@app.get('/api/v1/edge-sync/topic-captures')
+async def pull_topic_capture(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    edge = await edge_sync.edge_principal(session, _bearer(request))
+    return await topic_capture.pull(session, as_uuid(edge['id']))
+
+
+@app.get('/api/v1/edge-sync/topic-captures/{job_id}')
+async def edge_topic_capture_status(job_id: str, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    edge = await edge_sync.edge_principal(session, _bearer(request))
+    return await topic_capture.get_capture(session, parse_uuid(job_id), edge_id=as_uuid(edge['id']))
+
+
+@app.post('/api/v1/edge-sync/topic-captures/{job_id}')
+async def finish_topic_capture(job_id: str, body: topic_capture.CaptureResult, request: Request,
+                               session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    edge = await edge_sync.edge_principal(session, _bearer(request))
+    return await topic_capture.finish(session, as_uuid(edge['id']), parse_uuid(job_id), body)
 
 
 @app.post("/api/v1/edge-sync/commands/{job_id}")

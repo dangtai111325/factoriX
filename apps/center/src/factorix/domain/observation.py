@@ -65,14 +65,14 @@ class Observation:
             "json",
         }:
             raise ObservationError("INVALID_TYPE", "unsupported data type")
-        _validate_value(self.data_type, self.value)
+        validate_value(self.data_type, self.value)
         if self.unit is not None and (len(self.unit) > 32 or "/" in self.unit and self.unit.count("/") > 3):
             raise ObservationError("INVALID_UNIT", "invalid unit")
         if self.provenance is not None:
             _assert_depth(self.provenance, 0)
 
 
-def _validate_value(data_type: str, value: Any) -> None:
+def validate_value(data_type: str, value: Any) -> None:
     if value is None:
         return
     if data_type == "bool":
@@ -82,7 +82,7 @@ def _validate_value(data_type: str, value: Any) -> None:
     if data_type == "int64":
         if isinstance(value, bool) or not isinstance(value, int):
             raise ObservationError("INVALID_VALUE", "integer value required")
-        if abs(value) > 2**63 - 1:
+        if not -(2**63) <= value < 2**63:
             raise ObservationError("INVALID_VALUE", "integer out of range")
         return
     if data_type == "float64":
@@ -114,6 +114,10 @@ def _assert_depth(value: Any, depth: int) -> None:
             raise ObservationError("JSON_TOO_WIDE", "json array too long")
         for item in value:
             _assert_depth(item, depth + 1)
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ObservationError("NON_FINITE", "non-finite JSON number")
+    elif value is not None and not isinstance(value, (str, int, float, bool)):
+        raise ObservationError("INVALID_VALUE", "JSON-compatible value required")
 
 
 def ordering_key(event_time: datetime, received_time: datetime, event_uid: str) -> tuple[datetime, datetime, str]:

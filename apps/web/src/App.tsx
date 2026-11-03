@@ -1,5 +1,5 @@
 import React from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import {
   ForgotPasswordPage,
   GuestOnly,
@@ -20,13 +20,18 @@ import { FactoryLayoutPage } from './pages/03_FactoryLayout/FactoryLayoutPage';
 import { KnowledgeGraphPage } from './pages/04_KnowledgeGraph/KnowledgeGraphPage';
 import { ConnectionsPage } from './pages/05_Connections/ConnectionsPage';
 import { AddDataWizardPage } from './pages/06_AddDataWizard/AddDataWizardPage';
-import { SignalsCatalogPage } from './pages/08_SignalsCatalog/SignalsCatalogPage';
-import { LiveOperationsPage } from './pages/10_LiveOperations/LiveOperationsPage';
-import { DiagnosticsPage } from './pages/11_Diagnostics/DiagnosticsPage';
-import { ActivityLogPage } from './pages/12_ActivityLog/ActivityLogPage';
 import { OutputGroupsPage } from './pages/13_OutputGroups/OutputGroupsPage';
 import { EdgesPage } from './pages/16_Edges/EdgesPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
+import { CollectorSignalsPage, CollectorDiagnosticsPage } from './pages/Collector/CollectorWorkspace';
+import { ModelCatalogPage } from './pages/DataModels/ModelCatalogPage';
+import { OutputGroupLivePage } from './pages/DataModels/OutputGroupLivePage';
+import { legacyRoutes, legacyDestination } from './features/navigation/routes';
+
+const LegacyRoute: React.FC = () => {
+  const location = useLocation();
+  return <Navigate replace to={legacyDestination(location.pathname, location.search, location.hash)} />;
+};
 
 const ProtectedAppShell: React.FC = () => (
   <AppProvider>
@@ -42,23 +47,21 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/factory/structure" element={<FactoryStructurePage />} />
               <Route path="/factory/layout" element={<FactoryLayoutPage />} />
               <Route path="/factory/graph" element={<KnowledgeGraphPage />} />
-              <Route path="/acquisition/connections" element={<ConnectionsPage />} />
-              <Route path="/acquisition/edges" element={<EdgesPage />} />
-              <Route path="/acquisition/add-data" element={<AddDataWizardPage />} />
-              <Route path="/acquisition/studio/opcua" element={<ComingSoonPage />} />
-              <Route path="/signals" element={<SignalsCatalogPage />} />
-              <Route path="/signals/calculated" element={<ComingSoonPage />} />
-              <Route path="/live/monitor" element={<LiveOperationsPage />} />
-              <Route path="/live/diagnostics" element={<DiagnosticsPage />} />
-              <Route path="/live/activity" element={<ActivityLogPage />} />
-              <Route path="/signals/output-groups" element={<OutputGroupsPage />} />
-              <Route path="/acquisition/studio/mqtt" element={<ComingSoonPage />} />
-              <Route path="/acquisition/studio/http" element={<ComingSoonPage />} />
-              <Route path="/dashboards" element={<ComingSoonPage />} />
-              <Route path="/storage" element={<ComingSoonPage />} />
-              <Route path="/alarms" element={<ComingSoonPage />} />
-              <Route path="/reports" element={<ComingSoonPage />} />
-              <Route path="/administration" element={<ComingSoonPage />} />
+              <Route path="/collector/connections" element={<ConnectionsPage />} />
+              <Route path="/collector/edges" element={<EdgesPage />} />
+              <Route path="/collector/add-data" element={<AddDataWizardPage />} />
+              <Route path="/collector/signals" element={<CollectorSignalsPage />} />
+              <Route path="/collector/signals/live" element={<CollectorSignalsPage />} />
+              <Route path="/collector/diagnostics" element={<CollectorDiagnosticsPage />} />
+              <Route path="/collector/diagnostics/activity" element={<CollectorDiagnosticsPage />} />
+              <Route path="/models" element={<ModelCatalogPage />} />
+              <Route path="/models/designer" element={<OutputGroupsPage />} />
+              <Route path="/models/live-preview" element={<OutputGroupLivePage />} />
+              <Route path="/models/output-groups" element={<OutputGroupsPage />} />
+              <Route path="/models/formulas" element={<ComingSoonPage />} />
+              {Object.keys(legacyRoutes).map(path => <Route key={path} path={path} element={<LegacyRoute />} />)}
+              {['opcua', 'mqtt', 'http'].map(protocol => <Route key={protocol} path={`/acquisition/studio/${protocol}`} element={<LegacyRoute />} />)}
+              {['dashboards','historian','analytics','alarms','reports','administration'].map(module=><Route key={module} path={`/${module}/*`} element={<ComingSoonPage/>}/>)}
               <Route path="*" element={<Navigate to="/overview" replace />} />
             </Routes>
           </div>

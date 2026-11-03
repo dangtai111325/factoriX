@@ -1,0 +1,24 @@
+﻿import { chromium } from '@playwright/test';
+const base = process.env.FACTORIX_E2E_BASE || 'http://127.0.0.1:8080';
+const browser = await chromium.launch({ headless: true });
+const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+await page.goto(base + '/register', { waitUntil: 'networkidle' });
+console.log('status', await page.evaluate(async () => {
+  const r = await fetch('/api/v1/auth/status', { credentials: 'include' });
+  return r.json();
+}));
+await page.locator('#register-name').fill('QA Auditor');
+await page.locator('#register-email').fill('qa@factorix.local');
+await page.locator('#register-username').fill('qaaudit');
+await page.locator('#register-password').fill('QaAudit!Pass2026');
+await page.locator('#register-confirm').fill('QaAudit!Pass2026');
+await page.locator('input[type=checkbox]').check();
+const respPromise = page.waitForResponse(r => r.url().includes('/auth') || r.url().includes('/register') || r.url().includes('/bootstrap'), { timeout: 10000 }).catch(() => null);
+await page.getByRole('button', { name: /Create administrator/i }).click();
+await page.waitForTimeout(3000);
+const resp = await respPromise;
+console.log('url', page.url());
+console.log('resp', resp && { url: resp.url(), status: resp.status(), body: await resp.text().catch(()=>'') });
+console.log('body alerts', await page.locator('body').innerText().then(t => t.split('\n').filter(l => /error|must|fail|invalid|agree|created|sign/i.test(l)).slice(0,20)));
+await page.screenshot({ path: 'scripts/register-debug.png', fullPage: true });
+await browser.close();

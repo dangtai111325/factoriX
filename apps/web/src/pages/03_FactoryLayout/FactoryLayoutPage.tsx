@@ -65,7 +65,7 @@ export const FactoryLayoutPage: React.FC = () => {
   if (!selectedNode) {
     return (
       <div className="space-y-3">
-        <h1 className="fx-page-title">Factory Layout</h1>
+        <h1 className="fx-page-title">Layout Designer</h1>
         <p className="fx-page-subtitle">Lines and machines appear on this floor after you add them in Factory Structure.</p>
       </div>
     );
@@ -80,7 +80,7 @@ export const FactoryLayoutPage: React.FC = () => {
       {/* Region 1 & 2: Heading & Edit/View Toggles */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="fx-page-title">Factory Layout Designer</h1>
+          <h1 className="fx-page-title">Layout Designer</h1>
           <p className="fx-page-subtitle">
             Visual plant floor editor, physical placement, and real-time operational overlay.
           </p>

@@ -9,7 +9,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 ROOT = Path(__file__).resolve().parents[2]
-for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
+for line in ((ROOT / ".env").read_text(encoding="utf-8") if (ROOT / ".env").exists() else "").splitlines():
     if not line or line.startswith("#") or "=" not in line:
         continue
     key, value = line.split("=", 1)
@@ -34,6 +34,9 @@ from factorix.platform.db import session_factory
 
 
 async def _wipe() -> None:
+    from test_support.database import require_disposable_database
+
+    require_disposable_database(get_settings().database_url)
     factory = session_factory()
     async with factory() as session:
         await session.execute(

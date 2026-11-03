@@ -12,6 +12,7 @@ import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { useApp } from '../../store/AppContext';
 import { OutputGroup } from '../../types';
+import { useOutputGroupPreview } from '../DataModels/OutputGroupLivePage';
 
 function createDraftGroup(): OutputGroup {
   const stamp = Date.now().toString(36);
@@ -36,6 +37,7 @@ export const OutputGroupsPage: React.FC = () => {
 
   const selectedGroup =
     outputGroups.find((g) => g.id === selectedGroupId) || outputGroups[0] || null;
+  const preview = useOutputGroupPreview(selectedGroup?.id || '');
 
   useEffect(() => {
     if (!selectedGroup) {
@@ -96,30 +98,7 @@ export const OutputGroupsPage: React.FC = () => {
     );
   }
 
-  const projectedPayload = JSON.stringify(
-    {
-      timestamp: new Date().toISOString(),
-      topic,
-      qos: 1,
-      source: 'FactoriX-UNS-Publisher-v1',
-      metrics: selectedGroup.assignedSignals.reduce((acc, sigId) => {
-        const found = signals.find((s) => s.id === sigId);
-        if (found) {
-          acc[found.tag] = {
-            value: found.currentValue,
-            unit: found.unit,
-            quality: found.quality,
-            timestamp: found.lastUpdated,
-          };
-        } else {
-          acc[sigId] = { value: 0, status: 'NOT_FOUND' };
-        }
-        return acc;
-      }, {} as Record<string, unknown>),
-    },
-    null,
-    2
-  );
+  const projectedPayload = preview.payload ? JSON.stringify(preview.payload, null, 2) : 'No Data';
 
   const handleCopy = () => {
     navigator.clipboard.writeText(projectedPayload);
@@ -137,12 +116,6 @@ export const OutputGroupsPage: React.FC = () => {
     setTimeout(() => setDispatchToast(null), 3000);
   };
 
-  const handleTestDispatch = () => {
-    setDispatchToast(
-      `[Simulated Dispatch] Published message to "${topic}" (${selectedGroup.assignedSignals.length} metrics bundled)`
-    );
-    setTimeout(() => setDispatchToast(null), 4000);
-  };
 
   const handleRemoveSignal = (sigId: string) => {
     const updated = selectedGroup.assignedSignals.filter((id) => id !== sigId);
@@ -165,9 +138,9 @@ export const OutputGroupsPage: React.FC = () => {
           <Button
             variant="secondary"
             icon={<Play className="w-4 h-4 text-[#0DBA67]" />}
-            onClick={handleTestDispatch}
+            disabled
           >
-            Test Dispatch (Simulated)
+            Publishing unavailable
           </Button>
           <Button variant="primary" icon={<Save className="w-4 h-4" />} onClick={handleSave}>
             Save Output Group
@@ -296,17 +269,17 @@ export const OutputGroupsPage: React.FC = () => {
             </div>
           </Card>
 
-          <Card title="Publication Dispatch Settings">
+          <Card title="Output Settings">
             <div className="grid grid-cols-2 gap-3 text-[12px]">
               <div>
                 <label className="block text-[#657794] font-semibold mb-1">Publish Interval</label>
                 <div className="font-mono font-bold text-[#111B37]">
-                  {selectedGroup.publishIntervalMs} ms
+                  Not configured
                 </div>
               </div>
               <div>
                 <label className="block text-[#657794] font-semibold mb-1">QoS Level</label>
-                <div className="font-mono font-bold text-[#111B37]">QoS 1 (At least once)</div>
+                <div className="font-mono font-bold text-[#111B37]">Not configured</div>
               </div>
             </div>
           </Card>

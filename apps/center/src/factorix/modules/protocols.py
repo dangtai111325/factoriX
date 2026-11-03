@@ -28,24 +28,34 @@ class OpcUaConfig(BaseModel):
 
 
 class MqttConfig(BaseModel):
-    host: str
+    host: str = Field(min_length=1, max_length=253)
     port: int = Field(default=1883, ge=1, le=65535)
     protocol_version: Literal["3.1.1", "5"] = "3.1.1"
     tls: bool = False
+    tls_ca_pem: str | None = Field(default=None, max_length=65536)
     anonymous: bool = False
     username: str | None = None
     client_id: str | None = None
     topics: list[str] = Field(default_factory=list, max_length=64)
     qos: Literal[0, 1, 2] = 1
+    keepalive: int = Field(default=60, ge=0, le=65535)
+    clean_session: bool = True
+    session_expiry: int = Field(default=0, ge=0, le=4294967295)
+    timestamp_jsonpath: str | None = Field(default=None, max_length=512)
 
 
 class HttpConfig(BaseModel):
     base_url: str
     path: str = "/"
+    method: Literal["GET", "POST"] = "GET"
     auth: Literal["none", "api_key", "basic", "bearer"] = "none"
+    username: str | None = None
     header_name: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict, max_length=32)
     timeout_ms: int = Field(default=5000, ge=200, le=30000)
-    query: dict[str, str] = Field(default_factory=dict)
+    query: dict[str, str] = Field(default_factory=dict, max_length=64)
+    body_json: Any = None
+    timestamp_jsonpath: str | None = Field(default=None, max_length=512)
 
 
 _MODELS = {
@@ -89,10 +99,12 @@ def accept_connection(protocol: str, payload: dict[str, Any]) -> tuple[str, dict
         if not data.get("username"):
             data["anonymous"] = True
     elif stored == "mqtt":
+        if data.get("protocol_version") == "5.0":
+            data["protocol_version"] = "5"
         topic = data.pop("topic_filter", None)
         if topic and not data.get("topics"):
             data["topics"] = [str(topic)]
-        if not data.get("username"):
+        if "anonymous" not in data and not data.get("username"):
             data["anonymous"] = True
     elif stored == "http":
         url = str(data.pop("url", "") or "")
@@ -102,7 +114,6 @@ def accept_connection(protocol: str, payload: dict[str, Any]) -> tuple[str, dict
             data["path"] = parsed.path or "/"
             if parsed.query:
                 data["query"] = dict(parse_qsl(parsed.query))
-        data.pop("method", None)
         if data.get("interval_ms") is not None:
             interval = int(data.pop("interval_ms"))
         data.setdefault("auth", "none")
@@ -132,11 +143,19 @@ def parse_config(protocol: str, payload: dict[str, Any]) -> dict[str, Any]:
             pass
     if protocol == "mqtt":
         for topic in data["topics"]:
-            if topic.startswith("$") or "#" in topic[:-1] or any(part == "" for part in topic.split("/")):
-                raise AppError(422, "TOPIC", "Topic filter không hợp lệ.")
+            levels = topic.split("/")
+            if (not topic or "\x00" in topic or len(topic.encode("utf-8")) > 65535
+                    or any(("#" in part and (part != "#" or index != len(levels) - 1))
+                           or ("+" in part and part != "+") for index, part in enumerate(levels))):
+                raise AppError(422, "TOPIC", "Invalid MQTT topic filter.")
         if data["anonymous"] is False and not data["username"]:
-            raise AppError(422, "AUTH", "MQTT cần username hoặc bật anonymous rõ ràng.")
+            raise AppError(422, "AUTH", "MQTT requires a username or explicit anonymous access.")
     if protocol == "http":
+        parsed_url = urlparse(data["base_url"])
+        if parsed_url.username or parsed_url.password:
+            raise AppError(422, "SECRET", "Use authentication fields instead of credentials in the URL.")
+        if any(name.lower() in {"authorization", "proxy-authorization", "cookie", "x-api-key"} for name in data["headers"]):
+            raise AppError(422, "SECRET", "Use encrypted authentication fields for credential headers.")
         if not str(data["base_url"]).startswith(("http://", "https://")):
             raise AppError(422, "CONFIG", "HTTP base URL không hợp lệ.")
         if data["auth"] == "none" and str(data["base_url"]).startswith("https://") is False:

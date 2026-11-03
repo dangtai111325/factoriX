@@ -178,7 +178,7 @@ export const DiagnosticsPage: React.FC = () => {
                 </p>
                 <button
                   type="button"
-                  onClick={() => navigate('/acquisition/connections')}
+                  onClick={() => navigate('/collector/connections')}
                   className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#1D63BD] hover:underline mt-1"
                 >
                   Go to Connections
@@ -525,7 +525,7 @@ export const DiagnosticsPage: React.FC = () => {
                   size="sm"
                   variant="secondary"
                   className="text-xs"
-                  onClick={() => navigate('/acquisition/connections')}
+                  onClick={() => navigate('/collector/connections')}
                 >
                   Open Connection
                 </Button>

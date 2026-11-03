@@ -233,13 +233,15 @@ async def _owned_binding(
     release = await fetch_one(
         session,
         """
-        SELECT revision FROM configuration_releases
+        SELECT revision, published_at FROM configuration_releases
         WHERE tenant_id = :tenant_id AND edge_id = :edge_id AND revision = :revision AND status <> 'FAILED'
         """,
         {"tenant_id": tenant_id, "edge_id": edge_id, "revision": observation.config_revision},
     )
     if release is None:
         return None
+    # Only the Center's published revision establishes binding validity. Both
+    # source and Edge receive clocks may predate a newly created mapping.
     row = await fetch_one(
         session,
         """
@@ -252,15 +254,17 @@ async def _owned_binding(
         JOIN connections c ON c.id = j.connection_id
         WHERE s.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
           AND s.id = :signal_id AND c.edge_id = :edge_id
+          AND r.archived_at IS NULL AND s.status = 'ACTIVE'
           AND b.enabled = TRUE
-          AND b.valid_from <= :event_time
-          AND (b.valid_to IS NULL OR b.valid_to > :event_time)
+          AND b.valid_from <= :released_at
+          AND (b.valid_to IS NULL OR b.valid_to > :released_at)
+        FOR SHARE OF r
         """,
         {
             "tenant_id": tenant_id,
             "signal_id": observation.signal_id,
             "edge_id": edge_id,
-            "event_time": observation.event_time,
+            "released_at": release["published_at"],
         },
     )
     if row is None:
@@ -682,10 +686,16 @@ async def _run_formulas(
         JOIN signal_definitions s ON s.id = f.signal_id
         JOIN resources r ON r.id = s.resource_id
         WHERE d.dependency_signal_id = :signal_id AND f.status = 'PUBLISHED' AND s.tenant_id = :tenant_id
+          AND r.archived_at IS NULL AND s.status = 'ACTIVE'
         """,
         {"signal_id": signal_id, "tenant_id": tenant_id},
     )
     for formula in formulas:
+        target = await fetch_one(session, """SELECT id FROM resources
+            WHERE id = :id AND tenant_id = :tenant_id AND archived_at IS NULL FOR SHARE""",
+            {"id": formula["resource_id"], "tenant_id": tenant_id})
+        if target is None:
+            continue
         aliases = await fetch_all(
             session,
             "SELECT variable_alias, dependency_signal_id FROM formula_dependencies WHERE formula_id = :id",

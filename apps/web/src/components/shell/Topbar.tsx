@@ -105,17 +105,14 @@ export const Topbar: React.FC = () => {
     )}
     <header className="fx-topbar select-none relative z-30">
       {/* Left: Breadcrumbs / Interactive Plant Switcher */}
-      <div className="flex items-center gap-3">
+      <div className="fx-topbar-left flex min-w-0 items-center gap-3">
         <div className="flex items-center gap-2 text-[13px] text-[#657794]">
-          <span className="font-semibold text-[#111B37]">FactoriX Industrial IoT</span>
-          <span className="text-[#CBD5E1]">/</span>
-
           {/* Interactive Plant / Site Switcher Dropdown (From Images 32 & 46) */}
           <div className="relative" ref={siteDropdownRef}>
             <button
               type="button"
               onClick={() => setSiteDropdownOpen(!siteDropdownOpen)}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#EEF5FF] text-[#1D63BD] hover:bg-[#E1EDFC] text-[12px] font-semibold border border-[#BED7F7] transition-colors shadow-2xs"
+              className="fx-scope-button inline-flex min-w-0 items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#EEF5FF] text-[#1D63BD] hover:bg-[#E1EDFC] text-[12px] font-semibold border border-[#BED7F7] transition-colors shadow-2xs"
               title="Click to switch physical plant or line"
             >
               <span
@@ -127,7 +124,7 @@ export const Topbar: React.FC = () => {
                     : 'bg-[#94A3B8]'
                 }`}
               />
-              <span>{currentPlant.name}</span>
+              <span className="truncate">{currentPlant.name}</span>
               <ChevronDown className="w-3.5 h-3.5 text-[#1D63BD]" />
             </button>
 
@@ -204,7 +201,7 @@ export const Topbar: React.FC = () => {
         )}
 
         {/* Visualization stream pause button (Review FX-17) */}
-        <div className="flex items-center gap-2 pl-2 border-l border-[#E2E8F0]">
+        <div className="fx-stream-controls flex items-center gap-2 pl-2 border-l border-[#E2E8F0]">
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide ${
               !isStreaming
@@ -340,7 +337,7 @@ export const Topbar: React.FC = () => {
                   type="button"
                   onClick={() => {
                     setDaemonPopoverOpen(false);
-                    navigate('/live/diagnostics');
+                    navigate('/collector/diagnostics');
                   }}
                   className="text-[#1D63BD] font-semibold hover:underline"
                 >
@@ -353,16 +350,17 @@ export const Topbar: React.FC = () => {
       </div>
 
       {/* Right Controls */}
-      <div className="flex items-center gap-3.5">
+      <div className="fx-topbar-right flex shrink-0 items-center gap-3.5">
         {/* Global Search Bar */}
         <button
           type="button"
+          aria-label="Search signals, tags and assets"
           onClick={() => setSearchOpen(true)}
-          className="w-[280px] h-[38px] px-3 rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-between text-[13px] text-[#94A3B8] hover:border-[#2A82E7] hover:text-[#334568] transition-colors shadow-2xs"
+          className="fx-global-search w-[280px] h-[38px] px-3 rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-between text-[13px] text-[#94A3B8] hover:border-[#2A82E7] hover:text-[#334568] transition-colors shadow-2xs"
         >
           <div className="flex items-center gap-2">
             <Search className="w-4 h-4 text-[#657794]" />
-            <span>Search signals, tags, assets...</span>
+            <span className="fx-search-copy">Search signals, tags, assets...</span>
           </div>
           <kbd className="px-1.5 py-0.5 text-[11px] font-mono bg-[#F1F5FA] border border-[#CBD5E1] rounded text-[#657794]">
             Ctrl K
@@ -372,7 +370,7 @@ export const Topbar: React.FC = () => {
         {/* Notification Bell */}
         <button
           type="button"
-          onClick={() => navigate('/live/activity')}
+          onClick={() => navigate('/collector/diagnostics/activity')}
           className="relative w-10 h-10 rounded-lg border border-[#E3EAF3] bg-white hover:bg-[#F9FAFD] flex items-center justify-center text-[#334568] transition-colors"
           title="System notifications & activity log"
         >
@@ -380,7 +378,7 @@ export const Topbar: React.FC = () => {
         </button>
 
         {/* User Identity Profile */}
-        <div className="flex items-center gap-3 pl-2 border-l border-[#E2E8F0]">
+        <div className="fx-operator-profile flex items-center gap-3 pl-2 border-l border-[#E2E8F0]">
           <div className="w-9 h-9 rounded-full bg-[#FFF0F1] border border-[#FAC6C9] flex items-center justify-center text-[#EF1B24] font-bold text-[13px]">
             <UserRound className="w-4 h-4" />
           </div>

@@ -150,7 +150,7 @@ export const SignalsCatalogPage: React.FC = () => {
           <Button
             variant="primary"
             icon={<Plus className="w-4 h-4" />}
-            onClick={() => navigate('/acquisition/add-data')}
+            onClick={() => navigate('/collector/add-data')}
           >
             Create Signal
           </Button>

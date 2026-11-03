@@ -5,13 +5,13 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 ROOT = Path(__file__).resolve().parents[4]
-for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
+for line in ((ROOT / ".env").read_text(encoding="utf-8") if (ROOT / ".env").exists() else "").splitlines():
     if not line or line.startswith("#") or "=" not in line:
         continue
     key, value = line.split("=", 1)
@@ -44,6 +44,9 @@ async def _close_pool_between_tests():
 
 
 async def _wipe() -> None:
+    from test_support.database import require_disposable_database
+
+    require_disposable_database(get_settings().database_url)
     factory = session_factory()
     async with factory() as session:
         await session.execute(
@@ -69,6 +72,64 @@ async def _wipe() -> None:
 
 def _stamp(moment: datetime) -> str:
     return moment.isoformat().replace("+00:00", "Z")
+
+
+@pytest.mark.asyncio
+async def test_commissioning_transports_draft_mappings_and_rejects_incomplete_success():
+    await _wipe()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost") as client:
+        created = await client.post("/api/v1/auth/bootstrap", headers={"X-Bootstrap-Token": "integration-bootstrap-token"}, json={
+            "login": "commission-admin", "email": "commission@example.com", "password": "Correct-Horse-9",
+            "display_name": "Protocol tests", "tenant_code": "protocol-tests",
+        })
+        assert created.status_code == 201, created.text
+        assert (await client.post("/api/v1/auth/login", json={"login": "commission-admin", "password": "Correct-Horse-9"})).status_code == 200
+        headers = {"X-CSRF-Token": client.cookies.get("fx_csrf")}
+        site = (await client.post("/api/v1/sites", headers=headers, json={"code": "TEST", "name": "Test", "timezone": "UTC"})).json()
+        edge = (await client.post("/api/v1/edges", headers=headers, json={"name": "test-edge", "site_id": site["id"]})).json()
+        token = await client.post(f"/api/v1/edges/{edge['id']}/enrollment-token", headers=headers)
+        enrolled = await client.post("/api/v1/edge-sync/enroll", json={"enrollment_token": token.json()["enrollment_token"]})
+        edge_headers = {"Authorization": f"Bearer {enrolled.json()['credential']}"}
+        connection = await client.post("/api/v1/connections", headers=headers, json={
+            "name": "draft-mqtt", "site_id": site["id"], "edge_id": edge["id"], "protocol": "mqtt_client",
+            "config": {"host": "127.0.0.1", "anonymous": True, "topics": ["factory/#"]},
+        })
+        assert connection.status_code == 201, connection.text
+        fields = [{"name": "Employee", "data_type": "string", "address": {"topic": "factory/+/state", "jsonpath": "$.employee"}}]
+        queued = await client.post(f"/api/v1/connections/{connection.json()['id']}/tests", headers=headers, json={"fields": fields})
+        assert queued.status_code == 202, queued.text
+        job_id = queued.json()["job_id"]
+        command = (await client.get("/api/v1/edge-sync/commands", headers=edge_headers)).json()["job"]
+        assert command["fields"] == fields
+        assert command["connection_version"] == 1
+        incomplete = await client.post(f"/api/v1/edge-sync/commands/{job_id}", headers=edge_headers, json={
+            "status": "PASSED", "stages": [{"stage": "NETWORK", "status": "PASSED"}],
+        })
+        assert incomplete.status_code == 422, incomplete.text
+        stages = [{"stage": name, "status": "PASSED", "duration_ms": 1} for name in
+                  ("NETWORK", "AUTH", "PROTOCOL", "READ_OR_SUBSCRIBE", "DECODE", "MAPPING", "VALIDATION")]
+        finished = await client.post(f"/api/v1/edge-sync/commands/{job_id}", headers=edge_headers, json={"status": "PASSED", "stages": stages})
+        assert finished.status_code == 200, finished.text
+        replay = await client.post(f"/api/v1/edge-sync/commands/{job_id}", headers=edge_headers, json={"status": "FAILED", "stages": []})
+        assert replay.status_code == 409, replay.text
+        assert (await client.get(f"/api/v1/commissioning/{job_id}")).json()["status"] == "COMPLETED"
+        # A result is valid only for the tested connection revision and deadline.
+        stale = (await client.post(f"/api/v1/connections/{connection.json()['id']}/tests", headers=headers, json={"fields": fields})).json()["job_id"]
+        assert (await client.get("/api/v1/edge-sync/commands", headers=edge_headers)).json()["job"]["id"] == stale
+        async with session_factory()() as session:
+            await session.execute(text("UPDATE connections SET version = version + 1 WHERE id = :id"), {"id": UUID(connection.json()["id"])})
+            await session.commit()
+        changed = await client.post(f"/api/v1/edge-sync/commands/{stale}", headers=edge_headers, json={"status": "PASSED", "stages": stages})
+        assert changed.status_code == 409, changed.text
+        assert (await client.get(f"/api/v1/commissioning/{stale}")).json()["error_code"] == "CONFIG_CHANGED"
+        expired = (await client.post(f"/api/v1/connections/{connection.json()['id']}/tests", headers=headers, json={"fields": fields})).json()["job_id"]
+        async with session_factory()() as session:
+            await session.execute(text("UPDATE commissioning_jobs SET expires_at = now() - interval '1 second' WHERE id = :id"), {"id": UUID(expired)})
+            await session.commit()
+        assert (await client.get("/api/v1/edge-sync/commands", headers=edge_headers)).json()["job"] is None
+        timeout = (await client.get(f"/api/v1/commissioning/{expired}")).json()
+        assert timeout["status"] == "FAILED"
+        assert timeout["error_code"] == "TIMEOUT"
 
 
 @pytest.mark.asyncio
@@ -211,6 +272,11 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
         )
         assert bulk.status_code == 201, bulk.text
         signal_id = bulk.json()["created"][0]
+        catalog = await client.get("/api/v1/signals")
+        source = next(item for item in catalog.json()["items"] if item["id"] == signal_id)
+        assert source["connection_id"] == connection.json()["id"]
+        assert source["address_json"]["offset"] == 100
+        assert source["protocol"] == "modbus_tcp"
         token = await client.post(f"/api/v1/edges/{edge.json()['id']}/enrollment-token", headers=headers)
         assert token.status_code == 201, token.text
         enrolled = await client.post("/api/v1/edge-sync/enroll", json={"enrollment_token": token.json()["enrollment_token"]})
@@ -237,6 +303,14 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
             "origin": "LIVE",
             "config_revision": release.json()["revision"],
         }
+        retained = await client.post(
+            "/api/v1/edge-sync/observations",
+            headers=edge_headers,
+            json={"observations": [{**payload, "event_uid": "edge-01:temp:retained", "event_time": older,
+                                    "source_time": older, "received_time": older, "value": 48}]},
+        )
+        assert retained.json()["results"][0]["status"] == "committed", retained.text
+        assert (await client.get(f"/api/v1/signals/{signal_id}/latest")).json()["value"] == 48
         first = await client.post(
             "/api/v1/edge-sync/observations",
             headers=edge_headers,
@@ -329,6 +403,18 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
         )
         assert history.status_code == 200, history.text
         assert any(item["value"] == 0 for item in history.json()["items"])
+        unpublished = await client.post("/api/v1/signals/bulk", headers=headers, json={
+            "resource_id": machine.json()["id"], "atomic": True, "items": [{
+                "key": "not_published", "name": "Draft source", "data_type": "float64",
+                "source_field": {"acquisition_job_id": job_id, "address_kind": "modbus_register", "address": {"offset": 200, "native_type": "float32"}},
+            }],
+        })
+        assert unpublished.status_code == 201, unpublished.text
+        blocked = await client.post("/api/v1/edge-sync/observations", headers=edge_headers, json={"observations": [{
+            **payload, "signal_id": unpublished.json()["created"][0], "event_uid": "unpublished-source",
+            "event_time": _stamp(datetime.now(timezone.utc)), "received_time": _stamp(datetime.now(timezone.utc)), "value": 99,
+        }]})
+        assert blocked.json()["results"][0]["status"] == "quarantined", blocked.text
         assert (await client.post("/api/v1/auth/logout", headers=headers)).status_code == 200
         assert (await client.get("/api/v1/auth/me")).status_code == 401
 

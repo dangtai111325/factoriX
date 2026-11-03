@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules.common import as_uuid, execute, fetch_one, jsonb, utcnow
+from factorix.modules.commissioning import expire_jobs
 from factorix.modules.telemetry import ingest_observations
 from factorix.platform.errors import AppError
 from factorix.platform.security import decrypt_secret, hash_token, new_token
@@ -159,29 +160,34 @@ async def accept_observations(session: AsyncSession, edge: dict[str, Any], items
 
 
 async def pull_commands(session: AsyncSession, edge: dict[str, Any]) -> dict[str, Any]:
+    await expire_jobs(session, edge_id=as_uuid(edge["id"]))
     jobs = await fetch_one(
         session,
         """
-        SELECT j.id, j.connection_id, j.stages_json, c.protocol, c.config_json, c.endpoint_redacted, c.secret_ref
+        SELECT j.id, j.connection_id, j.stages_json, j.request_json, j.connection_version,
+               c.protocol, c.config_json, c.endpoint_redacted, c.secret_ref
         FROM commissioning_jobs j
         JOIN connections c ON c.id = j.connection_id
         WHERE j.status = 'PENDING' AND c.edge_id = :edge_id
         ORDER BY j.id
         LIMIT 1
+        FOR UPDATE OF j SKIP LOCKED
         """,
         {"edge_id": as_uuid(edge["id"])},
     )
     if jobs is None:
         return {"job": None}
     await execute(session, "UPDATE commissioning_jobs SET status = 'RUNNING', started_at = :now WHERE id = :id", {"now": utcnow(), "id": as_uuid(jobs["id"])})
+    jobs["fields"] = (jobs.pop("request_json") or {}).get("fields", [])
     return {"job": jobs}
 
 
 async def finish_command(session: AsyncSession, edge: dict[str, Any], job_id: UUID, body: dict[str, Any]) -> dict[str, Any]:
+    await expire_jobs(session, edge_id=as_uuid(edge["id"]))
     job = await fetch_one(
         session,
         """
-        SELECT j.id FROM commissioning_jobs j
+        SELECT j.id, j.status FROM commissioning_jobs j
         JOIN connections c ON c.id = j.connection_id
         WHERE j.id = :id AND c.edge_id = :edge_id
         """,
@@ -189,9 +195,16 @@ async def finish_command(session: AsyncSession, edge: dict[str, Any], job_id: UU
     )
     if job is None:
         raise AppError(404, "NOT_FOUND", "Commissioning command not found.")
+    if job["status"] != "RUNNING":
+        raise AppError(409, "STATE", "Only a running commissioning command can be completed.")
     status = body.get("status")
     if status not in {"PASSED", "FAILED", "CANCELLED"}:
         raise AppError(422, "STATE", "Kết quả kiểm thử không hợp lệ.")
+    if status == "PASSED":
+        stages = {item.get("stage"): item.get("status") for item in body.get("stages", []) if isinstance(item, dict)}
+        required = {"NETWORK", "PROTOCOL", "READ_OR_SUBSCRIBE", "DECODE", "MAPPING", "VALIDATION"}
+        if any(stages.get(name) != "PASSED" for name in required) or stages.get("AUTH") not in {"PASSED", "NOT_APPLICABLE"}:
+            raise AppError(422, "INCOMPLETE_TEST", "A passed test must prove every acquisition and mapping stage.")
     await execute(
         session,
         """

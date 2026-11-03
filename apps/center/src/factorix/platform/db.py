@@ -36,6 +36,9 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             yield session
             await session.commit()
         except Exception:
+            from factorix.platform.after_commit import discard
+
+            discard(session)
             await session.rollback()
             raise
         from factorix.platform.after_commit import flush

@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     smtp_from: str = "tai.dang@avenue-net.com"
     appliance: bool = False
     data_dir: str = ""
+    credential_path: str = ""
+    enrollment_file: str = ""
     web_dist: str = ""
 
     @field_validator("database_url")

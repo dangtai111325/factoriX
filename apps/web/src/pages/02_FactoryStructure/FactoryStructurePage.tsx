@@ -1,11 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Plus,
   Search,
-  Building2,
-  Factory,
-  Boxes,
-  Cpu,
+  Pencil,
   ChevronRight,
   ChevronDown,
   Activity,
@@ -13,59 +10,70 @@ import {
   Copy,
   Archive,
   Layers,
-} from 'lucide-react';
-import { Button } from '../../components/common/Button';
-import { Card } from '../../components/common/Card';
-import { Badge } from '../../components/common/Badge';
-import { useApp } from '../../store/AppContext';
-import { useNavigate, useSearchParams } from 'react-router-dom';
-import { ResourceNode } from '../../types';
-import { AddResourceModal } from '../../components/modals/AddResourceModal';
-import { MoveResourceModal } from '../../components/modals/MoveResourceModal';
-import { translateApiError } from '../../utils/apiErrors';
+} from 'lucide-react'
+import { Button } from '../../components/common/Button'
+import { Card } from '../../components/common/Card'
+import { Badge } from '../../components/common/Badge'
+import { Dialog } from '../../components/common/Dialog'
+import { useApp } from '../../store/AppContext'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { ResourceNode } from '../../types'
+import { AddResourceModal } from '../../components/modals/AddResourceModal'
+import { MoveResourceModal } from '../../components/modals/MoveResourceModal'
+import { ImportResourcesModal } from '../../components/modals/ImportResourcesModal'
+import { translateApiError } from '../../utils/apiErrors'
+import type {
+  ResourceEditorSnapshot,
+  ResourceFormValues,
+  LocalApplianceStatus,
+} from '../../features/assets/model'
+import { loadLocalAppliance } from '../../features/assets/api'
 import {
-  allowedChildTypes,
   ancestorPath,
   buildResourceTree,
   childrenOf,
   filterResourcesWithAncestors,
   hasChildren,
   HierarchyTreeNode,
-} from '../../utils/resourceHierarchy';
+} from '../../utils/resourceHierarchy'
 
 function titleCaseType(type: string): string {
-  return type.charAt(0).toUpperCase() + type.slice(1);
+  return type.charAt(0).toUpperCase() + type.slice(1)
 }
 
 function getIconForType(type: string) {
-  switch (type.toLowerCase()) {
-    case 'enterprise':
-    case 'site':
-      return <Building2 className="w-4 h-4 text-[#2A82E7]" />;
-    case 'plant':
-      return <Factory className="w-4 h-4 text-[#8858EA]" />;
-    case 'line':
-    case 'zone':
-    case 'workshop':
-      return <Boxes className="w-4 h-4 text-[#FFAA23]" />;
-    default:
-      return <Cpu className="w-4 h-4 text-[#EF1B24]" />;
+  const labels: Record<string, string> = {
+    enterprise: 'ENT',
+    site: 'SITE',
+    area: 'AREA',
+    plant: 'PLANT',
+    line: 'LINE',
+    machine: 'MACH',
   }
+  return (
+    <span
+      className="inline-flex shrink-0 items-center gap-1 text-[var(--fx-muted)]"
+      title={type.replace(/_/g, ' ')}
+    >
+      <Layers className="h-3.5 w-3.5" aria-hidden="true" />
+      <span className="text-[10px] font-semibold uppercase">{labels[type] || type.replace(/_/g, ' ')}</span>
+    </span>
+  )
 }
 
 function statusPresentation(status?: string): {
-  label: string;
-  variant: 'good' | 'warning' | 'error' | 'neutral';
+  label: string
+  variant: 'good' | 'warning' | 'error' | 'neutral'
 } {
   switch (status) {
     case 'running':
-      return { label: 'RUNNING', variant: 'good' };
+      return { label: 'RUNNING', variant: 'good' }
     case 'offline':
-      return { label: 'OFFLINE', variant: 'error' };
+      return { label: 'OFFLINE', variant: 'error' }
     case 'warning':
-      return { label: 'WARNING', variant: 'warning' };
+      return { label: 'WARNING', variant: 'warning' }
     default:
-      return { label: 'NO DATA', variant: 'neutral' };
+      return { label: 'NO DATA', variant: 'neutral' }
   }
 }
 
@@ -74,33 +82,33 @@ function enrichResourceCounts(
   resources: ResourceNode[],
   signals: Array<{ resourceId: string }>,
 ): ResourceNode[] {
-  const childCounts = new Map<string, number>();
-  const signalCounts = new Map<string, number>();
+  const childCounts = new Map<string, number>()
+  const signalCounts = new Map<string, number>()
 
   for (const resource of resources) {
-    if (!resource.parentId) continue;
-    childCounts.set(resource.parentId, (childCounts.get(resource.parentId) || 0) + 1);
+    if (!resource.parentId) continue
+    childCounts.set(resource.parentId, (childCounts.get(resource.parentId) || 0) + 1)
   }
   for (const signal of signals) {
-    if (!signal.resourceId) continue;
-    signalCounts.set(signal.resourceId, (signalCounts.get(signal.resourceId) || 0) + 1);
+    if (!signal.resourceId) continue
+    signalCounts.set(signal.resourceId, (signalCounts.get(signal.resourceId) || 0) + 1)
   }
 
   return resources.map((resource) => ({
     ...resource,
     childrenCount: resource.childrenCount ?? childCounts.get(resource.id) ?? 0,
     signalsCount: resource.signalsCount ?? signalCounts.get(resource.id) ?? 0,
-  }));
+  }))
 }
 
 interface TreeRowProps {
-  node: HierarchyTreeNode;
-  depth: number;
-  selectedId: string;
-  expandedNodes: Record<string, boolean>;
-  onToggle: (id: string) => void;
-  onSelect: (id: string) => void;
-  onKeyNavigate: (event: React.KeyboardEvent, node: HierarchyTreeNode) => void;
+  node: HierarchyTreeNode
+  depth: number
+  selectedId: string
+  expandedNodes: Record<string, boolean>
+  onToggle: (id: string) => void
+  onSelect: (id: string) => void
+  onKeyNavigate: (event: React.KeyboardEvent, node: HierarchyTreeNode) => void
 }
 
 const TreeRow: React.FC<TreeRowProps> = ({
@@ -112,18 +120,22 @@ const TreeRow: React.FC<TreeRowProps> = ({
   onSelect,
   onKeyNavigate,
 }) => {
-  const { resource, children } = node;
-  const isSelected = resource.id === selectedId;
-  const hasKids = children.length > 0;
-  const isExpanded = expandedNodes[resource.id] ?? true;
-  const signalCount = resource.signalsCount ?? 0;
+  const { resource, children } = node
+  const isSelected = resource.id === selectedId
+  const hasKids = children.length > 0
+  const isExpanded = expandedNodes[resource.id] ?? true
+  const signalCount = resource.signalsCount ?? 0
 
   return (
     <>
       <div
         role="treeitem"
+        id={`resource-tree-${resource.id}`}
+        aria-level={depth + 1}
+        title={`${resource.name} [${resource.code}]`}
         aria-label={`${resource.name}, ${signalCount} bound signals`}
         aria-expanded={hasKids ? isExpanded : undefined}
+        aria-owns={hasKids && isExpanded ? `resource-group-${resource.id}` : undefined}
         aria-selected={isSelected}
         tabIndex={isSelected ? 0 : -1}
         style={{ paddingLeft: `${depth * 14 + 8}px` }}
@@ -142,8 +154,8 @@ const TreeRow: React.FC<TreeRowProps> = ({
               tabIndex={-1}
               aria-label={isExpanded ? 'Collapse' : 'Expand'}
               onClick={(e) => {
-                e.stopPropagation();
-                onToggle(resource.id);
+                e.stopPropagation()
+                onToggle(resource.id)
               }}
               className="p-0.5 text-[#94A3B8] hover:text-[#111B37] flex-shrink-0"
             >
@@ -158,13 +170,16 @@ const TreeRow: React.FC<TreeRowProps> = ({
           )}
           {getIconForType(resource.type)}
           <span className="truncate">{resource.name}</span>
+          {resource.lifecycle === 'ARCHIVED' ? (
+            <span className="text-[10px] font-semibold text-[var(--fx-muted)]">ARCHIVED</span>
+          ) : null}
         </div>
         <span className="text-[11px] font-mono text-[#94A3B8] ml-2 flex-shrink-0" aria-hidden="true">
           {signalCount}
         </span>
       </div>
       {children.length > 0 && isExpanded ? (
-        <div role="group">
+        <div role="group" id={`resource-group-${resource.id}`}>
           {children.map((child) => (
             <TreeRow
               key={child.resource.id}
@@ -180,286 +195,460 @@ const TreeRow: React.FC<TreeRowProps> = ({
         </div>
       ) : null}
     </>
-  );
-};
+  )
+}
 
 export const FactoryStructurePage: React.FC = () => {
   const {
-    resources: rawResources,
-    signals,
+    modelResources: rawResources,
+    modelSignals: signals,
+    resourceTypes,
     activities,
     selectedResourceId,
     setSelectedResourceId,
     addResource,
+    loadResourceEditor,
+    editResource,
+    createResourceType,
     moveResource,
     archiveResource,
-  } = useApp();
-  const [searchParams] = useSearchParams();
-  const [searchTerm, setSearchTerm] = useState('');
+    restoreResource,
+    refresh,
+  } = useApp()
+  const [searchParams] = useSearchParams()
+  const [searchTerm, setSearchTerm] = useState('')
   const [moveToast, setMoveToast] = useState<{
-    message: string;
-    undoParentId?: string;
-    linkTo?: string;
-  } | null>(null);
-  const [pageError, setPageError] = useState<string | null>(null);
-  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
-  const [expandedInitialized, setExpandedInitialized] = useState(false);
+    message: string
+    undoMove?: { id: string; parentId: string | null; version: number }
+    undoArchive?: { id: string; version: number }
+    linkTo?: string
+  } | null>(null)
+  const [pageError, setPageError] = useState<string | null>(null)
+  const [showArchived, setShowArchived] = useState(false)
+  const [archiveTarget, setArchiveTarget] = useState<ResourceNode | null>(null)
+  const [archiveBusy, setArchiveBusy] = useState(false)
+  const [archiveError, setArchiveError] = useState('')
+  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({})
+  const [expandedInitialized, setExpandedInitialized] = useState(false)
 
-  const [isAddModalOpen, setIsAddModalOpen] = useState(searchParams.get('modal') === 'add');
-  const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
+  const [isAddModalOpen, setIsAddModalOpen] = useState(searchParams.get('modal') === 'add')
+  const [isImportOpen, setIsImportOpen] = useState(false)
+  const [editingResource, setEditingResource] = useState<ResourceEditorSnapshot | undefined>()
+  const [editingLoading, setEditingLoading] = useState(false)
+  const [applianceStatus, setApplianceStatus] = useState<LocalApplianceStatus | null>(null)
+  const [applianceStatusError, setApplianceStatusError] = useState('')
+  useEffect(() => {
+    if (!isAddModalOpen || editingResource) return
+    let closed = false
+    setApplianceStatus(null)
+    setApplianceStatusError('')
+    loadLocalAppliance()
+      .then((status) => {
+        if (!closed) setApplianceStatus(status)
+      })
+      .catch((error) => {
+        if (!closed) setApplianceStatusError(translateApiError(error))
+      })
+    return () => {
+      closed = true
+    }
+  }, [isAddModalOpen, editingResource?.id])
+  const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move')
+  const [movingResource, setMovingResource] = useState<ResourceNode | null>(null)
+  useEffect(() => {
+    if (!moveToast) return
+    const timer = window.setTimeout(() => setMoveToast(null), 10000)
+    return () => window.clearTimeout(timer)
+  }, [moveToast])
 
-  const navigate = useNavigate();
+  const navigate = useNavigate()
 
-  const resources = useMemo(
-    () => enrichResourceCounts(rawResources, signals),
-    [rawResources, signals],
-  );
+  const resources = useMemo(() => enrichResourceCounts(rawResources, signals), [rawResources, signals])
 
   const visibleResources = useMemo(
-    () => filterResourcesWithAncestors(resources, searchTerm),
-    [resources, searchTerm],
-  );
+    () =>
+      filterResourcesWithAncestors(
+        resources.filter((resource) => showArchived || resource.lifecycle !== 'ARCHIVED'),
+        searchTerm,
+      ),
+    [resources, searchTerm, showArchived],
+  )
 
-  const tree = useMemo(() => buildResourceTree(visibleResources), [visibleResources]);
+  const tree = useMemo(() => buildResourceTree(visibleResources), [visibleResources])
 
   const flatVisibleOrder = useMemo(() => {
-    const order: HierarchyTreeNode[] = [];
+    const order: HierarchyTreeNode[] = []
     const walk = (nodes: HierarchyTreeNode[]) => {
       for (const node of nodes) {
-        order.push(node);
-        const expanded = expandedNodes[node.resource.id] ?? true;
-        if (expanded && node.children.length) walk(node.children);
+        order.push(node)
+        const expanded = expandedNodes[node.resource.id] ?? true
+        if (expanded && node.children.length) walk(node.children)
       }
-    };
-    walk(tree);
-    return order;
-  }, [tree, expandedNodes]);
+    }
+    walk(tree)
+    return order
+  }, [tree, expandedNodes])
 
   // Default-expand all parents once resources load
   useEffect(() => {
-    if (!resources.length || expandedInitialized) return;
-    const next: Record<string, boolean> = {};
+    if (!resources.length || expandedInitialized) return
+    const next: Record<string, boolean> = {}
     for (const r of resources) {
-      if (hasChildren(resources, r.id)) next[r.id] = true;
+      if (hasChildren(resources, r.id)) next[r.id] = true
     }
-    setExpandedNodes(next);
-    setExpandedInitialized(true);
-  }, [resources, expandedInitialized]);
+    setExpandedNodes(next)
+    setExpandedInitialized(true)
+  }, [resources, expandedInitialized])
 
   // Expand path to deep-linked resource
   useEffect(() => {
-    const resourceId = searchParams.get('resourceId');
+    const resourceId = searchParams.get('resourceId')
     if (resourceId && resources.some((item) => item.id === resourceId)) {
-      setSelectedResourceId(resourceId);
+      setSelectedResourceId(resourceId)
     }
-  }, [resources, searchParams, setSelectedResourceId]);
+  }, [resources, searchParams, setSelectedResourceId])
 
   // Keep ancestors of the selected node expanded so it stays visible
   useEffect(() => {
-    const focusId = selectedResourceId || resources[0]?.id;
-    if (!focusId) return;
-    const path = ancestorPath(resources, focusId);
-    if (path.length < 2) return;
+    const focusId = selectedResourceId || resources[0]?.id
+    if (!focusId) return
+    const path = ancestorPath(resources, focusId)
+    if (path.length < 2) return
     setExpandedNodes((prev) => {
-      let changed = false;
-      const next = { ...prev };
+      let changed = false
+      const next = { ...prev }
       for (const id of path.slice(0, -1)) {
         if (next[id] !== true) {
-          next[id] = true;
-          changed = true;
+          next[id] = true
+          changed = true
         }
       }
-      return changed ? next : prev;
-    });
-  }, [selectedResourceId, resources]);
+      return changed ? next : prev
+    })
+  }, [selectedResourceId, resources])
 
   // While filtering, keep ancestors expanded
   useEffect(() => {
-    if (!searchTerm.trim()) return;
+    if (!searchTerm.trim()) return
     setExpandedNodes((prev) => {
-      const next = { ...prev };
+      const next = { ...prev }
       for (const r of visibleResources) {
-        if (hasChildren(visibleResources, r.id)) next[r.id] = true;
+        if (hasChildren(visibleResources, r.id)) next[r.id] = true
       }
-      return next;
-    });
-  }, [searchTerm, visibleResources]);
+      return next
+    })
+  }, [searchTerm, visibleResources])
 
   const toggleExpand = useCallback((id: string) => {
-    setExpandedNodes((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
-  }, []);
+    setExpandedNodes((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }))
+  }, [])
 
   const selectedResource =
-    resources.find((r) => r.id === selectedResourceId) || resources[0];
-  const selectedStatus = statusPresentation(selectedResource?.status);
+    resources.find((r) => r.id === selectedResourceId && (showArchived || r.lifecycle !== 'ARCHIVED')) ||
+    resources.find((r) => showArchived || r.lifecycle !== 'ARCHIVED')
+  const selectedStatus =
+    selectedResource?.lifecycle === 'ARCHIVED'
+      ? { label: 'ARCHIVED', variant: 'neutral' as const }
+      : !selectedResource?.signalsCount
+        ? {
+            label: selectedResource?.type.replace(/_/g, ' ').toUpperCase() || 'RESOURCE',
+            variant: 'neutral' as const,
+          }
+        : statusPresentation(selectedResource?.status)
 
   const childResources = selectedResource
-    ? childrenOf(resources, selectedResource.id)
-    : [];
+    ? childrenOf(resources, selectedResource.id).filter(
+        (resource) => showArchived || resource.lifecycle !== 'ARCHIVED',
+      )
+    : []
 
   const canArchive = selectedResource
-    ? !hasChildren(resources, selectedResource.id)
-    : false;
+    ? selectedResource.lifecycle !== 'ARCHIVED' &&
+      !resources.some(
+        (resource) => resource.parentId === selectedResource.id && resource.lifecycle !== 'ARCHIVED',
+      )
+    : false
 
   const canonicalPath = (() => {
-    if (!selectedResource) return '';
-    const names: string[] = [];
-    const seen = new Set<string>();
-    let current: ResourceNode | undefined = selectedResource;
+    if (!selectedResource) return ''
+    const names: string[] = []
+    const seen = new Set<string>()
+    let current: ResourceNode | undefined = selectedResource
     while (current && !seen.has(current.id)) {
-      seen.add(current.id);
-      names.unshift(current.name);
-      current = resources.find((item) => item.id === current?.parentId);
+      seen.add(current.id)
+      names.unshift(current.name)
+      current = resources.find((item) => item.id === current?.parentId)
     }
-    return names.join(' / ');
-  })();
+    return names.join(' / ')
+  })()
 
-  const declaredAttributes = Object.entries(selectedResource?.attributes || {}).filter(
-    ([key]) => key !== 'siteId' && key !== 'version',
-  );
+  const declaredAttributes = Object.entries(selectedResource?.properties || {})
 
-  const allowedTypesForSelected = selectedResource
-    ? allowedChildTypes(selectedResource.type).map(titleCaseType)
-    : ['Enterprise'];
-
-  const handleCreateResource = async (data: {
-    name: string;
-    type: string;
-    parentPath: string;
-    description: string;
-    properties: Record<string, string>;
-  }) => {
-    setPageError(null);
+  const openCreate = () => {
+    setEditingResource(undefined)
+    setIsAddModalOpen(true)
+  }
+  const openEdit = async () => {
+    if (!selectedResource) return
+    setEditingLoading(true)
+    setPageError(null)
     try {
-      const result = await addResource({
-        name: data.name,
-        parentId: selectedResource?.id,
-        type: (data.type.toLowerCase() || 'enterprise') as ResourceNode['type'],
-        description: data.description,
-        attributes: data.properties,
-      });
+      setEditingResource(await loadResourceEditor(selectedResource.id))
+      setIsAddModalOpen(true)
+    } catch (caught) {
+      setPageError(translateApiError(caught))
+    } finally {
+      setEditingLoading(false)
+    }
+  }
+  const handleCreateResource = async (data: ResourceFormValues) => {
+    setPageError(null)
+    try {
+      if (editingResource) {
+        await editResource(editingResource, data)
+        setMoveToast({ message: `Saved "${data.name}".` })
+        return
+      }
+      const result = await addResource(data)
       if (result?.edgeCreated) {
+        const enrollment = result.enrollmentError
+          ? `Site was created. Local enrollment was not queued: ${result.enrollmentError}`
+          : result.enrollmentStatus === 'already_enrolled'
+            ? 'This appliance is already enrolled for the Edge.'
+            : result.enrollmentStatus
+              ? 'Local enrollment was requested; wait for the Edge heartbeat to confirm it.'
+              : 'Enroll the Edge from Edge Collectors before commissioning.'
         setMoveToast({
-          message: `Edge "${result.edgeName || 'collector'}" was created and needs enrollment before commissioning.`,
-          linkTo: '/acquisition/edges',
-        });
-        setTimeout(() => setMoveToast(null), 8000);
+          message:
+            `Edge "${result.edgeName || 'collector'}" was created. ${enrollment} ${(result.warnings || []).map((warning) => warning.message).join(' ')}`.trim(),
+          linkTo: '/collector/edges',
+        })
+      } else if (result.warnings?.length) {
+        setMoveToast({ message: result.warnings.map((warning) => warning.message).join(' ') })
       }
     } catch (caught) {
-      throw new Error(translateApiError(caught));
+      throw new Error(translateApiError(caught))
     }
-  };
+  }
 
-  const handleMoveResource = async (targetParentId: string) => {
-    if (!selectedResource) return { success: false, error: 'No resource selected.' };
-    const oldParentId = selectedResource.parentId;
-    const res = await moveResource(selectedResource.id, targetParentId);
+  const handleMoveResource = async (targetParentId: string | null, hierarchyMode: 'guided' | 'strict') => {
+    const resource = movingResource || selectedResource
+    if (!resource) return { success: false, error: 'No resource selected.' }
+    const oldParentId = resource.parentId
+    const res = await moveResource(resource.id, targetParentId, {
+      version: Number(resource.version || resource.attributes?.version || 1),
+      hierarchyMode,
+    })
     if (!res.success) {
-      return { success: false, error: translateApiError(res.error || 'Move failed') };
+      return { success: false, error: translateApiError(res.error || 'Move failed') }
     }
-    setExpandedNodes((prev) => ({ ...prev, [targetParentId]: true }));
+    if (targetParentId) setExpandedNodes((prev) => ({ ...prev, [targetParentId]: true }))
     setMoveToast({
-      message: `Successfully moved "${selectedResource.name}"`,
-      undoParentId: oldParentId,
-    });
-    setTimeout(() => setMoveToast(null), 5000);
-    setPageError(null);
-    return { success: true };
-  };
+      message: `Moved "${resource.name}".${res.warnings?.length ? ` ${res.warnings.map((warning) => warning.message).join(' ')}` : ''}`,
+      undoMove: { id: resource.id, parentId: oldParentId || null, version: res.version! },
+    })
+    setPageError(null)
+    return { success: true }
+  }
 
-  const handleUndoMove = () => {
-    if (moveToast?.undoParentId && selectedResource) {
-      void moveResource(selectedResource.id, moveToast.undoParentId);
-      setMoveToast(null);
+  const handleUndoMove = async () => {
+    const undo = moveToast?.undoMove
+    if (!undo) return
+    const result = await moveResource(undo.id, undo.parentId, { version: undo.version })
+    if (!result.success) {
+      setPageError(result.error || 'Undo failed.')
+      return
     }
-  };
+    setSelectedResourceId(undo.id)
+    setMoveToast(null)
+  }
 
   const handleArchive = async () => {
-    if (!selectedResource) return;
-    if (!canArchive) {
-      setPageError('Archive child resources first.');
-      return;
+    if (!archiveTarget) return
+    setArchiveBusy(true)
+    setArchiveError('')
+    try {
+      const res = await archiveResource(
+        archiveTarget.id,
+        Number(archiveTarget.version || archiveTarget.attributes?.version || 1),
+      )
+      if (!res.success) {
+        setArchiveError(translateApiError(res.error || 'Archive failed'))
+        return
+      }
+      setSelectedResourceId(archiveTarget.parentId || '')
+      setMoveToast({
+        message: res.deploymentPending ? 'Archived. Collector update queued.' : 'Archived.',
+        undoArchive: { id: archiveTarget.id, version: res.version! },
+      })
+      setArchiveTarget(null)
+    } finally {
+      setArchiveBusy(false)
     }
-    setPageError(null);
-    const res = await archiveResource(selectedResource.id);
-    if (!res.success) {
-      setPageError(translateApiError(res.error || 'Archive failed'));
+  }
+  const handleRestore = async (id: string, version: number) => {
+    setPageError(null)
+    try {
+      await restoreResource(id, version)
+      setMoveToast({ message: 'Resource restored. Collector updates are applied through its Edge.' })
+    } catch (caught) {
+      setPageError(translateApiError(caught))
     }
-  };
+  }
 
   const handleTreeKeyNavigate = useCallback(
     (event: React.KeyboardEvent, node: HierarchyTreeNode) => {
-      const { resource, children } = node;
-      const expanded = expandedNodes[resource.id] ?? true;
-      const index = flatVisibleOrder.findIndex((n) => n.resource.id === resource.id);
+      const { resource, children } = node
+      const expanded = expandedNodes[resource.id] ?? true
+      const index = flatVisibleOrder.findIndex((n) => n.resource.id === resource.id)
+      const focusNode = (id: string) => {
+        setSelectedResourceId(id)
+        requestAnimationFrame(() => document.getElementById(`resource-tree-${id}`)?.focus())
+      }
 
       if (event.key === 'ArrowRight') {
-        event.preventDefault();
+        event.preventDefault()
         if (children.length && !expanded) {
-          toggleExpand(resource.id);
+          toggleExpand(resource.id)
         } else if (children.length && expanded) {
-          setSelectedResourceId(children[0].resource.id);
+          focusNode(children[0].resource.id)
         }
-        return;
+        return
       }
       if (event.key === 'ArrowLeft') {
-        event.preventDefault();
+        event.preventDefault()
         if (children.length && expanded) {
-          toggleExpand(resource.id);
+          toggleExpand(resource.id)
         } else if (resource.parentId) {
-          setSelectedResourceId(resource.parentId);
+          focusNode(resource.parentId)
         }
-        return;
+        return
       }
       if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        const next = flatVisibleOrder[index + 1];
-        if (next) setSelectedResourceId(next.resource.id);
-        return;
+        event.preventDefault()
+        const next = flatVisibleOrder[index + 1]
+        if (next) focusNode(next.resource.id)
+        return
       }
       if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        const prev = flatVisibleOrder[index - 1];
-        if (prev) setSelectedResourceId(prev.resource.id);
-        return;
+        event.preventDefault()
+        const prev = flatVisibleOrder[index - 1]
+        if (prev) focusNode(prev.resource.id)
+        return
+      }
+      if (event.key === 'Home' || event.key === 'End') {
+        event.preventDefault()
+        const target =
+          event.key === 'Home' ? flatVisibleOrder[0] : flatVisibleOrder[flatVisibleOrder.length - 1]
+        if (target) focusNode(target.resource.id)
+        return
       }
       if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        setSelectedResourceId(resource.id);
+        event.preventDefault()
+        setSelectedResourceId(resource.id)
       }
     },
     [expandedNodes, flatVisibleOrder, setSelectedResourceId, toggleExpand],
-  );
+  )
+
+  const resourceModal = (
+    <AddResourceModal
+      isOpen={isAddModalOpen}
+      onClose={() => setIsAddModalOpen(false)}
+      resources={resources.filter((resource) => resource.lifecycle !== 'ARCHIVED')}
+      resourceTypes={resourceTypes}
+      parentId={selectedResource?.lifecycle === 'ARCHIVED' ? undefined : selectedResource?.id}
+      initialResource={editingResource}
+      appliance={applianceStatus}
+      applianceError={applianceStatusError}
+      onSave={handleCreateResource}
+      onCreateType={createResourceType}
+    />
+  )
+
+  const importModal = (
+    <ImportResourcesModal
+      key="asset-import"
+      isOpen={isImportOpen}
+      onClose={() => setIsImportOpen(false)}
+      resources={rawResources}
+      resourceTypes={resourceTypes}
+      onImported={async (result) => {
+        await refresh()
+        const first =
+          result.items.find((item) => item.action === 'CREATE' && item.id) ||
+          result.items.find((item) => item.id)
+        if (first?.id) setSelectedResourceId(first.id)
+      }}
+    />
+  )
+  const notification = moveToast ? (
+    <div
+      role="status"
+      className="fixed bottom-4 right-4 z-50 flex max-w-[calc(100vw-2rem)] flex-wrap items-center gap-3 rounded-xl bg-slate-900 px-4 py-3 text-white shadow-xl"
+    >
+      <span className="break-words text-xs font-semibold">{moveToast.message}</span>
+      {moveToast.linkTo ? (
+        <Button
+          variant="ghost"
+          className="!text-white"
+          onClick={() => {
+            navigate(moveToast.linkTo!)
+            setMoveToast(null)
+          }}
+        >
+          Open Edges
+        </Button>
+      ) : null}
+      {moveToast.undoMove ? (
+        <Button variant="ghost" className="!text-white" onClick={() => void handleUndoMove()}>
+          Undo
+        </Button>
+      ) : null}
+      {moveToast.undoArchive ? (
+        <Button
+          variant="ghost"
+          className="!text-white"
+          onClick={() => void handleRestore(moveToast.undoArchive!.id, moveToast.undoArchive!.version)}
+        >
+          Undo
+        </Button>
+      ) : null}
+    </div>
+  ) : null
 
   if (!selectedResource) {
     return (
       <div className="space-y-4">
         <h1 className="fx-page-title">Factory Structure</h1>
         <p className="fx-page-subtitle">
-          The model is empty. Create an enterprise, then a site, plant, line and machine. Each step
-          is checked by the server.
+          Create an enterprise and build your factory model. Recommended types guide the hierarchy; you can
+          adapt it to your operation.
         </p>
         {pageError && (
           <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
             {pageError}
           </p>
         )}
-        <Button
-          variant="primary"
-          icon={<Plus className="w-4 h-4" />}
-          onClick={() => setIsAddModalOpen(true)}
-        >
+        <Button variant="primary" icon={<Plus className="w-4 h-4" />} onClick={openCreate}>
           Create enterprise
         </Button>
-        <AddResourceModal
-          isOpen={isAddModalOpen}
-          onClose={() => setIsAddModalOpen(false)}
-          parentPath="(root)"
-          allowedTypes={['Enterprise']}
-          onAddResource={handleCreateResource}
-        />
+        <Button variant="secondary" onClick={() => setIsImportOpen(true)}>
+          Import resources
+        </Button>
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={showArchived}
+            onChange={(event) => setShowArchived(event.target.checked)}
+          />
+          Show archived
+        </label>
+        {resourceModal}
+        {importModal}
+        {notification}
       </div>
-    );
+    )
   }
 
   return (
@@ -467,12 +656,20 @@ export const FactoryStructurePage: React.FC = () => {
       {/* Region 1 & 2: Heading & Actions Toolbar */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="fx-page-title">Factory Structure</h1>
+          <h1 className="fx-page-title">Hierarchy Structure</h1>
           <p className="fx-page-subtitle">
             Enterprise asset topology, functional locations, and resource hierarchy.
           </p>
         </div>
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <label className="flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(event) => setShowArchived(event.target.checked)}
+            />
+            Show archived
+          </label>
           <div className="relative w-56">
             <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#94A3B8]" />
             <input
@@ -483,18 +680,29 @@ export const FactoryStructurePage: React.FC = () => {
               className="fx-input !pl-9 h-9 text-[13px]"
             />
           </div>
-          <Button
-            variant="primary"
-            icon={<Plus className="w-4 h-4" />}
-            onClick={() => setIsAddModalOpen(true)}
-            disabled={allowedTypesForSelected.length === 0}
-          >
+          <Button variant="primary" icon={<Plus className="w-4 h-4" />} onClick={openCreate}>
             Add Resource
+          </Button>
+          <Button variant="secondary" onClick={() => setIsImportOpen(true)}>
+            Import resources
+          </Button>
+          <Button
+            variant="secondary"
+            icon={<Pencil className="h-4 w-4" />}
+            onClick={() => void openEdit()}
+            loading={editingLoading}
+            disabled={selectedResource.lifecycle === 'ARCHIVED'}
+          >
+            Edit
           </Button>
           <Button
             variant="secondary"
             icon={<ArrowRightLeft className="w-4 h-4" />}
-            onClick={() => setIsMoveModalOpen(true)}
+            onClick={() => {
+              setMovingResource(selectedResource)
+              setIsMoveModalOpen(true)
+            }}
+            disabled={selectedResource.lifecycle === 'ARCHIVED'}
           >
             Move
           </Button>
@@ -509,7 +717,10 @@ export const FactoryStructurePage: React.FC = () => {
           <Button
             variant="secondary"
             icon={<Archive className="w-4 h-4" />}
-            onClick={() => void handleArchive()}
+            onClick={() => {
+              setArchiveError('')
+              setArchiveTarget(selectedResource)
+            }}
             disabled={!canArchive}
             title={
               canArchive
@@ -519,6 +730,14 @@ export const FactoryStructurePage: React.FC = () => {
           >
             Archive
           </Button>
+          {selectedResource.lifecycle === 'ARCHIVED' ? (
+            <Button
+              variant="secondary"
+              onClick={() => void handleRestore(selectedResource.id, Number(selectedResource.version))}
+            >
+              Restore
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -538,7 +757,7 @@ export const FactoryStructurePage: React.FC = () => {
                 Hierarchy Tree
               </span>
               <span className="text-[11px] font-semibold text-[#657794]">
-                {visibleResources.length} nodes
+                {visibleResources.length} {visibleResources.length === 1 ? 'node' : 'nodes'}
               </span>
             </div>
             <div className="p-3 overflow-y-auto flex-1" role="tree" aria-label="Factory hierarchy">
@@ -573,8 +792,8 @@ export const FactoryStructurePage: React.FC = () => {
                 size="sm"
                 variant="ghost"
                 icon={<Plus className="w-3.5 h-3.5" />}
-                onClick={() => setIsAddModalOpen(true)}
-                disabled={allowedTypesForSelected.length === 0}
+                onClick={openCreate}
+                disabled={selectedResource.lifecycle === 'ARCHIVED'}
               >
                 Add Child
               </Button>
@@ -586,7 +805,12 @@ export const FactoryStructurePage: React.FC = () => {
                 </div>
               ) : (
                 childResources.map((child) => {
-                  const childStatus = statusPresentation(child.status);
+                  const childStatus =
+                    child.lifecycle === 'ARCHIVED'
+                      ? { label: 'ARCHIVED', variant: 'neutral' as const }
+                      : !child.signalsCount
+                        ? { label: child.type.replace(/_/g, ' ').toUpperCase(), variant: 'neutral' as const }
+                        : statusPresentation(child.status)
                   return (
                     <div
                       key={child.id}
@@ -605,7 +829,7 @@ export const FactoryStructurePage: React.FC = () => {
                         <span>{child.signalsCount ?? 0} signals linked</span>
                       </div>
                     </div>
-                  );
+                  )
                 })
               )}
             </div>
@@ -618,18 +842,13 @@ export const FactoryStructurePage: React.FC = () => {
             <div className="flex items-start justify-between">
               <div>
                 <div className="flex items-center gap-2.5">
-                  <h2 className="text-[18px] font-extrabold text-[#111B37]">
-                    {selectedResource.name}
-                  </h2>
+                  <h2 className="text-[18px] font-extrabold text-[#111B37]">{selectedResource.name}</h2>
                   <Badge variant={selectedStatus.variant}>{selectedStatus.label}</Badge>
                 </div>
                 <div className="text-[12px] font-mono text-[#657794] mt-1">
-                  ID:{' '}
-                  <span className="text-[#111B37] font-semibold">
-                    {selectedResource.code || 'RES-01'}
-                  </span>{' '}
-                  · Type:{' '}
-                  <span className="uppercase text-[#2A82E7] font-bold">{selectedResource.type}</span>
+                  Code:{' '}
+                  <span className="text-[#111B37] font-semibold">{selectedResource.code || 'RES-01'}</span> ·
+                  Type: <span className="uppercase text-[#2A82E7] font-bold">{selectedResource.type}</span>
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -645,9 +864,7 @@ export const FactoryStructurePage: React.FC = () => {
                   size="sm"
                   variant="primary"
                   icon={<Activity className="w-3.5 h-3.5" />}
-                  onClick={() =>
-                    navigate(`/acquisition/add-data?resourceId=${selectedResource.id}`)
-                  }
+                  onClick={() => navigate(`/collector/add-data?resourceId=${selectedResource.id}`)}
                 >
                   Add Signals
                 </Button>
@@ -662,7 +879,9 @@ export const FactoryStructurePage: React.FC = () => {
                   declaredAttributes.map(([k, v]) => (
                     <div key={k} className="flex justify-between py-1 border-b border-[#F1F5FA]">
                       <span className="text-[#657794]">{k}</span>
-                      <span className="font-semibold text-[#111B37]">{String(v)}</span>
+                      <span className="break-all font-semibold text-[#111B37]">
+                        {v === null ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v)}
+                      </span>
                     </div>
                   ))
                 ) : (
@@ -676,12 +895,8 @@ export const FactoryStructurePage: React.FC = () => {
             <Card title="Topology Context" className="h-[240px]">
               <div className="space-y-3 text-[12px]">
                 <div>
-                  <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">
-                    Canonical Path
-                  </span>
-                  <p className="font-mono text-[#111B37] font-medium text-[12px] mt-0.5">
-                    {canonicalPath}
-                  </p>
+                  <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">Canonical Path</span>
+                  <p className="font-mono text-[#111B37] font-medium text-[12px] mt-0.5">{canonicalPath}</p>
                 </div>
                 <div className="pt-2 border-t border-[#E3EAF3]">
                   <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">
@@ -736,54 +951,47 @@ export const FactoryStructurePage: React.FC = () => {
         </div>
       </div>
 
-      <AddResourceModal
-        isOpen={isAddModalOpen}
-        onClose={() => setIsAddModalOpen(false)}
-        parentPath={
-          selectedResource ? `${selectedResource.code} · ${selectedResource.name}` : '(root)'
-        }
-        allowedTypes={
-          allowedTypesForSelected.length
-            ? allowedTypesForSelected
-            : ['Machine']
-        }
-        onAddResource={handleCreateResource}
-      />
+      {resourceModal}
+      {importModal}
+      <Dialog
+        isOpen={Boolean(archiveTarget)}
+        title={`Archive "${archiveTarget?.name || ''}"?`}
+        busy={archiveBusy}
+        onClose={() => setArchiveTarget(null)}
+      >
+        <div className="space-y-4 p-6 text-sm">
+          <p>
+            The resource will be hidden from the active model and its signal mappings will stop collecting.
+            Configuration and latest values are retained. Shared connections continue collecting other
+            resources.
+          </p>
+          <p>You can restore it later using Show archived.</p>
+          {archiveError ? (
+            <p role="alert" className="text-[var(--fx-error)]">
+              {archiveError}
+            </p>
+          ) : null}
+          <div className="flex justify-end gap-3">
+            <Button variant="secondary" disabled={archiveBusy} onClick={() => setArchiveTarget(null)}>
+              Cancel
+            </Button>
+            <Button variant="danger" loading={archiveBusy} onClick={() => void handleArchive()}>
+              Archive resource
+            </Button>
+          </div>
+        </div>
+      </Dialog>
 
       <MoveResourceModal
         isOpen={isMoveModalOpen}
         onClose={() => setIsMoveModalOpen(false)}
-        selectedResource={selectedResource}
+        selectedResource={movingResource || selectedResource}
         allResources={resources}
+        resourceTypes={resourceTypes}
         onMoveResource={handleMoveResource}
       />
 
-      {moveToast && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-900 text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
-          <span className="text-xs font-semibold">{moveToast.message}</span>
-          {moveToast.linkTo && (
-            <button
-              type="button"
-              onClick={() => {
-                setMoveToast(null);
-                navigate(moveToast.linkTo!);
-              }}
-              className="text-xs font-bold text-sky-300 hover:text-sky-200 underline ml-2"
-            >
-              Open Edges
-            </button>
-          )}
-          {moveToast.undoParentId && (
-            <button
-              type="button"
-              onClick={handleUndoMove}
-              className="text-xs font-bold text-amber-400 hover:text-amber-300 underline ml-2"
-            >
-              Undo
-            </button>
-          )}
-        </div>
-      )}
+      {notification}
     </div>
-  );
-};
+  )
+}

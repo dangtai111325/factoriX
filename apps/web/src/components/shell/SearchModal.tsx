@@ -113,7 +113,7 @@ export const SearchModal: React.FC = () => {
                   <button
                     key={sig.id}
                     type="button"
-                    onClick={() => handleSelect(`/signals?signalId=${sig.id}`)}
+                    onClick={() => handleSelect(`/collector/signals?signalId=${sig.id}`)}
                     className="w-full flex items-center justify-between p-2 rounded-lg text-left hover:bg-[#FFF0F1]/60 group transition-colors"
                   >
                     <div>
@@ -139,7 +139,7 @@ export const SearchModal: React.FC = () => {
                   <button
                     key={conn.id}
                     type="button"
-                    onClick={() => handleSelect(`/acquisition/connections?connectionId=${conn.id}`)}
+                    onClick={() => handleSelect(`/collector/connections?connectionId=${conn.id}`)}
                     className="w-full flex items-center justify-between p-2 rounded-lg text-left hover:bg-[#FFF0F1]/60 group transition-colors"
                   >
                     <div>

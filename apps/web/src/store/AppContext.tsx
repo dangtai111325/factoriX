@@ -1,5 +1,10 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { ApiError, api } from '../api/client'
+import { commissioningPassed, mappingContract } from '../features/acquisition/contracts'
+import { normalizeLiveState } from '../features/signals/live'
+import { createAsset, loadModelResources } from '../features/assets/api'
+import { codePreviewFromName } from '../utils/resourceHierarchy'
+import type { ResourceEditorSnapshot, ResourceFormValues, ResourceTypeDefinition, ResourceTypeInput } from '../features/assets/model'
 import {
   ActivityEvent,
   ConnectionItem,
@@ -29,6 +34,7 @@ export interface AcquisitionField {
   address: string
   dataType: string
   unit: string
+  topic?: string
 }
 
 export interface AcquisitionDraft {
@@ -66,6 +72,9 @@ interface AppContextType {
   currentPlant: PlantScope
   setCurrentPlant: (plant: PlantScope) => void
   resources: ResourceNode[]
+  modelResources: ResourceNode[]
+  modelSignals: SignalItem[]
+  resourceTypes: ResourceTypeDefinition[]
   connections: ConnectionItem[]
   edges: EdgeItem[]
   signals: SignalItem[]
@@ -90,18 +99,22 @@ interface AppContextType {
   setSearchQuery: (query: string) => void
   collectorLabel: string
   resetToReference: () => void
-  addResource: (resource: Partial<ResourceNode>) => Promise<{ edgeCreated?: boolean; edgeId?: string; edgeName?: string }>
-  moveResource: (resourceId: string, newParentId: string) => Promise<{ success: boolean; error?: string }>
-  archiveResource: (resourceId: string) => Promise<{ success: boolean; error?: string }>
+  addResource: (resource: ResourceFormValues) => Promise<{ edgeCreated?: boolean; edgeId?: string; edgeName?: string; enrollmentStatus?: string; enrollmentError?: string; warnings?: Array<{ code: string; message: string }> }>
+  loadResourceEditor: (id: string) => Promise<ResourceEditorSnapshot>
+  editResource: (snapshot: ResourceEditorSnapshot, resource: ResourceFormValues) => Promise<void>
+  createResourceType: (resourceType: ResourceTypeInput) => Promise<ResourceTypeDefinition>
+  moveResource: (resourceId: string, newParentId: string | null, options?: { version?: number; hierarchyMode?: 'guided' | 'strict' }) => Promise<{ success: boolean; error?: string; version?: number; warnings?: Array<{ code: string; message: string }> }>
+  archiveResource: (resourceId: string, version: number) => Promise<{ success: boolean; error?: string; version?: number; deploymentPending?: boolean }>
+  restoreResource: (resourceId: string, version: number) => Promise<void>
   updateLayoutNode: (id: string, updates: Partial<LayoutMachineNode>) => void
   testConnection: (id: string) => Promise<{ success: boolean; latency: number }>
   runDeterministicConnectionTest: (id: string, scenario?: string) => Promise<{ overallStatus: TestExecutionState; latency: number; steps: TestStepResult[] }>
   prepareAcquisition: (draft: AcquisitionDraft) => Promise<PreparedConnection>
-  commissionAcquisition: (connectionId: string) => Promise<{ passed: boolean; stages: Array<{ name: string; status: string; latency?: number }>; errorCode?: string }>
+  commissionAcquisition: (connectionId: string, draft?: AcquisitionDraft) => Promise<{ passed: boolean; stages: Array<{ name: string; status: string; latency?: number; detail?: string }>; errorCode?: string }>
   activateAcquisition: (prepared: PreparedConnection, draft: AcquisitionDraft) => Promise<void>
   deleteConnection: (connectionId: string) => Promise<void>
   issueEnrollmentToken: (edgeId: string) => Promise<{ enrollment_token: string; expires_at: string; expires_in_seconds: number; edge_id: string }>
-  queueApplianceEnroll: (edgeId: string) => Promise<{ status: string }>
+  queueApplianceEnroll: (edgeId: string) => Promise<{ status: string; refreshFailed?: boolean }>
   addSignal: (signal: Partial<SignalItem>) => void
   bulkDeleteSignals: (signalIds: string[]) => { count: number; undo: () => void }
   bulkAssignOutputGroup: (signalIds: string[], groupId: string) => void
@@ -116,12 +129,7 @@ function text(value: unknown): string {
 }
 
 function codeFrom(name: string): string {
-  const raw = name
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^A-Za-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 64)
+  const raw = codePreviewFromName(name)
   if (!raw) return `R${Date.now().toString(36)}`.slice(0, 64)
   return /^[A-Za-z0-9]/.test(raw) ? raw : `R-${raw}`.slice(0, 64)
 }
@@ -177,6 +185,7 @@ function scopeToPlant(all: ResourceNode[], plantId: string): ResourceNode[] {
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [allResources, setAllResources] = useState<ResourceNode[]>([])
+  const [resourceTypes, setResourceTypes] = useState<ResourceTypeDefinition[]>([])
   const [connections, setConnections] = useState<ConnectionItem[]>([])
   const [edges, setEdges] = useState<EdgeItem[]>([])
   const [signals, setSignals] = useState<SignalItem[]>([])
@@ -195,9 +204,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [collectorLabel, setCollectorLabel] = useState('Collector: not enrolled')
   const [layoutMeta, setLayoutMeta] = useState<{ id: string; version: number } | null>(null)
 
+  const activeResources = useMemo(() => allResources.filter(resource => resource.lifecycle !== 'ARCHIVED'), [allResources])
   const resources = useMemo(
-    () => scopeToPlant(allResources, currentPlant.id),
-    [allResources, currentPlant.id],
+    () => scopeToPlant(activeResources, currentPlant.id),
+    [activeResources, currentPlant.id],
   )
   const resourceIds = useMemo(() => new Set(resources.map((item) => item.id)), [resources])
   const scopedConnections = useMemo(() => {
@@ -210,15 +220,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const scopedSignals = signals.filter((item) => !currentPlant.id || resourceIds.has(item.resourceId))
 
   const refresh = useCallback(async () => {
-    const [resourcePage, connectionPage, signalPage, layoutPage, groupPage, auditPage, edgePage] = await Promise.all([
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/resources?view=all&limit=200'),
+    const [resourcePage, connectionPage, signalPage, layoutPage, groupPage, auditPage, edgePage, sitePage, typePage] = await Promise.all([
+      loadModelResources(),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/connections'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/signals?limit=500'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/layouts'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/output-groups'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/audit-events?limit=50'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/edges'),
+      api<{ items: Array<Record<string, unknown>> }>('/api/v1/sites'),
+      api<{ items: ResourceTypeDefinition[] }>('/api/v1/resource-types'),
     ])
+    setResourceTypes(typePage.items)
     const mappedResources: ResourceNode[] = (resourcePage.items || []).map((row) => ({
       id: text(row.id),
       name: text(row.name),
@@ -226,19 +239,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       code: text(row.code),
       status: 'idle',
       parentId: row.parent_id ? text(row.parent_id) : undefined,
+      description: text(row.description),
+      properties: row.properties_json && typeof row.properties_json === 'object' ? row.properties_json as Record<string, unknown> : {},
+      version: Number(row.version || 1),
+      lifecycle: text(row.status) as 'ACTIVE' | 'ARCHIVED',
+      createdAt: text(row.created_at),
+      updatedAt: text(row.updated_at),
       attributes: {
         siteId: text(row.site_id),
         version: text(row.version || 1),
       },
     }))
-    const plantRows = mappedResources.filter((item) => item.type === 'plant')
+    const siteTimezone = new Map((sitePage.items || []).map(site => [text(site.id), text(site.timezone)]))
+    const resourcesById = new Map(mappedResources.map(resource => [resource.id, resource]))
+    const resourcePath = (id: string, fallback: string) => {
+      const chain: string[] = []
+      const visited = new Set<string>()
+      let resource = resourcesById.get(id)
+      while (resource && !visited.has(resource.id)) {
+        visited.add(resource.id)
+        chain.unshift(resource.name)
+        resource = resource.parentId ? resourcesById.get(resource.parentId) : undefined
+      }
+      return chain.join(' / ') || fallback
+    }
+    const activeModel = mappedResources.filter(item => item.lifecycle !== 'ARCHIVED')
+    const plantRows = activeModel.filter((item) => item.type === 'plant')
     const nextPlants = plantRows.map((item) => ({
       id: item.id,
       name: item.name,
       code: item.code,
       zone: mappedResources.find((parent) => parent.id === item.parentId)?.name || 'Site',
       status: 'operational' as const,
-      assetsCount: descendants(mappedResources, item.id).size,
+      assetsCount: descendants(activeModel, item.id).size,
+      timezone: siteTimezone.get(item.attributes?.siteId || '') || undefined,
     }))
     setPlants(nextPlants)
     setCurrentPlant((current) => nextPlants.find((item) => item.id === current.id) || nextPlants[0] || EMPTY_PLANT)
@@ -276,21 +310,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSignals(
       (signalPage.items || []).map((row) => {
         const state = latest.get(text(row.id))
-        const value = (state?.value_json as { v?: unknown } | undefined)?.v
         const dataType = text(row.data_type)
         return {
           id: text(row.id),
           name: text(row.display_name || row.key),
           tag: text(row.key),
-          sourceConnectionId: '',
-          sourceConnectionName: connectionName.get(text(row.connection_id)) || 'Collector',
+          sourceConnectionId: text(row.connection_id),
+          sourceConnectionName: connectionName.get(text(row.connection_id)) || text(row.connection_name) || 'Not linked',
+          sourceProtocol: row.protocol ? protocolOf(text(row.protocol)) : undefined,
+          sourceAddress: row.address_json && typeof row.address_json === 'object' ? row.address_json as Record<string, unknown> : undefined,
           resourceId: text(row.resource_id),
-          resourcePath: text(row.resource_name || row.resource_code),
+          resourcePath: resourcePath(text(row.resource_id), text(row.resource_name || row.resource_code)),
           dataType: dataType === 'boolean' || dataType === 'bool' ? 'boolean' : signalType(dataType),
           unit: text(row.unit),
-          currentValue: value == null ? '—' : (value as string | number | boolean),
-          quality: (text(state?.quality || 'UNKNOWN') as SignalItem['quality']) || 'UNKNOWN',
-          lastUpdated: text(state?.event_time),
+          ...normalizeLiveState(state),
+          canonicalType: dataType,
+          timezone: siteTimezone.get(resourcesById.get(text(row.resource_id))?.attributes?.siteId || '') || undefined,
           sampleIntervalMs: Number(row.expected_interval_ms || 1000),
         }
       }),
@@ -337,6 +372,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         eventType: text(row.event_type),
         message: `${text(row.event_type)} ${text(row.entity_type)}`.trim(),
         details: (row.after_json as Record<string, unknown>) || {},
+        entityId: text(row.entity_id),
+        entityType: text(row.entity_type),
       })),
     )
     const edgeItems = edgePage.items || []
@@ -410,47 +447,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     window.location.assign('/register')
   }
 
-  const addResource = async (resource: Partial<ResourceNode>) => {
+  const addResource = async (resource: ResourceFormValues) => {
     const typeKey = (resource.type || 'machine').toLowerCase()
     const name = resource.name || 'Resource'
-    const code = codeFrom(resource.code || name)
+    const code = resource.code
     const parent = allResources.find((item) => item.id === resource.parentId)
-    let siteId = parent?.attributes?.siteId || ''
-    let edgeCreated: { id: string; name: string } | null = null
-    if (typeKey === 'site') {
-      const site = await api<{ id: string }>('/api/v1/sites', {
-        method: 'POST',
-        body: JSON.stringify({ code, name, timezone: 'Asia/Ho_Chi_Minh' }),
-      })
-      siteId = site.id
+    const created = await createAsset(resource, parent)
+    const edgeCreated = created.edge
+    try {
+      await refresh()
+    } catch {
+      created.warnings = [...(created.warnings || []), { code: 'REFRESH_FAILED', message: 'Resource was created, but the model could not refresh. Reload to see it.' }]
     }
-    const created = await api<{ id: string }>('/api/v1/resources', {
-      method: 'POST',
-      body: JSON.stringify({
-        type_key: typeKey,
-        code,
-        name,
-        site_id: typeKey === 'enterprise' ? null : siteId,
-        parent_id: parent?.id || null,
-        relation_code: 'CONTAINS',
-        description: resource.description || '',
-        properties: resource.attributes || {},
-      }),
-    })
-    if (typeKey === 'site') {
-      const edgeName = `Edge ${name}`
-      const edge = await api<{ id: string }>('/api/v1/edges', {
-        method: 'POST',
-        body: JSON.stringify({ site_id: siteId, name: edgeName }),
-      })
-      try {
-        await api(`/api/v1/edges/${edge.id}/appliance`, { method: 'POST' })
-      } catch {
-        // Appliance mode may be off; Edge still needs manual enrollment.
-      }
-      edgeCreated = { id: edge.id, name: edgeName }
-    }
-    await refresh()
     setSelectedResourceId(created.id)
     if (typeKey === 'plant') {
       setCurrentPlant({
@@ -463,41 +471,71 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       })
     }
     if (edgeCreated) {
-      return { edgeCreated: true, edgeId: edgeCreated.id, edgeName: edgeCreated.name }
+      return { edgeCreated: true, edgeId: edgeCreated.id, edgeName: edgeCreated.name, enrollmentStatus: created.enrollmentStatus, enrollmentError: created.enrollmentError, warnings: created.warnings }
     }
-    return {}
+    return { warnings: created.warnings }
   }
 
-  const moveResource = async (resourceId: string, newParentId: string) => {
+  const loadResourceEditor = async (id: string): Promise<ResourceEditorSnapshot> => {
+    const row = await api<Record<string, unknown>>(`/api/v1/resources/${id}`)
+    return { id: text(row.id), version: Number(row.version), name: text(row.name), code: text(row.code),
+      type: text(row.type_key), parentId: row.parent_id ? text(row.parent_id) : undefined,
+      description: text(row.description), properties: row.properties_json as Record<string, unknown> || {} }
+  }
+
+  const editResource = async (snapshot: ResourceEditorSnapshot, resource: ResourceFormValues) => {
+    await api(`/api/v1/resources/${snapshot.id}`, { method: 'PATCH', body: JSON.stringify({
+      version: snapshot.version, name: resource.name, code: resource.code, description: resource.description,
+      properties: resource.properties,
+    }) })
+    await refresh()
+  }
+
+  const createResourceType = async (resourceType: ResourceTypeInput) => {
+    const created = await api<ResourceTypeDefinition>('/api/v1/resource-types', { method: 'POST', body: JSON.stringify(resourceType) })
+    setResourceTypes(current => [...current.filter(type => type.key !== created.key), created])
+    return created
+  }
+
+  const moveResource = async (resourceId: string, newParentId: string | null, options?: { version?: number; hierarchyMode?: 'guided' | 'strict' }) => {
     const current = allResources.find((item) => item.id === resourceId)
     if (!current) return { success: false, error: 'Resource was not found.' }
     if (resourceId === newParentId) return { success: false, error: 'A resource cannot contain itself.' }
     try {
-      await api(`/api/v1/resources/${resourceId}/move`, {
+      const moved = await api<{ version: number; warnings?: Array<{ code: string; message: string }> }>(`/api/v1/resources/${resourceId}/move`, {
         method: 'POST',
         body: JSON.stringify({
-          version: Number(current.attributes?.version || 1),
+          version: options?.version ?? Number(current.version || current.attributes?.version || 1),
           parent_id: newParentId,
+          hierarchy_mode: options?.hierarchyMode || 'guided',
         }),
       })
       await refresh()
-      return { success: true }
+      return { success: true, version: moved.version, warnings: moved.warnings }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Move failed' }
     }
   }
 
-  const archiveResource = async (resourceId: string) => {
+  const archiveResource = async (resourceId: string, version: number) => {
     try {
-      await api(`/api/v1/resources/${resourceId}/archive`, { method: 'POST' })
+      const archived = await api<{ version: number; deployments?: unknown[] }>(`/api/v1/resources/${resourceId}/archive`, {
+        method: 'POST', body: JSON.stringify({ version }),
+      })
       await refresh()
       if (selectedResourceId === resourceId) {
         setSelectedResourceId('')
       }
-      return { success: true }
+      return { success: true, version: archived.version, deploymentPending: Boolean(archived.deployments?.length) }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Archive failed' }
     }
+  }
+
+  const restoreResource = async (resourceId: string, version: number) => {
+    await api(`/api/v1/resources/${resourceId}/restore`, { method: 'POST', body: JSON.stringify({ version }) })
+    await refresh()
+    setSelectedResourceId(resourceId)
   }
 
   const updateLayoutNode = (id: string, updates: Partial<LayoutMachineNode>) => {
@@ -543,7 +581,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { endpoint, security_mode: 'None', anonymous: true, interval_ms }
     }
     if (draft.protocol === 'mqtt') {
-      const topic = draft.extra.trim()
+      const topic = draft.extra
       return {
         host: draft.host,
         port,
@@ -584,7 +622,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const resource = allResources.find((item) => item.id === draft.resourceId)
     const siteId = resource?.attributes?.siteId
     if (!resource || !siteId) throw new Error('Choose a machine that belongs to a site.')
-    if (draft.protocol === 'mqtt' && !draft.extra.trim()) throw new Error('MQTT needs one topic.')
+    if (draft.protocol === 'mqtt' && !draft.extra) throw new Error('MQTT needs one topic.')
     if (!draft.host.trim()) throw new Error('The endpoint is required.')
     const edgeId = await ensureEdge(siteId)
     const created = await api<{ id: string; jobs?: Array<{ id: string }> }>('/api/v1/connections', {
@@ -603,10 +641,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return { connectionId: created.id, jobId, edgeId }
   }
 
-  const commissionAcquisition = async (connectionId: string) => {
+  const commissionAcquisition = async (connectionId: string, draft?: AcquisitionDraft) => {
     let queued: { job_id?: string; error_code?: string; message?: string; status?: string }
     try {
-      queued = await api(`/api/v1/connections/${connectionId}/tests`, { method: 'POST' })
+      queued = await api(`/api/v1/connections/${connectionId}/tests`, {
+        method: 'POST', body: draft ? JSON.stringify({ fields: draft.fields.map(field => mappingContract(draft, field)) }) : undefined,
+      })
     } catch (error) {
       if (error instanceof ApiError && (error.code === 'EDGE_NOT_ENROLLED' || /not enrolled/i.test(error.message))) {
         return {
@@ -629,9 +669,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     let last: {
       status?: string
       error_code?: string
-      stages_json?: Array<{ stage: string; status: string; duration_ms?: number }>
+      stages_json?: Array<{ stage: string; status: string; duration_ms?: number; detail?: string }>
     } = {}
-    for (let attempt = 0; attempt < 8; attempt += 1) {
+    for (let attempt = 0; attempt < 48; attempt += 1) {
       last = await api(`/api/v1/commissioning/${jobId}`)
       const status = text(last.status)
       const code = text(last.error_code)
@@ -663,31 +703,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ],
       }
     }
-    const stages = (last.stages_json || []).map((stage) => ({
+    const stages = (last.stages_json || []).filter(stage => stage.stage === stage.stage.toUpperCase()).map((stage) => ({
       name: stage.stage,
       status: stage.status,
       latency: stage.duration_ms,
+      detail: stage.detail,
     }))
-    const failed = stages.some((stage) => stage.status === 'FAILED')
-    const network = stages.find((stage) => stage.name === 'NETWORK')
-    const passed = !failed && (network?.status === 'PASSED' || network?.status === 'COMPLETED' || finalStatus === 'PASSED' || finalStatus === 'COMPLETED')
-    return { passed, stages }
+    const passed = commissioningPassed(finalStatus, stages)
+    return { passed, stages, errorCode: last.error_code }
   }
 
   const activateAcquisition = async (prepared: PreparedConnection, draft: AcquisitionDraft) => {
-    const native = (value: string) => {
-      const name = value.toLowerCase()
-      if (name.includes('float')) return 'float32'
-      if (name.includes('bool')) return 'bool'
-      if (name.includes('int')) return 'uint16'
-      return 'float32'
-    }
-    const canonical = (value: string) => {
-      const kind = native(value)
-      if (kind === 'bool') return 'bool'
-      if (kind === 'uint16') return 'int64'
-      return 'float64'
-    }
     await api('/api/v1/signals/bulk', {
       method: 'POST',
       body: JSON.stringify({
@@ -696,20 +722,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         items: draft.fields.map((field) => ({
           key: codeFrom(field.name),
           name: field.name,
-          data_type: canonical(field.dataType),
+          data_type: mappingContract(draft, field).data_type,
           unit: field.unit,
           expected_interval_ms: draft.intervalMs,
           source_field: {
             acquisition_job_id: prepared.jobId,
             address_kind: draft.protocol === 'modbus' ? 'modbus_register' : draft.protocol,
-            address:
-              draft.protocol === 'modbus'
-                ? { offset: Number(field.address), register_area: 'holding', native_type: native(field.dataType), word_order: 'big' }
-                : draft.protocol === 'opcua'
-                  ? { node_id: field.address }
-                  : draft.protocol === 'mqtt'
-                    ? { topic: draft.extra, jsonpath: field.address, qos: 1 }
-                    : { path: connectionConfig(draft).path, jsonpath: field.address },
+            address: mappingContract(draft, field).address,
           },
         })),
       }),
@@ -743,7 +762,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const queueApplianceEnroll = async (edgeId: string) => {
     const result = await api<{ status: string }>(`/api/v1/edges/${edgeId}/appliance`, { method: 'POST' })
-    await refresh()
+    try { await refresh() } catch { return { ...result, refreshFailed: true } }
     return result
   }
 
@@ -757,6 +776,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     currentPlant,
     setCurrentPlant,
     resources,
+    modelResources: allResources,
+    modelSignals: signals,
+    resourceTypes,
     connections: scopedConnections,
     edges,
     signals: scopedSignals,
@@ -782,8 +804,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     collectorLabel,
     resetToReference: () => undefined,
     addResource,
+    loadResourceEditor,
+    editResource,
+    createResourceType,
     moveResource,
     archiveResource,
+    restoreResource,
     updateLayoutNode,
     testConnection,
     runDeterministicConnectionTest: async (id, _scenario) => {

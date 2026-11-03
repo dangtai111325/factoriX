@@ -1,4 +1,4 @@
-export type ResourceType = 'enterprise' | 'site' | 'plant' | 'zone' | 'line' | 'machine' | 'sensor';
+export type ResourceType = string;
 
 export interface ResourceNode {
   id: string;
@@ -14,6 +14,9 @@ export interface ResourceNode {
   attributes?: Record<string, string>;
   createdAt?: string;
   updatedAt?: string;
+  properties?: Record<string, unknown>;
+  version?: number;
+  lifecycle?: 'ACTIVE' | 'ARCHIVED';
 }
 
 export type ProtocolType = 'modbus' | 'opcua' | 'mqtt' | 'http';
@@ -38,6 +41,7 @@ export interface PlantScope {
   zone: string;
   status: 'operational' | 'warning' | 'maintenance';
   assetsCount: number;
+  timezone?: string;
 }
 
 export interface ConnectionItem {
@@ -70,13 +74,25 @@ export interface SignalItem {
   tag: string;
   sourceConnectionId: string;
   sourceConnectionName: string;
+  sourceProtocol?: ProtocolType;
+  sourceAddress?: Record<string, unknown>;
   resourceId: string;
   resourcePath: string;
   plantId?: string;
   dataType: SignalDataType;
   unit?: string;
   currentValue: number | string | boolean;
-  quality: 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE';
+  rawValue?: unknown;
+  hasObservation?: boolean;
+  observationId?: string;
+  sourceTime?: string;
+  receivedTime?: string;
+  lastGoodValue?: unknown;
+  qualityReason?: string;
+  freshness?: 'FRESH' | 'STALE' | 'UNKNOWN';
+  timezone?: string;
+  canonicalType?: string;
+  quality: 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE' | 'UNKNOWN';
   lastUpdated: string;
   sampleIntervalMs: number;
   bindingType?: SignalBindingType;
@@ -94,6 +110,8 @@ export interface ActivityEvent {
   eventType: string;
   message: string;
   details?: Record<string, any>;
+  entityId?: string;
+  entityType?: string;
 }
 
 export interface LayoutMachineNode {

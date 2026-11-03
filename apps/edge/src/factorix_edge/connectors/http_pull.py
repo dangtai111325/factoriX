@@ -23,17 +23,22 @@ class HttpPullConnector:
         self.timeout_s = timeout_s
 
     async def get_json(self, path: str, headers: dict[str, str] | None = None) -> Any:
+        return await self.request_json(path, headers=headers)
+
+    async def request_json(self, path: str, *, method: str = "GET", headers: dict[str, str] | None = None,
+                           query: dict[str, str] | None = None, body: Any = None) -> Any:
         if "://" in path or path.startswith("//"):
             raise ConnectorError("CONFIG", "Đường dẫn HTTP phải tương đối.")
-        url = urljoin(self.base_url, path.lstrip("/"))
+        url = httpx.URL(urljoin(self.base_url, path.lstrip("/"))).copy_merge_params(query or {})
         try:
             async with httpx.AsyncClient(timeout=self.timeout_s, follow_redirects=False) as client:
-                response = await client.get(url, headers=headers or {})
+                response = await client.request(method, url, headers=headers or {},
+                                                json=body if method == "POST" else None)
         except httpx.HTTPError as exc:
             raise ConnectorError("NETWORK", "HTTP pull không kết nối được.") from exc
         if 300 <= response.status_code < 400:
             raise ConnectorError("REDIRECT", "HTTP redirect bị từ chối.")
-        if response.status_code == 401:
+        if response.status_code in {401, 403}:
             raise ConnectorError("AUTH", "HTTP từ chối xác thực.")
         if response.status_code == 429:
             raise ConnectorError("RATE_LIMIT", "HTTP báo giới hạn tần suất.")

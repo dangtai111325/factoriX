@@ -1,242 +1,147 @@
-import React from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import {
-  LayoutDashboard,
-  Database,
-  Bell,
-  FileText,
-  Settings,
-  ArrowRight,
-  Sparkles,
-  Layers,
-  ShieldAlert,
-} from 'lucide-react';
-import { Button } from '../../components/common/Button';
-import { Card } from '../../components/common/Card';
+import React from 'react'
+import { useLocation, Link } from 'react-router-dom'
+import { LayoutDashboard, Database, Bell, ChartNoAxesColumn, FileText, Settings, Braces } from 'lucide-react'
+import { Card } from '../../components/common/Card'
+import { plannedModules } from '../../features/navigation/routes'
 
-interface ModuleMeta {
-  title: string;
-  tagline: string;
-  icon: React.ElementType;
-  description: string;
-  roadmapPhase: string;
-  plannedFeatures: string[];
-}
-
-const moduleDirectory: Record<string, ModuleMeta> = {
-  '/acquisition/studio/opcua': {
-    title: 'Protocol Studio · OPC UA',
-    tagline: 'Browse OPC UA address spaces and map nodes into signals.',
-    icon: Layers,
-    description:
-      'Protocol Studio is not active in this appliance build. Use Add Data Wizard to create OPC UA connections, commission the endpoint, and activate mapped signals through the collector.',
-    roadmapPhase: 'Coming next · Protocol browse & map',
-    plannedFeatures: [
-      'Live OPC UA node tree browse against a commissioned endpoint',
-      'Drag selected nodes into signal mappings',
-      'Security policy and certificate picker',
-      'Save mappings into the same activation path as Add Data Wizard',
-    ],
-  },
-  '/acquisition/studio/mqtt': {
-    title: 'Protocol Studio · MQTT',
-    tagline: 'Inspect broker payloads and map JSONPath fields into signals.',
-    icon: Layers,
-    description:
-      'MQTT Studio is not active yet. Create MQTT connections and topic mappings from Add Data Wizard so the collector owns the live path.',
-    roadmapPhase: 'Coming next · Protocol browse & map',
-    plannedFeatures: [
-      'Live topic subscription preview',
-      'JSONPath extractor rules with sample payloads',
-      'QoS and retained-message controls',
-      'Activation into the collector config release',
-    ],
-  },
-  '/acquisition/studio/http': {
-    title: 'Protocol Studio · HTTP',
-    tagline: 'Poll REST endpoints and project response fields into signals.',
-    icon: Layers,
-    description:
-      'HTTP Studio is not active yet. Configure HTTP poll connections from Add Data Wizard for a working collector path.',
-    roadmapPhase: 'Coming next · Protocol browse & map',
-    plannedFeatures: [
-      'Request builder with auth headers',
-      'Response JSONPath mapping',
-      'Interval and timeout controls',
-      'Activation into the collector config release',
-    ],
-  },
-  '/signals/calculated': {
-    title: 'Calculated Signals',
-    tagline: 'Formula workbench for derived industrial measurements.',
-    icon: Sparkles,
-    description:
-      'Calculated signal rules are not persisted in this appliance build. Collect raw signals through Add Data Wizard first; formula rules arrive with the next signals workstream.',
-    roadmapPhase: 'Coming next · Formula engine',
-    plannedFeatures: [
-      'AST formula editor with live preview',
-      'Unit-aware derived signals',
-      'Division-by-zero and missing-value guards',
-      'Publish calculated signals into output groups',
-    ],
-  },
+const modules: Record<
+  string,
+  { title: string; description: string; icon: React.ElementType; features: string[] }
+> = {
   '/dashboards': {
-    title: 'Executive & Operational Dashboards',
-    tagline: 'Self-service widget builder, line supervision, and custom telemetry tiles.',
+    title: 'Dashboards',
     icon: LayoutDashboard,
-    description:
-      'The Dashboard builder consumes observations published by the Data Collector and unified namespace topics. It is decoupled from raw hardware ingestion to guarantee zero telemetry overhead on the collection loop.',
-    roadmapPhase: 'FactoriX Workstream 5 · Studio & Visualization',
-    plannedFeatures: [
-      'Multi-gauge and real-time sparkline visualization widgets',
-      'Drag-and-drop grid canvas with responsive card layouts',
-      'Operator role-based dashboard workspaces and sharing',
-      'Direct link to Factory Model hierarchy and assets',
+    description: 'Build visual workspaces using collected signals and structured model outputs.',
+    features: [
+      'Dashboard library and templates',
+      'Responsive widget builder',
+      'Factory and resource views',
+      'Workspace sharing and display settings',
     ],
   },
-  '/storage': {
-    title: 'Time-Series Historian & Cold Storage',
-    tagline: 'Long-term telemetry archival, downsampling, and persistent historian databases.',
+  '/historian': {
+    title: 'Historian & Storage',
     icon: Database,
     description:
-      'In the current Data Collector version, telemetry is buffered in high-performance in-memory ring buffers. Dedicated cold storage utilizes Apache IoTDB / TimescaleDB for multi-year historical trend retention.',
-    roadmapPhase: 'FactoriX Workstream 4 · Historian Infrastructure',
-    plannedFeatures: [
-      'Configurable retention policies (raw, 1m downsampled, 1h summary)',
-      'Time-series partition management and SSD/cold tiering',
-      'Historical query API with high throughput aggregate rollups',
-      'Automatic backup to cloud or on-premise S3 object storage',
+      'Choose which raw, canonical or model-output values to retain, with explicit storage and retention policies.',
+    features: [
+      'Storage destinations and policies',
+      'Historical queries and trends',
+      'Downsampling and retention',
+      'Backup and restore',
     ],
   },
   '/alarms': {
-    title: 'Alarms, Events & ISA-18.2 Management',
-    tagline: 'High-priority threshold alarms, operator acknowledgement, and escalation workflows.',
+    title: 'Alarms & Events',
     icon: Bell,
-    description:
-      'Industrial alarms are managed through strict ISA-18.2 lifecycle state machines. Alarm thresholds will trigger notifications via SMS, Email, and webhook escalations without stalling OT poll loops.',
-    roadmapPhase: 'FactoriX Workstream 6 · Incident & Notification Engine',
-    plannedFeatures: [
-      'Static, dynamic and deviation alarm thresholds',
-      'Alarm shelving, suppression, and operator acknowledgement',
-      'Audited event rationalization and root cause logging',
-      'Escalation rosters with on-call engineer shifts',
+    description: 'Define industrial alarm rules, review events and manage operator responses.',
+    features: [
+      'Alarm rules and priorities',
+      'Acknowledgment and shelving',
+      'Notification routing',
+      'Event history and analysis',
+    ],
+  },
+  '/analytics': {
+    title: 'Analytics',
+    icon: ChartNoAxesColumn,
+    description: 'Explore production, equipment and energy data through reusable analyses.',
+    features: [
+      'Analysis workspaces',
+      'KPI definitions and calculations',
+      'Production and energy comparisons',
+      'Reusable analysis templates',
     ],
   },
   '/reports': {
-    title: 'Automated Reports & Production Insights',
-    tagline: 'Scheduled shift summaries, downtime Pareto charts, and exportable PDF/Excel briefs.',
+    title: 'Reports',
     icon: FileText,
-    description:
-      'Automated shift reporting aggregates collector observations and MES production orders to calculate OEE, availability, and energy consumption metrics.',
-    roadmapPhase: 'FactoriX Workstream 7 · Business Intelligence',
-    plannedFeatures: [
-      'Scheduled shift change PDF generation and automated email delivery',
-      'Energy usage and carbon footprint compliance templates',
-      'Custom KPI aggregations across plants, lines and work centers',
-      'Export to Excel (XLSX), CSV and enterprise BI data lakes',
+    description: 'Create and export summaries from selected signals, models and reporting periods.',
+    features: [
+      'Report templates and builder',
+      'Reporting schedules',
+      'Export and delivery settings',
+      'Report library',
     ],
   },
   '/administration': {
-    title: 'Enterprise Administration & RBAC',
-    tagline: 'User directory, single sign-on, role permissions, and audit governance.',
+    title: 'Administration',
     icon: Settings,
-    description:
-      'The current local development candidate runs in single-operator mode. Enterprise administration incorporates Keycloak OAuth2 / OIDC, granular resource-level access control, and compliance auditing.',
-    roadmapPhase: 'FactoriX Foundation · Identity & Governance',
-    plannedFeatures: [
-      'Keycloak Single Sign-On (SSO) with LDAP / Active Directory sync',
-      'Role-based permissions: Operator, Plant Engineer, System Admin',
-      'Audit log trail for all configuration activations and rollbacks',
-      'API token management and rate limiting quotas',
+    description: 'Manage users, access, appliance settings and administrative audit records.',
+    features: [
+      'Users and roles',
+      'Security and sessions',
+      'Appliance and email settings',
+      'Administrative audit and integrations',
     ],
   },
-};
-
+  '/models/formulas': {
+    title: 'Formula Editor',
+    icon: Braces,
+    description: 'Create derived signals and model calculations with a shared, validated formula editor.',
+    features: [
+      'Signal bindings and units',
+      'Formula validation and preview',
+      'Dependency and cycle checks',
+      'Explicit activation and revisions',
+    ],
+  },
+}
 export const ComingSoonPage: React.FC = () => {
-  const location = useLocation();
-  const navigate = useNavigate();
-
-  const meta =
-    moduleDirectory[location.pathname] || {
-      title: 'Planned FactoriX Module',
-      tagline: 'Scheduled for upcoming release in the FactoriX Smart Manufacturing roadmap.',
-      icon: Sparkles,
-      description: 'This module is scheduled according to the FactoriX Architecture Roadmap.',
-      roadmapPhase: 'Future Roadmap Item',
-      plannedFeatures: ['Upcoming feature suite in active design phase'],
-    };
-
-  const Icon = meta.icon;
-
+  const location = useLocation()
+  const module = plannedModules.find(
+    (module) => location.pathname === module.path || location.pathname.startsWith(`${module.path}/`),
+  )
+  const section = module?.children.find((child) => child.path === location.pathname)
+  const meta = modules[module?.path || location.pathname]
+  if (!meta) return <p>Module unavailable.</p>
+  const Icon = meta.icon
   return (
-    <div className="space-y-6 max-w-4xl mx-auto py-8 animate-in fade-in duration-200">
-      {/* Header Banner */}
-      <div className="text-center space-y-3">
-        <div className="w-16 h-16 rounded-2xl bg-[#FFF0F1] border border-[#FAC6C9] mx-auto flex items-center justify-center text-[#EF1B24] shadow-sm">
-          <Icon className="w-8 h-8" />
-        </div>
-        <div className="inline-block px-3 py-1 rounded-full bg-[#EEF5FF] text-[#2A82E7] font-bold text-[12px] border border-[#D4DFEC]">
-          {meta.roadmapPhase}
-        </div>
-        <h1 className="text-[28px] font-extrabold text-[#111B37] tracking-tight">{meta.title}</h1>
-        <p className="text-[15px] text-[#657794] max-w-xl mx-auto leading-relaxed">{meta.tagline}</p>
+    <div className="mx-auto max-w-4xl space-y-6 py-4">
+      <div className="space-y-3">
+        <Icon aria-hidden="true" className="h-8 w-8 text-[var(--fx-muted)]" />
+        <span className="inline-block rounded bg-[#F1F5FA] px-2 py-1 text-xs font-semibold text-[var(--fx-muted)]">
+          Coming soon
+        </span>
+        <h1 className="fx-page-title">{section?.label || meta.title}</h1>
+        <p className="fx-page-subtitle">{meta.description}</p>
       </div>
-
-      {/* Architectural Context Card */}
-      <Card title="Architectural Role & Scope" className="p-6">
-        <p className="text-[14px] text-[#334568] leading-relaxed mb-6">{meta.description}</p>
-
-        <h3 className="text-[13px] font-bold text-[#111B37] uppercase tracking-wider mb-3">
-          Planned Core Capabilities:
-        </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {meta.plannedFeatures.map((feat, idx) => (
-            <div
-              key={idx}
-              className="p-3.5 rounded-xl bg-[#F9FAFD] border border-[#E3EAF3] flex items-start gap-3"
+      {module ? (
+        <nav aria-label={`${module.label} sections`} className="flex flex-wrap gap-2">
+          {module.children.map((child) => (
+            <Link
+              key={child.path}
+              aria-current={section?.path === child.path ? 'page' : undefined}
+              className={`rounded-lg border border-[var(--fx-border)] px-3 py-2 text-sm ${section?.path === child.path ? 'bg-[#FFF0F1] text-[#EF1B24]' : ''}`}
+              to={child.path}
             >
-              <span className="w-2 h-2 rounded-full bg-[#EF1B24] mt-1.5 flex-shrink-0" />
-              <span className="text-[13px] font-semibold text-[#111B37]">{feat}</span>
-            </div>
+              {child.label}
+            </Link>
           ))}
-        </div>
+        </nav>
+      ) : null}
+      <Card className="space-y-3 p-5">
+        <h2 className="text-sm font-bold">Planned capabilities</h2>
+        <ul className="grid list-inside list-disc gap-3 text-sm text-[var(--fx-muted)] sm:grid-cols-2">
+          {meta.features.map((feature) => (
+            <li key={feature}>{feature}</li>
+          ))}
+        </ul>
       </Card>
-
-      {/* Return to Core Collector Action Bar */}
-      <div className="p-5 rounded-2xl bg-white border border-[#D4DFEC] shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
-        <div>
-          <h4 className="text-[14px] font-bold text-[#111B37]">
-            Return to Active OT Data Collection
-          </h4>
-          <p className="text-[12px] text-[#657794]">
-            Explore the live collector engine, telemetry streaming, or factory layout.
-          </p>
-        </div>
-        <div className="flex items-center gap-2.5">
-          <Button
-            variant="secondary"
-            onClick={() => navigate('/overview')}
-            icon={<ArrowRight className="w-4 h-4" />}
-          >
-            Overview
-          </Button>
-          <Button
-            variant="primary"
-            onClick={() =>
-              navigate(
-                location.pathname.startsWith('/acquisition/studio') || location.pathname === '/signals/calculated'
-                  ? '/acquisition/add-data'
-                  : '/live/monitor',
-              )
-            }
-            icon={<ArrowRight className="w-4 h-4" />}
-          >
-            {location.pathname.startsWith('/acquisition/studio') || location.pathname === '/signals/calculated'
-              ? 'Add Data Wizard'
-              : 'Live Monitor'}
-          </Button>
-        </div>
+      <div className="flex flex-wrap gap-3">
+        <Link
+          className="rounded-lg border border-[var(--fx-border)] px-4 py-2 text-sm font-semibold"
+          to="/overview"
+        >
+          Overview
+        </Link>
+        <Link
+          className="rounded-lg border border-[var(--fx-border)] px-4 py-2 text-sm font-semibold"
+          to="/collector/signals/live"
+        >
+          Live Monitor
+        </Link>
       </div>
     </div>
-  );
-};
+  )
+}

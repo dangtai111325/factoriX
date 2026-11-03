@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Network,
   Cable,
@@ -16,10 +16,14 @@ import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { useApp } from '../../store/AppContext';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { mappingRowIssues, validMqttFilter } from '../../features/acquisition/contracts';
+import { MqttFieldCapture } from '../../features/acquisition/MqttFieldCapture';
+import { appendDiscoveredFields } from '../../features/acquisition/mqttDiscovery';
 
 type ProtocolId = 'modbus' | 'opcua' | 'mqtt' | 'http' | 'formula';
 
 type MappingRow = {
+  topic?: string;
   address: string;
   name: string;
   type: string;
@@ -47,11 +51,7 @@ function isValidModbusUnit(value: string): boolean {
 }
 
 function isValidMqttTopic(topic: string): boolean {
-  const t = topic.trim();
-  if (!t) return false;
-  if (t.includes('#') && !t.endsWith('/#') && t !== '#') return false;
-  if (t.split('/').some((seg) => seg.includes('#') && seg !== '#')) return false;
-  return true;
+  return validMqttFilter(topic);
 }
 
 export const AddDataWizardPage: React.FC = () => {
@@ -69,7 +69,10 @@ export const AddDataWizardPage: React.FC = () => {
   const machines = resources.filter((item) => item.type === 'machine' || item.type === 'line');
 
   const [step, setStep] = useState(1);
-  const [selectedProtocol, setSelectedProtocol] = useState<ProtocolId | null>(null);
+  const [selectedProtocol, setSelectedProtocol] = useState<ProtocolId | null>(() => {
+    const protocol = searchParams.get('protocol');
+    return ['modbus', 'opcua', 'mqtt', 'http', 'formula'].includes(protocol || '') ? protocol as ProtocolId : null;
+  });
   const [resourceId, setResourceId] = useState('');
   const [connectionName, setConnectionName] = useState('');
   const [host, setHost] = useState('');
@@ -89,9 +92,11 @@ export const AddDataWizardPage: React.FC = () => {
   const [httpMethod, setHttpMethod] = useState('GET');
   const [interval, setIntervalMs] = useState('1000');
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [showMappingErrors, setShowMappingErrors] = useState(false);
   const [prepared, setPrepared] = useState<{ connectionId: string; jobId: string; edgeId: string } | null>(null);
   const [wizardError, setWizardError] = useState('');
   const [discardPrompt, setDiscardPrompt] = useState(false);
+  const [captureBusy, setCaptureBusy] = useState(false);
 
   const [registers, setRegisters] = useState<MappingRow[]>([
     { address: '', name: '', type: 'Holding Register', dataType: 'Float32', unit: '' },
@@ -156,7 +161,7 @@ export const AddDataWizardPage: React.FC = () => {
   }, [selectedProtocol]);
 
   const draftExtra = () => {
-    if (selectedProtocol === 'mqtt') return mqttTopic.trim();
+    if (selectedProtocol === 'mqtt') return mqttTopic;
     if (selectedProtocol === 'http') return httpPath.trim() || '/';
     if (selectedProtocol === 'opcua') return opcSecurity;
     return unitId.trim();
@@ -193,15 +198,30 @@ export const AddDataWizardPage: React.FC = () => {
         address: row.address.trim(),
         dataType: row.dataType,
         unit: row.unit,
+        ...(selectedProtocol === 'mqtt' ? {topic:row.topic || ''} : {}),
       })),
-    mqttQos: Number(mqttQos) || 1,
+    mqttQos: Number(mqttQos),
     mqttClientId,
     mqttVersion,
-    mqttKeepalive: Number(mqttKeepalive) || 60,
+    mqttKeepalive: Number(mqttKeepalive),
     mqttTls,
     mqttAnonymous,
     httpMethod,
   });
+
+  const { fields: currentFields, ...currentConfig } = draft();
+  const configFingerprint = JSON.stringify(currentConfig);
+  const latestConfigFingerprint = useRef(configFingerprint);
+  latestConfigFingerprint.current = configFingerprint;
+  const mappingFingerprint = JSON.stringify(currentFields);
+  const draftFingerprint = configFingerprint + mappingFingerprint;
+  const latestDraftFingerprint = useRef(draftFingerprint);
+  latestDraftFingerprint.current = draftFingerprint;
+  useEffect(() => { setPrepared(null); }, [configFingerprint]);
+  useEffect(() => {
+    setTestSuccess(false);
+    setTestStages([]);
+  }, [draftFingerprint]);
 
   const validateStep2 = (): boolean => {
     const errors: Record<string, string> = {};
@@ -217,6 +237,7 @@ export const AddDataWizardPage: React.FC = () => {
         errors.mqttTopic = 'Enter a valid MQTT topic filter (wildcards # and + allowed).';
       }
       if (!['0', '1', '2'].includes(mqttQos)) errors.mqttQos = 'QoS must be 0, 1, or 2.';
+      if (!/^\d+$/.test(mqttKeepalive) || Number(mqttKeepalive) > 65535) errors.mqttKeepalive = 'Keepalive must be 0–65535 seconds.';
     } else if (selectedProtocol === 'opcua') {
       const ep = opcEndpoint.trim() || (host.trim() ? `opc.tcp://${host.trim()}:${port}` : '');
       if (!ep) errors.opcEndpoint = 'OPC UA endpoint URL is required.';
@@ -251,6 +272,12 @@ export const AddDataWizardPage: React.FC = () => {
   };
 
   const validateStep3 = (): boolean => {
+    setShowMappingErrors(true);
+    const issues = mappingRowIssues(selectedProtocol === 'formula' || !selectedProtocol ? 'modbus' : selectedProtocol, registers);
+    if (issues.length) {
+      setWizardError('Correct the highlighted mapping rows before continuing.');
+      return false;
+    }
     const valid = registers.filter((row) => row.name.trim() && row.address.trim());
     if (!valid.length) {
       setWizardError('Add at least one complete mapping row (name + address/JSONPath/NodeId).');
@@ -259,9 +286,14 @@ export const AddDataWizardPage: React.FC = () => {
     setWizardError('');
     return true;
   };
+  const mappingErrors = useMemo(() => {
+    const issues = showMappingErrors ? mappingRowIssues(selectedProtocol === 'formula' || !selectedProtocol ? 'modbus' : selectedProtocol, registers) : [];
+    return new Map(issues.map(issue=>[`${issue.row}.${issue.field}`,issue.message]));
+  }, [showMappingErrors, selectedProtocol, registers]);
 
   const handleRunTest = async () => {
     if (!validateStep2() || !validateStep3()) return;
+    const testedFingerprint = draftFingerprint;
     setIsTesting(true);
     setTestSuccess(false);
     setWizardError('');
@@ -269,12 +301,16 @@ export const AddDataWizardPage: React.FC = () => {
       const body = draft();
       const next = prepared ?? (await prepareAcquisition(body));
       setPrepared(next);
-      const result = await commissionAcquisition(next.connectionId);
+      const result = await commissionAcquisition(next.connectionId, body);
+      if (latestDraftFingerprint.current !== testedFingerprint) {
+        setWizardError('The configuration changed during the test. Run the test again.');
+        return;
+      }
       setTestStages(
         result.stages.map((stage) => ({
           name: stage.name,
           status:
-            stage.status === 'PASSED' || stage.status === 'COMPLETED'
+            ['PASSED', 'COMPLETED', 'NOT_APPLICABLE'].includes(stage.status)
               ? 'pass'
               : stage.status === 'FAILED'
                 ? 'fail'
@@ -288,10 +324,10 @@ export const AddDataWizardPage: React.FC = () => {
         const hint =
           failed?.name?.toUpperCase().includes('EDGE') ||
           result.stages.some((s) => String(s.status).includes('EDGE_NOT_ENROLLED'))
-            ? ' Edge is not enrolled — open Acquisition › Edges to enroll the collector.'
+            ? ' Edge is not enrolled — open Data Collector › Edge Collectors to enroll the collector.'
             : '';
         setWizardError(
-          (failed ? `Handshake failed at ${failed.name}.` : 'Handshake did not pass.') + hint,
+          (failed ? `Acquisition test failed at ${failed.name}. ${failed.detail || ''}` : 'Acquisition test did not pass.') + hint,
         );
       }
     } catch (error) {
@@ -310,10 +346,10 @@ export const AddDataWizardPage: React.FC = () => {
     try {
       const body = draft();
       if (!prepared) throw new Error('Run the handshake before activation.');
-      if (!testSuccess) throw new Error('Activation stays locked until the collector passes the network stage.');
+      if (!testSuccess) throw new Error('Run a successful acquisition and mapping test before activation.');
       if (!body.fields.length) throw new Error('Add at least one named field before activation.');
       await activateAcquisition(prepared, body);
-      navigate('/signals');
+      navigate('/collector/signals');
     } catch (error) {
       setWizardError(error instanceof Error ? error.message : 'Activation failed');
     }
@@ -336,7 +372,7 @@ export const AddDataWizardPage: React.FC = () => {
         /* best effort */
       }
     }
-    navigate('/acquisition/connections');
+    navigate('/collector/connections');
   };
 
   const stepLabels = [
@@ -685,6 +721,7 @@ export const AddDataWizardPage: React.FC = () => {
                     value={mqttKeepalive}
                     onChange={(e) => setMqttKeepalive(e.target.value)}
                   />
+                  {fieldErrors.mqttKeepalive && <p className="text-[11px] text-[#F2343B] mt-1">{fieldErrors.mqttKeepalive}</p>}
                 </div>
                 <div className="flex items-center gap-4 md:col-span-2">
                   <label className="flex items-center gap-2 text-[12px] text-[#111B37]">
@@ -827,6 +864,7 @@ export const AddDataWizardPage: React.FC = () => {
                     type: mappingColumns.type,
                     dataType: 'Float32',
                     unit: '',
+                    ...(selectedProtocol === 'mqtt' ? {topic:!/[+#]/.test(mqttTopic)?mqttTopic:''}:{}),
                   },
                 ]);
               }}
@@ -835,10 +873,24 @@ export const AddDataWizardPage: React.FC = () => {
             </Button>
           }
         >
+          {selectedProtocol === 'mqtt' ? <MqttFieldCapture
+            key={configFingerprint}
+            filter={mqttTopic}
+            onBusy={setCaptureBusy}
+            prepare={async () => {
+              if (!validateStep2()) throw new Error('Correct the connection settings before capture.');
+              const next = prepared ?? await prepareAcquisition(draft());
+              if (latestConfigFingerprint.current !== configFingerprint) throw new Error('Connection settings changed. Capture again with the current settings.');
+              setPrepared(next);
+              return next.connectionId;
+            }}
+            onAdd={(topic, fields) => setRegisters(previous => appendDiscoveredFields(previous, topic, fields))}
+          /> : null}
           <div className="overflow-x-auto">
             <table className="fx-table">
               <thead>
                 <tr>
+                  {selectedProtocol === 'mqtt' ? <th>Topic</th> : null}
                   <th>{mappingColumns.address}</th>
                   <th>Tag Name</th>
                   <th>{mappingColumns.type}</th>
@@ -850,10 +902,13 @@ export const AddDataWizardPage: React.FC = () => {
               <tbody>
                 {registers.map((reg, idx) => (
                   <tr key={idx}>
+                    {selectedProtocol === 'mqtt' ? <td className="min-w-64"><input aria-label={`Row ${idx+1} topic`} aria-invalid={mappingErrors.has(`${idx}.topic`)} aria-describedby={mappingErrors.has(`${idx}.topic`)?`mapping-topic-${idx}`:undefined} className="fx-input h-8 font-mono text-xs" value={reg.topic || ''} maxLength={2048} placeholder="Exact topic or explicit field filter" onChange={event=>setRegisters(previous=>previous.map((row,at)=>at===idx?{...row,topic:event.target.value}:row))}/>{mappingErrors.has(`${idx}.topic`)?<p id={`mapping-topic-${idx}`} className="mt-1 text-xs text-[var(--fx-error)]">{mappingErrors.get(`${idx}.topic`)}</p>:null}</td>:null}
                     <td>
                       <input
                         type="text"
                         value={reg.address}
+                        aria-label={`Row ${idx+1} address`}
+                        aria-invalid={mappingErrors.has(`${idx}.address`)}
                         placeholder={mappingColumns.hint}
                         onChange={(e) => {
                           const val = e.target.value;
@@ -861,17 +916,21 @@ export const AddDataWizardPage: React.FC = () => {
                         }}
                         className="fx-input h-8 font-mono text-[12px]"
                       />
+                      {mappingErrors.has(`${idx}.address`)?<p className="mt-1 text-xs text-[var(--fx-error)]">{mappingErrors.get(`${idx}.address`)}</p>:null}
                     </td>
                     <td>
                       <input
                         type="text"
                         value={reg.name}
+                        aria-label={`Row ${idx+1} name`}
+                        aria-invalid={mappingErrors.has(`${idx}.name`)}
                         onChange={(e) => {
                           const val = e.target.value;
                           setRegisters((prev) => prev.map((r, i) => (i === idx ? { ...r, name: val } : r)));
                         }}
                         className="fx-input h-8 font-semibold text-[12px]"
                       />
+                      {mappingErrors.has(`${idx}.name`)?<p className="mt-1 text-xs text-[var(--fx-error)]">{mappingErrors.get(`${idx}.name`)}</p>:null}
                     </td>
                     <td>
                       <span className="text-[12px] text-[#657794]">{reg.type}</span>
@@ -880,6 +939,7 @@ export const AddDataWizardPage: React.FC = () => {
                       <select
                         className="fx-input h-8 text-[12px]"
                         value={reg.dataType}
+                        aria-label={`Row ${idx+1} data type`}
                         onChange={(e) => {
                           const val = e.target.value;
                           setRegisters((prev) =>
@@ -888,9 +948,12 @@ export const AddDataWizardPage: React.FC = () => {
                         }}
                       >
                         <option value="Float32">Float32</option>
+                        <option value="Float64">Float64</option>
                         <option value="Int32">Int32</option>
+                        <option value="Int64">Int64</option>
                         <option value="Bool">Bool</option>
                         <option value="String">String</option>
+                        <option value="JSON">JSON</option>
                       </select>
                     </td>
                     <td>
@@ -995,7 +1058,7 @@ export const AddDataWizardPage: React.FC = () => {
                 <button
                   type="button"
                   className="text-[#EF1B24] font-semibold underline"
-                  onClick={() => navigate('/acquisition/edges')}
+                  onClick={() => navigate('/collector/edges')}
                 >
                   Edges
                 </button>
@@ -1021,6 +1084,7 @@ export const AddDataWizardPage: React.FC = () => {
                     <div>
                       <span className="text-[12px] font-bold text-[#111B37]">{r.name}</span>
                       <span className="text-[10px] text-[#657794] font-mono block">{r.address}</span>
+                      {selectedProtocol==='mqtt'?<span className="block break-all font-mono text-[10px] text-[#657794]">{r.topic}</span>:null}
                     </div>
                     <div className="text-right">
                       <span className="text-[14px] font-extrabold text-[#111B37] tabular-nums">
@@ -1039,7 +1103,7 @@ export const AddDataWizardPage: React.FC = () => {
         <Button
           variant="secondary"
           icon={<ArrowLeft className="w-4 h-4" />}
-          disabled={step === 1}
+          disabled={step === 1 || captureBusy || isTesting}
           onClick={() => setStep((s) => s - 1)}
         >
           Back
@@ -1049,6 +1113,7 @@ export const AddDataWizardPage: React.FC = () => {
           <Button
             variant="primary"
             icon={<ArrowRight className="w-4 h-4" />}
+            disabled={captureBusy}
             onClick={() => {
               if (step === 1) {
                 if (!selectedProtocol) {
@@ -1071,6 +1136,7 @@ export const AddDataWizardPage: React.FC = () => {
               }
               if (step === 2) {
                 if (!validateStep2()) return;
+                if (selectedProtocol==='mqtt' && !/[+#]/.test(mqttTopic)) setRegisters(previous=>previous.map(row=>row.topic?row:{...row,topic:mqttTopic}));
                 setStep(3);
                 return;
               }

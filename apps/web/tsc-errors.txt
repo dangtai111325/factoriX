@@ -1,0 +1,7 @@
+﻿src/pages/01_Overview/OverviewPage.tsx(337,22): error TS2304: Cannot find name 'describeEvent'.
+src/store/AppContext.tsx(569,15): error TS2451: Cannot redeclare block-scoped variable 'policy'.
+src/store/AppContext.tsx(570,15): error TS2451: Cannot redeclare block-scoped variable 'policy'.
+src/store/AppContext.tsx(583,11): error TS1117: An object literal cannot have multiple properties with the same name.
+src/store/AppContext.tsx(1534,5): error TS2322: Type '(group: OutputGroup) => Promise<void>' is not assignable to type '(group: OutputGroup) => Promise<string>'.
+  Type 'Promise<void>' is not assignable to type 'Promise<string>'.
+    Type 'void' is not assignable to type 'string'.

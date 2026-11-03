@@ -1,277 +1,532 @@
-import React, { useEffect, useState } from 'react';
-import { X, Plus, FolderPlus, Trash2 } from 'lucide-react';
-import { translateApiError } from '../../utils/apiErrors';
-import { codePreviewFromName, validateResourceName } from '../../utils/resourceHierarchy';
+import React, { useEffect, useMemo, useState } from 'react'
+import { Plus, Trash2 } from 'lucide-react'
+import { Button } from '../common/Button'
+import { Dialog } from '../common/Dialog'
+import type { ResourceNode } from '../../types'
+import { translateApiError } from '../../utils/apiErrors'
+import { codePreviewFromName, validateResourceName } from '../../utils/resourceHierarchy'
+import { propertyRows, propertyValues, recommendedType, resourcePathLabel } from '../../features/assets/model'
+import type {
+  PropertyKind,
+  PropertyRow,
+  ResourceEditorSnapshot,
+  ResourceFormValues,
+  ResourceTypeDefinition,
+  ResourceTypeInput,
+  LocalApplianceStatus,
+} from '../../features/assets/model'
 
 export interface AddResourceModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-  parentPath?: string;
-  allowedTypes?: string[];
-  onAddResource?: (newResource: {
-    name: string;
-    type: string;
-    parentPath: string;
-    description: string;
-    properties: Record<string, string>;
-  }) => void | Promise<void>;
+  isOpen: boolean
+  onClose: () => void
+  resources: ResourceNode[]
+  resourceTypes: ResourceTypeDefinition[]
+  parentId?: string
+  initialResource?: ResourceEditorSnapshot
+  onSave: (values: ResourceFormValues) => Promise<void>
+  onCreateType?: (values: ResourceTypeInput) => Promise<ResourceTypeDefinition>
+  appliance?: LocalApplianceStatus | null
+  applianceError?: string
 }
+
+const labelClass = 'mb-1 block text-xs font-semibold text-[var(--fx-body)]'
+const categories = ['ENTERPRISE', 'SITE', 'AREA', 'WORK_CENTER', 'ASSET', 'POSITION', 'CUSTOM']
 
 export const AddResourceModal: React.FC<AddResourceModalProps> = ({
   isOpen,
   onClose,
-  parentPath = '(root)',
-  allowedTypes = ['Enterprise', 'Site', 'Plant', 'Zone', 'Line', 'Workshop', 'Machine', 'Sensor'],
-  onAddResource,
+  resources,
+  resourceTypes,
+  parentId,
+  initialResource,
+  onSave,
+  onCreateType,
+  appliance,
+  applianceError,
 }) => {
-  const [name, setName] = useState('');
-  const [type, setType] = useState(allowedTypes[0] || 'Machine');
-  const [currentPath, setCurrentPath] = useState(parentPath);
-  const [description, setDescription] = useState('');
-  const [properties, setProperties] = useState<Array<{ key: string; value: string }>>([]);
-  const [error, setError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const allowedKey = allowedTypes.join('|');
+  const editing = Boolean(initialResource)
+  const initialParent = initialResource?.parentId ?? parentId
+  const defaultType = () => {
+    const parent = resources.find((resource) => resource.id === initialParent)
+    return (
+      initialResource?.type ||
+      resourceTypes.find((type) => recommendedType(type, parent?.type))?.key ||
+      resourceTypes[0]?.key ||
+      ''
+    )
+  }
+  const [name, setName] = useState(initialResource?.name || '')
+  const [code, setCode] = useState(initialResource?.code || '')
+  const [codeEdited, setCodeEdited] = useState(editing)
+  const [typeKey, setTypeKey] = useState(defaultType)
+  const [targetParent, setTargetParent] = useState(initialParent || '')
+  const [description, setDescription] = useState(initialResource?.description || '')
+  const [rows, setRows] = useState<PropertyRow[]>(() => propertyRows(initialResource?.properties || {}))
+  const [strict, setStrict] = useState(false)
+  const [timezone, setTimezone] = useState('Asia/Ho_Chi_Minh')
+  const [useAppliance, setUseAppliance] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const [newTypeKey, setNewTypeKey] = useState('')
+  const [newTypeName, setNewTypeName] = useState('')
+  const [newTypeCategory, setNewTypeCategory] = useState('CUSTOM')
+  const [creatingType, setCreatingType] = useState(false)
+  const [typeError, setTypeError] = useState('')
+  const [createdTypes, setCreatedTypes] = useState<ResourceTypeDefinition[]>([])
+
+  // Pin the form on open/object identity, never reset an unsaved draft during polling.
+  useEffect(() => {
+    if (!isOpen) return
+    setName(initialResource?.name || '')
+    setCode(initialResource?.code || '')
+    setCodeEdited(Boolean(initialResource))
+    setTypeKey(defaultType())
+    setTargetParent(initialParent || '')
+    setDescription(initialResource?.description || '')
+    setRows(propertyRows(initialResource?.properties || {}))
+    setStrict(false)
+    setTimezone('Asia/Ho_Chi_Minh')
+    setUseAppliance(false)
+    setError('')
+    setSubmitting(false)
+    setNewTypeKey('')
+    setNewTypeName('')
+    setTypeError('')
+    setCreatedTypes([])
+  }, [isOpen, initialResource?.id])
 
   useEffect(() => {
-    if (!isOpen) return;
-    setName('');
-    setType(allowedTypes[0] || 'Machine');
-    setCurrentPath(parentPath);
-    setDescription('');
-    setProperties([]);
-    setError('');
-    setSubmitting(false);
-  }, [isOpen, parentPath, allowedKey]);
-
+    setUseAppliance(false)
+  }, [typeKey])
   useEffect(() => {
-    if (!isOpen) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isOpen, onClose]);
+    if (!appliance?.available) setUseAppliance(false)
+  }, [appliance?.available])
 
-  if (!isOpen) return null;
+  const parent = resources.find((resource) => resource.id === targetParent)
+  const types = useMemo(
+    () =>
+      Array.from(new Map([...resourceTypes, ...createdTypes].map((type) => [type.key, type])).values()).sort(
+        (a, b) =>
+          Number(recommendedType(b, parent?.type)) - Number(recommendedType(a, parent?.type)) ||
+          a.name.localeCompare(b.name),
+      ),
+    [resourceTypes, createdTypes, parent?.type],
+  )
+  useEffect(() => {
+    if (!typeKey && types.length) setTypeKey(types[0].key)
+  }, [typeKey, types])
+  const selectedType = types.find((type) => type.key === typeKey)
+  const typeGroups = [
+    { label: 'Recommended', items: types.filter((type) => recommendedType(type, parent?.type)) },
+    ...categories.map((category) => ({
+      label: category.replace(/_/g, ' '),
+      items: types.filter((type) => type.category === category && !recommendedType(type, parent?.type)),
+    })),
+  ].filter((group) => group.items.length)
+  const isRecommended = selectedType ? recommendedType(selectedType, parent?.type) : false
+  const actualCode = codeEdited ? code : codePreviewFromName(name)
+  const busy = submitting || creatingType
 
-  const codePreview = codePreviewFromName(name);
-
-  const handleAddProperty = () => {
-    setProperties([...properties, { key: '', value: '' }]);
-  };
-
-  const handleRemoveProperty = (index: number) => {
-    setProperties(properties.filter((_, i) => i !== index));
-  };
-
-  const handlePropertyChange = (index: number, field: 'key' | 'value', val: string) => {
-    const next = [...properties];
-    next[index][field] = val;
-    setProperties(next);
-  };
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const nameError = validateResourceName(name);
+  const updateRow = (index: number, update: Partial<PropertyRow>) =>
+    setRows((current) => current.map((row, at) => (at === index ? { ...row, ...update } : row)))
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault()
+    const nameError = validateResourceName(name)
     if (nameError) {
-      setError(nameError);
-      return;
+      setError(nameError)
+      return
     }
-    const chosen = allowedTypes.includes(type) ? type : allowedTypes[0];
-    if (!chosen) return;
-
-    const propsMap = properties.reduce<Record<string, string>>((acc, item) => {
-      if (item.key.trim()) acc[item.key.trim()] = item.value.trim();
-      return acc;
-    }, {});
-
-    setSubmitting(true);
-    setError('');
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(actualCode.trim())) {
+      setError(
+        'Resource code must be 1–64 letters, digits, dots, underscores or hyphens, starting with a letter or digit.',
+      )
+      return
+    }
+    if (!selectedType) {
+      setError('Select a resource type.')
+      return
+    }
+    if (!editing && strict && !isRecommended) {
+      setError('Choose a recommended placement or turn off Strict hierarchy.')
+      return
+    }
+    setError('')
+    setSubmitting(true)
     try {
-      await onAddResource?.({
+      await onSave({
         name: name.trim(),
-        type: chosen,
-        parentPath: currentPath,
-        description: description.trim(),
-        properties: propsMap,
-      });
-      onClose();
+        code: actualCode.trim(),
+        type: typeKey,
+        parentId: targetParent || undefined,
+        description,
+        properties: propertyValues(rows),
+        hierarchyMode: strict ? 'strict' : 'guided',
+        timezone,
+        useAppliance: typeKey === 'site' && useAppliance && Boolean(appliance?.available),
+      })
+      onClose()
     } catch (caught) {
-      setError(translateApiError(caught));
+      setError(translateApiError(caught))
     } finally {
-      setSubmitting(false);
+      setSubmitting(false)
     }
-  };
+  }
+  const createType = async () => {
+    if (!onCreateType) return
+    if (!newTypeName.trim() || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(newTypeKey.trim())) {
+      setTypeError(
+        'Enter a type name and a valid key of at most 64 letters, digits, dots, underscores or hyphens.',
+      )
+      return
+    }
+    setCreatingType(true)
+    setTypeError('')
+    try {
+      const created = await onCreateType({
+        key: newTypeKey.trim().toLowerCase(),
+        name: newTypeName.trim(),
+        category: newTypeCategory,
+        parent_type_keys: parent ? [parent.type] : [],
+        child_type_keys: [],
+      })
+      setCreatedTypes((current) => [...current, created])
+      setTypeKey(created.key)
+      setNewTypeKey('')
+      setNewTypeName('')
+    } catch (caught) {
+      setTypeError(translateApiError(caught))
+    } finally {
+      setCreatingType(false)
+    }
+  }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-fadeIn">
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="add-resource-title"
-        className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]"
-      >
-        {/* Modal Header */}
-        <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-red-50 text-[#EF1B24] flex items-center justify-center font-bold">
-              <FolderPlus className="w-5 h-5" />
-            </div>
-            <div>
-              <h2 id="add-resource-title" className="text-lg font-bold text-slate-900">
-                Add Factory Resource
-              </h2>
-              <p className="text-xs text-slate-500">
-                Define and insert a new entity into the factory hierarchy
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 transition-colors"
-            aria-label="Close"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        {/* Modal Body */}
-        <form onSubmit={handleSubmit} className="p-6 space-y-5 overflow-y-auto flex-1 text-sm">
-          {/* Context Path */}
+    <Dialog isOpen={isOpen} onClose={onClose} busy={busy} title={editing ? 'Edit resource' : 'Add resource'}>
+      <form onSubmit={(event) => void save(event)} className="space-y-5 p-6 text-sm">
+        <fieldset disabled={busy} className="space-y-5">
           <div>
-            <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">
-              Context Path (Parent)
+            <label className={labelClass} htmlFor="resource-parent">
+              Parent
             </label>
-            <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 break-all">
-              {currentPath}
-            </div>
+            <select
+              id="resource-parent"
+              className="fx-input"
+              value={targetParent}
+              disabled={editing}
+              onChange={(event) => setTargetParent(event.target.value)}
+            >
+              <option value="">Root level</option>
+              {resources.map((resource) => (
+                <option key={resource.id} value={resource.id}>
+                  {resourcePathLabel(resources, resource.id)}
+                </option>
+              ))}
+            </select>
+            {editing ? (
+              <p className="mt-1 text-xs text-[var(--fx-muted)]">
+                Use Move to change the parent and review its impact.
+              </p>
+            ) : null}
           </div>
-
-          {/* Resource Name and Type */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid gap-4 sm:grid-cols-2">
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Resource Name <span className="text-[#EF1B24]">*</span>
+              <label className={labelClass} htmlFor="resource-name">
+                Display name
               </label>
               <input
-                type="text"
+                id="resource-name"
+                className="fx-input"
                 required
+                maxLength={200}
                 value={name}
-                onChange={(e) => {
-                  setName(e.target.value);
-                  if (error) setError('');
-                }}
-                placeholder="e.g. CNC-03, Line 04, Packaging Line"
-                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
+                autoFocus
+                onChange={(event) => setName(event.target.value)}
+                autoComplete="off"
               />
-              <p className="mt-1.5 text-[11px] text-slate-500 font-mono">
-                Code preview:{' '}
-                <span className="text-slate-700 font-semibold">{codePreview || '—'}</span>
-              </p>
+              <p className="mt-1 text-xs text-[var(--fx-muted)] tabular-nums">{name.length}/200</p>
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Resource Type <span className="text-[#EF1B24]">*</span>
+              <label className={labelClass} htmlFor="resource-code">
+                Resource code
               </label>
-              <select
-                value={type}
-                onChange={(e) => setType(e.target.value)}
-                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
-              >
-                {allowedTypes.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
-                  </option>
-                ))}
-              </select>
+              <input
+                id="resource-code"
+                className="fx-input font-mono"
+                required
+                maxLength={64}
+                value={actualCode}
+                onChange={(event) => {
+                  setCodeEdited(true)
+                  setCode(event.target.value)
+                }}
+                autoComplete="off"
+              />
+              <p className="mt-1 text-xs text-[var(--fx-muted)]">
+                Unique under this parent. Source addresses stay unchanged.
+              </p>
             </div>
           </div>
-
-          {/* Description */}
           <div>
-            <label className="block text-xs font-semibold text-slate-700 mb-1">Description</label>
+            <label className={labelClass} htmlFor="resource-type">
+              Resource type
+            </label>
+            <select
+              id="resource-type"
+              className="fx-input"
+              value={typeKey}
+              disabled={editing}
+              onChange={(event) => setTypeKey(event.target.value)}
+            >
+              {!types.length ? <option value="">Resource types are unavailable</option> : null}
+              {typeGroups.map((group) => (
+                <optgroup key={group.label} label={group.label}>
+                  {group.items.map((type) => (
+                    <option key={type.key} value={type.key}>
+                      {type.name}
+                      {recommendedType(type, parent?.type) ? ' · Recommended' : ''}
+                      {!type.is_system ? ' · Custom' : ''}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+            {!editing ? (
+              <>
+                <label className="mt-3 flex items-center gap-2 text-xs font-medium">
+                  <input
+                    type="checkbox"
+                    checked={strict}
+                    onChange={(event) => setStrict(event.target.checked)}
+                  />{' '}
+                  Strict hierarchy
+                </label>
+                {!isRecommended && selectedType ? (
+                  <p
+                    role="status"
+                    className="mt-2 rounded-lg bg-[var(--fx-warning-soft)] p-3 text-xs text-amber-900"
+                  >
+                    This placement is outside the recommended hierarchy. Guided mode allows it; Site
+                    boundaries and cycle checks still apply.
+                  </p>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+          {!editing && typeKey === 'site' ? (
+            <div>
+              <label className={labelClass} htmlFor="resource-timezone">
+                Site timezone
+              </label>
+              <input
+                id="resource-timezone"
+                className="fx-input"
+                required
+                value={timezone}
+                onChange={(event) => setTimezone(event.target.value)}
+              />
+              <p className="mt-1 text-xs text-[var(--fx-muted)]">
+                IANA timezone, for example Asia/Ho_Chi_Minh or UTC. An Edge is created with the Site.
+              </p>
+              <label className="mt-3 flex items-center gap-2 text-xs font-medium">
+                <input
+                  type="checkbox"
+                  name="useAppliance"
+                  checked={useAppliance}
+                  disabled={!appliance?.available}
+                  onChange={(event) => setUseAppliance(event.target.checked)}
+                />
+                Use this appliance for this Site
+              </label>
+              <p className="mt-1 text-xs text-[var(--fx-muted)]">
+                {applianceError
+                  ? 'Appliance availability could not be verified. You can create the Site and enroll its Edge later.'
+                  : !appliance
+                    ? 'Checking local appliance availability…'
+                    : !appliance.enabled
+                      ? 'Local appliance enrollment is unavailable here. Enroll the Edge separately.'
+                      : appliance.available
+                        ? 'Optional. Enrollment is requested only when this option is selected.'
+                        : appliance.state === 'CONFLICT'
+                          ? 'The local appliance identity needs attention in Edge Collectors before enrollment.'
+                          : 'This appliance is already assigned. Create the Site independently and manage its collector in Edge Collectors.'}
+              </p>
+            </div>
+          ) : null}
+          <div>
+            <label className={labelClass} htmlFor="resource-description">
+              Description
+            </label>
             <textarea
+              id="resource-description"
+              className="fx-input"
               rows={2}
               value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="Operational purpose, physical location, or maintenance notes..."
-              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
+              onChange={(event) => setDescription(event.target.value)}
             />
           </div>
-
-          {/* Key-Value Properties */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-xs font-semibold text-slate-700">
-                Resource Metadata & Technical Attributes
-              </label>
-              <button
+          <section aria-label="Resource properties">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <h3 className="text-xs font-semibold">Properties</h3>
+              <Button
                 type="button"
-                onClick={handleAddProperty}
-                className="text-xs font-medium text-[#EF1B24] hover:text-red-700 flex items-center gap-1"
+                size="sm"
+                variant="ghost"
+                icon={<Plus className="h-3.5 w-3.5" />}
+                onClick={() => setRows((current) => [...current, { key: '', value: '', kind: 'string' }])}
               >
-                <Plus className="w-3.5 h-3.5" /> Add Property
-              </button>
+                Add property
+              </Button>
             </div>
-            <div className="space-y-2 max-h-36 overflow-y-auto pr-1">
-              {properties.map((prop, idx) => (
-                <div key={idx} className="flex items-center gap-2">
+            {!rows.length ? <p className="text-xs text-[var(--fx-muted)]">No properties declared.</p> : null}
+            <div className="space-y-3">
+              {rows.map((row, index) => (
+                <div
+                  key={index}
+                  className="grid grid-cols-[minmax(0,1fr)_7rem_2rem] gap-2 rounded-lg border border-[var(--fx-border)] p-3"
+                >
                   <input
-                    type="text"
-                    placeholder="Key (e.g. SerialNum)"
-                    value={prop.key}
-                    onChange={(e) => handlePropertyChange(idx, 'key', e.target.value)}
-                    className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs text-slate-800 focus:outline-none focus:border-[#EF1B24]"
+                    className="fx-input min-w-0"
+                    aria-label={`Property ${index + 1} name`}
+                    placeholder="Property name"
+                    value={row.key}
+                    onChange={(event) => updateRow(index, { key: event.target.value })}
                   />
-                  <input
-                    type="text"
-                    placeholder="Value"
-                    value={prop.value}
-                    onChange={(e) => handlePropertyChange(idx, 'value', e.target.value)}
-                    className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs text-slate-800 focus:outline-none focus:border-[#EF1B24]"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveProperty(idx)}
-                    className="p-1.5 text-slate-400 hover:text-red-600 rounded"
+                  <select
+                    className="fx-input"
+                    aria-label={`Property ${index + 1} type`}
+                    value={row.kind}
+                    onChange={(event) =>
+                      updateRow(index, {
+                        kind: event.target.value as PropertyKind,
+                        value:
+                          event.target.value === 'null'
+                            ? 'null'
+                            : event.target.value === 'boolean'
+                              ? 'false'
+                              : row.value,
+                      })
+                    }
                   >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                    <option value="string">Text</option>
+                    <option value="number">Number</option>
+                    <option value="boolean">Boolean</option>
+                    <option value="null">Null</option>
+                    <option value="json">JSON</option>
+                  </select>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="!p-0"
+                    aria-label={`Remove property ${index + 1}`}
+                    onClick={() => setRows((current) => current.filter((_, at) => at !== index))}
+                    icon={<Trash2 className="h-4 w-4" />}
+                  />
+                  <div className="col-span-3">
+                    {row.kind === 'boolean' ? (
+                      <select
+                        className="fx-input"
+                        aria-label={`Property ${index + 1} value`}
+                        value={row.value}
+                        onChange={(event) => updateRow(index, { value: event.target.value })}
+                      >
+                        <option value="true">true</option>
+                        <option value="false">false</option>
+                      </select>
+                    ) : row.kind === 'json' ? (
+                      <textarea
+                        className="fx-input font-mono"
+                        rows={2}
+                        aria-label={`Property ${index + 1} value`}
+                        value={row.value}
+                        onChange={(event) => updateRow(index, { value: event.target.value })}
+                      />
+                    ) : (
+                      <input
+                        className="fx-input"
+                        aria-label={`Property ${index + 1} value`}
+                        value={row.value}
+                        disabled={row.kind === 'null'}
+                        onChange={(event) => updateRow(index, { value: event.target.value })}
+                      />
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
-          </div>
-
-          {error && (
-            <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-              {error}
-            </p>
-          )}
-
-          {/* Footer Actions */}
-          <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={submitting}
-              className="px-5 py-2 text-xs font-semibold text-white bg-[#EF1B24] hover:bg-[#d0171f] rounded-lg shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50"
-            >
-              <Plus className="w-4 h-4" /> {submitting ? 'Creating…' : 'Create Resource'}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
-  );
-};
+          </section>
+          {!editing && onCreateType ? (
+            <details className="rounded-lg border border-[var(--fx-border)] p-3">
+              <summary className="cursor-pointer text-xs font-semibold">New resource type</summary>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <label className={labelClass}>
+                  Type name
+                  <input
+                    className="fx-input mt-1"
+                    maxLength={200}
+                    value={newTypeName}
+                    onChange={(event) => setNewTypeName(event.target.value)}
+                  />
+                </label>
+                <label className={labelClass}>
+                  Type key
+                  <input
+                    className="fx-input mt-1 font-mono"
+                    maxLength={64}
+                    value={newTypeKey}
+                    onChange={(event) => setNewTypeKey(event.target.value)}
+                  />
+                </label>
+                <label className={labelClass}>
+                  Category
+                  <select
+                    className="fx-input mt-1"
+                    value={newTypeCategory}
+                    onChange={(event) => setNewTypeCategory(event.target.value)}
+                  >
+                    {categories.map((category) => (
+                      <option key={category} value={category}>
+                        {category.replace(/_/g, ' ')}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="self-end">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() => void createType()}
+                    loading={creatingType}
+                  >
+                    Create type
+                  </Button>
+                </div>
+              </div>
+              <p className="mt-2 text-xs text-[var(--fx-muted)]">
+                The selected parent's type becomes a recommended parent. The new type is available throughout
+                the model.
+              </p>
+              {typeError ? (
+                <p role="alert" className="mt-2 text-xs text-[var(--fx-error)]">
+                  {typeError}
+                </p>
+              ) : null}
+            </details>
+          ) : null}
+        </fieldset>
+        {error ? (
+          <p role="alert" className="rounded-lg bg-[var(--fx-error-soft)] p-3 text-xs text-[var(--fx-error)]">
+            {error}
+          </p>
+        ) : null}
+        <footer className="flex justify-end gap-3 border-t border-[var(--fx-border)] pt-4">
+          <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={submitting} disabled={busy || !selectedType}>
+            {editing ? 'Save changes' : 'Create resource'}
+          </Button>
+        </footer>
+      </form>
+    </Dialog>
+  )
+}

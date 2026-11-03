@@ -1,12 +1,15 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Copy, Check, RefreshCw, KeyRound, Server } from 'lucide-react';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { Badge } from '../../components/common/Badge';
 import { useApp } from '../../store/AppContext';
+import { loadLocalAppliance } from '../../features/assets/api';
+import type { LocalApplianceStatus } from '../../features/assets/model';
+import { resourcePathLabel } from '../../features/assets/model';
 
 export const EdgesPage: React.FC = () => {
-  const { edges, resources, refresh, issueEnrollmentToken, queueApplianceEnroll } = useApp();
+  const { edges, modelResources: resources, refresh, issueEnrollmentToken, queueApplianceEnroll } = useApp();
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [tokenInfo, setTokenInfo] = useState<{
@@ -16,15 +19,29 @@ export const EdgesPage: React.FC = () => {
   } | null>(null);
   const [copied, setCopied] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [local, setLocal] = useState<LocalApplianceStatus | null>(null);
+  const [localError, setLocalError] = useState('');
+  const [notice, setNotice] = useState('');
+  useEffect(() => {
+    let closed = false;
+    loadLocalAppliance().then(status => { if (!closed) setLocal(status); })
+      .catch(() => { if (!closed) setLocalError('Local appliance availability could not be verified.'); });
+    return () => { closed = true; };
+  }, []);
 
-  const siteName = (siteId: string) =>
-    resources.find((r) => r.id === siteId || r.attributes?.siteId === siteId)?.name || siteId || '—';
+  const siteName = (siteId: string) => {
+    const site = resources.find(r => r.type === 'site' && r.attributes?.siteId === siteId);
+    return site ? resourcePathLabel(resources, site.id) : siteId || '—';
+  };
 
   const reload = async () => {
     setLoading(true);
     setError('');
+    setLocal(null);
+    setLocalError('');
     try {
-      await refresh();
+      const [, status] = await Promise.all([refresh(), loadLocalAppliance()]);
+      setLocal(status);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to refresh edges');
     } finally {
@@ -52,8 +69,12 @@ export const EdgesPage: React.FC = () => {
   const queueAppliance = async (edgeId: string) => {
     setBusyId(edgeId);
     setError('');
+    setNotice('');
     try {
-      await queueApplianceEnroll(edgeId);
+      const result = await queueApplianceEnroll(edgeId);
+      setNotice(result.status === 'already_enrolled' ? 'This appliance is already enrolled for this Edge.'
+        : `Enrollment request saved. Wait for the Edge heartbeat to confirm enrollment.${result.refreshFailed ? ' Refresh to reload the Edge state.' : ''}`);
+      try { setLocal(await loadLocalAppliance()); } catch { setLocal(null); setLocalError('Enrollment was requested, but appliance status could not refresh.'); }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Appliance enroll queue failed');
     } finally {
@@ -85,12 +106,19 @@ export const EdgesPage: React.FC = () => {
           icon={<RefreshCw className="w-4 h-4" />}
           onClick={() => void reload()}
           loading={loading}
+          disabled={busyId !== null}
         >
           Refresh
         </Button>
       </div>
 
       {error && <p className="text-[12px] text-[#F2343B]">{error}</p>}
+      {notice && <p role="status" className="text-xs text-[var(--fx-body)]">{notice}</p>}
+      <p className="text-xs text-[var(--fx-muted)]">
+        {localError || (!local ? 'Checking local appliance…' : !local.enabled ? 'Local appliance enrollment is unavailable in this instance.'
+          : local.available ? 'Local appliance is available. Assign it explicitly to one Edge.'
+          : `Local appliance: ${local.state.replace(/_/g, ' ')}${local.site_id ? ` · ${siteName(local.site_id)}` : ''}. Existing assignments cannot be replaced here.`)}
+      </p>
 
       {tokenInfo && (
         <Card className="p-4 border-[#BED7F7] bg-[#EEF5FF]/50">
@@ -174,9 +202,12 @@ export const EdgesPage: React.FC = () => {
                         variant="secondary"
                         loading={busyId === edge.id}
                         onClick={() => void queueAppliance(edge.id)}
-                        title="Writes enrollment token for the on-box collector"
+                        disabled={Boolean(busyId) || loading || !local?.enabled || local.state === 'CONFLICT'
+                          || (!local.available && local.edge_id !== edge.id)
+                          || edge.enrollmentStatus === 'ENROLLED'}
+                        title={local?.edge_id === edge.id ? 'This appliance is assigned to this Edge.' : local?.available ? 'Assign the local appliance to this Edge.' : 'The local appliance is unavailable or already assigned.'}
                       >
-                        Queue appliance enroll
+                        {local?.edge_id === edge.id && edge.enrollmentStatus === 'ENROLLED' ? 'This appliance' : local?.edge_id === edge.id ? 'Retry local enrollment' : 'Use this appliance'}
                       </Button>
                     </div>
                   </td>

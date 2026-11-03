@@ -119,6 +119,26 @@ body {
   margin: 0 auto;
 }
 
+.fx-mobile-navigation { display: none; }
+@media (max-width: 1279px) {
+  .fx-topbar .fx-global-search { width: 38px; justify-content: center; padding: 0; }
+  .fx-global-search .fx-search-copy, .fx-global-search kbd { display: none; }
+  .fx-scope-button { max-width: 220px; }
+}
+@media (max-width: 1023px) {
+  .fx-sidebar { display: none; }
+  .fx-mobile-navigation { display: inline-flex; position: fixed; z-index: 45; top: 12px; left: 12px; }
+  .fx-topbar { left: 0; padding-left: 60px; padding-right: 12px; gap: 10px; }
+  .fx-main { margin-left: 0; width: 100%; }
+}
+@media (max-width: 767px) {
+  .fx-topbar-right { gap: 8px; }
+  .fx-topbar .fx-operator-profile, .fx-topbar .fx-stream-controls > span { display: none; }
+  .fx-topbar-left, .fx-topbar-left > div { min-width: 0; gap: 6px; }
+  .fx-scope-button { max-width: min(160px, 38vw); }
+  .fx-content { padding: 16px 12px 28px; }
+}
+
 /* Common FactoriX UI Component styles */
 .fx-card {
   background: var(--fx-surface);

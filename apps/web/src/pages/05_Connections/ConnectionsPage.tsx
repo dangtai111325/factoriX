@@ -92,7 +92,7 @@ export const ConnectionsPage: React.FC = () => {
           <Button
             variant="primary"
             icon={<Plus className="w-4 h-4" />}
-            onClick={() => navigate('/acquisition/add-data')}
+            onClick={() => navigate('/collector/add-data')}
           >
             New Connection
           </Button>
@@ -269,7 +269,7 @@ export const ConnectionsPage: React.FC = () => {
                           title="Edit connection settings in Add Data wizard"
                           onClick={(e) => {
                             e.stopPropagation();
-                            navigate(`/acquisition/add-data?resourceId=${encodeURIComponent(conn.plantId || '')}`);
+                            navigate(`/collector/add-data?resourceId=${encodeURIComponent(conn.plantId || '')}`);
                           }}
                         >
                           <Edit2 className="w-3.5 h-3.5" />

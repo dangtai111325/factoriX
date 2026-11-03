@@ -5,6 +5,7 @@ from __future__ import annotations
 SYSTEM_TYPES: tuple[tuple[str, str, str], ...] = (
     ("enterprise", "Enterprise", "ENTERPRISE"),
     ("site", "Site", "SITE"),
+    ("area", "Area", "AREA"),
     ("plant", "Plant", "AREA"),
     ("zone", "Zone", "AREA"),
     ("line", "Line", "WORK_CENTER"),
@@ -29,6 +30,14 @@ RELATION_TYPES: tuple[tuple[str, str, bool, bool], ...] = (
 CONTAINS_PAIRS: tuple[tuple[str, str], ...] = (
     ("enterprise", "site"),
     ("site", "plant"),
+    ("site", "area"),
+    ("plant", "area"),
+    ("area", "plant"),
+    ("area", "zone"),
+    ("area", "line"),
+    ("area", "workshop"),
+    ("area", "machine"),
+    ("area", "utility_system"),
     ("plant", "zone"),
     ("plant", "line"),
     ("plant", "workshop"),
@@ -47,6 +56,10 @@ CONTAINS_PAIRS: tuple[tuple[str, str], ...] = (
     ("cell", "sensor"),
     ("utility_system", "sensor"),
     ("utility_system", "machine"),
+    ("machine", "sensor"),
+    ("machine", "physical_asset"),
+    ("machine", "functional_position"),
+    ("functional_position", "sensor"),
 )
 
 HIERARCHY_PRESETS: dict[str, list[dict[str, object]]] = {

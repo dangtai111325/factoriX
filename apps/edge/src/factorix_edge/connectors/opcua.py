@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from asyncua import Client
+from asyncua import Client, ua
 
 from factorix.domain.network import AllowedEndpoint, assert_url
 from factorix_edge.connectors.errors import ConnectorError
@@ -46,29 +46,35 @@ class OpcUaConnector:
 
         class _Changes:
             def __init__(self) -> None:
-                self.rows: list[dict[str, Any]] = []
+                self.rows: dict[str, dict[str, Any]] = {}
+                self.complete = asyncio.Event()
 
             def datachange_notification(self, node: object, val: object, data: object) -> None:
-                del data
-                status = getattr(getattr(node, "status", None), "StatusCode", None)
-                self.rows.append(
-                    {
-                        "node_id": str(getattr(node, "nodeid", "")),
-                        "value": _plain(val),
-                        "quality": "GOOD" if status is None or _good(status) else "BAD",
-                        "source_time": None,
-                    }
-                )
+                node_id = node.nodeid.to_string()
+                if node_id not in expected:
+                    return
+                value = getattr(getattr(data, "monitored_item", None), "Value", None)
+                status = getattr(value, "StatusCode", None)
+                self.rows[node_id] = {
+                    "node_id": node_id, "value": _plain(val),
+                    "quality": "GOOD" if status is not None and _good(status) else "BAD",
+                    "source_time": getattr(value, "SourceTimestamp", None),
+                }
+                if expected <= self.rows.keys():
+                    self.complete.set()
 
+        expected = {normalize_node_id(node_id) for node_id in node_ids}
         handler = _Changes()
         subscription = await self.client.create_subscription(500, handler)
-        nodes = [self.client.get_node(node_id) for node_id in node_ids]
-        await subscription.subscribe_data_change(nodes)
-        await asyncio.sleep(timeout_s)
-        await subscription.delete()
-        if len(handler.rows) < len(node_ids):
-            raise ConnectorError("SUBSCRIBE", "OPC UA chưa giao đủ MonitoredItem.")
-        return handler.rows[: len(node_ids)]
+        try:
+            nodes = [self.client.get_node(node_id) for node_id in node_ids]
+            await subscription.subscribe_data_change(nodes)
+            await asyncio.wait_for(handler.complete.wait(), timeout_s)
+        except TimeoutError as exc:
+            raise ConnectorError("SUBSCRIBE", "Not every requested OPC UA node produced a notification.") from exc
+        finally:
+            await subscription.delete()
+        return [handler.rows[normalize_node_id(node_id)] for node_id in node_ids]
 
     async def close(self) -> None:
         await self.client.disconnect()
@@ -81,6 +87,10 @@ def _good(status: object) -> bool:
         except Exception:
             return False
     return "Good" in str(status)
+
+
+def normalize_node_id(value: str) -> str:
+    return ua.NodeId.from_string(value).to_string()
 
 
 def _plain(value: Any) -> Any:

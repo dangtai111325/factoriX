@@ -75,18 +75,21 @@ async def main() -> None:
             snapshot_path=Path(os.environ.get("FACTORIX_CONFIG_PATH", str(outbox_path.parent / "active-config.json"))),
         )
         health_path = Path(os.environ.get("FACTORIX_EDGE_HEALTH", str(outbox_path.parent / "edge-health.json")))
-        while True:
-            ok = False
-            try:
-                await runtime.cycle()
-                ok = True
-            except Exception:
+        try:
+            while True:
                 ok = False
-            try:
-                health_path.write_text(json.dumps({"ok": ok, "pending": runtime.outbox.pending_count()}), encoding="utf-8")
-            except OSError:
-                pass
-            await asyncio.sleep(float(os.environ.get("FACTORIX_EDGE_INTERVAL_S", "1")))
+                try:
+                    await runtime.cycle()
+                    ok = True
+                except Exception:
+                    ok = False
+                try:
+                    health_path.write_text(json.dumps({"ok": ok, "pending": runtime.outbox.pending_count()}), encoding="utf-8")
+                except OSError:
+                    pass
+                await asyncio.sleep(float(os.environ.get("FACTORIX_EDGE_INTERVAL_S", "1")))
+        finally:
+            await runtime.close()
 
 
 if __name__ == "__main__":
