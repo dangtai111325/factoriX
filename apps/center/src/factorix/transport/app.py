@@ -46,7 +46,9 @@ from factorix.modules.identity import (
     require_bootstrap_token,
     touch_me,
 )
+from factorix.modules.protocols import public_protocol
 from factorix.platform.mail import SmtpMailer
+from factorix.platform.security import hash_token
 from factorix.modules.resources import (
     HierarchyIn,
     ImportIn,
@@ -140,7 +142,7 @@ async def request_context(request: Request, call_next):  # type: ignore[no-untyp
     response.headers["X-Correlation-Id"] = request.state.correlation_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; frame-ancestors 'none'; base-uri 'self'"
     return response
 
 
@@ -210,11 +212,63 @@ async def reset_password(body: ResetIn, session: AsyncSession = Depends(db_sessi
     return await confirm_password_reset(session, body)
 
 
+class ResetLinkIn(BaseModel):
+    token: str
+    new_password: str
+
+
+@app.post("/api/v1/auth/reset-password")
+async def reset_password_link(body: ResetLinkIn, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
+    row = await fetch_one(
+        session,
+        """
+        SELECT a.email
+        FROM password_reset_codes c
+        JOIN admin_accounts a ON a.id = c.admin_id
+        WHERE c.code_hash = :code_hash AND c.consumed_at IS NULL
+        ORDER BY c.created_at DESC
+        LIMIT 1
+        """,
+        {"code_hash": hash_token(body.token.strip())},
+    )
+    if row is None or not row.get("email"):
+        raise AppError(401, "INVALID_CODE", "Code is incorrect or has expired.")
+    return await confirm_password_reset(session, ResetIn(email=str(row["email"]), code=body.token.strip(), new_password=body.new_password))
+
+
 @app.post("/api/v1/auth/logout")
 async def logout(response: Response, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     await identity.execute_logout(session, as_uuid(principal["session_id"]))
     clear_cookies(response, settings)
     return {"status": "signed_out"}
+
+
+class RevertIn(BaseModel):
+    confirm: str
+
+
+@app.post("/api/v1/admin/revert-to-zero")
+async def revert_zero(body: RevertIn, response: Response, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
+    del principal
+    if body.confirm != "REVERT":
+        raise AppError(422, "CONFIRM", "Type REVERT exactly to wipe this installation.")
+    await identity.revert_to_zero(session)
+    if settings.data_dir:
+        root = Path(settings.data_dir)
+        for name in (
+            "enrollment",
+            "edge-credential",
+            "outbox.sqlite",
+            "outbox.sqlite-wal",
+            "outbox.sqlite-shm",
+            "active-config.json",
+            "edge-health.json",
+        ):
+            target = root / name
+            if target.is_file():
+                target.unlink()
+    clear_cookies(response, settings)
+    return {"status": "empty"}
 
 
 @app.get("/api/v1/auth/status")
@@ -240,7 +294,7 @@ async def change_password(body: PasswordIn, principal: dict[str, Any] = Depends(
 
     account = await fetch_one(session, "SELECT password_hash, login FROM admin_accounts WHERE id = :id", {"id": as_uuid(principal["admin_id"])})
     if account is None or not verify_password(account["password_hash"], body.current_password):
-        raise AppError(401, "INVALID_CREDENTIALS", "Mật khẩu hiện tại không đúng.")
+        raise AppError(401, "INVALID_CREDENTIALS", "Current password is incorrect.")
     validate_password(body.new_password, account["login"])
     from factorix.modules.common import execute
 
@@ -364,7 +418,7 @@ async def validate_hierarchy(view_id: str, principal: dict[str, Any] = Depends(a
     tenant_id, _actor = _ids(principal)
     row = await fetch_one(session, "SELECT level_rules_json FROM hierarchy_views WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(view_id), "tenant_id": tenant_id})
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy mẫu phân cấp.")
+        raise AppError(404, "NOT_FOUND", "Hierarchy template not found.")
     errors = resources.validate_levels(row["level_rules_json"] or [])
     return {"valid": not errors, "errors": errors}
 
@@ -411,7 +465,7 @@ async def connector_types(principal: dict[str, Any] = Depends(admin)) -> dict[st
 async def connector_schema(protocol: str, principal: dict[str, Any] = Depends(admin)) -> dict[str, Any]:
     del principal
     if protocol not in collect.CAPABILITIES:
-        raise AppError(404, "NOT_FOUND", "Không có giao thức này.")
+        raise AppError(404, "NOT_FOUND", "Protocol not found.")
     return {"protocol": protocol, "capabilities": collect.CAPABILITIES[protocol], "can_write": False}
 
 
@@ -439,6 +493,12 @@ async def pause_connection(connection_id: str, request: Request, principal: dict
     return await collect.pause_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
 
 
+@app.delete("/api/v1/connections/{connection_id}")
+async def delete_connection(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.archive_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
+
+
 @app.post("/api/v1/connections/{connection_id}/tests", status_code=202)
 async def commission(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
@@ -450,8 +510,16 @@ async def commission_job(job_id: str, principal: dict[str, Any] = Depends(admin)
     tenant_id, _actor = _ids(principal)
     row = await fetch_one(session, "SELECT id, connection_id, stages_json, status, error_code, diagnostic, started_at, completed_at FROM commissioning_jobs WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(job_id), "tenant_id": tenant_id})
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy phiên kiểm thử.")
-    return row
+        raise AppError(404, "NOT_FOUND", "Commissioning job not found.")
+    status = "COMPLETED" if row["status"] == "PASSED" else row["status"]
+    stages = list(row.get("stages_json") or [])
+    by_stage = {item.get("stage"): item for item in stages if isinstance(item, dict)}
+    aliases = {"NETWORK": "transport", "READ_OR_SUBSCRIBE": "read_sample", "DECODE": "decode_quality"}
+    for source, alias in aliases.items():
+        found = by_stage.get(source)
+        if isinstance(found, dict):
+            stages.append({**found, "stage": alias})
+    return {**row, "status": status, "stages_json": stages}
 
 
 @app.get("/api/v1/signals")
@@ -537,7 +605,7 @@ async def publish_group(group_id: str, principal: dict[str, Any] = Depends(admin
 
     row = await fetch_one(session, "SELECT id FROM output_groups WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(group_id), "tenant_id": tenant_id})
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy nhóm đầu ra.")
+        raise AppError(404, "NOT_FOUND", "Output group not found.")
     await execute(session, "UPDATE output_groups SET status = 'PUBLISHED', version = version + 1 WHERE id = :id", {"id": parse_uuid(group_id)})
     return {"id": group_id, "status": "PUBLISHED"}
 
@@ -570,7 +638,7 @@ async def enrollment(edge_id: str, request: Request, principal: dict[str, Any] =
 @app.post("/api/v1/edges/{edge_id}/appliance", status_code=201)
 async def appliance_enrollment(edge_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     if not settings.appliance or not settings.data_dir:
-        raise AppError(404, "NOT_FOUND", "Ghi danh trong appliance chưa được bật.")
+        raise AppError(404, "NOT_FOUND", "Appliance enrollment is not enabled.")
     tenant_id, actor = _ids(principal)
     issued = await collect.issue_enrollment(session, tenant_id, parse_uuid(edge_id), actor, correlation_id(request))
     directory = Path(settings.data_dir)
@@ -810,7 +878,10 @@ async def search(q: str, principal: dict[str, Any] = Depends(admin), session: As
     pattern = f"%{q.strip()}%"
     return {
         "resources": await fetch_all(session, "SELECT id, code, name FROM resources WHERE tenant_id = :tenant_id AND (name ILIKE :q OR code ILIKE :q) ORDER BY code LIMIT 8", {"tenant_id": tenant_id, "q": pattern}),
-        "connections": await fetch_all(session, "SELECT id, name, protocol FROM connections WHERE tenant_id = :tenant_id AND name ILIKE :q ORDER BY name LIMIT 8", {"tenant_id": tenant_id, "q": pattern}),
+        "connections": [
+            {**row, "protocol": public_protocol(str(row["protocol"]))}
+            for row in await fetch_all(session, "SELECT id, name, protocol FROM connections WHERE tenant_id = :tenant_id AND name ILIKE :q ORDER BY name LIMIT 8", {"tenant_id": tenant_id, "q": pattern})
+        ],
         "signals": await fetch_all(session, "SELECT id, key, display_name FROM signal_definitions WHERE tenant_id = :tenant_id AND (key ILIKE :q OR display_name ILIKE :q) ORDER BY key LIMIT 8", {"tenant_id": tenant_id, "q": pattern}),
     }
 
@@ -950,5 +1021,5 @@ _mount_spa()
 def _time(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        raise AppError(422, "TIMEZONE", "Thời điểm phải có múi giờ.")
+        raise AppError(422, "TIMEZONE", "Timestamps must include a timezone.")
     return parsed.astimezone(timezone.utc)

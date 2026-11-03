@@ -51,7 +51,7 @@ def compile_path(expression: str) -> list[PathToken]:
         if ch == "[":
             end = expression.find("]", i)
             if end < 0:
-                raise MappingError("INVALID_PATH", "Thiếu dấu ].")
+                raise MappingError("INVALID_PATH", "Missing closing ].")
             inner = expression[i + 1 : end].strip()
             if inner == "*":
                 tokens.append(PathToken("wildcard"))
@@ -62,12 +62,12 @@ def compile_path(expression: str) -> list[PathToken]:
             elif inner.isdigit() or (inner.startswith("-") and inner[1:].isdigit()):
                 tokens.append(PathToken("index", index=int(inner)))
             else:
-                raise MappingError("INVALID_PATH", "Chỉ mục không hợp lệ.")
+                raise MappingError("INVALID_PATH", "Invalid index.")
             i = end + 1
             continue
         raise MappingError("INVALID_PATH", "Cú pháp JSONPath không được hỗ trợ.")
     if sum(1 for token in tokens if token.kind == "wildcard") > 1:
-        raise MappingError("INVALID_PATH", "Chỉ một wildcard được phép.")
+        raise MappingError("INVALID_PATH", "Only one wildcard is allowed.")
     return tokens
 
 
@@ -128,7 +128,7 @@ def apply_cardinality(
         return MapResult(True, matches, len(matches))
     if cardinality == "REJECT_MULTI":
         if len(matches) > 1:
-            raise MappingError("CARDINALITY", "Nhiều giá trị khớp một tín hiệu scalar.")
+            raise MappingError("CARDINALITY", "Multiple values matched a scalar signal.")
         return MapResult(True, matches[0], 1)
     if cardinality == "MAP_BY_ID":
         if not map_id_field:

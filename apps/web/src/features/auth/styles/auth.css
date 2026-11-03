@@ -1,0 +1,241 @@
+.fx-auth-shell {
+  min-height: 100dvh;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(520px, 1fr);
+  background: var(--fx-app-bg);
+}
+
+.fx-auth-showcase {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  padding: clamp(28px, 3.6vw, 54px);
+  padding-bottom: 24px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  background: radial-gradient(circle at 18% 6%, #ffffff 0%, #f6f9fc 60%, #eef3f9 100%);
+}
+
+.fx-auth-showcase::before {
+  content: '';
+  position: absolute;
+  inset: 22% 0 0 0;
+  z-index: -1;
+  background: url('/auth/factory.png') left bottom / cover no-repeat;
+  pointer-events: none;
+}
+
+.fx-auth-showcase::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(180deg, rgba(250, 252, 255, 0.95) 0%, rgba(250, 252, 255, 0.4) 34%, rgba(250, 252, 255, 0) 58%);
+  pointer-events: none;
+}
+
+.fx-auth-showcase-top {
+  position: relative;
+  z-index: 1;
+}
+
+.fx-auth-feature-card {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 16px 22px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.84);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 0 10px 28px -4px rgba(15, 23, 42, 0.04), 0 2px 8px -1px rgba(15, 23, 42, 0.02);
+  transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+
+.fx-auth-feature-card:hover {
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 12px 32px -4px rgba(15, 23, 42, 0.07);
+}
+
+.fx-auth-feature-icon {
+  width: 58px;
+  height: 58px;
+  border-radius: 16px;
+  border: 1px solid #FECDD3;
+  background: #FEF2F2;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.fx-auth-form-host {
+  min-width: 0;
+  padding: clamp(20px, 3vw, 56px);
+  display: grid;
+  align-items: center;
+  position: relative;
+}
+
+.fx-auth-utilities {
+  position: absolute;
+  top: 24px;
+  right: 32px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--fx-body);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.fx-auth-card {
+  margin: 0 auto;
+  width: 100%;
+  max-width: 620px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.98);
+  border: 1px solid rgba(227, 234, 243, 0.85);
+  box-shadow: 0 10px 45px rgba(17, 27, 55, 0.04);
+  padding: clamp(24px, 3.5vw, 44px);
+}
+
+.fx-auth-input-wrap {
+  position: relative;
+}
+
+.fx-auth-input {
+  width: 100%;
+  min-height: 52px;
+  border: 1px solid var(--fx-border-strong);
+  border-radius: 10px;
+  padding: 0 44px 0 48px;
+  background: #ffffff;
+  color: var(--fx-ink);
+  font-size: 15px;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.fx-auth-input::placeholder {
+  color: #94A3B8;
+  font-size: 15px;
+}
+
+.fx-auth-input:hover {
+  border-color: #b8c7d9;
+}
+
+.fx-auth-input:focus-visible {
+  outline: 3px solid rgba(239, 27, 36, 0.18);
+  outline-offset: 2px;
+  border-color: var(--fx-primary);
+}
+
+.fx-auth-input[aria-invalid='true'] {
+  border-color: var(--fx-error);
+}
+
+.fx-auth-input-icon {
+  position: absolute;
+  left: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #657794;
+  pointer-events: none;
+}
+
+.fx-auth-input-action {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #657794;
+  background: transparent;
+  border: 0;
+  padding: 6px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.fx-auth-input-action:hover {
+  color: var(--fx-ink);
+  background: var(--fx-bg-soft);
+}
+
+.fx-auth-button-primary {
+  width: 100%;
+  min-height: 54px;
+  background: var(--fx-primary);
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 17px;
+  border: 0;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+.fx-auth-button-primary:hover:not(:disabled) {
+  background: var(--fx-primary-hover);
+}
+
+.fx-auth-button-primary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.fx-auth-button-primary:focus-visible {
+  outline: 3px solid rgba(239, 27, 36, 0.18);
+  outline-offset: 2px;
+}
+
+.fx-auth-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+@media (max-width: 1023px) {
+  .fx-auth-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .fx-auth-showcase {
+    display: none;
+  }
+
+  .fx-auth-form-host {
+    padding: 24px 16px 40px;
+  }
+
+  .fx-auth-card {
+    padding: 28px 20px;
+  }
+
+  .fx-auth-utilities {
+    position: static;
+    justify-content: flex-end;
+    margin-bottom: 12px;
+  }
+}
+
+@media (max-width: 520px) {
+  .fx-auth-two-col {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fx-auth-shell *,
+  .fx-auth-shell *::before,
+  .fx-auth-shell *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

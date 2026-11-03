@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlparse
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -53,6 +54,59 @@ _MODELS = {
     "mqtt": MqttConfig,
     "http": HttpConfig,
 }
+
+_FROM_PUBLIC = {
+    "modbus_tcp": "modbus_tcp",
+    "opcua": "opcua",
+    "opc_ua": "opcua",
+    "mqtt": "mqtt",
+    "mqtt_client": "mqtt",
+    "http": "http",
+    "http_pull": "http",
+}
+
+_TO_PUBLIC = {"opcua": "opc_ua", "mqtt": "mqtt_client", "http": "http_pull"}
+
+
+def public_protocol(protocol: str) -> str:
+    return _TO_PUBLIC.get(protocol, protocol)
+
+
+def accept_connection(protocol: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any], int | None]:
+    """Translate the console's protocol names and field names into the stored contract."""
+    stored = _FROM_PUBLIC.get(protocol, protocol)
+    data = dict(payload)
+    interval: int | None = None
+    if data.get("interval_ms") is not None:
+        interval = int(data.pop("interval_ms"))
+    if stored == "opcua":
+        if not data.get("endpoint") and data.get("endpoint_url"):
+            data["endpoint"] = data.pop("endpoint_url")
+        else:
+            data.pop("endpoint_url", None)
+        if data.get("security_mode") == "None":
+            data["allow_insecure"] = True
+        if not data.get("username"):
+            data["anonymous"] = True
+    elif stored == "mqtt":
+        topic = data.pop("topic_filter", None)
+        if topic and not data.get("topics"):
+            data["topics"] = [str(topic)]
+        if not data.get("username"):
+            data["anonymous"] = True
+    elif stored == "http":
+        url = str(data.pop("url", "") or "")
+        if url and not data.get("base_url"):
+            parsed = urlparse(url)
+            data["base_url"] = f"{parsed.scheme}://{parsed.netloc}"
+            data["path"] = parsed.path or "/"
+            if parsed.query:
+                data["query"] = dict(parse_qsl(parsed.query))
+        data.pop("method", None)
+        if data.get("interval_ms") is not None:
+            interval = int(data.pop("interval_ms"))
+        data.setdefault("auth", "none")
+    return stored, data, interval
 
 
 def parse_config(protocol: str, payload: dict[str, Any]) -> dict[str, Any]:

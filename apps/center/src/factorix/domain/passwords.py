@@ -35,7 +35,7 @@ def validate_password(password: str, login: str) -> None:
     if password.lower() in _BLOCKED or login.lower() in password.lower():
         raise PasswordPolicyError("WEAK_PASSWORD", "Mật khẩu quá dễ đoán.")
     if sum(1 for pattern in _CLASSES if pattern.search(password)) < 3:
-        raise PasswordPolicyError("WEAK_PASSWORD", "Mật khẩu cần ít nhất 3 nhóm ký tự.")
+        raise PasswordPolicyError("WEAK_PASSWORD", "Password needs at least 3 character classes.")
     if password != password.strip() or any(ch in password for ch in ("\n", "\r", "\x00")):
         raise PasswordPolicyError("WEAK_PASSWORD", "Mật khẩu chứa ký tự không hợp lệ.")
 

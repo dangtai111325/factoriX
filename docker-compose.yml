@@ -1,0 +1,16 @@
+# One-click FactoriX appliance: web + Postgres + Center + Edge on port 8080.
+services:
+  factorix:
+    build: .
+    image: factorix:latest
+    container_name: factorix-appliance
+    ports:
+      - "8080:8080"
+    volumes:
+      - factorix-data:/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  factorix-data:

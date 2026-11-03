@@ -1,28 +1,32 @@
 {
-  "name": "@factorix/web",
+  "name": "factorix-iiot-frontend",
   "private": true,
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 8080",
-    "build": "tsc -p tsconfig.json --noEmit && vite build",
-    "preview": "vite preview --host 127.0.0.1 --port 8080"
+    "dev": "vite --port 3000 --host",
+    "build": "tsc && vite build",
+    "check": "tsc --noEmit",
+    "preview": "vite preview --port 3000",
+    "test:visual": "playwright test"
   },
   "dependencies": {
-    "@fontsource/ibm-plex-mono": "5.2.7",
-    "@fontsource/ibm-plex-sans": "5.2.8",
-    "@tanstack/react-table": "8.21.3",
-    "@xyflow/react": "12.8.4",
-    "echarts": "6.0.0",
-    "react": "19.2.0",
-    "react-dom": "19.2.0",
-    "react-router-dom": "7.9.4"
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.16.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0",
+    "tailwind-merge": "^2.5.4"
   },
   "devDependencies": {
-    "@types/react": "19.2.2",
-    "@types/react-dom": "19.2.2",
-    "@vitejs/plugin-react": "5.1.0",
-    "playwright": "^1.64.1",
-    "typescript": "5.9.3",
-    "vite": "7.1.12"
+    "@playwright/test": "^1.49.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
   }
 }

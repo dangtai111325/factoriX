@@ -41,7 +41,7 @@ def same_dimension(left: str | None, right: str | None) -> bool:
 
 def add_units(left: str | None, right: str | None) -> UnitCheck:
     if left is None or right is None:
-        return UnitCheck(False, None, "Thiếu đơn vị.")
+        return UnitCheck(False, None, "Unit is required.")
     if not same_dimension(left, right):
-        return UnitCheck(False, None, "Không cộng được hai đại lượng khác chiều.")
+        return UnitCheck(False, None, "Cannot add quantities with incompatible dimensions.")
     return UnitCheck(True, left, "ok")

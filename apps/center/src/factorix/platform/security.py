@@ -51,4 +51,4 @@ def decrypt_secret(data_key: str, ciphertext: bytes) -> str:
     try:
         return new_fernet(data_key).decrypt(ciphertext).decode("utf-8")
     except InvalidToken as exc:
-        raise RuntimeError("Không giải mã được bí mật.") from exc
+        raise RuntimeError("Could not decrypt the secret.") from exc

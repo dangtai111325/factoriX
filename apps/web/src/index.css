@@ -1,0 +1,270 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --fx-primary: #EF1B24;
+  --fx-primary-hover: #D9141D;
+  --fx-primary-active: #C7111A;
+  --fx-primary-tint: #FFF0F1;
+  --fx-primary-tint-light: #FFF7F8;
+  --fx-ink: #111B37;
+  --fx-body: #334568;
+  --fx-muted: #657794;
+  --fx-placeholder: #94A3B8;
+  --fx-surface: #FFFFFF;
+  --fx-app-bg: #F6F8FC;
+  --fx-bg-soft: #F9FAFD;
+  --fx-border: #E3EAF3;
+  --fx-border-strong: #D4DFEC;
+  --fx-success: #0DBA67;
+  --fx-success-soft: #E9FBF1;
+  --fx-warning: #FFAA23;
+  --fx-warning-soft: #FFF6E5;
+  --fx-error: #F2343B;
+  --fx-error-soft: #FFF0F1;
+  --fx-info: #2A82E7;
+  --fx-info-soft: #EEF5FF;
+  --fx-violet: #8858EA;
+  --fx-teal: #21B5AE;
+  --fx-sidebar-width: 276px;
+  --fx-topbar-height: 62px;
+  --fx-content-padding: 24px;
+  --fx-card-gap: 12px;
+  --fx-radius-sm: 6px;
+  --fx-radius-md: 10px;
+  --fx-radius-card: 12px;
+  --fx-radius-lg: 16px;
+  --fx-shadow-card: 0 3px 16px rgba(24,44,75,0.04);
+  --fx-font-ui: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --fx-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--fx-font-ui);
+  color: var(--fx-ink);
+  background-color: var(--fx-app-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #D4DFEC;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* App Layout Classes */
+.fx-app-shell {
+  min-height: 100vh;
+  display: flex;
+}
+
+.fx-sidebar {
+  position: fixed;
+  z-index: 40;
+  inset: 0 auto 0 0;
+  width: var(--fx-sidebar-width);
+  background: #ffffff;
+  border-right: 1px solid var(--fx-border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.fx-topbar {
+  position: fixed;
+  z-index: 30;
+  left: var(--fx-sidebar-width);
+  right: 0;
+  top: 0;
+  height: var(--fx-topbar-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: rgba(255, 255, 255, 0.98);
+  border-bottom: 1px solid var(--fx-border);
+  padding: 0 24px;
+  backdrop-filter: blur(8px);
+}
+
+.fx-main {
+  margin-left: var(--fx-sidebar-width);
+  padding-top: var(--fx-topbar-height);
+  min-height: 100vh;
+  width: calc(100% - var(--fx-sidebar-width));
+  background: var(--fx-app-bg);
+}
+
+.fx-content {
+  padding: 20px var(--fx-content-padding) 36px;
+  max-width: 1680px;
+  margin: 0 auto;
+}
+
+/* Common FactoriX UI Component styles */
+.fx-card {
+  background: var(--fx-surface);
+  border: 1px solid var(--fx-border);
+  border-radius: var(--fx-radius-card);
+  box-shadow: var(--fx-shadow-card);
+}
+
+.fx-page-title {
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+  color: var(--fx-ink);
+}
+
+.fx-page-subtitle {
+  font-size: 14px;
+  line-height: 1.5;
+  margin-top: 4px;
+  color: var(--fx-muted);
+}
+
+.fx-btn {
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 8px;
+  padding: 0 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.fx-btn-primary {
+  color: #ffffff;
+  background: var(--fx-primary);
+  border: 1px solid var(--fx-primary);
+}
+.fx-btn-primary:hover {
+  background: var(--fx-primary-hover);
+  border-color: var(--fx-primary-hover);
+}
+.fx-btn-primary:active {
+  background: var(--fx-primary-active);
+}
+
+.fx-btn-secondary {
+  background: #ffffff;
+  color: var(--fx-body);
+  border: 1px solid var(--fx-border-strong);
+}
+.fx-btn-secondary:hover {
+  background: var(--fx-bg-soft);
+  color: var(--fx-ink);
+}
+
+.fx-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.fx-table th {
+  height: 36px;
+  color: var(--fx-muted);
+  text-align: left;
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: #F1F5FA;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--fx-border);
+}
+
+.fx-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #ECF0F6;
+  color: var(--fx-body);
+}
+
+.fx-table tbody tr {
+  transition: background-color 100ms ease;
+}
+
+.fx-table tbody tr:hover {
+  background: #F9FAFD;
+}
+
+.fx-table tbody tr[data-selected="true"] {
+  background: #FFF1F2;
+}
+
+.fx-badge {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.fx-badge-good {
+  background: #E8FBF0;
+  color: #0A9855;
+}
+
+.fx-badge-warning {
+  background: #FFF3DA;
+  color: #B96B00;
+}
+
+.fx-badge-error {
+  background: #FFE5E7;
+  color: #DB2028;
+}
+
+.fx-badge-info {
+  background: #EEF5FF;
+  color: #2A82E7;
+}
+
+.fx-input {
+  min-height: 36px;
+  width: 100%;
+  padding: 0 12px;
+  color: var(--fx-ink);
+  background: #ffffff;
+  border: 1px solid var(--fx-border-strong);
+  border-radius: 7px;
+  font-size: 13px;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.fx-input:focus {
+  outline: none;
+  border-color: var(--fx-info);
+  box-shadow: 0 0 0 3px rgba(42, 130, 231, 0.15);
+}
+
+.fx-input::placeholder {
+  color: var(--fx-placeholder);
+}

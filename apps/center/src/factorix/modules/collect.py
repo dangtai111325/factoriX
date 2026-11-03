@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain.formula import FormulaError, bind, detect_cycles, evaluate, output_quality, parse_expression
@@ -16,7 +16,7 @@ from factorix.domain.jsonpath import MappingError, apply_cardinality, compile_pa
 from factorix.domain.units import add_units
 from factorix.domain.uns import TopicError, render_topic
 from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, jsonb, parse_uuid, utcnow
-from factorix.modules.protocols import parse_config, redacted_endpoint
+from factorix.modules.protocols import accept_connection, parse_config, public_protocol, redacted_endpoint
 from factorix.platform.errors import AppError
 from factorix.platform.security import encrypt_secret, new_token, hash_token
 
@@ -85,6 +85,15 @@ class FormulaIn(BaseModel):
     unit: str | None = None
     temporal_policy: dict[str, Any] = Field(default_factory=lambda: {"mode": "LATEST_WITH_MAX_AGE", "max_age_ms": 10000})
 
+    @field_validator("temporal_policy", mode="before")
+    @classmethod
+    def _temporal_policy(cls, value: Any) -> Any:
+        if value == "LATEST":
+            return {"mode": "LATEST_WITH_MAX_AGE", "max_age_ms": 10000}
+        if isinstance(value, str) and value:
+            return {"mode": value}
+        return value
+
 
 class PreviewIn(BaseModel):
     expression: str
@@ -126,7 +135,7 @@ async def _owned_edge(session: AsyncSession, tenant_id: UUID, edge_id: UUID) -> 
         {"id": edge_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy Edge.")
+        raise AppError(404, "NOT_FOUND", "Edge not found.")
     row.pop("credential_hash", None)
     return row
 
@@ -153,16 +162,22 @@ async def create_edge(session: AsyncSession, tenant_id: UUID, actor: UUID, body:
 async def issue_enrollment(session: AsyncSession, tenant_id: UUID, edge_id: UUID, actor: UUID, correlation_id: str) -> dict[str, Any]:
     await _owned_edge(session, tenant_id, edge_id)
     token = new_token()
+    expires = utcnow() + timedelta(minutes=30)
     await execute(
         session,
         """
         INSERT INTO edge_enrollment_tokens (id, edge_id, token_hash, expires_at)
         VALUES (:id, :edge_id, :token_hash, :expires_at)
         """,
-        {"id": uuid4(), "edge_id": edge_id, "token_hash": hash_token(token), "expires_at": utcnow() + timedelta(minutes=30)},
+        {"id": uuid4(), "edge_id": edge_id, "token_hash": hash_token(token), "expires_at": expires},
     )
     await audit(session, tenant_id=tenant_id, event_type="EDGE_ENROLL_TOKEN", actor_id=actor, entity_type="edge", entity_id=edge_id, before=None, after={"ttl_minutes": 30}, correlation_id=correlation_id)
-    return {"enrollment_token": token, "expires_in_seconds": 1800}
+    return {
+        "enrollment_token": token,
+        "expires_in_seconds": 1800,
+        "expires_at": expires.isoformat().replace("+00:00", "Z"),
+        "edge_id": str(edge_id),
+    }
 
 
 async def create_connection(
@@ -174,14 +189,15 @@ async def create_connection(
     data_key: str,
     correlation_id: str,
 ) -> dict[str, Any]:
-    config = parse_config(body.protocol, body.config)
+    protocol, raw_config, interval_override = accept_connection(body.protocol, body.config)
+    config = parse_config(protocol, raw_config)
     edge = await _owned_edge(session, tenant_id, parse_uuid(body.edge_id))
     if str(edge["site_id"]) != body.site_id:
-        raise AppError(422, "SCOPE", "Edge không thuộc site đã chọn.")
+        raise AppError(422, "SCOPE", "Edge does not belong to the selected site.")
     secret_ref = None
     if body.secret_input:
         if len(body.secret_input) > 4096:
-            raise AppError(422, "SECRET", "Bí mật quá dài.")
+            raise AppError(422, "SECRET", "Secret is too long.")
         secret_ref = uuid4()
         await execute(
             session,
@@ -209,16 +225,16 @@ async def create_connection(
             "tenant_id": tenant_id,
             "site_id": parse_uuid(body.site_id),
             "edge_id": as_uuid(edge["id"]),
-            "protocol": body.protocol,
+            "protocol": protocol,
             "name": body.name.strip(),
-            "endpoint": redacted_endpoint(body.protocol, config),
+            "endpoint": redacted_endpoint(protocol, config),
             "secret_ref": secret_ref,
             "config": jsonb(config),
             "now": now,
         },
     )
-    mode = "SUBSCRIBE" if body.protocol in {"mqtt", "opcua"} else "POLL"
-    interval = None if mode == "SUBSCRIBE" else 1000
+    mode = "SUBSCRIBE" if protocol == "mqtt" else "POLL"
+    interval = interval_override if interval_override is not None else (None if mode == "SUBSCRIBE" else 1000)
     await execute(
         session,
         """
@@ -243,12 +259,14 @@ async def get_connection(session: AsyncSession, tenant_id: UUID, connection_id: 
         {"id": connection_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy kết nối.")
+        raise AppError(404, "NOT_FOUND", "Connection not found.")
     row["jobs"] = await fetch_all(
         session,
         "SELECT id, mode, interval_ms, timeout_ms, enabled, version FROM acquisition_jobs WHERE connection_id = :id",
         {"id": connection_id},
     )
+    row["protocol"] = public_protocol(str(row["protocol"]))
+    row["config"] = row.get("config_json") or {}
     return row
 
 
@@ -256,15 +274,16 @@ async def list_connections(session: AsyncSession, tenant_id: UUID, *, protocol: 
     where = ["tenant_id = :tenant_id", "status <> 'ARCHIVED'"]
     params: dict[str, Any] = {"tenant_id": tenant_id}
     if protocol:
+        stored, _config, _interval = accept_connection(protocol, {})
         where.append("protocol = :protocol")
-        params["protocol"] = protocol
+        params["protocol"] = stored
     if site_id:
         where.append("site_id = :site_id")
         params["site_id"] = parse_uuid(site_id)
     if status:
         where.append("status = :status")
         params["status"] = status
-    return await fetch_all(
+    rows = await fetch_all(
         session,
         f"""
         SELECT id, name, protocol, endpoint_redacted, edge_id, site_id, health, status, last_error, version, secret_ref IS NOT NULL AS secret_configured
@@ -272,6 +291,13 @@ async def list_connections(session: AsyncSession, tenant_id: UUID, *, protocol: 
         """,
         params,
     )
+    for row in rows:
+        row["protocol"] = public_protocol(str(row["protocol"]))
+    return rows
+
+
+def _signal_type(value: str) -> str:
+    return "bool" if value == "boolean" else value
 
 
 async def pause_connection(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str) -> dict[str, Any]:
@@ -293,13 +319,13 @@ async def bulk_signals(
     correlation_id: str,
 ) -> dict[str, Any]:
     if not body.items or len(body.items) > 500:
-        raise AppError(422, "LIMIT", "Mỗi lần tạo từ 1 đến 500 tín hiệu.")
+        raise AppError(422, "LIMIT", "Create between 1 and 500 signals at a time.")
     resource_id = parse_uuid(body.resource_id)
     resource = await fetch_one(session, "SELECT id, archived_at FROM resources WHERE id = :id AND tenant_id = :tenant_id", {"id": resource_id, "tenant_id": tenant_id})
     if resource is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy tài nguyên.")
+        raise AppError(404, "NOT_FOUND", "Resource not found.")
     if resource["archived_at"] is not None:
-        raise AppError(409, "ARCHIVED", "Không thêm tín hiệu vào tài nguyên đã lưu trữ.")
+        raise AppError(409, "ARCHIVED", "Cannot add signals to an archived resource.")
     errors: list[dict[str, str]] = []
     prepared: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -308,7 +334,8 @@ async def bulk_signals(
         if not key or len(key) > 64 or key in seen:
             errors.append({"path": f"items[{index}].key", "code": "INVALID"})
             continue
-        if item.data_type not in {"bool", "int64", "float64", "string", "enum", "json"}:
+        data_type = _signal_type(item.data_type)
+        if data_type not in {"bool", "int64", "float64", "string", "enum", "json"}:
             errors.append({"path": f"items[{index}].data_type", "code": "INVALID"})
             continue
         seen.add(key)
@@ -320,9 +347,11 @@ async def bulk_signals(
         if exists:
             errors.append({"path": f"items[{index}].key", "code": "DUPLICATE"})
             continue
-        prepared.append(item.model_dump())
+        dumped = item.model_dump()
+        dumped["data_type"] = data_type
+        prepared.append(dumped)
     if errors and body.atomic:
-        raise AppError(422, "BULK_REJECTED", "Không tạo tín hiệu nào vì có dòng lỗi.", field_errors=errors)
+        raise AppError(422, "BULK_REJECTED", "No signals were created because some rows have errors.", field_errors=errors)
     created: list[str] = []
     now = utcnow()
     for item in prepared:
@@ -425,7 +454,7 @@ async def _signal(session: AsyncSession, tenant_id: UUID, signal_id: UUID) -> di
         {"id": signal_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy tín hiệu.")
+        raise AppError(404, "NOT_FOUND", "Signal not found.")
     return row
 
 
@@ -438,7 +467,7 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
     if query:
         where.append("(s.display_name ILIKE :q OR s.key ILIKE :q)")
         params["q"] = f"%{query.strip()}%"
-    return await fetch_all(
+    rows = await fetch_all(
         session,
         f"""
         SELECT s.id, s.key, s.display_name, s.data_type, s.unit, s.category, s.resource_id, s.version, s.expected_interval_ms,
@@ -450,6 +479,10 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
         """,
         params,
     )
+    for row in rows:
+        if row.get("data_type") == "bool":
+            row["data_type"] = "boolean"
+    return rows
 
 
 def validate_mapping(body: MappingPreviewIn) -> dict[str, Any]:
@@ -492,7 +525,7 @@ async def save_formula(session: AsyncSession, tenant_id: UUID, actor: UUID, body
         await _signal(session, tenant_id, signal_id)
     else:
         if not body.resource_id or not body.key or not body.display_name:
-            raise AppError(422, "SIGNAL", "Cần resource, key và tên cho tín hiệu tính toán.")
+            raise AppError(422, "SIGNAL", "Calculated signals require a resource, key, and name.")
         signal_id = uuid4()
         now = utcnow()
         await execute(
@@ -567,7 +600,7 @@ async def publish_formula(session: AsyncSession, tenant_id: UUID, actor: UUID, f
         {"id": formula_id, "tenant_id": tenant_id},
     )
     if formula is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy công thức.")
+        raise AppError(404, "NOT_FOUND", "Formula not found.")
     graph = await _formula_graph(session, tenant_id)
     deps = await fetch_all(
         session,
@@ -625,10 +658,10 @@ def preview_formula(body: PreviewIn) -> dict[str, Any]:
 async def create_output_group(session: AsyncSession, tenant_id: UUID, actor: UUID, body: OutputGroupIn, correlation_id: str) -> dict[str, Any]:
     resource = await fetch_one(session, "SELECT id, code, name FROM resources WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(body.resource_id), "tenant_id": tenant_id})
     if resource is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy tài nguyên.")
+        raise AppError(404, "NOT_FOUND", "Resource not found.")
     aliases = [str(member["alias"]) for member in body.members]
     if len(aliases) != len(set(aliases)):
-        raise AppError(422, "ALIAS", "Alias trong nhóm bị trùng.")
+        raise AppError(422, "ALIAS", "Duplicate alias in the output group.")
     try:
         render_topic(body.topic_template, {"enterprise": "e", "site": "s", "plant": "p", "zone": None, "line": None, "resource": resource["code"], "group": body.key})
     except TopicError as exc:
@@ -678,7 +711,7 @@ async def preview_output_group(session: AsyncSession, tenant_id: UUID, group_id:
         {"id": group_id, "tenant_id": tenant_id},
     )
     if group is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy nhóm đầu ra.")
+        raise AppError(404, "NOT_FOUND", "Output group not found.")
     members = await fetch_all(
         session,
         """
@@ -841,6 +874,13 @@ async def publish_release(session: AsyncSession, tenant_id: UUID, actor: UUID, b
 
 async def request_commission(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str) -> dict[str, Any]:
     connection = await get_connection(session, tenant_id, connection_id)
+    edge = await _owned_edge(session, tenant_id, as_uuid(connection["edge_id"]))
+    if edge.get("enrollment_status") != "ENROLLED":
+        raise AppError(
+            409,
+            "EDGE_NOT_ENROLLED",
+            "No enrolled collector for this site. Enroll the Edge first.",
+        )
     stages = [
         {"stage": name, "status": "PENDING", "duration_ms": None, "detail": ""}
         for name in ("NETWORK", "AUTH", "PROTOCOL", "READ_OR_SUBSCRIBE", "DECODE", "MAPPING", "VALIDATION")
@@ -859,3 +899,32 @@ async def request_commission(session: AsyncSession, tenant_id: UUID, actor: UUID
     )
     await audit(session, tenant_id=tenant_id, event_type="COMMISSION_REQUEST", actor_id=actor, entity_type="connection", entity_id=connection_id, before=None, after={"job_id": str(job_id), "protocol": connection["protocol"]}, correlation_id=correlation_id)
     return {"job_id": str(job_id), "status": "PENDING"}
+
+
+async def archive_connection(session: AsyncSession, tenant_id: UUID, actor: UUID, connection_id: UUID, correlation_id: str) -> dict[str, Any]:
+    current = await get_connection(session, tenant_id, connection_id)
+    if current["status"] == "ARCHIVED":
+        raise AppError(409, "ARCHIVED", "Connection is already archived.")
+    if current["status"] not in {"DRAFT", "PAUSED"}:
+        raise AppError(
+            409,
+            "CONNECTION_IN_USE",
+            "Only draft or paused connections can be archived. Pause the connection first.",
+        )
+    await execute(
+        session,
+        "UPDATE connections SET status = 'ARCHIVED', health = 'UNKNOWN', version = version + 1, updated_at = :now WHERE id = :id",
+        {"now": utcnow(), "id": connection_id},
+    )
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="CONNECTION_ARCHIVE",
+        actor_id=actor,
+        entity_type="connection",
+        entity_id=connection_id,
+        before={"status": current["status"]},
+        after={"status": "ARCHIVED"},
+        correlation_id=correlation_id,
+    )
+    return {"id": str(connection_id), "status": "ARCHIVED"}

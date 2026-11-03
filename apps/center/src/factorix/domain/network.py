@@ -73,7 +73,7 @@ def assert_allowed(host: str, port: int, allowlist: list[AllowedEndpoint], *, sc
     if normalized in {"localhost", "metadata.google.internal"} or normalized.endswith(".local"):
         matched = any(item.host.lower() == normalized and item.port == port for item in allowlist)
         if not matched:
-            raise NetworkPolicyError("BLOCKED", "Host bị chặn bởi chính sách mạng.")
+            raise NetworkPolicyError("BLOCKED", "Host is blocked by network policy.")
     addresses = _resolve(normalized)
     for address in addresses:
         ip = ipaddress.ip_address(address)
@@ -98,7 +98,7 @@ def assert_url(url: str, allowlist: list[AllowedEndpoint]) -> tuple[str, int]:
     if parsed.scheme not in {"http", "https", "opc.tcp", "mqtt", "mqtts", "tcp"}:
         raise NetworkPolicyError("SCHEME", "Giao thức URL không được phép.")
     if parsed.username or parsed.password:
-        raise NetworkPolicyError("URL_SECRET", "Không đặt bí mật trong URL.")
+        raise NetworkPolicyError("URL_SECRET", "Do not put secrets in the URL.")
     host = parsed.hostname
     port = parsed.port or _default_port(parsed.scheme)
     if not host or port is None:
@@ -120,10 +120,10 @@ def _resolve(host: str) -> list[str]:
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as exc:
-        raise NetworkPolicyError("DNS", "Không phân giải được host.") from exc
+        raise NetworkPolicyError("DNS", "Could not resolve the host.") from exc
     addresses = []
     for info in infos:
         addresses.append(info[4][0])
     if not addresses:
-        raise NetworkPolicyError("DNS", "Không phân giải được host.")
+        raise NetworkPolicyError("DNS", "Could not resolve the host.")
     return addresses

@@ -23,6 +23,7 @@ WIDGETS = {
     "kpi",
     "gauge",
     "timeseries",
+    "chart",
     "machine_status",
     "energy",
     "latest_table",
@@ -386,7 +387,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
     if not signal_ids:
         return []
     if len(signal_ids) > 200:
-        raise AppError(422, "LIMIT", "Tối đa 200 tín hiệu mỗi lần đọc latest.")
+        raise AppError(422, "LIMIT", "At most 200 signals per latest read.")
     rows = await fetch_all(
         session,
         """
@@ -429,7 +430,7 @@ async def history(
     if end <= start:
         raise AppError(422, "RANGE", "Khoảng thời gian không hợp lệ.")
     if end - start > timedelta(days=31):
-        raise AppError(422, "RANGE", "Cửa sổ truy vấn tối đa 31 ngày. Hãy thu hẹp hoặc dùng aggregation.")
+        raise AppError(422, "RANGE", "Query window is limited to 31 days. Narrow the range or use aggregation.")
     limit = min(max(limit, 1), 2000)
     params: dict[str, Any] = {
         "tenant_id": tenant_id,
@@ -482,7 +483,7 @@ async def aggregate(
     if bucket_ms < 1000 or bucket_ms > 86_400_000:
         raise AppError(422, "BUCKET", "Bucket phải từ 1 giây đến 1 ngày.")
     if len(signal_ids) > 20:
-        raise AppError(422, "LIMIT", "Tối đa 20 tín hiệu mỗi truy vấn tổng hợp.")
+        raise AppError(422, "LIMIT", "At most 20 signals per aggregation query.")
     sql_fn = {"min": "min", "max": "max", "avg": "avg", "sum": "sum", "count": "count"}[fn]
     value_expr = "count(*)" if fn == "count" else f"{sql_fn}((value_json->>'v')::double precision)"
     rows = await fetch_all(
@@ -827,7 +828,7 @@ async def _policy(session: AsyncSession, tenant_id: UUID, policy_id: UUID) -> di
         {"id": policy_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy chính sách lưu trữ.")
+        raise AppError(404, "NOT_FOUND", "Retention policy not found.")
     return row
 
 
@@ -888,9 +889,9 @@ async def create_dashboard(session: AsyncSession, tenant_id: UUID, actor: UUID, 
 async def patch_dashboard(session: AsyncSession, tenant_id: UUID, actor: UUID, dashboard_id: UUID, body: DashboardPatch, correlation_id: str) -> dict[str, Any]:
     current = await _dashboard(session, tenant_id, dashboard_id)
     if int(current["version"]) != body.version:
-        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "Dashboard đã được chỉnh sửa ở nơi khác.")
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This dashboard was modified elsewhere.")
     if current["archived_at"] is not None:
-        raise AppError(409, "ARCHIVED", "Dashboard đã lưu trữ.")
+        raise AppError(409, "ARCHIVED", "Dashboard is archived.")
     if body.draft is not None:
         await _validate_widgets(session, tenant_id, body.draft.get("widgets", []))
     await execute(
@@ -918,7 +919,7 @@ async def _validate_widgets(session: AsyncSession, tenant_id: UUID, widgets: lis
         raise AppError(422, "LIMIT", "Tối đa 40 widget trên một dashboard.")
     for widget in widgets:
         if widget.get("type") not in WIDGETS:
-            raise AppError(422, "WIDGET", "Loại widget không được hỗ trợ.")
+            raise AppError(422, "WIDGET", "Unsupported widget type.")
         for binding in widget.get("bindings", []):
             signal = await fetch_one(
                 session,
@@ -926,14 +927,14 @@ async def _validate_widgets(session: AsyncSession, tenant_id: UUID, widgets: lis
                 {"id": parse_uuid(str(binding["signal_id"])), "tenant_id": tenant_id},
             )
             if signal is None:
-                raise AppError(422, "BINDING", "Widget tham chiếu tín hiệu ngoài phạm vi.")
+                raise AppError(422, "BINDING", "Widget references a signal outside its scope.")
 
 
 async def publish_dashboard(session: AsyncSession, tenant_id: UUID, actor: UUID, dashboard_id: UUID, correlation_id: str) -> dict[str, Any]:
     current = await _dashboard(session, tenant_id, dashboard_id)
     widgets = (current["draft_json"] or {}).get("widgets", [])
     if not widgets:
-        raise AppError(422, "EMPTY", "Dashboard chưa có widget.")
+        raise AppError(422, "EMPTY", "Dashboard has no widgets yet.")
     await _validate_widgets(session, tenant_id, widgets)
     revision = int(current["published_revision"] or 0) + 1
     await execute(
@@ -960,7 +961,8 @@ async def _dashboard(session: AsyncSession, tenant_id: UUID, dashboard_id: UUID)
         {"id": dashboard_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy dashboard.")
+        raise AppError(404, "NOT_FOUND", "Dashboard not found.")
+    row["draft"] = row.get("draft_json") or {"widgets": []}
     return row
 
 

@@ -96,14 +96,14 @@ def _aware(value: datetime | None) -> datetime:
     if value is None:
         return utcnow()
     if value.tzinfo is None:
-        raise AppError(422, "TIMEZONE", "Thời điểm phải có múi giờ.")
+        raise AppError(422, "TIMEZONE", "Timestamps must include a timezone.")
     return value.astimezone(timezone.utc)
 
 
 async def create_site(session: AsyncSession, tenant_id: UUID, actor: UUID, body: SiteIn, correlation_id: str) -> dict[str, Any]:
     code = validate_code(body.code)
     if not body.timezone or len(body.timezone) > 64:
-        raise AppError(422, "TIMEZONE", "Múi giờ không hợp lệ.")
+        raise AppError(422, "TIMEZONE", "Invalid timezone.")
     row_id = uuid4()
     now = utcnow()
     try:
@@ -116,7 +116,7 @@ async def create_site(session: AsyncSession, tenant_id: UUID, actor: UUID, body:
             {"id": row_id, "tenant_id": tenant_id, "code": code, "name": body.name.strip(), "timezone": body.timezone, "now": now},
         )
     except Exception as exc:
-        raise AppError(409, "DUPLICATE", "Mã site đã tồn tại.") from exc
+        raise AppError(409, "DUPLICATE", "A site with this code already exists.") from exc
     created = await fetch_one(session, "SELECT * FROM sites WHERE id = :id", {"id": row_id})
     await audit(session, tenant_id=tenant_id, event_type="SITE_CREATE", actor_id=actor, entity_type="site", entity_id=row_id, before=None, after=created, correlation_id=correlation_id)
     assert created is not None
@@ -130,7 +130,7 @@ async def list_sites(session: AsyncSession, tenant_id: UUID) -> list[dict[str, A
 async def get_site(session: AsyncSession, tenant_id: UUID, site_id: UUID) -> dict[str, Any]:
     row = await fetch_one(session, "SELECT * FROM sites WHERE id = :id AND tenant_id = :tenant_id", {"id": site_id, "tenant_id": tenant_id})
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy site.")
+        raise AppError(404, "NOT_FOUND", "Site not found.")
     return row
 
 
@@ -141,7 +141,7 @@ async def _type_by_key(session: AsyncSession, tenant_id: UUID, key: str) -> dict
         {"tenant_id": tenant_id, "key": key},
     )
     if row is None:
-        raise AppError(422, "UNKNOWN_TYPE", "Loại tài nguyên không tồn tại.")
+        raise AppError(422, "UNKNOWN_TYPE", "Resource type does not exist.")
     return row
 
 
@@ -161,7 +161,7 @@ async def create_resource(
     if site_id is not None:
         await get_site(session, tenant_id, site_id)
     if type_row["key"] != "enterprise" and site_id is None:
-        raise AppError(422, "SITE_REQUIRED", "Tài nguyên này cần site.")
+        raise AppError(422, "SITE_REQUIRED", "This resource requires a site.")
     parent = None
     if body.parent_id:
         parent = await _resource(session, tenant_id, parse_uuid(body.parent_id))
@@ -174,7 +174,7 @@ async def create_resource(
         {"tenant_id": tenant_id, "code": code},
     )
     if duplicate:
-        raise AppError(409, "DUPLICATE", "Mã tài nguyên đã tồn tại.", field_errors=[{"path": "code", "code": "DUPLICATE"}])
+        raise AppError(409, "DUPLICATE", "A resource with this code already exists.", field_errors=[{"path": "code", "code": "DUPLICATE"}])
     await execute(
         session,
         """
@@ -203,7 +203,7 @@ async def create_resource(
         moment = _aware(body.valid_from)
         if body.relation_code == "INSTALLED_AT":
             if type_row["key"] != "physical_asset":
-                raise AppError(422, "DOMAIN", "Chỉ tài sản vật lý mới lắp vào vị trí chức năng.")
+                raise AppError(422, "DOMAIN", "Only physical assets can be installed at a functional position.")
             await _link(session, tenant_id, resource_id, as_uuid(parent["id"]), "INSTALLED_AT", moment)
         else:
             await _link(session, tenant_id, as_uuid(parent["id"]), resource_id, body.relation_code, moment)
@@ -230,7 +230,7 @@ async def _assert_contains(
 ) -> None:
     if relation_code == "INSTALLED_AT":
         if parent_key != "functional_position":
-            raise AppError(422, "DOMAIN", "INSTALLED_AT gắn tài sản vào vị trí chức năng.")
+            raise AppError(422, "DOMAIN", "INSTALLED_AT links a physical asset to a functional position.")
         return
     if relation_code != "CONTAINS":
         return
@@ -244,9 +244,9 @@ async def _assert_contains(
         {"tenant_id": tenant_id, "parent": parent_key, "child": child_key},
     )
     if allowed is None:
-        raise AppError(422, "ADJACENCY", "Không thể đặt loại này bên dưới cha đã chọn.")
+        raise AppError(422, "ADJACENCY", "This resource type cannot be placed under the selected parent.")
     if parent.get("status") == "ARCHIVED" or parent.get("archived_at"):
-        raise AppError(409, "ARCHIVED_PARENT", "Không thêm con vào tài nguyên đã lưu trữ.")
+        raise AppError(409, "ARCHIVED_PARENT", "Cannot add children under an archived resource.")
 
 
 async def _link(session: AsyncSession, tenant_id: UUID, parent_id: UUID, child_id: UUID, relation_code: str, valid_from: datetime) -> None:
@@ -256,7 +256,7 @@ async def _link(session: AsyncSession, tenant_id: UUID, parent_id: UUID, child_i
         {"tenant_id": tenant_id, "code": relation_code},
     )
     if relation is None:
-        raise AppError(422, "RELATION", "Loại quan hệ không tồn tại.")
+        raise AppError(422, "RELATION", "Relation type does not exist.")
     if relation["acyclic"]:
         edges = await fetch_all(
             session,
@@ -304,7 +304,7 @@ async def _resource(session: AsyncSession, tenant_id: UUID, resource_id: UUID) -
         {"id": resource_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy tài nguyên.")
+        raise AppError(404, "NOT_FOUND", "Resource not found.")
     return row
 
 
@@ -437,9 +437,9 @@ async def patch_resource(
 ) -> dict[str, Any]:
     current = await _resource(session, tenant_id, resource_id)
     if int(current["version"]) != body.version:
-        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "Tài nguyên đã được chỉnh sửa ở nơi khác.")
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
     if current["archived_at"] is not None:
-        raise AppError(409, "ARCHIVED", "Tài nguyên đã lưu trữ chỉ đọc.")
+        raise AppError(409, "ARCHIVED", "Archived resources are read-only.")
     name = body.name.strip() if body.name is not None else current["name"]
     description = body.description if body.description is not None else current["description"]
     code = current["code"]
@@ -479,7 +479,7 @@ async def patch_resource(
 async def move_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID, body: MoveIn, correlation_id: str) -> dict[str, Any]:
     current = await _resource(session, tenant_id, resource_id)
     if int(current["version"]) != body.version:
-        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "Tài nguyên đã được chỉnh sửa ở nơi khác.")
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere.")
     parent = await _resource(session, tenant_id, parse_uuid(body.parent_id))
     await _assert_contains(session, tenant_id, parent["type_key"], current["type_key"], parent, "CONTAINS")
     moment = _aware(body.at)
@@ -535,7 +535,7 @@ async def archive_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         {"id": resource_id},
     )
     if children and int(children["count"]) > 0:
-        raise AppError(409, "HAS_CHILDREN", "Hãy lưu trữ các tài nguyên con trước.")
+        raise AppError(409, "HAS_CHILDREN", "Archive child resources first.")
     now = utcnow()
     await execute(
         session,
@@ -555,7 +555,7 @@ async def create_type(session: AsyncSession, tenant_id: UUID, actor: UUID, body:
     except ResourceInvariantError as exc:
         raise AppError(422, exc.code, str(exc)) from exc
     if body.category not in {"ENTERPRISE", "SITE", "AREA", "WORK_CENTER", "ASSET", "POSITION", "CUSTOM"}:
-        raise AppError(422, "CATEGORY", "Nhóm loại không hợp lệ.")
+        raise AppError(422, "CATEGORY", "Invalid type category.")
     type_id = uuid4()
     await execute(
         session,
@@ -644,7 +644,7 @@ async def neighbors(
 async def save_layout_draft(session: AsyncSession, tenant_id: UUID, actor: UUID, layout_id: UUID, body: LayoutDraft, correlation_id: str) -> dict[str, Any]:
     current = await _layout(session, tenant_id, layout_id)
     if int(current["version"]) != body.version:
-        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "Layout đã được chỉnh sửa ở nơi khác.")
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This layout was modified elsewhere.")
     _reject_topology_keys(body.draft)
     await execute(
         session,
@@ -662,7 +662,7 @@ async def save_layout_draft(session: AsyncSession, tenant_id: UUID, actor: UUID,
 def _reject_topology_keys(draft: dict[str, Any]) -> None:
     banned = {"resource_relations", "parent_id", "contains"}
     if banned & set(draft):
-        raise AppError(422, "LAYOUT_SCOPE", "Layout không được ghi quan hệ tài nguyên.")
+        raise AppError(422, "LAYOUT_SCOPE", "Layouts cannot write resource relationships.")
 
 
 async def _layout(session: AsyncSession, tenant_id: UUID, layout_id: UUID) -> dict[str, Any]:
@@ -672,7 +672,7 @@ async def _layout(session: AsyncSession, tenant_id: UUID, layout_id: UUID) -> di
         {"id": layout_id, "tenant_id": tenant_id},
     )
     if row is None:
-        raise AppError(404, "NOT_FOUND", "Không tìm thấy layout.")
+        raise AppError(404, "NOT_FOUND", "Layout not found.")
     return row
 
 
@@ -726,7 +726,7 @@ async def publish_layout(session: AsyncSession, tenant_id: UUID, actor: UUID, la
 
 async def import_resources(session: AsyncSession, tenant_id: UUID, actor: UUID, body: ImportIn, correlation_id: str) -> dict[str, Any]:
     if len(body.rows) > 2000:
-        raise AppError(422, "LIMIT", "Mỗi lần nhập tối đa 2000 dòng.")
+        raise AppError(422, "LIMIT", "Import is limited to 2000 rows at a time.")
     errors: list[dict[str, str]] = []
     planned: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -738,18 +738,18 @@ async def import_resources(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         try:
             validate_code(code)
             if not name:
-                raise ResourceInvariantError("NAME", "Thiếu tên.")
+                raise ResourceInvariantError("NAME", "Name is required.")
             await _type_by_key(session, tenant_id, type_key)
         except (ResourceInvariantError, AppError) as exc:
             errors.append({"row": str(index), "code": getattr(exc, "code", "INVALID"), "message": str(exc)})
             continue
         if code in seen:
-            errors.append({"row": str(index), "code": "DUPLICATE", "message": "Mã lặp trong tệp."})
+            errors.append({"row": str(index), "code": "DUPLICATE", "message": "Duplicate code in the import file."})
             continue
         seen.add(code)
         planned.append({"code": code, "name": name, "type_key": type_key, "parent_code": parent_code})
     if errors:
-        raise AppError(422, "IMPORT_INVALID", "Tệp nhập có dòng không hợp lệ.", extra={"row_errors": errors})
+        raise AppError(422, "IMPORT_INVALID", "The import file has invalid rows.", extra={"row_errors": errors})
     if body.dry_run:
         return {"dry_run": True, "accepted": len(planned), "created": 0}
     created = 0
@@ -762,7 +762,7 @@ async def import_resources(session: AsyncSession, tenant_id: UUID, actor: UUID, 
                 {"tenant_id": tenant_id, "code": row["parent_code"]},
             )
             if parent is None:
-                raise AppError(422, "MISSING_PARENT", f"Không thấy cha {row['parent_code']}.")
+                raise AppError(422, "MISSING_PARENT", f"Parent not found: {row['parent_code']}.")
             parent_id = parent["id"]
         await create_resource(
             session,
@@ -788,7 +788,7 @@ def hierarchy_presets() -> dict[str, Any]:
 async def create_hierarchy(session: AsyncSession, tenant_id: UUID, actor: UUID, body: HierarchyIn, correlation_id: str) -> dict[str, Any]:
     errors = validate_levels(body.level_rules)
     if errors:
-        raise AppError(422, "HIERARCHY", "Mẫu phân cấp không hợp lệ.", extra={"level_errors": errors})
+        raise AppError(422, "HIERARCHY", "Invalid hierarchy template.", extra={"level_errors": errors})
     row_id = uuid4()
     await execute(
         session,
@@ -820,7 +820,7 @@ def validate_levels(levels: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
     keys = [str(level.get("type_key", "")) for level in levels]
     if keys != list(dict.fromkeys(keys)):
-        errors.append("Loại tài nguyên bị lặp trong mẫu.")
+        errors.append("Duplicate resource type in the template.")
     rank = {key: index for index, key in enumerate(["enterprise", "site", "plant", "zone", "workshop", "line", "cell", "utility_system", "machine", "sensor", "physical_asset", "functional_position"])}
     previous = -1
     for key in keys:
@@ -833,9 +833,9 @@ def validate_levels(levels: list[dict[str, Any]]) -> list[str]:
 
 def sanitize_svg(payload: str) -> str:
     if len(payload.encode("utf-8")) > 2_000_000:
-        raise AppError(422, "UPLOAD", "SVG vượt quá 2 MB.")
+        raise AppError(422, "UPLOAD", "SVG exceeds 2 MB.")
     lowered = payload.lower()
     banned = ("<script", "foreignobject", "javascript:", "onload=", "onclick=", "onerror=", "<iframe", "xlink:href=\"http", "href=\"http")
     if any(token in lowered for token in banned) or not payload.strip().lower().startswith("<svg"):
-        raise AppError(422, "UPLOAD", "SVG không đạt kiểm tra an toàn.")
+        raise AppError(422, "UPLOAD", "SVG failed the safety check.")
     return payload

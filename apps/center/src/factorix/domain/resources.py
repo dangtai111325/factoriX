@@ -21,7 +21,7 @@ class ResourceInvariantError(ValueError):
 def validate_code(code: str) -> str:
     cleaned = code.strip()
     if not CODE_RE.fullmatch(cleaned):
-        raise ResourceInvariantError("INVALID_CODE", "Mã tài nguyên không hợp lệ.")
+        raise ResourceInvariantError("INVALID_CODE", "Invalid resource code.")
     return cleaned
 
 
@@ -40,7 +40,7 @@ def assert_no_cycle(edges: list[tuple[UUID, UUID]], start: UUID, proposed_parent
     `edges` are existing child -> parent pairs. Adding child=start, parent=proposed_parent.
     """
     if start == proposed_parent:
-        raise ResourceInvariantError("CYCLE", "Không thể gắn tài nguyên vào chính nó.")
+        raise ResourceInvariantError("CYCLE", "A resource cannot be linked to itself.")
     parent_of: dict[UUID, list[UUID]] = {}
     for child, parent in edges:
         parent_of.setdefault(child, []).append(parent)
@@ -55,7 +55,7 @@ def assert_no_cycle(edges: list[tuple[UUID, UUID]], start: UUID, proposed_parent
         seen.add(node)
         for parent in parent_of.get(node, []):
             if parent == start:
-                raise ResourceInvariantError("CYCLE", "Quan hệ tạo thành vòng.")
+                raise ResourceInvariantError("CYCLE", "This relationship would create a cycle.")
             stack.append(parent)
 
 
@@ -84,5 +84,5 @@ def close_and_open(
 ) -> tuple[datetime, datetime]:
     """Close the previous INSTALLED_AT at T and open the next from T."""
     if previous_open is not None and at < previous_open:
-        raise ResourceInvariantError("TEMPORAL_ORDER", "Thời điểm thay thế phải sau thời điểm lắp hiện tại.")
+        raise ResourceInvariantError("TEMPORAL_ORDER", "The replacement time must be after the current installation time.")
     return at, at
