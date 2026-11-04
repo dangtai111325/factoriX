@@ -72,7 +72,7 @@ export const AddDataWizardPage: React.FC = () => {
   const [newConnProtocol, setNewConnProtocol] = useState<'mqtt' | 'modbus' | 'opcua' | 'http'>('mqtt');
   const [newConnName, setNewConnName] = useState<string>('');
   const [newConnHost, setNewConnHost] = useState<string>('192.168.2.108');
-  const [newConnPort, setNewConnPort] = useState<string>('18883');
+  const [newConnPort, setNewConnPort] = useState<string>('1883');
   const [newConnEdgeId, setNewConnEdgeId] = useState<string>('');
   const [newConnAuthType, setNewConnAuthType] = useState<string>('none');
   const [newConnUsername, setNewConnUsername] = useState<string>('');
@@ -490,21 +490,36 @@ export const AddDataWizardPage: React.FC = () => {
 
     try {
       const conn = connections.find((c) => c.id === selectedConnectionId) || connections[0];
-      const jobRes = await api<{ id: string }>('/api/v1/jobs', {
-        method: 'POST',
-        body: JSON.stringify({
-          connection_id: conn.id,
-          mode: 'POLL',
-          interval_ms: Number(pollIntervalMs) || 1000,
-        }),
-      });
+      if (!conn) throw new Error('No connection selected');
+
+      // Ensure we have the acquisition job id for this connection
+      let jobId = '';
+      try {
+        const connDetail = await api<{ id: string; jobs?: Array<{ id: string }> }>(`/api/v1/connections/${conn.id}`);
+        if (connDetail?.jobs?.[0]?.id) {
+          jobId = connDetail.jobs[0].id;
+        }
+      } catch {
+        // ignore and fallback
+      }
+
+      if (!jobId) {
+        const jobRes = await api<{ id: string }>('/api/v1/jobs', {
+          method: 'POST',
+          body: JSON.stringify({
+            connection_id: conn.id,
+            mode: 'POLL',
+            interval_ms: Number(pollIntervalMs) || 1000,
+          }),
+        });
+        jobId = jobRes.id;
+      }
 
       // Targets list: targetResource + any selected similar resources (TC-UI-AD-28)
       const targetIdsToCreate = [selectedTargetId, ...selectedSimilarResourceIds];
 
       for (const tId of targetIdsToCreate) {
         const resObj = resources.find((r) => r.id === tId);
-        const code = resObj?.code || 'res';
 
         const bulkItems = fields.map((f) => {
           // Replace machine code in topic if similar resource
@@ -518,6 +533,11 @@ export const AddDataWizardPage: React.FC = () => {
           else if (f.dataType === 'Boolean') canonType = 'bool';
           else if (f.dataType === 'Text') canonType = 'text';
 
+          let jsonPath = (f.address || '').trim();
+          if (jsonPath && !jsonPath.startsWith('$')) {
+            jsonPath = `$.${jsonPath}`;
+          }
+
           return {
             key: f.name,
             name: f.name,
@@ -525,11 +545,11 @@ export const AddDataWizardPage: React.FC = () => {
             unit: f.unit || undefined,
             expected_interval_ms: 10000,
             source_field: {
-              acquisition_job_id: jobRes.id,
-              address_kind: 'mqtt',
+              acquisition_job_id: jobId,
+              address_kind: 'mqtt_jsonpath',
               address: {
                 topic: finalTopic,
-                jsonpath: f.address,
+                jsonpath: jsonPath,
                 qos: Number(mqttQos) || 1,
               },
             },
@@ -1095,19 +1115,42 @@ export const AddDataWizardPage: React.FC = () => {
               <span className="text-[12px] font-bold text-[#111B37]">
                 Configured Signals ({fields.length})
               </span>
-              {targetResource && similarResources.length > 0 && (
+              <div className="flex items-center gap-2">
                 <Button
                   size="sm"
                   variant="outline"
                   onClick={() => {
-                    setSelectedSimilarResourceIds(similarResources.map((r) => r.id));
-                    setShowSimilarModal(true);
+                    const baseTopic = mqttTopicFilter.replace(/#$/, '').replace(/\/$/, '');
+                    const newField: FieldRow = {
+                      id: `f-${Date.now()}`,
+                      topic: `${baseTopic}/state`,
+                      address: '$.status',
+                      name: fields.some((f) => f.name === 'status') ? `status_${fields.length + 1}` : 'status',
+                      dataType: 'Integer',
+                      unit: '',
+                      sample: 2,
+                    };
+                    setFields((prev) => [...prev, newField]);
+                    invalidateTest();
                   }}
                   className="text-[11px] h-7"
                 >
-                  Apply to similar resources…
+                  <Plus className="w-3.5 h-3.5 mr-1" /> Add field
                 </Button>
-              )}
+                {targetResource && similarResources.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setSelectedSimilarResourceIds(similarResources.map((r) => r.id));
+                      setShowSimilarModal(true);
+                    }}
+                    className="text-[11px] h-7"
+                  >
+                    Apply to similar resources…
+                  </Button>
+                )}
+              </div>
             </div>
 
             {fields.length === 0 ? (

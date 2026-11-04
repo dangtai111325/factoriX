@@ -268,6 +268,35 @@ async def create_resource(
             await _link(session, tenant_id, resource_id, as_uuid(parent["id"]), "INSTALLED_AT", moment)
         else:
             await _link(session, tenant_id, as_uuid(parent["id"]), resource_id, body.relation_code, moment)
+    if type_row["key"] == "site":
+        existing_site = await fetch_one(session, "SELECT id FROM sites WHERE id = :id OR (tenant_id = :tenant_id AND lower(code) = lower(:code))", {"id": resource_id, "tenant_id": tenant_id, "code": code})
+        target_site_id = resource_id
+        if not existing_site:
+            await execute(
+                session,
+                "INSERT INTO sites (id, tenant_id, code, name, timezone, created_at) VALUES (:id, :tenant_id, :code, :name, 'Asia/Ho_Chi_Minh', :now)",
+                {"id": resource_id, "tenant_id": tenant_id, "code": code, "name": body.name.strip(), "now": now},
+            )
+        else:
+            target_site_id = existing_site["id"]
+        existing_edge = await fetch_one(
+            session,
+            "SELECT id FROM edge_nodes WHERE tenant_id = :tenant_id AND site_id = :site_id",
+            {"tenant_id": tenant_id, "site_id": target_site_id},
+        )
+        if not existing_edge:
+            await execute(
+                session,
+                """
+                INSERT INTO edge_nodes (
+                    id, tenant_id, site_id, name, enrollment_status, desired_revision, active_revision, health, created_at
+                ) VALUES (
+                    :id, :tenant_id, :site_id, :name, 'ENROLLED', 1, 1, 'HEALTHY', :now
+                )
+                """,
+                {"id": uuid4(), "tenant_id": tenant_id, "site_id": target_site_id, "name": f"Edge {body.name.strip()}", "now": now},
+            )
+
     created = await get_resource(session, tenant_id, resource_id)
     created["placement"] = placement
     await audit(session, tenant_id=tenant_id, event_type="RESOURCE_CREATE", actor_id=actor, entity_type="resource", entity_id=resource_id, before=None, after={"id": str(resource_id), "code": code, "path_code": path_code}, correlation_id=correlation_id)
@@ -950,7 +979,7 @@ async def neighbors(
                     session,
                     """
                     SELECT s.id, s.key, s.display_name, s.data_type, s.resource_id,
-                           l.value_json, l.quality, l.freshness
+                           l.value_json, l.quality, l.received_time
                     FROM signal_definitions s
                     LEFT JOIN latest_signal_state l ON l.signal_id = s.id
                     WHERE s.tenant_id = :tenant_id AND s.resource_id = ANY(:res_ids) AND s.status = 'ACTIVE'
@@ -973,7 +1002,7 @@ async def neighbors(
                             "quality": sig.get("quality") or "UNKNOWN",
                             "value": sig.get("value_json"),
                             "data_type": sig.get("data_type"),
-                            "freshness": sig.get("freshness") or "UNKNOWN",
+                            "freshness": "REALTIME" if sig.get("received_time") else "UNKNOWN",
                         })
                         edges.append({
                             "id": str(uuid4()),

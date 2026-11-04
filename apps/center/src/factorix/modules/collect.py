@@ -32,7 +32,7 @@ CAPABILITIES = {
 class ConnectionIn(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     site_id: str
-    edge_id: str
+    edge_id: str | None = None
     protocol: str
     config: dict[str, Any]
     secret_input: str | None = None
@@ -215,6 +215,22 @@ async def create_connection(
     data_key: str,
     correlation_id: str,
 ) -> dict[str, Any]:
+    if body.site_id:
+        target_site = await fetch_one(session, "SELECT * FROM sites WHERE id = :id", {"id": parse_uuid(body.site_id)})
+        if not target_site:
+            res_row = await fetch_one(session, "SELECT * FROM resources WHERE id = :id", {"id": parse_uuid(body.site_id)})
+            if res_row:
+                site_by_code = await fetch_one(session, "SELECT * FROM sites WHERE tenant_id = :tenant_id AND lower(code) = lower(:code)", {"tenant_id": tenant_id, "code": res_row["code"]})
+                if site_by_code:
+                    body.site_id = str(site_by_code["id"])
+                else:
+                    await execute(
+                        session,
+                        "INSERT INTO sites (id, tenant_id, code, name, timezone, created_at) VALUES (:id, :tenant_id, :code, :name, 'Asia/Ho_Chi_Minh', :now)",
+                        {"id": res_row["id"], "tenant_id": tenant_id, "code": res_row["code"], "name": res_row["name"], "now": utcnow()},
+                    )
+                    body.site_id = str(res_row["id"])
+
     dup = await fetch_one(
         session,
         "SELECT id FROM connections WHERE tenant_id = :tenant_id AND site_id = :site_id AND lower(name) = lower(:name) AND status <> 'ARCHIVED'",
@@ -225,8 +241,43 @@ async def create_connection(
 
     protocol, raw_config, interval_override = accept_connection(body.protocol, body.config)
     config = parse_config(protocol, raw_config)
-    edge = await _owned_edge(session, tenant_id, parse_uuid(body.edge_id))
-    if str(edge["site_id"]) != body.site_id:
+
+    edge = None
+    if body.edge_id:
+        try:
+            edge = await _owned_edge(session, tenant_id, parse_uuid(body.edge_id))
+        except AppError:
+            edge = None
+    if edge is None and body.site_id:
+        edge = await fetch_one(
+            session,
+            "SELECT * FROM edge_nodes WHERE tenant_id = :tenant_id AND site_id = :site_id ORDER BY created_at LIMIT 1",
+            {"tenant_id": tenant_id, "site_id": parse_uuid(body.site_id)},
+        )
+        if edge is None:
+            site_row = await fetch_one(session, "SELECT name FROM resources WHERE id = :site_id", {"site_id": parse_uuid(body.site_id)})
+            if not site_row:
+                site_row = await fetch_one(session, "SELECT name FROM sites WHERE id = :site_id", {"site_id": parse_uuid(body.site_id)})
+            site_name = site_row["name"] if site_row else "Site"
+            edge_id = uuid4()
+            now = utcnow()
+            await execute(
+                session,
+                """
+                INSERT INTO edge_nodes (
+                    id, tenant_id, site_id, name, enrollment_status, desired_revision, active_revision, health, created_at
+                ) VALUES (
+                    :id, :tenant_id, :site_id, :name, 'ENROLLED', 1, 1, 'HEALTHY', :now
+                )
+                """,
+                {"id": edge_id, "tenant_id": tenant_id, "site_id": parse_uuid(body.site_id), "name": f"Edge {site_name}", "now": now},
+            )
+            edge = await _owned_edge(session, tenant_id, edge_id)
+        body.edge_id = str(edge["id"])
+
+    if edge is None:
+        raise AppError(404, "NOT_FOUND", "Edge not found.")
+    if body.site_id and str(edge["site_id"]) != body.site_id:
         raise AppError(422, "SCOPE", "Edge does not belong to the selected site.")
     secret_ref = None
     if body.secret_input:

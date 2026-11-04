@@ -51,7 +51,7 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({
         .split('\n')
         .map((l) => l.trim())
         .filter(Boolean);
-      const res = await api<{ create: Array<{ code: string; type: string; parent?: string }>; existing: number }>('/api/v1/resources/import/from-topics', {
+      const res = await api<{ create: Array<{ code: string; type?: string; type_key?: string; parent?: string; parent_code?: string }>; existing: any }>('/api/v1/resources/import/from-topics', {
         method: 'POST',
         body: JSON.stringify({
           topics: topicLines,
@@ -60,9 +60,18 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({
           skip_suffix_levels: 1,
         }),
       });
+      const existingCount = Array.isArray(res.existing)
+        ? res.existing.length
+        : typeof res.existing === 'number'
+        ? res.existing
+        : 0;
       setPreviewResult({
-        created: res.create || [],
-        existing: res.existing || 0,
+        created: (res.create || []).map((item) => ({
+          code: item.code,
+          type: item.type_key || item.type || 'machine',
+          parent: item.parent_code || item.parent,
+        })),
+        existing: existingCount,
       });
     } catch (err: any) {
       setError(err?.message || 'Failed to preview import.');
@@ -107,7 +116,7 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({
       >
         <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-blue-50 text-[#2A82E7] flex items-center justify-center font-bold">
+            <div className="w-10 h-10 rounded-lg bg-red-50 text-[#EF1B24] flex items-center justify-center font-bold">
               <UploadCloud className="w-5 h-5" />
             </div>
             <div>
@@ -145,7 +154,7 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({
               <button
                 type="button"
                 onClick={() => setTopicsText(TIPA_SAMPLE_TOPICS)}
-                className="text-xs text-[#2A82E7] hover:underline"
+                className="text-xs text-[#EF1B24] hover:underline"
               >
                 Load TIPA sample
               </button>
@@ -154,7 +163,7 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({
               rows={8}
               value={topicsText}
               onChange={(e) => setTopicsText(e.target.value)}
-              className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#2A82E7]/20 focus:border-[#2A82E7]"
+              className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
               placeholder="uns/Enterprise/Site/Area/Line/Machine/metric"
             />
           </div>

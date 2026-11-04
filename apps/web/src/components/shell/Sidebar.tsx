@@ -55,8 +55,8 @@ const mainNav: NavGroup[] = [
     label: 'Data Collector',
     icon: Database,
     children: [
-      { label: 'Add Connection', path: '/collector/connections' },
-      { label: 'Add Data', path: '/collector/signals' },
+      { label: 'Connections', path: '/collector/connections' },
+      { label: 'Signals', path: '/collector/signals' },
       { label: 'Edge Collectors', path: '/collector/edges' },
       { label: 'Diagnostics', path: '/collector/diagnostics' },
     ],

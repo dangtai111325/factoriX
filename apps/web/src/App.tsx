@@ -43,8 +43,38 @@ const RedirectWithQuery: React.FC<{ to: string; extraParams?: Record<string, str
   return <Navigate to={destination} replace />;
 };
 
+const ROUTE_TITLES: Record<string, string> = {
+  '/overview': 'Overview',
+  '/factory/structure': 'Hierarchy Structure',
+  '/factory/layout': 'Layout Designer',
+  '/factory/graph': 'Knowledge Graph',
+  '/collector/connections': 'Connections',
+  '/collector/add-data': 'Add Data',
+  '/collector/signals': 'Signals',
+  '/collector/edges': 'Edge Collectors',
+  '/collector/diagnostics': 'Diagnostics',
+  '/models': 'Data Models',
+  '/dashboards': 'Dashboards',
+  '/historian': 'Historian & Storage',
+  '/alarms': 'Alarms & Events',
+  '/analytics': 'Analytics',
+  '/reports': 'Reports',
+  '/admin': 'Administration',
+};
+
+const PageTitleUpdater: React.FC = () => {
+  const location = useLocation();
+  React.useEffect(() => {
+    const matchedPath = Object.keys(ROUTE_TITLES).find((path) => location.pathname.startsWith(path));
+    const title = matchedPath ? ROUTE_TITLES[matchedPath] : 'FactoriX';
+    document.title = `${title} · FactoriX`;
+  }, [location.pathname]);
+  return null;
+};
+
 const ProtectedAppShell: React.FC = () => (
   <AppProvider>
+    <PageTitleUpdater />
     <div className="fx-app-shell">
       <Sidebar />
       <div className="flex-1 min-w-0">

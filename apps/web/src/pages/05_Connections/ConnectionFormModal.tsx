@@ -88,8 +88,10 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
   const [generalError, setGeneralError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
-  // Initialize or reset form
+  // Initialize or reset form when modal opens
   useEffect(() => {
+    if (!isOpen) return;
+
     if (connectionToEdit) {
       setName(connectionToEdit.name);
       setProtocol(connectionToEdit.protocol);
@@ -117,14 +119,22 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
       const defaultSite = sites[0];
       const siteCode = defaultSite?.code || 'Site';
       const rand = Math.random().toString(36).substring(2, 6);
-      setName(`mqtt-192.168.2.108`);
+      setName('');
       setSiteId(defaultSite?.id || '');
+      setProtocol('mqtt');
+      setMqttHost('192.168.2.108');
+      setMqttPort(1883);
+      setMqttVersion('3.1.1');
       setClientId(`factorix-${siteCode}-${rand}`);
+      setKeepalive(60);
+      setCleanSession(true);
+      setMqttAuth('none');
+      setTls(false);
       setFieldErrors({});
       setGeneralError(null);
       setTestResult(null);
     }
-  }, [connectionToEdit, isOpen, sites]);
+  }, [connectionToEdit, isOpen]);
 
   // TLS toggling auto-updates default port (TC-UI-CN-04)
   const handleToggleTls = (enabled: boolean) => {

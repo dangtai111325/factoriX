@@ -734,6 +734,36 @@ async def commission_job(job_id: str, principal: dict[str, Any] = Depends(admin)
     }
 
 
+class JobIn(BaseModel):
+    connection_id: str
+    mode: str = "POLL"
+    interval_ms: int = 1000
+
+
+@app.post("/api/v1/jobs")
+async def create_or_get_job(body: JobIn, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, _actor = _ids(principal)
+    conn_id = parse_uuid(body.connection_id)
+    conn = await fetch_one(session, "SELECT id FROM connections WHERE id = :id AND tenant_id = :tenant_id", {"id": conn_id, "tenant_id": tenant_id})
+    if conn is None:
+        raise AppError(404, "NOT_FOUND", "Connection not found.")
+    job = await fetch_one(session, "SELECT id FROM acquisition_jobs WHERE connection_id = :id", {"id": conn_id})
+    if job:
+        await execute(session, "UPDATE acquisition_jobs SET mode = :mode, interval_ms = :interval_ms WHERE id = :id", {"id": job["id"], "mode": body.mode, "interval_ms": body.interval_ms})
+        return {"id": str(job["id"])}
+    job_id = uuid4()
+    await execute(
+        session,
+        """
+        INSERT INTO acquisition_jobs (id, connection_id, mode, interval_ms, timeout_ms, enabled, concurrency_limit, config_revision, version)
+        VALUES (:id, :connection_id, :mode, :interval_ms, 3000, TRUE, 1, 1, 1)
+        """,
+        {"id": job_id, "connection_id": conn_id, "mode": body.mode, "interval_ms": body.interval_ms},
+    )
+    return {"id": str(job_id)}
+
+
+
 @app.get("/api/v1/signals")
 async def signals(resource_id: str | None = None, q: str | None = None, limit: int = 200, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
@@ -1216,11 +1246,11 @@ async def overview(principal: dict[str, Any] = Depends(admin), session: AsyncSes
     machines = await fetch_one(session, "SELECT count(*) AS count FROM resources r JOIN resource_types t ON t.id = r.type_id WHERE r.tenant_id = :tenant_id AND t.key = 'machine' AND r.archived_at IS NULL", {"tenant_id": tenant_id})
     connections = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status = 'ACTIVE'", {"tenant_id": tenant_id})
     conn_total_row = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status <> 'ARCHIVED'", {"tenant_id": tenant_id})
-    conn_online_row = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status = 'ACTIVE' AND health = 'ONLINE'", {"tenant_id": tenant_id})
+    conn_online_row = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status = 'ACTIVE' AND health IN ('HEALTHY', 'ONLINE')", {"tenant_id": tenant_id})
     edges = await fetch_all(session, "SELECT id, name, health, active_revision, desired_revision, last_heartbeat, outbox_pending FROM edge_nodes WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
     healthy = sum(1 for edge in edges if edge["health"] in {"HEALTHY", "ACTIVE", "ONLINE"})
     storage = await telemetry.storage_overview(session, tenant_id)
-    last_obs = await fetch_one(session, "SELECT max(received_at) AS last_at FROM observations_current WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
+    last_obs = await fetch_one(session, "SELECT max(received_time) AS last_at FROM latest_signal_state WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
     last_data_at = last_obs["last_at"].isoformat().replace("+00:00", "Z") if last_obs and last_obs["last_at"] else None
 
     return {

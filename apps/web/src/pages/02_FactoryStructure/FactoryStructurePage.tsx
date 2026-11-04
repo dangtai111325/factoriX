@@ -11,6 +11,7 @@ import {
   Activity,
   ArrowRightLeft,
   Copy,
+  Edit2,
   Archive,
   Layers,
   UploadCloud,
@@ -22,6 +23,7 @@ import { useApp } from '../../store/AppContext';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ResourceNode } from '../../types';
 import { AddResourceModal } from '../../components/modals/AddResourceModal';
+import { EditResourceModal } from '../../components/modals/EditResourceModal';
 import { MoveResourceModal } from '../../components/modals/MoveResourceModal';
 import { ImportTopicsModal } from '../../components/modals/ImportTopicsModal';
 import { translateApiError } from '../../utils/apiErrors';
@@ -195,6 +197,7 @@ export const FactoryStructurePage: React.FC = () => {
     addResource,
     moveResource,
     archiveResource,
+    refresh,
   } = useApp();
   const [searchParams] = useSearchParams();
   const [searchTerm, setSearchTerm] = useState('');
@@ -208,6 +211,7 @@ export const FactoryStructurePage: React.FC = () => {
   const [expandedInitialized, setExpandedInitialized] = useState(false);
 
   const [isAddModalOpen, setIsAddModalOpen] = useState(searchParams.get('modal') === 'add');
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
 
@@ -513,11 +517,12 @@ export const FactoryStructurePage: React.FC = () => {
           </Button>
           <Button
             variant="secondary"
-            icon={<Copy className="w-4 h-4" />}
-            disabled
-            title="Duplicate is not available in this appliance build"
+            icon={<Edit2 className="w-4 h-4" />}
+            onClick={() => setIsEditModalOpen(true)}
+            disabled={!selectedResource}
+            title={selectedResource ? `Edit ${selectedResource.name}` : 'Select a resource to edit'}
           >
-            Duplicate
+            Edit
           </Button>
           <Button
             variant="secondary"
@@ -661,6 +666,14 @@ export const FactoryStructurePage: React.FC = () => {
                 <Button
                   size="sm"
                   variant="secondary"
+                  icon={<Edit2 className="w-3.5 h-3.5" />}
+                  onClick={() => setIsEditModalOpen(true)}
+                >
+                  Edit
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
                   icon={<ArrowRightLeft className="w-3.5 h-3.5" />}
                   onClick={() => setIsMoveModalOpen(true)}
                 >
@@ -777,6 +790,17 @@ export const FactoryStructurePage: React.FC = () => {
         isOpen={isImportModalOpen}
         onClose={() => setIsImportModalOpen(false)}
         onSuccess={() => window.location.reload()}
+      />
+
+      <EditResourceModal
+        isOpen={isEditModalOpen}
+        onClose={() => setIsEditModalOpen(false)}
+        resource={selectedResource}
+        onSuccess={async () => {
+          await refresh();
+          setMoveToast({ message: `Resource "${selectedResource?.name}" updated` });
+          setTimeout(() => setMoveToast(null), 5000);
+        }}
       />
 
       <MoveResourceModal
