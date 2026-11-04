@@ -992,7 +992,8 @@ async def neighbors(
                         SELECT b.signal_id, c.id AS connection_id, c.name AS connection_name,
                                c.protocol, c.health, c.site_id
                         FROM signal_bindings b
-                        JOIN acquisition_jobs j ON j.id = b.acquisition_job_id
+                        JOIN source_fields sf ON sf.id = b.source_field_id
+                        JOIN acquisition_jobs j ON j.id = sf.acquisition_job_id
                         JOIN connections c ON c.id = j.connection_id
                         WHERE b.signal_id = ANY(:sig_ids) AND b.enabled = TRUE
                         """,

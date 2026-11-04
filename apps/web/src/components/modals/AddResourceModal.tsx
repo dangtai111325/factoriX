@@ -60,27 +60,36 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
     setSubmitting(false);
 
     // Fetch types from API
-    api<{ types: ResourceTypeOption[] }>('/api/v1/resource-types')
+    api<{ items?: ResourceTypeOption[]; types?: ResourceTypeOption[] }>('/api/v1/resource-types')
       .then((res) => {
-        const types = res?.types || [];
+        const types = res?.items || res?.types || [];
         setAvailableTypes(types);
-        if (recommendedTypes.length > 0) {
-          setType(recommendedTypes[0]);
+        const match = recommendedTypes.length > 0
+          ? types.find((t) => recommendedTypes.some((r) => r.toLowerCase() === t.key.toLowerCase()))
+          : null;
+        if (match) {
+          setType(match.key);
+        } else if (recommendedTypes.length > 0) {
+          setType(recommendedTypes[0].toLowerCase());
         } else if (types.length > 0) {
           setType(types[0].key);
         }
       })
       .catch(() => {
         // Fallback standard types
-        setAvailableTypes([
+        const fallbacks: ResourceTypeOption[] = [
           { key: 'enterprise', name: 'Enterprise', category: 'ENTERPRISE' },
           { key: 'site', name: 'Site', category: 'SITE' },
           { key: 'area', name: 'Area', category: 'AREA' },
           { key: 'zone', name: 'Zone', category: 'AREA' },
           { key: 'line', name: 'Line', category: 'LINE' },
           { key: 'machine', name: 'Machine', category: 'MACHINE' },
-        ]);
-        setType('line');
+        ];
+        setAvailableTypes(fallbacks);
+        const match = recommendedTypes.length > 0
+          ? fallbacks.find((t) => recommendedTypes.some((r) => r.toLowerCase() === t.key.toLowerCase()))
+          : null;
+        setType(match ? match.key : 'enterprise');
       });
   }, [isOpen, parentId]);
 
@@ -104,7 +113,9 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
 
   if (!isOpen) return null;
 
-  const isRecommended = recommendedTypes.length === 0 || recommendedTypes.includes(type);
+  const isRecommended =
+    recommendedTypes.length === 0 ||
+    recommendedTypes.some((r) => r.toLowerCase() === type.toLowerCase());
   const isStrictBlocked = hierarchyMode === 'strict' && !isRecommended;
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -288,7 +299,9 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
               className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
             >
               {availableTypes.map((t) => {
-                const rec = recommendedTypes.length === 0 || recommendedTypes.includes(t.key);
+                const rec =
+                  recommendedTypes.length === 0 ||
+                  recommendedTypes.some((r) => r.toLowerCase() === t.key.toLowerCase());
                 return (
                   <option key={t.key} value={t.key} disabled={hierarchyMode === 'strict' && !rec}>
                     {t.name} ({t.category}) {rec ? '— Recommended' : '— Non-standard'}

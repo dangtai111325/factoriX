@@ -339,14 +339,16 @@ async def list_connections(session: AsyncSession, tenant_id: UUID, *, protocol: 
         LEFT JOIN (
             SELECT j.connection_id, count(DISTINCT b.signal_id) AS signal_count
             FROM acquisition_jobs j
-            JOIN signal_bindings b ON b.acquisition_job_id = j.id
+            JOIN source_fields sf ON sf.acquisition_job_id = j.id
+            JOIN signal_bindings b ON b.source_field_id = sf.id
             WHERE b.enabled = TRUE
             GROUP BY j.connection_id
         ) sig ON sig.connection_id = c.id
         LEFT JOIN (
             SELECT j.connection_id, count(*) AS messages_per_min
             FROM acquisition_jobs j
-            JOIN signal_bindings b ON b.acquisition_job_id = j.id
+            JOIN source_fields sf ON sf.acquisition_job_id = j.id
+            JOIN signal_bindings b ON b.source_field_id = sf.id
             JOIN observations o ON o.signal_id = b.signal_id AND o.received_time >= now() - INTERVAL '60 seconds'
             GROUP BY j.connection_id
         ) obs ON obs.connection_id = c.id

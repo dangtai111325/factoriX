@@ -322,8 +322,8 @@ export const FactoryStructurePage: React.FC = () => {
   );
 
   const allowedTypesForSelected = selectedResource
-    ? allowedChildTypes(selectedResource.type).map(titleCaseType)
-    : ['Enterprise'];
+    ? allowedChildTypes(selectedResource.type)
+    : ['enterprise'];
 
   const handleCreateResource = async (data: {
     name: string;
