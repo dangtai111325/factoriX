@@ -20,7 +20,7 @@ class ModbusConnector:
     async def connect(self) -> None:
         await self.client.connect()
         if not self.client.connected:
-            raise ConnectionError(f"Modbus TCP không kết nối được {self.host}:{self.port}")
+            raise ConnectionError(f"Cannot connect to Modbus TCP {self.host}:{self.port}")
 
     async def read_block(self, block: ReadBlock) -> list[dict[str, Any]]:
         if block.area == "holding":
@@ -32,14 +32,14 @@ class ModbusConnector:
         else:
             response = await self.client.read_discrete_inputs(block.start, count=block.count, device_id=block.unit_id)
         if response.isError():
-            raise ConnectionError("Modbus trả về lỗi.")
+            raise ConnectionError("Modbus returned an error response.")
         if block.area in {"holding", "input"}:
             return self._decode_registers(block, list(response.registers))
         return self._decode_bits(block, list(response.bits))
 
     def _decode_registers(self, block: ReadBlock, words: list[int]) -> list[dict[str, Any]]:
         if getattr(words, "isError", None):
-            raise ConnectionError("Modbus trả về lỗi.")
+            raise ConnectionError("Modbus returned an error response.")
         decoded: list[dict[str, Any]] = []
         for field in block.fields:
             offset = field.offset - block.start

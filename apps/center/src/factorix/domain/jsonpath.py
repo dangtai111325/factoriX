@@ -27,9 +27,9 @@ class PathToken:
 
 def compile_path(expression: str) -> list[PathToken]:
     if not expression or not expression.startswith("$"):
-        raise MappingError("INVALID_PATH", "JSONPath phải bắt đầu bằng $.")
+        raise MappingError("INVALID_PATH", "JSONPath must start with $.")
     if len(expression) > 512:
-        raise MappingError("PATH_TOO_LONG", "JSONPath quá dài.")
+        raise MappingError("PATH_TOO_LONG", "JSONPath is too long.")
     tokens: list[PathToken] = []
     i = 1
     while i < len(expression):
@@ -37,7 +37,7 @@ def compile_path(expression: str) -> list[PathToken]:
         if ch == ".":
             i += 1
             if i >= len(expression):
-                raise MappingError("INVALID_PATH", "JSONPath kết thúc bằng dấu chấm.")
+                raise MappingError("INVALID_PATH", "JSONPath ends with trailing dot.")
             if expression[i] == "[":
                 continue
             start = i
@@ -45,7 +45,7 @@ def compile_path(expression: str) -> list[PathToken]:
                 i += 1
             name = expression[start:i]
             if not name.isidentifier() and not name.replace("_", "").isalnum():
-                raise MappingError("INVALID_PATH", "Tên khóa không hợp lệ. Dùng $['k.hóa'].")
+                raise MappingError("INVALID_PATH", "Invalid key name. Use bracket notation $['key'].")
             tokens.append(PathToken("key", key=name))
             continue
         if ch == "[":
@@ -65,7 +65,7 @@ def compile_path(expression: str) -> list[PathToken]:
                 raise MappingError("INVALID_PATH", "Invalid index.")
             i = end + 1
             continue
-        raise MappingError("INVALID_PATH", "Cú pháp JSONPath không được hỗ trợ.")
+        raise MappingError("INVALID_PATH", "JSONPath syntax is not supported.")
     if sum(1 for token in tokens if token.kind == "wildcard") > 1:
         raise MappingError("INVALID_PATH", "Only one wildcard is allowed.")
     return tokens
@@ -132,14 +132,14 @@ def apply_cardinality(
         return MapResult(True, matches[0], 1)
     if cardinality == "MAP_BY_ID":
         if not map_id_field:
-            raise MappingError("CARDINALITY", "MAP_BY_ID cần trường định danh.")
+            raise MappingError("CARDINALITY", "MAP_BY_ID requires identifier field.")
         mapped: dict[str, Any] = {}
         for item in matches:
             if not isinstance(item, dict) or map_id_field not in item:
-                raise MappingError("CARDINALITY", "Phần tử không có định danh.")
+                raise MappingError("CARDINALITY", "Element is missing identifier.")
             mapped[str(item[map_id_field])] = item
         return MapResult(True, mapped, len(matches))
-    raise MappingError("CARDINALITY", "Chính sách cardinality không hỗ trợ.")
+    raise MappingError("CARDINALITY", "Cardinality policy is not supported.")
 
 
 def suggest_type(samples: list[Any]) -> str:

@@ -1,24 +1,27 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import {
   House,
   Box,
   Database,
-  Activity,
-  Monitor,
+  Layers,
   LayoutDashboard,
   Bell,
+  LineChart,
   FileText,
   Settings,
   ChevronDown,
   RotateCcw,
+  LogOut,
 } from 'lucide-react';
-import { useApp } from '../../store/AppContext';
 import { useAuth } from '../../features/auth';
+import { RevertToZeroModal } from '../modals/RevertToZeroModal';
+import factorixLogo from '../../assets/factorix_brand_logo.png';
 
 interface NavChild {
   label: string;
   path: string;
+  soon?: boolean;
 }
 
 interface NavGroup {
@@ -26,11 +29,11 @@ interface NavGroup {
   label: string;
   icon: React.ElementType;
   path?: string;
+  soon?: boolean;
   children?: NavChild[];
-  isFuture?: boolean;
 }
 
-const navConfig: NavGroup[] = [
+const mainNav: NavGroup[] = [
   {
     id: 'overview',
     label: 'Overview',
@@ -42,243 +45,468 @@ const navConfig: NavGroup[] = [
     label: 'Factory Model',
     icon: Box,
     children: [
-      { label: 'Structure', path: '/factory/structure' },
-      { label: 'Layout', path: '/factory/layout' },
+      { label: 'Hierarchy Structure', path: '/factory/structure' },
+      { label: 'Layout Designer', path: '/factory/layout' },
       { label: 'Knowledge Graph', path: '/factory/graph' },
     ],
   },
   {
-    id: 'acquisition',
-    label: 'Acquisition',
+    id: 'collector',
+    label: 'Data Collector',
     icon: Database,
     children: [
-      { label: 'Connections', path: '/acquisition/connections' },
-      { label: 'Edges', path: '/acquisition/edges' },
-      { label: 'Add Data', path: '/acquisition/add-data' },
-      { label: 'Protocol Studio Later', path: '/acquisition/studio/opcua' },
+      { label: 'Add Connection', path: '/collector/connections' },
+      { label: 'Add Data', path: '/collector/signals' },
+      { label: 'Edge Collectors', path: '/collector/edges' },
+      { label: 'Diagnostics', path: '/collector/diagnostics' },
     ],
   },
   {
-    id: 'signals',
-    label: 'Signals',
-    icon: Activity,
+    id: 'models',
+    label: 'Data Models',
+    icon: Layers,
     children: [
-      { label: 'Catalog', path: '/signals' },
-      { label: 'Calculated Later', path: '/signals/calculated' },
-      { label: 'Output Groups', path: '/signals/output-groups' },
-    ],
-  },
-  {
-    id: 'live',
-    label: 'Live Operations',
-    icon: Monitor,
-    children: [
-      { label: 'Monitor', path: '/live/monitor' },
-      { label: 'Diagnostics', path: '/live/diagnostics' },
-      { label: 'Activity Log', path: '/live/activity' },
+      { label: 'Model Catalog', path: '/models' },
+      { label: 'Calculations', path: '/models?tab=calculations', soon: true },
     ],
   },
 ];
 
-const futureNavs: NavGroup[] = [
-  { id: 'dashboards', label: 'Dashboards', icon: LayoutDashboard, path: '/dashboards', isFuture: true },
-  { id: 'storage', label: 'Storage', icon: Database, path: '/storage', isFuture: true },
-  { id: 'alarms', label: 'Alarms & Events', icon: Bell, path: '/alarms', isFuture: true },
-  { id: 'reports', label: 'Reports', icon: FileText, path: '/reports', isFuture: true },
-  { id: 'admin', label: 'Administration', icon: Settings, path: '/administration', isFuture: true },
+const comingSoonNav: NavGroup[] = [
+  {
+    id: 'dashboards',
+    label: 'Dashboards',
+    icon: LayoutDashboard,
+    path: '/dashboards',
+    soon: true,
+    children: [
+      { label: 'Dashboard Library', path: '/dashboards/library' },
+      { label: 'Dashboard Builder', path: '/dashboards/builder' },
+      { label: 'Widget Library', path: '/dashboards/widgets' },
+    ],
+  },
+  {
+    id: 'historian',
+    label: 'Historian & Storage',
+    icon: Database,
+    path: '/historian',
+    soon: true,
+    children: [
+      { label: 'Data Explorer', path: '/historian/explorer' },
+      { label: 'Storage Policies', path: '/historian/policies' },
+      { label: 'Retention & Export', path: '/historian/retention' },
+    ],
+  },
+  {
+    id: 'alarms',
+    label: 'Alarms & Events',
+    icon: Bell,
+    path: '/alarms',
+    soon: true,
+    children: [
+      { label: 'Alarm Rules', path: '/alarms/rules' },
+      { label: 'Active Alarms', path: '/alarms/active' },
+      { label: 'Event History', path: '/alarms/history' },
+    ],
+  },
+  {
+    id: 'analytics',
+    label: 'Analytics',
+    icon: LineChart,
+    path: '/analytics',
+    soon: true,
+    children: [
+      { label: 'Analysis Workspace', path: '/analytics/workspace' },
+      { label: 'Advanced Trends', path: '/analytics/advanced' },
+    ],
+  },
+  {
+    id: 'reports',
+    label: 'Reports',
+    icon: FileText,
+    path: '/reports',
+    soon: true,
+    children: [
+      { label: 'Report Library', path: '/reports/library' },
+      { label: 'Report Builder', path: '/reports/builder' },
+      { label: 'Schedules', path: '/reports/schedules' },
+    ],
+  },
+  {
+    id: 'administration',
+    label: 'Administration',
+    icon: Settings,
+    path: '/administration',
+    soon: true,
+    children: [
+      { label: 'General Settings', path: '/administration/general' },
+      { label: 'Users & Roles', path: '/administration/users' },
+      { label: 'Integrations', path: '/administration/integrations' },
+      { label: 'Audit Log', path: '/administration/audit' },
+    ],
+  },
 ];
 
 export const Sidebar: React.FC = () => {
   const location = useLocation();
-  const { revertToZero } = useApp();
   const { signOut } = useAuth();
-  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({
-    factory: true,
-    acquisition: true,
-    signals: true,
-    live: true,
+  const [revertModalOpen, setRevertModalOpen] = useState(false);
+
+  // Group open state persistence
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem('fx.sidebar.groups');
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // fallback
+    }
+    return { factory: true, collector: true, models: true };
   });
+
+  // Coming soon master section open state (defaults to true so full tree is visible)
+  const [comingSoonOpen, setComingSoonOpen] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('fx.sidebar.comingSoon');
+      if (saved !== null) return saved === 'true';
+    } catch {
+      // fallback
+    }
+    return true;
+  });
+
+  // Coming soon sub-groups open state
+  const [openComingSoonSubGroups, setOpenComingSoonSubGroups] = useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem('fx.sidebar.comingSoonSubGroups');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {
+      dashboards: true,
+      historian: true,
+      alarms: true,
+      analytics: true,
+      reports: true,
+      administration: true,
+    };
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('fx.sidebar.groups', JSON.stringify(openGroups));
+    } catch {}
+  }, [openGroups]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('fx.sidebar.comingSoon', String(comingSoonOpen));
+    } catch {}
+  }, [comingSoonOpen]);
+
+  useEffect(() => {
+    const isAnyComingSoon = comingSoonNav.some(
+      (item) =>
+        location.pathname === item.path ||
+        Boolean(item.children?.some((c) => location.pathname === c.path)) ||
+        location.pathname.startsWith(item.path + '/')
+    );
+    if (isAnyComingSoon) {
+      setComingSoonOpen(true);
+    }
+  }, [location.pathname]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('fx.sidebar.comingSoonSubGroups', JSON.stringify(openComingSoonSubGroups));
+    } catch {}
+  }, [openComingSoonSubGroups]);
 
   const toggleGroup = (id: string) => {
     setOpenGroups((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
+  const toggleComingSoonSubGroup = (id: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setOpenComingSoonSubGroups((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const isChildActive = (path: string): boolean => {
+    if (path === '/collector/signals') {
+      return (
+        location.pathname === '/collector/signals' ||
+        location.pathname === '/collector/add-data' ||
+        location.pathname === '/signals' ||
+        location.pathname === '/live/monitor'
+      );
+    }
+    if (path === '/collector/connections') {
+      return (
+        location.pathname === '/collector/connections' ||
+        location.pathname === '/acquisition/connections'
+      );
+    }
+    if (path === '/collector/diagnostics') {
+      return (
+        location.pathname === '/collector/diagnostics' ||
+        location.pathname === '/live/diagnostics' ||
+        location.pathname === '/live/activity'
+      );
+    }
+    if (path === '/models') {
+      return (
+        location.pathname === '/models' &&
+        (!location.search || !location.search.includes('calculations'))
+      );
+    }
+    if (path === '/models?tab=calculations') {
+      return location.pathname === '/models' && location.search.includes('calculations');
+    }
+    return location.pathname === path;
+  };
+
   const isGroupActive = (group: NavGroup): boolean => {
-    if (group.path && location.pathname === group.path) return true;
+    if (group.path) {
+      if (group.path === '/models') {
+        return location.pathname.startsWith('/models') || location.pathname.startsWith('/signals/output-groups');
+      }
+      return location.pathname === group.path;
+    }
     if (group.children) {
-      return group.children.some((c) => location.pathname.startsWith(c.path));
+      return group.children.some((c) => isChildActive(c.path));
     }
     return false;
   };
 
   return (
-    <aside className="fx-sidebar select-none">
-      {/* Brand Header */}
-      <div className="h-[62px] px-5 flex items-center justify-between border-b border-[#E3EAF3]">
-        <div className="flex items-center gap-3">
-          <img src="/factorix-logo.png" alt="FactoriX" className="h-7 w-auto object-contain" />
-          <div className="flex flex-col">
-            <span className="text-[15px] font-bold tracking-tight text-[#111B37]">
-              Factori<span className="text-[#EF1B24]">X</span>
-            </span>
-            <span className="text-[10px] uppercase font-semibold tracking-wider text-[#657794]">
-              Industrial IoT
-            </span>
+    <>
+      <aside className="fx-sidebar select-none flex flex-col justify-between">
+        {/* Brand Header: Logo only in red/white tone per user request */}
+        <div>
+          <div className="h-[62px] px-5 flex items-center border-b border-[#E3EAF3]">
+            <img src={factorixLogo} alt="FactoriX" className="h-8 w-auto object-contain" />
           </div>
-        </div>
-      </div>
 
-      {/* Navigation Groups */}
-      <div className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
-        <div className="text-[11px] font-semibold text-[#94A3B8] uppercase px-3 pb-1 tracking-wider">
-          Core Collector
-        </div>
+          {/* Navigation Links */}
+          <div className="px-3 py-4 space-y-1 overflow-y-auto max-h-[calc(100vh-170px)]">
+            {mainNav.map((group) => {
+              const Icon = group.icon;
+              const active = isGroupActive(group);
+              const hasChildren = group.children && group.children.length > 0;
+              const isOpen = openGroups[group.id] ?? false;
 
-        {navConfig.map((group) => {
-          const Icon = group.icon;
-          const active = isGroupActive(group);
-          const hasChildren = group.children && group.children.length > 0;
-          const isOpen = openGroups[group.id] ?? false;
+              if (!hasChildren && group.path) {
+                return (
+                  <NavLink
+                    key={group.id}
+                    to={group.path}
+                    className={({ isActive }) =>
+                      `flex items-center gap-3.5 px-3 py-2.5 rounded-lg text-[14px] font-medium transition-all ${
+                        isActive
+                          ? 'bg-[#FEF2F2] text-[#EF1B24] font-semibold border-l-4 border-[#EF1B24]'
+                          : 'text-[#334568] hover:bg-[#FFF5F5] hover:text-[#EF1B24]'
+                      }`
+                    }
+                  >
+                    <Icon className={`w-5 h-5 ${active ? 'text-[#EF1B24]' : 'text-[#657794]'}`} />
+                    <span>{group.label}</span>
+                  </NavLink>
+                );
+              }
 
-          if (!hasChildren && group.path) {
-            return (
-              <NavLink
-                key={group.id}
-                to={group.path}
-                className={({ isActive }) =>
-                  `flex items-center gap-3.5 px-3 py-2.5 rounded-lg text-[14px] font-medium transition-all ${
-                    isActive
-                      ? 'bg-[#FFF0F1] text-[#EF1B24] font-semibold border-l-4 border-[#EF1B24]'
-                      : 'text-[#334568] hover:bg-[#F9FAFD] hover:text-[#111B37]'
-                  }`
-                }
-              >
-                <Icon className={`w-5 h-5 ${active ? 'text-[#EF1B24]' : 'text-[#657794]'}`} />
-                <span>{group.label}</span>
-              </NavLink>
-            );
-          }
+              return (
+                <div key={group.id} className="space-y-0.5">
+                  <button
+                    type="button"
+                    onClick={() => toggleGroup(group.id)}
+                    className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-[14px] font-medium transition-colors ${
+                      active
+                        ? 'text-[#EF1B24] font-semibold bg-[#FEF2F2]/60'
+                        : 'text-[#334568] hover:bg-[#FFF5F5] hover:text-[#EF1B24]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3.5">
+                      <Icon className={`w-5 h-5 ${active ? 'text-[#EF1B24]' : 'text-[#657794]'}`} />
+                      <span>{group.label}</span>
+                    </div>
+                    <ChevronDown
+                      className={`w-4 h-4 text-[#94A3B8] transition-transform duration-200 ${
+                        isOpen ? 'rotate-180 text-[#EF1B24]' : ''
+                      }`}
+                    />
+                  </button>
 
-          return (
-            <div key={group.id} className="space-y-0.5">
+                  {isOpen && group.children && (
+                    <div className="ml-5 pl-3 border-l border-[#E2E8F0] space-y-0.5 py-1">
+                      {group.children.map((child) => {
+                        const childActive = isChildActive(child.path);
+                        return (
+                          <NavLink
+                            key={child.path}
+                            to={child.path}
+                            className={`flex items-center justify-between px-3 py-1.5 rounded-md text-[13px] font-medium transition-colors ${
+                              childActive
+                                ? 'text-[#EF1B24] font-bold bg-[#FEF2F2]'
+                                : 'text-[#657794] hover:text-[#EF1B24] hover:bg-[#FFF5F5]'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5">
+                              <span
+                                className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                                  childActive ? 'bg-[#EF1B24]' : 'bg-transparent border border-[#CBD5E1]'
+                                }`}
+                              />
+                              <span className="whitespace-nowrap">{child.label}</span>
+                            </div>
+                            {child.soon && (
+                              <span className="text-[9px] font-medium px-1.5 py-0.2 rounded bg-[#FEF2F2] text-[#EF1B24] border border-[#FECACA] flex-shrink-0">
+                                Soon
+                              </span>
+                            )}
+                          </NavLink>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Coming Soon Group with Full Navigation Tree & Red Tone */}
+            <div className="pt-3">
               <button
                 type="button"
-                onClick={() => toggleGroup(group.id)}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-[14px] font-medium transition-colors ${
-                  active
-                    ? 'text-[#EF1B24] font-semibold bg-[#FFF0F1]/60'
-                    : 'text-[#334568] hover:bg-[#F9FAFD]'
-                }`}
+                onClick={() => setComingSoonOpen(!comingSoonOpen)}
+                aria-expanded={comingSoonOpen}
+                className="w-full flex items-center justify-between px-3 py-2 text-[13px] font-semibold text-[#64748B] hover:text-[#EF1B24] hover:bg-[#FFF5F5] rounded-lg transition-colors"
               >
-                <div className="flex items-center gap-3.5">
-                  <Icon className={`w-5 h-5 ${active ? 'text-[#EF1B24]' : 'text-[#657794]'}`} />
-                  <span>{group.label}</span>
+                <div className="flex items-center gap-2.5">
+                  <span>Coming soon</span>
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[#FEF2F2] text-[#EF1B24] border border-[#FECACA]">
+                    Soon
+                  </span>
                 </div>
                 <ChevronDown
                   className={`w-4 h-4 text-[#94A3B8] transition-transform duration-200 ${
-                    isOpen ? 'rotate-180 text-[#EF1B24]' : ''
+                    comingSoonOpen ? 'rotate-180 text-[#EF1B24]' : ''
                   }`}
                 />
               </button>
 
-              {isOpen && group.children && (
-                <div className="ml-5 pl-3 border-l border-[#E2E8F0] space-y-0.5 py-1">
-                  {group.children.map((child) => (
-                    <NavLink
-                      key={child.path}
-                      to={child.path}
-                      className={({ isActive }) =>
-                        `flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] font-medium transition-colors ${
-                          isActive
-                            ? 'text-[#EF1B24] font-bold bg-[#FFF0F1]'
-                            : 'text-[#657794] hover:text-[#111B37] hover:bg-[#F9FAFD]'
-                        }`
-                      }
-                    >
-                      {({ isActive }) => (
-                        <>
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full ${
-                              isActive ? 'bg-[#EF1B24]' : 'bg-transparent border border-[#CBD5E1]'
-                            }`}
-                          />
-                          <span>{child.label}</span>
-                        </>
-                      )}
-                    </NavLink>
-                  ))}
+              {comingSoonOpen && (
+                <div className="ml-2 pl-2 border-l border-[#E2E8F0] space-y-1 py-1">
+                  {comingSoonNav.map((item) => {
+                    const Icon = item.icon;
+                    const isSubOpen = openComingSoonSubGroups[item.id] ?? true;
+                    const hasChildren = item.children && item.children.length > 0;
+                    const itemActive =
+                      location.pathname === item.path ||
+                      Boolean(item.children?.some((c) => location.pathname === c.path));
+
+                    return (
+                      <div key={item.id} className="space-y-0.5">
+                        <div className="flex items-center justify-between rounded-lg hover:bg-[#FFF5F5] transition-colors">
+                          <NavLink
+                            to={item.path || '#'}
+                            className={({ isActive }) =>
+                              `flex-1 min-w-0 flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[13px] transition-colors ${
+                                isActive
+                                  ? 'bg-[#FEF2F2] text-[#EF1B24] font-semibold'
+                                  : 'text-[#64748B] hover:text-[#EF1B24]'
+                              }`
+                            }
+                          >
+                            <div className="flex items-center gap-2 min-w-0">
+                              <Icon className={`w-4 h-4 flex-shrink-0 ${itemActive ? 'text-[#EF1B24]' : 'text-[#94A3B8]'}`} />
+                              <span className="whitespace-nowrap">{item.label}</span>
+                            </div>
+                            <span className="flex-shrink-0 ml-1.5 text-[10px] font-medium px-1.5 py-0.2 rounded bg-[#FEF2F2] text-[#EF1B24] border border-[#FECACA]">
+                              Soon
+                            </span>
+                          </NavLink>
+                          {hasChildren && (
+                            <button
+                              type="button"
+                              onClick={(e) => toggleComingSoonSubGroup(item.id, e)}
+                              className="p-1 text-[#94A3B8] hover:text-[#EF1B24] transition-colors rounded flex-shrink-0 mr-0.5"
+                              title="Toggle submodules"
+                            >
+                              <ChevronDown
+                                className={`w-3.5 h-3.5 transition-transform duration-200 ${
+                                  isSubOpen ? 'rotate-180 text-[#EF1B24]' : ''
+                                }`}
+                              />
+                            </button>
+                          )}
+                        </div>
+
+                        {hasChildren && isSubOpen && (
+                          <div className="ml-4 pl-2.5 border-l border-[#E2E8F0] space-y-0.5 py-0.5">
+                            {item.children!.map((child) => {
+                              const childActive = location.pathname === child.path;
+                              return (
+                                <NavLink
+                                  key={child.path}
+                                  to={child.path}
+                                  className={`flex items-center gap-2 px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors ${
+                                    childActive
+                                      ? 'text-[#EF1B24] font-bold bg-[#FEF2F2]'
+                                      : 'text-[#64748B] hover:text-[#EF1B24] hover:bg-[#FFF5F5]'
+                                  }`}
+                                >
+                                  <span
+                                    className={`w-1.5 h-1.5 rounded-full ${
+                                      childActive ? 'bg-[#EF1B24]' : 'bg-transparent border border-[#CBD5E1]'
+                                    }`}
+                                  />
+                                  <span className="truncate">{child.label}</span>
+                                </NavLink>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
-          );
-        })}
-
-        {/* Future Modules Section */}
-        <div className="pt-4 pb-1">
-          <div className="text-[11px] font-semibold text-[#94A3B8] uppercase px-3 pb-1 tracking-wider flex items-center justify-between">
-            <span>Planned Modules</span>
-            <span className="text-[10px] lowercase px-1.5 py-0.2 rounded bg-[#F1F5FA] text-[#657794]">
-              roadmap
-            </span>
           </div>
         </div>
 
-        {futureNavs.map((mod) => {
-          const Icon = mod.icon;
-          return (
-            <NavLink
-              key={mod.id}
-              to={mod.path!}
-              className={({ isActive }) =>
-                `flex items-center justify-between px-3 py-2 rounded-lg text-[13px] font-medium transition-all ${
-                  isActive
-                    ? 'bg-[#FFF0F1] text-[#EF1B24] font-semibold'
-                    : 'text-[#657794] hover:bg-[#F9FAFD] hover:text-[#111B37]'
-                }`
-              }
-            >
-              <div className="flex items-center gap-3">
-                <Icon className="w-4 h-4 text-[#94A3B8]" />
-                <span>{mod.label}</span>
-              </div>
-              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-[#F1F5FA] text-[#94A3B8]">
-                Later
-              </span>
-            </NavLink>
-          );
-        })}
-      </div>
+        {/* Footer Actions */}
+        <div className="p-3 border-t border-[#E3EAF3] bg-[#F9FAFD]/80">
+          <button
+            type="button"
+            onClick={() => setRevertModalOpen(true)}
+            className="w-full mb-2 flex items-center justify-center gap-2 py-1.5 px-3 rounded-lg text-[12px] font-medium text-[#EF1B24] border border-[#FAC6C9] hover:bg-white transition-colors"
+            title="Deletes the installation, including all configurations and data."
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Revert To Zero</span>
+          </button>
 
-      {/* Footer Reset & Operator Info */}
-      <div className="p-3 border-t border-[#E3EAF3] bg-[#F9FAFD]/60">
-        <button
-          type="button"
-          onClick={() => {
-            const confirmText = window.prompt(
-              'Revert to zero deletes every user, model and sample. Type REVERT to continue.',
-            );
-            if (confirmText === 'REVERT') {
-              void revertToZero('REVERT');
-            }
-          }}
-          className="w-full mb-2 flex items-center justify-center gap-2 py-1.5 px-3 rounded-lg text-[12px] font-medium text-[#F2343B] border border-[#FAC6C9] hover:bg-white transition-colors"
-          title="Deletes the installation, including the administrator."
-        >
-          <RotateCcw className="w-3.5 h-3.5" />
-          <span>Revert To Zero</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            void signOut().then(() => {
-              window.location.assign('/login');
-            });
-          }}
-          className="w-full text-[11px] text-[#657794] hover:text-[#111B37]"
-        >
-          Sign out
-        </button>
-      </div>
-    </aside>
+          <div className="flex items-center justify-between px-1 pt-1 text-[11px] text-[#657794]">
+            <span className="font-medium text-[#94A3B8]">FactoriX 1.0.0</span>
+            <button
+              type="button"
+              onClick={() => {
+                void signOut().then(() => {
+                  window.location.assign('/login');
+                });
+              }}
+              className="flex items-center gap-1 hover:text-[#EF1B24] transition-colors font-medium"
+            >
+              <LogOut className="w-3 h-3" />
+              <span>Sign out</span>
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <RevertToZeroModal
+        isOpen={revertModalOpen}
+        onClose={() => setRevertModalOpen(false)}
+      />
+    </>
   );
 };

@@ -99,7 +99,7 @@ async def bootstrap_admin(session: AsyncSession, body: BootstrapIn, *, actor_ip_
     email = validate_email(body.email)
     validate_password(body.password, login)
     if body.locale not in {"vi", "en"}:
-        raise AppError(422, "INVALID_LOCALE", "Locale chỉ hỗ trợ vi hoặc en.")
+        raise AppError(422, "INVALID_LOCALE", "Locale only supports vi or en.")
     full_name = (body.full_name or "").strip() or login
     if len(full_name) > 120:
         raise AppError(422, "INVALID_NAME", "Full name must be at most 120 characters.")
@@ -219,7 +219,7 @@ async def login_admin(session: AsyncSession, settings: Settings, body: LoginIn) 
             raise AppError(
                 429,
                 "LOCKED",
-                "Đăng nhập đang bị tạm khóa.",
+                "Account is temporarily locked.",
                 retryable=True,
                 extra={"retry_after_seconds": max(seconds, 1)},
             )
@@ -244,7 +244,7 @@ async def login_admin(session: AsyncSession, settings: Settings, body: LoginIn) 
     ok = bool(account and account["disabled_at"] is None and verify_password(account["password_hash"], body.password))
     if not ok:
         await _record_failure(session, lookup, now)
-        raise AppError(401, "INVALID_CREDENTIALS", "Đăng nhập không thành công.")
+        raise AppError(401, "INVALID_CREDENTIALS", "Invalid email or password.")
     await execute(session, "DELETE FROM login_throttle WHERE login = :login", {"login": lookup})
     session_token = new_token()
     csrf_token = new_token()
@@ -319,7 +319,7 @@ async def _record_failure(session: AsyncSession, login: str, now: Any) -> None:
 
 async def principal_from_token(session: AsyncSession, token: str | None) -> dict[str, Any]:
     if not token:
-        raise AppError(401, "UNAUTHENTICATED", "Cần đăng nhập.")
+        raise AppError(401, "UNAUTHENTICATED", "Authentication required.")
     row = await fetch_one(
         session,
         """
@@ -333,14 +333,14 @@ async def principal_from_token(session: AsyncSession, token: str | None) -> dict
         {"token_hash": hash_token(token)},
     )
     if row is None or row["revoked_at"] is not None or row["disabled_at"] is not None:
-        raise AppError(401, "UNAUTHENTICATED", "Phiên không hợp lệ.")
+        raise AppError(401, "UNAUTHENTICATED", "Invalid session.")
     expires = row["expires_at"]
     if isinstance(expires, str):
         from datetime import datetime
 
         expires = datetime.fromisoformat(expires)
     if expires <= utcnow():
-        raise AppError(401, "SESSION_EXPIRED", "Phiên đã hết hạn.")
+        raise AppError(401, "SESSION_EXPIRED", "Session has expired.")
     return row
 
 
@@ -532,7 +532,7 @@ def require_bootstrap_token(settings: Settings, presented: str | None) -> None:
     if settings.environment == "development" and not expected:
         return
     if not expected or not presented:
-        raise AppError(403, "BOOTSTRAP_DISABLED", "Khởi tạo quản trị viên chưa được mở.")
+        raise AppError(403, "BOOTSTRAP_DISABLED", "Admin bootstrap is not enabled.")
     import hmac
 
     if not hmac.compare_digest(expected, presented):

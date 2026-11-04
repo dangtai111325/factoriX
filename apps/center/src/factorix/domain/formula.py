@@ -88,15 +88,15 @@ class FormulaProgram:
 
 def parse_expression(source: str) -> FormulaProgram:
     if not source or not source.strip():
-        raise FormulaError("EMPTY", "Biểu thức trống.")
+        raise FormulaError("EMPTY", "Expression is empty.")
     if len(source) > MAX_CHARS:
-        raise FormulaError("TOO_LARGE", "Biểu thức vượt quá giới hạn.")
+        raise FormulaError("TOO_LARGE", "Expression exceeds length limit.")
     if "__" in source:
-        raise FormulaError("FORBIDDEN", "Biểu thức chứa từ khóa bị cấm.")
+        raise FormulaError("FORBIDDEN", "Expression contains forbidden keyword.")
     try:
         tree = ast.parse(source, mode="eval")
     except SyntaxError as exc:
-        raise FormulaError("SYNTAX", "Cú pháp biểu thức không hợp lệ.", token=str(exc.lineno)) from exc
+        raise FormulaError("SYNTAX", "Expression syntax is invalid.", token=str(exc.lineno)) from exc
     names: list[str] = []
     warnings: list[str] = []
     count = 0
@@ -105,15 +105,15 @@ def parse_expression(source: str) -> FormulaProgram:
         nonlocal count
         count += 1
         if count > MAX_NODES or depth > MAX_DEPTH:
-            raise FormulaError("TOO_COMPLEX", "Biểu thức quá phức tạp.")
+            raise FormulaError("TOO_COMPLEX", "Expression is too complex.")
         if isinstance(node, ast.Expression):
             walk(node.body, depth + 1)
             return
         if isinstance(node, ast.Constant):
             if not isinstance(node.value, (int, float, str, bool, type(None))):
-                raise FormulaError("FORBIDDEN", "Hằng số không được phép.")
+                raise FormulaError("FORBIDDEN", "Literal constant is not allowed.")
             if isinstance(node.value, float) and not math.isfinite(node.value):
-                raise FormulaError("NON_FINITE", "Hằng số không hữu hạn.")
+                raise FormulaError("NON_FINITE", "Non-finite constant is not allowed.")
             return
         if isinstance(node, ast.Name):
             if node.id.startswith("_") or node.id in FUNCTIONS or node.id in WINDOW_FUNCTIONS:
@@ -123,24 +123,24 @@ def parse_expression(source: str) -> FormulaProgram:
             return
         if isinstance(node, ast.BinOp):
             if type(node.op) not in _ALLOWED_BINOPS:
-                raise FormulaError("FORBIDDEN", "Toán tử không được phép.")
+                raise FormulaError("FORBIDDEN", "Binary operator is not allowed.")
             walk(node.left, depth + 1)
             walk(node.right, depth + 1)
             return
         if isinstance(node, ast.UnaryOp):
             if type(node.op) not in _ALLOWED_UNARY:
-                raise FormulaError("FORBIDDEN", "Toán tử một ngôi không được phép.")
+                raise FormulaError("FORBIDDEN", "Unary operator is not allowed.")
             walk(node.operand, depth + 1)
             return
         if isinstance(node, ast.BoolOp):
             if not isinstance(node.op, (ast.And, ast.Or)):
-                raise FormulaError("FORBIDDEN", "Toán tử logic không được phép.")
+                raise FormulaError("FORBIDDEN", "Boolean operator is not allowed.")
             for value in node.values:
                 walk(value, depth + 1)
             return
         if isinstance(node, ast.Compare):
             if any(type(op) not in _ALLOWED_CMP for op in node.ops):
-                raise FormulaError("FORBIDDEN", "Phép so sánh không được phép.")
+                raise FormulaError("FORBIDDEN", "Comparison operator is not allowed.")
             walk(node.left, depth + 1)
             for comparator in node.comparators:
                 walk(comparator, depth + 1)
@@ -153,11 +153,11 @@ def parse_expression(source: str) -> FormulaProgram:
         if isinstance(node, ast.Call):
             _check_call(node, depth, walk)
             return
-        raise FormulaError("FORBIDDEN", f"Nút AST {type(node).__name__} bị cấm.")
+        raise FormulaError("FORBIDDEN", f"AST node {type(node).__name__} is forbidden.")
 
     walk(tree, 0)
     if _division_without_guard(tree):
-        warnings.append("Mẫu số có thể bằng 0. Thêm điều kiện trước khi chia.")
+        warnings.append("Denominator may be zero. Add condition before division.")
     normalized = ast.dump(tree, include_attributes=False)
     return FormulaProgram(
         tree=tree,
@@ -173,18 +173,18 @@ def _check_call(node: ast.Call, depth: int, walk: Any) -> None:
     name = node.func.id
     if name in WINDOW_FUNCTIONS:
         if len(node.args) != 2 or not isinstance(node.args[0], ast.Name):
-            raise FormulaError("WINDOW", "Hàm cửa sổ cần alias và khoảng thời gian hằng số.")
+            raise FormulaError("WINDOW", "Window function requires alias and constant duration.")
         if not isinstance(node.args[1], ast.Constant) or not isinstance(node.args[1].value, int):
-            raise FormulaError("WINDOW", "Cửa sổ thời gian phải là số giây hằng số.")
+            raise FormulaError("WINDOW", "Window duration must be a constant number of seconds.")
         seconds = node.args[1].value
         if seconds < 1 or seconds > 86_400:
-            raise FormulaError("WINDOW", "Cửa sổ thời gian phải từ 1 đến 86400 giây.")
+            raise FormulaError("WINDOW", "Window duration must be between 1 and 86400 seconds.")
         walk(node.args[0], depth + 1)
         return
     if name not in FUNCTIONS:
-        raise FormulaError("FORBIDDEN", f"Hàm {name} không nằm trong allowlist.", token=name)
+        raise FormulaError("FORBIDDEN", f"Function {name} is not allowed.", token=name)
     if len(node.args) > 8:
-        raise FormulaError("TOO_COMPLEX", "Quá nhiều đối số.")
+        raise FormulaError("TOO_COMPLEX", "Too many arguments.")
     for arg in node.args:
         walk(arg, depth + 1)
 
@@ -198,10 +198,10 @@ def _division_without_guard(tree: ast.Expression) -> bool:
 def bind(program: FormulaProgram, alias_to_signal: dict[str, UUID]) -> FormulaProgram:
     missing = [name for name in program.analysis.names if name not in alias_to_signal]
     if missing:
-        raise FormulaError("UNBOUND", "Biến chưa gắn signal: " + ", ".join(missing), token=missing[0])
+        raise FormulaError("UNBOUND", "Unbound signal variables: " + ", ".join(missing), token=missing[0])
     extra = [name for name in alias_to_signal if name not in program.analysis.names]
     if extra:
-        raise FormulaError("UNUSED_ALIAS", "Alias không xuất hiện trong biểu thức.")
+        raise FormulaError("UNUSED_ALIAS", "Alias does not appear in expression.")
     program.bindings = dict(alias_to_signal)
     return program
 
@@ -215,7 +215,7 @@ def detect_cycles(graph: dict[UUID, set[UUID]]) -> None:
         for dep in graph.get(node, ()):
             state = color.get(dep, 0)
             if state == 1:
-                raise FormulaError("CYCLE", "Công thức tạo vòng phụ thuộc.")
+                raise FormulaError("CYCLE", "Formula creates a dependency cycle.")
             if state == 0:
                 visit(dep, stack)
         stack.pop()
@@ -309,12 +309,12 @@ def _window(name: str, series: list[float]) -> float | int | None:
         return min(finite)
     if name == "max_over_time":
         return max(finite)
-    raise FormulaError("WINDOW", "Hàm cửa sổ không hỗ trợ.")
+    raise FormulaError("WINDOW", "Window function is not supported.")
 
 
 def _pow(left: Any, right: Any) -> float:
     if isinstance(right, (int, float)) and abs(float(right)) > 8:
-        raise FormulaError("EVAL", "Số mũ vượt giới hạn.")
+        raise FormulaError("EVAL", "Exponent exceeds limit.")
     result = left**right
     return _num(result)
 
@@ -322,7 +322,7 @@ def _pow(left: Any, right: Any) -> float:
 def _num(value: Any) -> Any:
     if isinstance(value, float):
         if not math.isfinite(value) or abs(value) > MAX_ABS:
-            raise FormulaError("EVAL", "Kết quả số vượt giới hạn an toàn.")
+            raise FormulaError("EVAL", "Numeric result exceeds safe bounds.")
     return value
 
 

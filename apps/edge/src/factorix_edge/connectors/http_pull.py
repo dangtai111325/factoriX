@@ -17,29 +17,29 @@ class HttpPullConnector:
 
     def __init__(self, base_url: str, allowlist: list[AllowedEndpoint], timeout_s: float = 5.0) -> None:
         if "://" not in base_url:
-            raise ConnectorError("CONFIG", "HTTP base URL phải có scheme.")
+            raise ConnectorError("CONFIG", "HTTP base URL must include scheme.")
         assert_url(base_url, allowlist)
         self.base_url = base_url.rstrip("/") + "/"
         self.timeout_s = timeout_s
 
     async def get_json(self, path: str, headers: dict[str, str] | None = None) -> Any:
         if "://" in path or path.startswith("//"):
-            raise ConnectorError("CONFIG", "Đường dẫn HTTP phải tương đối.")
+            raise ConnectorError("CONFIG", "HTTP path must be relative.")
         url = urljoin(self.base_url, path.lstrip("/"))
         try:
             async with httpx.AsyncClient(timeout=self.timeout_s, follow_redirects=False) as client:
                 response = await client.get(url, headers=headers or {})
         except httpx.HTTPError as exc:
-            raise ConnectorError("NETWORK", "HTTP pull không kết nối được.") from exc
+            raise ConnectorError("NETWORK", "Cannot connect to HTTP endpoint.") from exc
         if 300 <= response.status_code < 400:
-            raise ConnectorError("REDIRECT", "HTTP redirect bị từ chối.")
+            raise ConnectorError("REDIRECT", "HTTP redirect was rejected.")
         if response.status_code == 401:
-            raise ConnectorError("AUTH", "HTTP từ chối xác thực.")
+            raise ConnectorError("AUTH", "HTTP authentication failed.")
         if response.status_code == 429:
-            raise ConnectorError("RATE_LIMIT", "HTTP báo giới hạn tần suất.")
+            raise ConnectorError("RATE_LIMIT", "HTTP rate limit exceeded.")
         if response.status_code >= 400:
-            raise ConnectorError("PROTOCOL", f"HTTP trả mã {response.status_code}.")
+            raise ConnectorError("PROTOCOL", f"HTTP returned status code {response.status_code}.")
         try:
             return response.json()
         except json.JSONDecodeError as exc:
-            raise ConnectorError("DECODE", "HTTP không trả JSON.") from exc
+            raise ConnectorError("DECODE", "HTTP response is not JSON.") from exc

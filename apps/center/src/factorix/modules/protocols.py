@@ -31,8 +31,12 @@ class MqttConfig(BaseModel):
     host: str
     port: int = Field(default=1883, ge=1, le=65535)
     protocol_version: Literal["3.1.1", "5"] = "3.1.1"
+    keepalive: int = Field(default=60, ge=5, le=3600)
+    clean_session: bool = True
     tls: bool = False
-    anonymous: bool = False
+    tls_verify: bool = True
+    ca_secret_ref: str | None = None
+    anonymous: bool = True
     username: str | None = None
     client_id: str | None = None
     topics: list[str] = Field(default_factory=list, max_length=64)
@@ -42,6 +46,9 @@ class MqttConfig(BaseModel):
 class HttpConfig(BaseModel):
     base_url: str
     path: str = "/"
+    method: Literal["GET", "POST"] = "GET"
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: str | None = None
     auth: Literal["none", "api_key", "basic", "bearer"] = "none"
     header_name: str | None = None
     timeout_ms: int = Field(default=5000, ge=200, le=30000)
@@ -72,6 +79,32 @@ def public_protocol(protocol: str) -> str:
     return _TO_PUBLIC.get(protocol, protocol)
 
 
+def validate_mqtt_topic(topic: str) -> str | None:
+    if not topic:
+        return "Enter a topic filter."
+    if topic.startswith("/"):
+        return 'Topics should not start with "/".'
+    if topic.startswith("$"):
+        return 'Topics starting with "$" are reserved by the broker.'
+    parts = topic.split("/")
+    if any(p == "" for p in parts):
+        return "Topic levels cannot be empty."
+    for i, p in enumerate(parts):
+        if "#" in p and (p != "#" or i != len(parts) - 1):
+            return '"#" must be the last level on its own.'
+        if "+" in p and p != "+":
+            return '"+" must take a whole level.'
+    if len(topic.encode("utf-8")) > 65535:
+        return "Topic is too long."
+    return None
+
+
+def assert_valid_topic(topic: str) -> None:
+    err = validate_mqtt_topic(topic)
+    if err:
+        raise AppError(422, "TOPIC", err)
+
+
 def accept_connection(protocol: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any], int | None]:
     """Translate the console's protocol names and field names into the stored contract."""
     stored = _FROM_PUBLIC.get(protocol, protocol)
@@ -89,6 +122,8 @@ def accept_connection(protocol: str, payload: dict[str, Any]) -> tuple[str, dict
         if not data.get("username"):
             data["anonymous"] = True
     elif stored == "mqtt":
+        if data.get("protocol_version") == "5.0":
+            data["protocol_version"] = "5"
         topic = data.pop("topic_filter", None)
         if topic and not data.get("topics"):
             data["topics"] = [str(topic)]
@@ -102,7 +137,6 @@ def accept_connection(protocol: str, payload: dict[str, Any]) -> tuple[str, dict
             data["path"] = parsed.path or "/"
             if parsed.query:
                 data["query"] = dict(parse_qsl(parsed.query))
-        data.pop("method", None)
         if data.get("interval_ms") is not None:
             interval = int(data.pop("interval_ms"))
         data.setdefault("auth", "none")
@@ -112,38 +146,36 @@ def accept_connection(protocol: str, payload: dict[str, Any]) -> tuple[str, dict
 def parse_config(protocol: str, payload: dict[str, Any]) -> dict[str, Any]:
     model = _MODELS.get(protocol)
     if model is None:
-        raise AppError(422, "PROTOCOL", "Giao thức không được hỗ trợ.")
+        raise AppError(422, "PROTOCOL", "Unsupported protocol.")
     try:
         parsed = model.model_validate(payload)
     except ValidationError as exc:
         raise AppError(
             422,
             "CONFIG",
-            "Cấu hình kết nối không hợp lệ.",
+            "Invalid connection configuration.",
             field_errors=[{"path": ".".join(str(part) for part in error["loc"]), "code": "INVALID"} for error in exc.errors()],
         ) from exc
     data = parsed.model_dump()
     if protocol == "opcua":
         if not str(data["endpoint"]).startswith("opc.tcp://"):
-            raise AppError(422, "CONFIG", "Endpoint OPC UA phải bắt đầu bằng opc.tcp://")
+            raise AppError(422, "CONFIG", "The endpoint must start with opc.tcp://")
         if data["security_mode"] == "None" and not data["allow_insecure"]:
-            raise AppError(422, "INSECURE_PROFILE", "Security None cần xác nhận allow_insecure.")
+            raise AppError(422, "INSECURE_PROFILE", "Security None requires explicit allow_insecure.")
         if data["anonymous"] and data["security_mode"] == "SignAndEncrypt":
             pass
     if protocol == "mqtt":
         for topic in data["topics"]:
-            if topic.startswith("$") or "#" in topic[:-1] or any(part == "" for part in topic.split("/")):
-                raise AppError(422, "TOPIC", "Topic filter không hợp lệ.")
+            err = validate_mqtt_topic(topic)
+            if err:
+                raise AppError(422, "TOPIC", err)
         if data["anonymous"] is False and not data["username"]:
-            raise AppError(422, "AUTH", "MQTT cần username hoặc bật anonymous rõ ràng.")
+            raise AppError(422, "AUTH", "MQTT requires username or explicit anonymous.")
     if protocol == "http":
         if not str(data["base_url"]).startswith(("http://", "https://")):
-            raise AppError(422, "CONFIG", "HTTP base URL không hợp lệ.")
-        if data["auth"] == "none" and str(data["base_url"]).startswith("https://") is False:
-            # Cleartext without auth is allowed only when the operator explicitly set auth none.
-            pass
+            raise AppError(422, "CONFIG", "Invalid HTTP base URL.")
         if any(char in data["path"] for char in (" ", "\n")):
-            raise AppError(422, "CONFIG", "Đường dẫn HTTP không hợp lệ.")
+            raise AppError(422, "CONFIG", "Invalid HTTP path.")
     return data
 
 

@@ -20,7 +20,7 @@ async def _credential(client: httpx.AsyncClient, path: Path) -> str:
             return stored
     token = os.environ.get("FACTORIX_ENROLLMENT_TOKEN", "").strip()
     if not token:
-        raise SystemExit("Thiếu FACTORIX_ENROLLMENT_TOKEN hoặc file credential.")
+        raise SystemExit("Missing FACTORIX_ENROLLMENT_TOKEN or credential file.")
     response = await client.post("/api/v1/edge-sync/enroll", json={"enrollment_token": token})
     response.raise_for_status()
     credential = str(response.json()["credential"])

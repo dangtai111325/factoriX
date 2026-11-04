@@ -1,440 +1,567 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
-  MousePointer,
-  Hand,
   ZoomIn,
   ZoomOut,
   Maximize2,
-  Grid,
-  Undo2,
-  Redo2,
-  Save,
-  Cpu,
-  Boxes,
-  Factory,
-  RotateCw,
-  Trash2,
+  Edit3,
+  Eye,
+  RotateCcw,
   Plus,
+  ChevronRight,
+  Home,
+  CheckCircle2,
+  Loader2,
+  AlertCircle,
 } from 'lucide-react';
-import { Button } from '../../components/common/Button';
-import { Card } from '../../components/common/Card';
-import { Badge } from '../../components/common/Badge';
+import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import { useApp } from '../../store/AppContext';
-import { LayoutMachineNode } from '../../types';
+import { ResourceNode } from '../../types';
+import { calculateAutoGrid, ItemGeometry } from './AutoGrid';
+import { ResourceCard } from './ResourceCard';
+import { ResourceDetailPanel } from './ResourceDetailPanel';
+import { useLayoutPersistence, LevelDraft } from './useLayoutPersistence';
+import { AddResourceModal } from '../../components/modals/AddResourceModal';
 
 export const FactoryLayoutPage: React.FC = () => {
-  const { layoutNodes, updateLayoutNode } = useApp();
-  const [mode, setMode] = useState<'edit' | 'view'>('edit');
-  const [selectedNodeId, setSelectedNodeId] = useState<string>('layout-node-1');
-  const [zoom, setZoom] = useState<number>(100);
-  const [snapGrid, setSnapGrid] = useState<boolean>(true);
-  const [saveToast, setSaveToast] = useState<string | null>(null);
-  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
-  const [dragOffset, setDragOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const { scopedResources, signals, refresh } = useApp();
+  const [searchParams, setSearchParams] = useSearchParams();
 
-  const selectedNode = layoutNodes.find((n) => n.id === selectedNodeId) || layoutNodes[0];
+  const [mode, setMode] = useState<'view' | 'edit'>('view');
+  const [selectedLeafId, setSelectedLeafId] = useState<string | null>(null);
+  const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [zoomLevel, setZoomLevel] = useState(100);
 
-  const handleMouseDown = (e: React.MouseEvent, node: LayoutMachineNode) => {
-    if (mode !== 'edit') return;
-    setSelectedNodeId(node.id);
-    setDraggingNodeId(node.id);
-    setDragOffset({
-      x: e.clientX - node.x,
-      y: e.clientY - node.y,
+  // Custom placement overrides for active level: Record<childId, ItemGeometry>
+  const [customGeometries, setCustomGeometries] = useState<Record<string, ItemGeometry>>({});
+  const [isCustomMode, setIsCustomMode] = useState(false);
+
+  // Active dragging / resizing state
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [resizing, setResizing] = useState<{ id: string; corner: string } | null>(null);
+  const dragStartRef = useRef<{ clientX: number; clientY: number; initGeom: ItemGeometry } | null>(null);
+
+  // Layout persistence hook
+  const { saveStatus, lastSavedTime, saveLevel } = useLayoutPersistence('default-layout', 1);
+
+  // Current level derived from URL (?level=<id>)
+  const levelParam = searchParams.get('level');
+
+  // Hierarchy map: id -> ResourceNode
+  const resourceMap = useMemo(() => {
+    const map = new Map<string, ResourceNode>();
+    scopedResources.forEach((r) => map.set(r.id, r));
+    return map;
+  }, [scopedResources]);
+
+  // Root resources (resources with no parent or parent not in current scope)
+  const rootResources = useMemo(() => {
+    return scopedResources.filter((r) => !r.parentId && !r.parent_id);
+  }, [scopedResources]);
+
+  // Current level resource (null means root)
+  const currentLevel = useMemo(() => {
+    if (!levelParam) return null;
+    return resourceMap.get(levelParam) || null;
+  }, [levelParam, resourceMap]);
+
+  // Direct children of current level
+  const directChildren = useMemo(() => {
+    if (!currentLevel) {
+      // If root, show top-level enterprises/sites
+      return rootResources.length > 0 ? rootResources : scopedResources.slice(0, 1);
+    }
+    return scopedResources.filter(
+      (r) => r.parentId === currentLevel.id || r.parent_id === currentLevel.id
+    );
+  }, [currentLevel, rootResources, scopedResources]);
+
+  const childIds = useMemo(() => directChildren.map((c) => c.id), [directChildren]);
+
+  // Build breadcrumb trail from root to current level
+  const breadcrumbs = useMemo(() => {
+    const trail: ResourceNode[] = [];
+    let curr = currentLevel;
+    while (curr) {
+      trail.unshift(curr);
+      const parentId: string | null = curr.parentId || curr.parent_id || null;
+      curr = parentId ? resourceMap.get(parentId) || null : null;
+    }
+    return trail;
+  }, [currentLevel, resourceMap]);
+
+  // Reset custom placement when level changes
+  useEffect(() => {
+    setCustomGeometries({});
+    setIsCustomMode(false);
+    setSelectedLeafId(null);
+  }, [levelParam]);
+
+  // Keyboard navigation: Backspace navigates to parent
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Only process when not typing in an input
+      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) return;
+
+      if (e.key === 'Backspace') {
+        if (breadcrumbs.length > 1) {
+          e.preventDefault();
+          const parent = breadcrumbs[breadcrumbs.length - 2];
+          setSearchParams({ level: parent.id });
+        } else if (breadcrumbs.length === 1) {
+          e.preventDefault();
+          setSearchParams({});
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [breadcrumbs, setSearchParams]);
+
+  // Container dimensions
+  const containerW = 1200;
+  const containerH = 675; // 16:9 aspect ratio
+
+  // Calculated auto geometries for direct children
+  const autoGeometries = useMemo(() => {
+    return calculateAutoGrid(childIds, containerW, containerH);
+  }, [childIds]);
+
+  // Final geometry per child: custom or auto
+  const effectiveGeometries = useMemo(() => {
+    const result: Record<string, ItemGeometry> = {};
+    childIds.forEach((id) => {
+      if (isCustomMode && customGeometries[id]) {
+        result[id] = customGeometries[id];
+      } else {
+        result[id] = autoGeometries[id] || { x: 0, y: 0, w: 0.33, h: 0.5 };
+      }
     });
+    return result;
+  }, [childIds, isCustomMode, customGeometries, autoGeometries]);
+
+  // Children not placed yet (in custom mode)
+  const unplacedChildren = useMemo(() => {
+    if (!isCustomMode) return [];
+    return directChildren.filter((c) => !customGeometries[c.id]);
+  }, [directChildren, isCustomMode, customGeometries]);
+
+  // Roll-up statistics helper
+  const getRollup = (resourceId: string) => {
+    const descendants: ResourceNode[] = [];
+    const findDescendants = (id: string) => {
+      scopedResources.forEach((r) => {
+        if (r.parentId === id || r.parent_id === id) {
+          descendants.push(r);
+          findDescendants(r.id);
+        }
+      });
+    };
+    findDescendants(resourceId);
+
+    const descIds = new Set(descendants.map((d) => d.id));
+    const descSignals = signals.filter(
+      (s) => descIds.has(s.resourceId || s.resource_id || '')
+    );
+
+    const good = descSignals.filter((s) => s.quality?.toUpperCase() === 'GOOD').length;
+    const bad = descSignals.filter((s) => s.quality?.toUpperCase() === 'BAD').length;
+
+    return {
+      totalMachines: descendants.length,
+      goodCount: good,
+      badCount: bad,
+      hasSignals: descSignals.length > 0,
+    };
+  };
+
+  // Dragging and resizing mouse handlers
+  const handleMouseDownMove = (childId: string, e: React.MouseEvent) => {
+    if (mode !== 'edit') return;
+    setDraggingId(childId);
+    dragStartRef.current = {
+      clientX: e.clientX,
+      clientY: e.clientY,
+      initGeom: { ...effectiveGeometries[childId] },
+    };
+    setIsCustomMode(true);
+  };
+
+  const handleMouseDownResize = (childId: string, corner: string, e: React.MouseEvent) => {
+    if (mode !== 'edit') return;
+    e.stopPropagation();
+    setResizing({ id: childId, corner });
+    dragStartRef.current = {
+      clientX: e.clientX,
+      clientY: e.clientY,
+      initGeom: { ...effectiveGeometries[childId] },
+    };
+    setIsCustomMode(true);
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (!draggingNodeId || mode !== 'edit') return;
-    let newX = e.clientX - dragOffset.x;
-    let newY = e.clientY - dragOffset.y;
-    if (snapGrid) {
-      newX = Math.round(newX / 20) * 20;
-      newY = Math.round(newY / 20) * 20;
+    if (!dragStartRef.current) return;
+
+    const dx = (e.clientX - dragStartRef.current.clientX) / containerW;
+    const dy = (e.clientY - dragStartRef.current.clientY) / containerH;
+
+    if (draggingId) {
+      const init = dragStartRef.current.initGeom;
+      let newX = Math.max(0, Math.min(1 - init.w, init.x + dx));
+      let newY = Math.max(0, Math.min(1 - init.h, init.y + dy));
+      // Snap to 8px grid
+      const snapPx = 8;
+      newX = Math.round((newX * containerW) / snapPx) * (snapPx / containerW);
+      newY = Math.round((newY * containerH) / snapPx) * (snapPx / containerH);
+
+      const nextGeom: ItemGeometry = {
+        ...init,
+        x: Number(Math.max(0, Math.min(1 - init.w, newX)).toFixed(4)),
+        y: Number(Math.max(0, Math.min(1 - init.h, newY)).toFixed(4)),
+      };
+
+      const nextCustom = { ...effectiveGeometries, [draggingId]: nextGeom };
+      setCustomGeometries(nextCustom);
+
+      if (currentLevel) {
+        saveLevel(currentLevel.id, { mode: 'custom', items: nextCustom });
+      }
+    } else if (resizing) {
+      const init = dragStartRef.current.initGeom;
+      let newW = Math.max(0.1, Math.min(1 - init.x, init.w + dx));
+      let newH = Math.max(0.1, Math.min(1 - init.y, init.h + dy));
+
+      if (e.shiftKey) {
+        // Shift + drag preserves aspect ratio (TC-UI-LD-14)
+        const ratio = init.w / init.h;
+        newH = newW / ratio;
+      }
+
+      const nextGeom: ItemGeometry = {
+        ...init,
+        w: Number(Math.min(1 - init.x, newW).toFixed(4)),
+        h: Number(Math.min(1 - init.y, newH).toFixed(4)),
+      };
+
+      const nextCustom = { ...effectiveGeometries, [resizing.id]: nextGeom };
+      setCustomGeometries(nextCustom);
+
+      if (currentLevel) {
+        saveLevel(currentLevel.id, { mode: 'custom', items: nextCustom });
+      }
     }
-    updateLayoutNode(draggingNodeId, {
-      x: Math.max(20, Math.min(newX, 850)),
-      y: Math.max(20, Math.min(newY, 550)),
-    });
   };
 
   const handleMouseUp = () => {
-    setDraggingNodeId(null);
+    setDraggingId(null);
+    setResizing(null);
+    dragStartRef.current = null;
   };
 
-  if (!selectedNode) {
-    return (
-      <div className="space-y-3">
-        <h1 className="fx-page-title">Factory Layout</h1>
-        <p className="fx-page-subtitle">Lines and machines appear on this floor after you add them in Factory Structure.</p>
-      </div>
-    );
-  }
+  const handleResetToAuto = () => {
+    setCustomGeometries({});
+    setIsCustomMode(false);
+    if (currentLevel) {
+      saveLevel(currentLevel.id, { mode: 'auto', items: {} });
+    }
+  };
+
+  const selectedLeafResource = selectedLeafId ? resourceMap.get(selectedLeafId) : null;
 
   return (
     <div
-      className="space-y-4 animate-in fade-in duration-200 select-none"
+      className="space-y-4 animate-in fade-in duration-200 select-none pb-8"
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
     >
-      {/* Region 1 & 2: Heading & Edit/View Toggles */}
+      {/* Top Header: Breadcrumbs + Actions */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="fx-page-title">Factory Layout Designer</h1>
-          <p className="fx-page-subtitle">
-            Visual plant floor editor, physical placement, and real-time operational overlay.
-          </p>
-        </div>
-        <div className="flex items-center gap-3">
-          <div className="bg-[#F1F5FA] p-1 rounded-lg flex items-center border border-[#D4DFEC]">
+          {/* Breadcrumb Navigation (§5.2 & TC-UI-LD-01..07) */}
+          <nav aria-label="Hierarchy Breadcrumb" className="flex items-center gap-1.5 text-xs font-semibold text-[#64748B] mb-1">
             <button
               type="button"
-              onClick={() => setMode('edit')}
-              className={`px-3 py-1.5 rounded-md text-[13px] font-semibold transition-all ${
-                mode === 'edit'
-                  ? 'bg-white text-[#EF1B24] shadow-sm'
-                  : 'text-[#657794] hover:text-[#111B37]'
+              onClick={() => setSearchParams({})}
+              className={`hover:text-[#0B2545] transition-colors flex items-center gap-1 ${
+                !currentLevel ? 'text-[#0B2545] font-bold' : ''
               }`}
             >
-              Edit Mode
+              <Home className="w-3.5 h-3.5" />
+              <span>All</span>
             </button>
+            {breadcrumbs.map((crumb, idx) => {
+              const isLast = idx === breadcrumbs.length - 1;
+              return (
+                <React.Fragment key={crumb.id}>
+                  <ChevronRight className="w-3.5 h-3.5 text-[#CBD5E1]" />
+                  <button
+                    type="button"
+                    onClick={() => setSearchParams({ level: crumb.id })}
+                    className={`hover:text-[#0B2545] transition-colors truncate max-w-[140px] ${
+                      isLast ? 'text-[#0B2545] font-bold' : ''
+                    }`}
+                  >
+                    {crumb.name}
+                  </button>
+                </React.Fragment>
+              );
+            })}
+          </nav>
+          <h1 className="text-xl md:text-2xl font-black text-[#0B2545] tracking-tight">
+            {currentLevel ? currentLevel.name : 'Factory Layout Designer'}
+          </h1>
+        </div>
+
+        {/* Top Controls: View/Edit toggle + Reset Auto + Save status indicator */}
+        <div className="flex items-center gap-3">
+          {/* Saving Indicator (TC-UI-LD-13) */}
+          {mode === 'edit' && (
+            <div className="text-xs flex items-center gap-1.5 font-medium text-[#64748B] mr-2">
+              {saveStatus === 'saving' && (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[#134074]" />
+                  <span>Saving…</span>
+                </>
+              )}
+              {saveStatus === 'saved' && (
+                <>
+                  <CheckCircle2 className="w-3.5 h-3.5 text-[#10B981]" />
+                  <span>Saved · {lastSavedTime}</span>
+                </>
+              )}
+              {saveStatus === 'error' && (
+                <>
+                  <AlertCircle className="w-3.5 h-3.5 text-[#EF4444]" />
+                  <span>Could not save · Retrying</span>
+                </>
+              )}
+            </div>
+          )}
+
+          {mode === 'edit' && isCustomMode && (
+            <button
+              type="button"
+              onClick={handleResetToAuto}
+              className="px-3 py-1.5 rounded-lg border border-[#CBD5E1] bg-white text-xs font-semibold text-[#475569] hover:text-[#0B2545] hover:bg-[#F8FAFC] flex items-center gap-1.5 shadow-sm transition-all"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset to auto layout</span>
+            </button>
+          )}
+
+          <div className="bg-[#F1F5F9] p-1 rounded-xl flex items-center border border-[#E2E8F0]">
             <button
               type="button"
               onClick={() => setMode('view')}
-              className={`px-3 py-1.5 rounded-md text-[13px] font-semibold transition-all ${
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
                 mode === 'view'
-                  ? 'bg-white text-[#0DBA67] shadow-sm'
-                  : 'text-[#657794] hover:text-[#111B37]'
+                  ? 'bg-white text-[#0B2545] shadow-sm'
+                  : 'text-[#64748B] hover:text-[#0B2545]'
               }`}
             >
-              Live Monitor View
+              <Eye className="w-3.5 h-3.5" />
+              <span>View</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('edit')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
+                mode === 'edit'
+                  ? 'bg-white text-[#134074] shadow-sm'
+                  : 'text-[#64748B] hover:text-[#0B2545]'
+              }`}
+            >
+              <Edit3 className="w-3.5 h-3.5" />
+              <span>Edit layout</span>
             </button>
           </div>
-          <Button
-            variant="primary"
-            icon={<Save className="w-4 h-4" />}
-            onClick={() => {
-              const anchor = layoutNodes[0];
-              if (!anchor) {
-                setSaveToast('Add machines in Factory Structure before saving a layout.');
-              } else {
-                // Re-persist current positions through the same draft API used by drag.
-                updateLayoutNode(anchor.id, { x: anchor.x, y: anchor.y });
-                setSaveToast('Layout draft saved to the appliance.');
-              }
-              setTimeout(() => setSaveToast(null), 3000);
-            }}
-          >
-            Save Layout Draft
-          </Button>
         </div>
       </div>
 
-      {saveToast && (
-        <div className="p-3 bg-slate-900 text-white rounded-xl text-xs font-semibold shadow-lg flex items-center justify-between animate-in fade-in">
-          <span>{saveToast}</span>
-        </div>
-      )}
+      {/* Main Layout Workspace: Optional Left Tray (Edit mode) + Canvas + Optional Right Panel (Leaf Inspector) */}
+      <div className="flex gap-4 items-start relative min-h-[700px]">
+        {/* Left Tray: "Not placed yet" (Only in Edit mode) (TC-UI-LD-12, 21, 22) */}
+        {mode === 'edit' && (
+          <div className="w-64 bg-white border border-[#E2E8F0] rounded-2xl p-4 shadow-sm shrink-0 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-[#475569]">
+                Not placed yet ({unplacedChildren.length})
+              </h3>
+            </div>
 
-      {/* Main Designer Grid: Palette (Reg 3, 8) - Canvas (Reg 4, 5, 6) - Inspector (Reg 7) */}
-      <div className="grid grid-cols-12 gap-3.5">
-        {/* Left: Component Palette (Region 3) */}
-        <div className="col-span-12 lg:col-span-2 space-y-3.5">
-          <Card title="Asset Palette" className="p-3">
-            <p className="text-[11px] text-[#657794] mb-3">
-              Drag or click to add equipment to canvas:
-            </p>
-            <div className="space-y-2">
-              {[
-                { name: 'CNC Milling Unit', icon: Cpu, type: 'machine' },
-                { name: 'Stamping Press', icon: Factory, type: 'press' },
-                { name: 'Transfer Robot', icon: Boxes, type: 'robot' },
-                { name: 'Packaging Sealer', icon: Boxes, type: 'packaging' },
-              ].map((item, idx) => {
-                const Icon = item.icon;
-                return (
+            <div className="space-y-2 max-h-[460px] overflow-y-auto">
+              {unplacedChildren.length === 0 ? (
+                <div className="p-4 text-center border border-dashed border-[#CBD5E1] rounded-xl text-xs text-[#94A3B8]">
+                  All resources at this level are placed on canvas.
+                </div>
+              ) : (
+                unplacedChildren.map((item) => (
                   <div
-                    key={idx}
-                    className="p-2.5 rounded-lg border border-[#E3EAF3] hover:border-[#EF1B24] bg-white cursor-pointer transition-all flex items-center gap-2.5 shadow-sm text-[12px] font-semibold text-[#111B37]"
+                    key={item.id}
+                    onClick={() => {
+                      // Click places unplaced item onto canvas
+                      const nextGeom: ItemGeometry = { x: 0.1, y: 0.1, w: 0.33, h: 0.5 };
+                      setCustomGeometries((prev) => ({ ...prev, [item.id]: nextGeom }));
+                    }}
+                    className="p-3 rounded-xl border border-[#E2E8F0] hover:border-[#134074] bg-[#F8FAFC] hover:bg-white cursor-pointer transition-all shadow-sm"
                   >
-                    <Icon className="w-4 h-4 text-[#EF1B24]" />
-                    <span>{item.name}</span>
+                    <div className="text-xs font-bold text-[#0B2545] truncate">{item.name}</div>
+                    <div className="text-[10px] font-mono text-[#64748B]">{item.code}</div>
                   </div>
-                );
-              })}
-            </div>
-          </Card>
-
-          {/* Region 8: Quick Action Tools */}
-          <Card title="Canvas Tools" className="p-3">
-            <div className="space-y-2 text-[12px]">
-              <button
-                type="button"
-                onClick={() => setSnapGrid(!snapGrid)}
-                className={`w-full py-1.5 px-2 rounded-md flex items-center justify-between border ${
-                  snapGrid ? 'bg-[#FFF0F1] border-[#EF1B24] text-[#EF1B24] font-bold' : 'border-[#D4DFEC] text-[#657794]'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <Grid className="w-3.5 h-3.5" />
-                  <span>Snap to Grid</span>
-                </div>
-                <span>{snapGrid ? 'ON' : 'OFF'}</span>
-              </button>
-            </div>
-          </Card>
-        </div>
-
-        {/* Center: Canvas Toolbar (Region 4) & Floor Canvas (Region 5 & 6) */}
-        <div className="col-span-12 lg:col-span-7 space-y-2">
-          {/* Region 4: Canvas Toolbar */}
-          <div className="h-11 px-4 rounded-xl border border-[#E3EAF3] bg-white flex items-center justify-between shadow-sm">
-            <div className="flex items-center gap-1 border-r border-[#E3EAF3] pr-3">
-              <button
-                type="button"
-                className={`p-1.5 rounded-lg ${
-                  mode === 'edit' ? 'bg-[#FFF0F1] text-[#EF1B24]' : 'text-[#657794]'
-                }`}
-                title="Select tool"
-              >
-                <MousePointer className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                className={`p-1.5 rounded-lg ${
-                  mode === 'view' ? 'bg-[#FFF0F1] text-[#EF1B24]' : 'text-[#657794]'
-                }`}
-                title="Pan canvas"
-              >
-                <Hand className="w-4 h-4" />
-              </button>
+                ))
+              )}
             </div>
 
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setZoom((z) => Math.max(50, z - 10))}
-                className="p-1.5 rounded-lg text-[#657794] hover:bg-[#F1F5FA]"
-              >
-                <ZoomOut className="w-4 h-4" />
-              </button>
-              <span className="font-mono text-[12px] font-semibold text-[#111B37] w-12 text-center">
-                {zoom}%
-              </span>
-              <button
-                type="button"
-                onClick={() => setZoom((z) => Math.min(150, z + 10))}
-                className="p-1.5 rounded-lg text-[#657794] hover:bg-[#F1F5FA]"
-              >
-                <ZoomIn className="w-4 h-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setZoom(100)}
-                className="p-1.5 rounded-lg text-[#657794] hover:bg-[#F1F5FA]"
-                title="Fit to Screen"
-              >
-                <Maximize2 className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="flex items-center gap-1 border-l border-[#E3EAF3] pl-3">
-              <button type="button" className="p-1.5 rounded-lg text-[#94A3B8] hover:text-[#111B37]">
-                <Undo2 className="w-4 h-4" />
-              </button>
-              <button type="button" className="p-1.5 rounded-lg text-[#94A3B8] hover:text-[#111B37]">
-                <Redo2 className="w-4 h-4" />
-              </button>
-            </div>
+            {/* "+ Add resource here" button (TC-UI-LD-22) */}
+            <button
+              type="button"
+              onClick={() => setIsAddModalOpen(true)}
+              className="w-full py-2 px-3 rounded-xl bg-[#0B2545] hover:bg-[#134074] text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-sm transition-all"
+            >
+              <Plus className="w-4 h-4" />
+              <span>+ Add resource here</span>
+            </button>
           </div>
+        )}
 
-          {/* Region 5: Factory Floor Canvas with SVG Blueprint Reference */}
-          <div
-            className="h-[680px] rounded-xl border border-[#D4DFEC] bg-white relative overflow-hidden shadow-inner cursor-crosshair"
-            style={{
-              backgroundImage:
-                'radial-gradient(circle, #CBD5E1 1px, transparent 1px), radial-gradient(circle, #E2E8F0 1px, transparent 1px)',
-              backgroundSize: '20px 20px',
-              backgroundPosition: '0 0, 10px 10px',
-            }}
+        {/* Center Canvas Container with Zoom & Pan (§5.2 & TC-UI-LD-19, 20) */}
+        <div className="flex-1 bg-white border border-[#E2E8F0] rounded-2xl overflow-hidden shadow-sm flex flex-col">
+          {/* Zoom & Canvas Toolbar */}
+          <TransformWrapper
+            initialScale={1}
+            minScale={0.25}
+            maxScale={4}
+            centerOnInit
+            wheel={{ step: 0.1 }}
+            onTransform={(ref: any) => setZoomLevel(Math.round(ref.state.scale * 100))}
           >
-            {/* Plant Blueprint Vector Lines in Background */}
-            <svg className="absolute inset-0 w-full h-full pointer-events-none opacity-20">
-              <rect x="50" y="40" width="760" height="580" fill="none" stroke="#2A82E7" strokeWidth="2" strokeDasharray="6 4" />
-              <line x1="50" y1="220" x2="810" y2="220" stroke="#2A82E7" strokeWidth="1.5" strokeDasharray="4 4" />
-              <text x="70" y="65" fill="#2A82E7" fontSize="12" fontWeight="bold">ZONE A - MACHINING & FABRICATION</text>
-              <text x="70" y="245" fill="#2A82E7" fontSize="12" fontWeight="bold">ZONE B - ASSEMBLY & PACKAGING</text>
-            </svg>
-
-            {/* Draggable Machine Cards (Region 6) */}
-            {layoutNodes.map((node) => {
-              const isSelected = node.id === selectedNodeId;
-              return (
-                <div
-                  key={node.id}
-                  onMouseDown={(e) => handleMouseDown(e, node)}
-                  style={{
-                    left: `${node.x}px`,
-                    top: `${node.y}px`,
-                    width: `${node.width}px`,
-                    height: `${node.height}px`,
-                  }}
-                  className={`absolute rounded-xl bg-white p-3 cursor-move transition-shadow duration-75 select-none ${
-                    isSelected
-                      ? 'border-2 border-[#EF1B24] shadow-lg ring-4 ring-[#FFF0F1]'
-                      : 'border border-[#D4DFEC] hover:border-[#2A82E7] shadow-sm'
-                  }`}
-                >
-                  {/* Selected Handles */}
-                  {isSelected && mode === 'edit' && (
-                    <>
-                      <div className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-white border-2 border-[#EF1B24] rounded-sm" />
-                      <div className="absolute -top-1.5 -right-1.5 w-3 h-3 bg-white border-2 border-[#EF1B24] rounded-sm" />
-                      <div className="absolute -bottom-1.5 -left-1.5 w-3 h-3 bg-white border-2 border-[#EF1B24] rounded-sm" />
-                      <div className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-white border-2 border-[#EF1B24] rounded-sm" />
-                    </>
-                  )}
-
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[12px] font-bold text-[#111B37] truncate">{node.name}</span>
-                    <span
-                      className={`w-2 h-2 rounded-full ${
-                        node.status === 'running'
-                          ? 'bg-[#0DBA67]'
-                          : node.status === 'offline'
-                          ? 'bg-[#F2343B]'
-                          : 'bg-[#94A3B8]'
-                      }`}
-                    />
+            {({ zoomIn, zoomOut, resetTransform }) => (
+              <>
+                <div className="h-12 px-4 border-b border-[#E2E8F0] flex items-center justify-between bg-[#F8FAFC]">
+                  <div className="flex items-center gap-2 text-xs font-bold text-[#475569]">
+                    <span>Floor View</span>
+                    <span className="text-[#94A3B8]">·</span>
+                    <span className="text-[#64748B] font-mono font-normal">
+                      {directChildren.length} elements
+                    </span>
                   </div>
 
-                  <div className="text-[10px] font-mono text-[#657794]">{node.code}</div>
-
-                  {/* Real-time Overlay Stats */}
-                  <div className="mt-2 pt-2 border-t border-[#F1F5FA] grid grid-cols-2 gap-1 text-[11px]">
-                    {node.temperature !== undefined && (
-                      <div className="text-[#657794]">
-                        T: <span className="font-extrabold text-[#EF1B24]">{node.temperature}°C</span>
-                      </div>
-                    )}
-                    {node.speed !== undefined && (
-                      <div className="text-[#657794]">
-                        RPM: <span className="font-bold text-[#111B37]">{node.speed}</span>
-                      </div>
-                    )}
-                    {node.pressure !== undefined && (
-                      <div className="text-[#657794]">
-                        P: <span className="font-bold text-[#2A82E7]">{node.pressure}b</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Right: Properties Inspector (Region 7) */}
-        <div className="col-span-12 lg:col-span-3 space-y-3.5">
-          <Card title="Properties Inspector" className="h-[734px] overflow-y-auto">
-            <div className="space-y-4">
-              <div>
-                <span className="text-[11px] font-bold uppercase text-[#94A3B8]">Selected Asset</span>
-                <h3 className="text-[15px] font-extrabold text-[#111B37] mt-0.5">
-                  {selectedNode.name}
-                </h3>
-                <span className="font-mono text-[12px] text-[#657794]">{selectedNode.code}</span>
-              </div>
-
-              {/* Geometry Dimensions */}
-              <div className="pt-3 border-t border-[#E3EAF3] space-y-2.5">
-                <span className="text-[11px] font-bold uppercase text-[#94A3B8]">Placement & Size</span>
-                <div className="grid grid-cols-2 gap-2 text-[12px]">
-                  <div>
-                    <label className="text-[#657794] block text-[11px] mb-1">X Position</label>
-                    <input
-                      type="number"
-                      value={selectedNode.x}
-                      onChange={(e) =>
-                        updateLayoutNode(selectedNode.id, { x: parseInt(e.target.value) || 0 })
-                      }
-                      className="fx-input h-8 text-[12px]"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[#657794] block text-[11px] mb-1">Y Position</label>
-                    <input
-                      type="number"
-                      value={selectedNode.y}
-                      onChange={(e) =>
-                        updateLayoutNode(selectedNode.id, { y: parseInt(e.target.value) || 0 })
-                      }
-                      className="fx-input h-8 text-[12px]"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[#657794] block text-[11px] mb-1">Width</label>
-                    <input
-                      type="number"
-                      value={selectedNode.width}
-                      onChange={(e) =>
-                        updateLayoutNode(selectedNode.id, { width: parseInt(e.target.value) || 50 })
-                      }
-                      className="fx-input h-8 text-[12px]"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[#657794] block text-[11px] mb-1">Height</label>
-                    <input
-                      type="number"
-                      value={selectedNode.height}
-                      onChange={(e) =>
-                        updateLayoutNode(selectedNode.id, { height: parseInt(e.target.value) || 50 })
-                      }
-                      className="fx-input h-8 text-[12px]"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Operational Telemetry Summary */}
-              <div className="pt-3 border-t border-[#E3EAF3] space-y-2">
-                <span className="text-[11px] font-bold uppercase text-[#94A3B8]">
-                  Operational State
-                </span>
-                <div className="p-3 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3] space-y-1.5 text-[12px]">
-                  <div className="flex justify-between">
-                    <span className="text-[#657794]">Running Status:</span>
-                    <Badge
-                      variant={
-                        selectedNode.status === 'running'
-                          ? 'good'
-                          : selectedNode.status === 'offline'
-                          ? 'error'
-                          : selectedNode.status === 'idle' || !selectedNode.status
-                          ? 'neutral'
-                          : 'warning'
-                      }
+                  {/* Zoom Controls */}
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => zoomOut()}
+                      aria-label="Zoom out"
+                      className="p-1.5 rounded-lg text-[#64748B] hover:text-[#0B2545] hover:bg-[#E2E8F0] transition-colors"
                     >
-                      {selectedNode.status === 'running'
-                        ? 'RUNNING'
-                        : selectedNode.status === 'offline'
-                        ? 'OFFLINE'
-                        : selectedNode.status === 'warning'
-                        ? 'WARNING'
-                        : 'NO DATA'}
-                    </Badge>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-[#657794]">Power Consumption:</span>
-                    <span className="font-bold text-[#111B37]">{selectedNode.power ?? '—'}</span>
+                      <ZoomOut className="w-4 h-4" />
+                    </button>
+                    <span className="font-mono text-xs font-bold text-[#0B2545] w-12 text-center">
+                      {zoomLevel}%
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => zoomIn()}
+                      aria-label="Zoom in"
+                      className="p-1.5 rounded-lg text-[#64748B] hover:text-[#0B2545] hover:bg-[#E2E8F0] transition-colors"
+                    >
+                      <ZoomIn className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => resetTransform()}
+                      className="px-2.5 py-1 rounded-lg text-xs font-semibold text-[#475569] hover:text-[#0B2545] hover:bg-[#E2E8F0] flex items-center gap-1 transition-colors ml-1"
+                      title="Fit to container"
+                    >
+                      <Maximize2 className="w-3.5 h-3.5" />
+                      <span>Fit</span>
+                    </button>
                   </div>
                 </div>
-              </div>
-            </div>
-          </Card>
+
+                {/* 16:9 Canvas Stage with Dot Grid */}
+                <div className="flex-1 overflow-hidden relative cursor-default bg-[#F8FAFC]">
+                  <TransformComponent
+                    wrapperStyle={{ width: '100%', height: '680px' }}
+                    contentStyle={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                  >
+                    <div
+                      style={{
+                        width: `${containerW}px`,
+                        height: `${containerH}px`,
+                        backgroundImage: 'radial-gradient(circle, #CBD5E1 1px, transparent 1px)',
+                        backgroundSize: '24px 24px',
+                      }}
+                      className="relative border border-[#E2E8F0] bg-white rounded-xl shadow-inner overflow-hidden select-none"
+                    >
+                      {directChildren.length === 0 ? (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center text-[#94A3B8] p-6 text-center">
+                          <p className="text-sm font-semibold">No equipment placed here yet.</p>
+                          <p className="text-xs text-[#94A3B8] mt-1">
+                            Click "+ Add resource here" in Edit mode or create them in Factory Structure.
+                          </p>
+                        </div>
+                      ) : (
+                        directChildren.map((child) => {
+                          const geom = effectiveGeometries[child.id] || { x: 0, y: 0, w: 0.33, h: 0.5 };
+                          const childSubs = scopedResources.filter(
+                            (r) => r.parentId === child.id || r.parent_id === child.id
+                          );
+                          const isLeaf = childSubs.length === 0;
+
+                          return (
+                            <ResourceCard
+                              key={child.id}
+                              resource={child}
+                              childrenCount={childSubs.length}
+                              childTypeLabel={
+                                childSubs.length > 0 ? `${childSubs[0].type}s` : 'items'
+                              }
+                              signals={signals}
+                              rollup={getRollup(child.id)}
+                              geometry={geom}
+                              containerWidth={containerW}
+                              containerHeight={containerH}
+                              isEditMode={mode === 'edit'}
+                              isSelected={selectedLeafId === child.id}
+                              onDrillDown={() => setSearchParams({ level: child.id })}
+                              onSelectLeaf={() => setSelectedLeafId(child.id)}
+                              onMouseDownMove={(e) => handleMouseDownMove(child.id, e)}
+                              onMouseDownResize={(e, corner) => handleMouseDownResize(child.id, corner, e)}
+                            />
+                          );
+                        })
+                      )}
+                    </div>
+                  </TransformComponent>
+                </div>
+              </>
+            )}
+          </TransformWrapper>
         </div>
+
+        {/* Right Details Panel for Leaf Card (§5.2 step 5 & TC-UI-LD-11) */}
+        {selectedLeafResource && (
+          <ResourceDetailPanel
+            resource={selectedLeafResource}
+            signals={signals}
+            onClose={() => setSelectedLeafId(null)}
+          />
+        )}
       </div>
+
+      {/* Add Resource Modal (TC-UI-LD-22) */}
+      <AddResourceModal
+        isOpen={isAddModalOpen}
+        onClose={() => setIsAddModalOpen(false)}
+        parentId={currentLevel ? currentLevel.id : null}
+        parentName={currentLevel ? currentLevel.name : 'Root'}
+        parentPath={currentLevel ? currentLevel.code : '(root)'}
+        onAddResource={async (newRes) => {
+          setIsAddModalOpen(false);
+          await refresh();
+        }}
+      />
     </div>
   );
 };

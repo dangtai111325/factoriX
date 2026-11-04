@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -17,17 +20,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import collect, edge_sync, identity, resources, telemetry
 from factorix.modules.collect import (
+    CaptureIn,
     ConnectionIn,
+    ConnectionPatch,
     EdgeIn,
+    EdgePatch,
     FormulaIn,
     MappingPreviewIn,
     OutputGroupIn,
+    OutputGroupPatch,
     PreviewIn,
     ReleaseIn,
+    SignalBulkActionIn,
     SignalBulkIn,
     SignalPatch,
+    TestIn,
 )
-from factorix.modules.common import as_uuid, fetch_all, fetch_one, parse_uuid
+from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, parse_uuid
 from factorix.platform.after_commit import listen
 from factorix.modules.identity import (
     SESSION_COOKIE,
@@ -59,6 +68,7 @@ from factorix.modules.resources import (
     ResourceIn,
     ResourcePatch,
     SiteIn,
+    TopicImportIn,
     TypeIn,
 )
 from factorix.modules.telemetry import DashboardIn, DashboardPatch, RetentionIn
@@ -125,7 +135,135 @@ async def _publish_committed(events: list[dict[str, Any]]) -> None:
 
 listen(_publish_committed)
 
-app = FastAPI(title="FactoriX IIoT Center", version="1.0.0", openapi_url="/api/openapi.json")
+async def _background_health_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(10)
+            factory = session_factory()
+            async with factory() as session:
+                now = datetime.now(timezone.utc)
+                cutoff_edge = now - timedelta(seconds=30)
+                cutoff_conn = now - timedelta(seconds=35)
+                cutoff_com = now - timedelta(seconds=30)
+
+                # 1. Edge offline transition (CR-E02, EDGE-05)
+                stale_edges = await fetch_all(
+                    session,
+                    """
+                    SELECT id, tenant_id, name, health
+                    FROM edge_nodes
+                    WHERE enrollment_status = 'ENROLLED'
+                      AND health NOT IN ('OFFLINE', 'UNKNOWN')
+                      AND (last_heartbeat IS NULL OR last_heartbeat < :cutoff)
+                    """,
+                    {"cutoff": cutoff_edge},
+                )
+                for e in stale_edges:
+                    await execute(
+                        session,
+                        "UPDATE edge_nodes SET health = 'OFFLINE' WHERE id = :id",
+                        {"id": e["id"]},
+                    )
+                    await audit(
+                        session,
+                        tenant_id=as_uuid(e["tenant_id"]),
+                        event_type="EDGE_OFFLINE",
+                        actor_id=None,
+                        entity_type="edge",
+                        entity_id=as_uuid(e["id"]),
+                        before={"health": e["health"]},
+                        after={"health": "OFFLINE"},
+                        correlation_id=f"health-{uuid4().hex[:8]}",
+                        severity="WARN",
+                    )
+
+                # 2. Connection degraded transition (CR-C03, EDGE-09)
+                stale_conns = await fetch_all(
+                    session,
+                    """
+                    SELECT id, tenant_id, name, health
+                    FROM connections
+                    WHERE status = 'ACTIVE'
+                      AND health NOT IN ('DEGRADED', 'PAUSED')
+                      AND (last_success_at IS NULL OR last_success_at < :cutoff)
+                    """,
+                    {"cutoff": cutoff_conn},
+                )
+                for c in stale_conns:
+                    await execute(
+                        session,
+                        "UPDATE connections SET health = 'DEGRADED', last_error = 'No data received for 30 s' WHERE id = :id",
+                        {"id": c["id"]},
+                    )
+                    await audit(
+                        session,
+                        tenant_id=as_uuid(c["tenant_id"]),
+                        event_type="CONNECTION_DEGRADED",
+                        actor_id=None,
+                        entity_type="connection",
+                        entity_id=as_uuid(c["id"]),
+                        before={"health": c["health"]},
+                        after={"health": "DEGRADED", "last_error": "No data received for 30 s"},
+                        correlation_id=f"health-{uuid4().hex[:8]}",
+                        severity="WARN",
+                    )
+
+                # 3. Commissioning timeout reaper (CR-Q06, COM-12)
+                stale_jobs = await fetch_all(
+                    session,
+                    """
+                    SELECT id, tenant_id, connection_id
+                    FROM commissioning_jobs
+                    WHERE status IN ('PENDING', 'RUNNING')
+                      AND started_at < :cutoff
+                    """,
+                    {"cutoff": cutoff_com},
+                )
+                for j in stale_jobs:
+                    await execute(
+                        session,
+                        """
+                        UPDATE commissioning_jobs
+                        SET status = 'FAILED', error_code = 'TIMEOUT',
+                            diagnostic = 'The edge did not answer within 30 seconds.',
+                            completed_at = :now
+                        WHERE id = :id
+                        """,
+                        {"id": j["id"], "now": now},
+                    )
+                    await audit(
+                        session,
+                        tenant_id=as_uuid(j["tenant_id"]),
+                        event_type="COMMISSION_FAILED",
+                        actor_id=None,
+                        entity_type="commissioning",
+                        entity_id=as_uuid(j["id"]),
+                        before={"status": "PENDING"},
+                        after={"status": "FAILED", "error_code": "TIMEOUT"},
+                        correlation_id=f"reaper-{uuid4().hex[:8]}",
+                        severity="WARN",
+                    )
+                await session.commit()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    task = asyncio.create_task(_background_health_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+app = FastAPI(title="FactoriX IIoT Center", version="1.0.0", openapi_url="/api/openapi.json", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.web_origin],
@@ -376,6 +514,12 @@ async def archive_resource(resource_id: str, request: Request, principal: dict[s
     return await resources.archive_resource(session, tenant_id, actor, parse_uuid(resource_id), correlation_id(request))
 
 
+@app.post("/api/v1/resources/{resource_id}/restore")
+async def restore_resource(resource_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await resources.restore_resource(session, tenant_id, actor, parse_uuid(resource_id), correlation_id(request))
+
+
 @app.post("/api/v1/resources/{resource_id}/move")
 async def move_resource(resource_id: str, body: MoveIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
@@ -386,6 +530,12 @@ async def move_resource(resource_id: str, body: MoveIn, request: Request, princi
 async def import_resources(body: ImportIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await resources.import_resources(session, tenant_id, actor, body, correlation_id(request))
+
+
+@app.post("/api/v1/resources/import/from-topics")
+async def import_resources_from_topics(body: TopicImportIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await resources.import_from_topics(session, tenant_id, actor, body, correlation_id(request))
 
 
 @app.post("/api/v1/resource-relations", status_code=201)
@@ -424,11 +574,28 @@ async def validate_hierarchy(view_id: str, principal: dict[str, Any] = Depends(a
 
 
 @app.get("/api/v1/graph/neighbors")
-async def graph(resource_id: str, depth: int = 1, relation_types: str = "", as_of: str | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+@app.get("/api/v1/resources/neighbors")
+async def graph(
+    resource_id: str,
+    depth: int = 1,
+    relation_types: str = "",
+    include_data: bool = False,
+    as_of: str | None = None,
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
     moment = datetime.fromisoformat(as_of.replace("Z", "+00:00")) if as_of else None
     codes = [item for item in relation_types.split(",") if item]
-    return await resources.neighbors(session, tenant_id, parse_uuid(resource_id), depth=depth, relation_codes=codes, as_of=moment)
+    return await resources.neighbors(
+        session,
+        tenant_id,
+        parse_uuid(resource_id),
+        depth=depth,
+        relation_codes=codes,
+        as_of=moment,
+        include_data=include_data,
+    )
 
 
 @app.get("/api/v1/layouts")
@@ -487,10 +654,22 @@ async def connection_detail(connection_id: str, principal: dict[str, Any] = Depe
     return await collect.get_connection(session, tenant_id, parse_uuid(connection_id))
 
 
+@app.patch("/api/v1/connections/{connection_id}")
+async def patch_connection(connection_id: str, body: ConnectionPatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.patch_connection(session, tenant_id, actor, parse_uuid(connection_id), body, data_key=settings.data_key, correlation_id=correlation_id(request))
+
+
 @app.post("/api/v1/connections/{connection_id}/pause")
 async def pause_connection(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await collect.pause_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
+
+
+@app.post("/api/v1/connections/{connection_id}/resume")
+async def resume_connection(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.resume_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
 
 
 @app.delete("/api/v1/connections/{connection_id}")
@@ -499,27 +678,60 @@ async def delete_connection(connection_id: str, request: Request, principal: dic
     return await collect.archive_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
 
 
-@app.post("/api/v1/connections/{connection_id}/tests", status_code=202)
-async def commission(connection_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+@app.post("/api/v1/connections/{connection_id}/capture")
+async def capture_connection(connection_id: str, body: CaptureIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
-    return await collect.request_commission(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
+    return await collect.capture_connection(session, tenant_id, actor, parse_uuid(connection_id), body, correlation_id(request))
+
+
+@app.post("/api/v1/connections/{connection_id}/tests", status_code=202)
+async def commission(connection_id: str, request: Request, body: TestIn | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    mode = body.mode if body and body.mode else "FULL"
+    fields = body.fields if body else None
+    return await collect.request_commission(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request), mode=mode, fields=fields)
 
 
 @app.get("/api/v1/commissioning/{job_id}")
 async def commission_job(job_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
-    row = await fetch_one(session, "SELECT id, connection_id, stages_json, status, error_code, diagnostic, started_at, completed_at FROM commissioning_jobs WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(job_id), "tenant_id": tenant_id})
+    row = await fetch_one(session, "SELECT id, connection_id, stages_json, status, error_code, diagnostic, samples_json, started_at, completed_at FROM commissioning_jobs WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(job_id), "tenant_id": tenant_id})
     if row is None:
         raise AppError(404, "NOT_FOUND", "Commissioning job not found.")
+
+    # 30-second reaper
+    if row["status"] in {"PENDING", "RUNNING"}:
+        started = row.get("started_at")
+        if started:
+            from factorix.modules.common import utcnow
+            elapsed = (utcnow() - started).total_seconds()
+            if elapsed > 30:
+                await execute(
+                    session,
+                    """
+                    UPDATE commissioning_jobs
+                    SET status = 'FAILED', error_code = 'TIMEOUT', diagnostic = 'Commissioning job timed out after 30 seconds.', completed_at = :now
+                    WHERE id = :id
+                    """,
+                    {"now": utcnow(), "id": row["id"]},
+                )
+                row["status"] = "FAILED"
+                row["error_code"] = "TIMEOUT"
+                row["diagnostic"] = "Commissioning job timed out after 30 seconds."
+
     status = "COMPLETED" if row["status"] == "PASSED" else row["status"]
     stages = list(row.get("stages_json") or [])
-    by_stage = {item.get("stage"): item for item in stages if isinstance(item, dict)}
-    aliases = {"NETWORK": "transport", "READ_OR_SUBSCRIBE": "read_sample", "DECODE": "decode_quality"}
-    for source, alias in aliases.items():
-        found = by_stage.get(source)
-        if isinstance(found, dict):
-            stages.append({**found, "stage": alias})
-    return {**row, "status": status, "stages_json": stages}
+    return {
+        "id": row["id"],
+        "connection_id": row["connection_id"],
+        "status": status,
+        "error_code": row.get("error_code"),
+        "diagnostic": row.get("diagnostic") or "",
+        "stages_json": stages,
+        "samples_json": row.get("samples_json") or {},
+        "started_at": row.get("started_at"),
+        "completed_at": row.get("completed_at"),
+    }
 
 
 @app.get("/api/v1/signals")
@@ -538,6 +750,18 @@ async def signal_bulk(body: SignalBulkIn, request: Request, principal: dict[str,
 async def patch_signal(signal_id: str, body: SignalPatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await collect.patch_signal(session, tenant_id, actor, parse_uuid(signal_id), body, correlation_id(request))
+
+
+@app.delete("/api/v1/signals/{signal_id}")
+async def delete_signal(signal_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.delete_signal(session, tenant_id, actor, parse_uuid(signal_id), correlation_id(request))
+
+
+@app.post("/api/v1/signals/bulk-action")
+async def signal_bulk_action(body: SignalBulkActionIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.bulk_action_signals(session, tenant_id, actor, body, correlation_id(request))
 
 
 @app.get("/api/v1/signals/{signal_id}/latest")
@@ -592,6 +816,24 @@ async def create_group(body: OutputGroupIn, request: Request, principal: dict[st
     return await collect.create_output_group(session, tenant_id, actor, body, correlation_id(request))
 
 
+@app.get("/api/v1/output-groups/{group_id}")
+async def output_group_detail(group_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, _actor = _ids(principal)
+    return await collect.get_output_group(session, tenant_id, parse_uuid(group_id))
+
+
+@app.patch("/api/v1/output-groups/{group_id}")
+async def patch_output_group(group_id: str, body: OutputGroupPatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.patch_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
+
+
+@app.delete("/api/v1/output-groups/{group_id}")
+async def delete_output_group(group_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.delete_output_group(session, tenant_id, actor, parse_uuid(group_id), correlation_id(request))
+
+
 @app.get("/api/v1/output-groups/{group_id}/preview")
 async def group_preview(group_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
@@ -616,17 +858,63 @@ async def create_edge(body: EdgeIn, request: Request, principal: dict[str, Any] 
     return await collect.create_edge(session, tenant_id, actor, body, correlation_id(request))
 
 
+def _normalize_edge(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["health_raw"] = item.get("health")
+    if item.get("enrollment_status") != "ENROLLED":
+        item["health"] = "NOT_ENROLLED"
+    elif item.get("health") in {"HEALTHY", "ACTIVE", "CONFIG_VALIDATED"}:
+        item["health"] = "ONLINE"
+    elif item.get("health") in {"DEGRADED", "OFFLINE"}:
+        pass
+    else:
+        item["health"] = "OFFLINE"
+    return item
+
+
 @app.get("/api/v1/edges")
 async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
-    items = await fetch_all(session, "SELECT id, name, site_id, enrollment_status, desired_revision, active_revision, last_heartbeat, health, software_version, outbox_pending FROM edge_nodes WHERE tenant_id = :tenant_id ORDER BY name", {"tenant_id": tenant_id})
-    return {"items": items}
+    items = await fetch_all(session, "SELECT id, name, site_id, enrollment_status, desired_revision, active_revision, last_heartbeat, health, software_version, outbox_pending, queues_json FROM edge_nodes WHERE tenant_id = :tenant_id ORDER BY name", {"tenant_id": tenant_id})
+    return {"items": [_normalize_edge(item) for item in items]}
 
 
 @app.get("/api/v1/edges/{edge_id}")
 async def edge_detail(edge_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
-    return await collect._owned_edge(session, tenant_id, parse_uuid(edge_id))
+    raw = await collect._owned_edge(session, tenant_id, parse_uuid(edge_id))
+    return _normalize_edge(raw)
+
+
+@app.get("/api/v1/edges/{edge_id}/health")
+async def edge_health(edge_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, _actor = _ids(principal)
+    row = await fetch_one(
+        session,
+        """
+        SELECT id, name, enrollment_status, desired_revision, active_revision, last_heartbeat, health, software_version, queues_json
+        FROM edge_nodes
+        WHERE id = :id AND tenant_id = :tenant_id
+        """,
+        {"id": parse_uuid(edge_id), "tenant_id": tenant_id},
+    )
+    if row is None:
+        raise AppError(404, "NOT_FOUND", "Edge not found.")
+    norm = _normalize_edge(row)
+    norm["queues"] = row.get("queues_json") or {}
+    return norm
+
+
+@app.patch("/api/v1/edges/{edge_id}")
+async def patch_edge(edge_id: str, body: EdgePatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.patch_edge(session, tenant_id, actor, parse_uuid(edge_id), body, correlation_id(request))
+
+
+@app.delete("/api/v1/edges/{edge_id}")
+async def delete_edge(edge_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.delete_edge(session, tenant_id, actor, parse_uuid(edge_id), correlation_id(request))
 
 
 @app.post("/api/v1/edges/{edge_id}/enrollment-token", status_code=201)
@@ -652,13 +940,6 @@ async def appliance_enrollment(edge_id: str, request: Request, principal: dict[s
     return {"status": "queued"}
 
 
-@app.get("/api/v1/edges/{edge_id}/health")
-async def edge_health(edge_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, _actor = _ids(principal)
-    edge = await collect._owned_edge(session, tenant_id, parse_uuid(edge_id))
-    return {"id": edge["id"], "health": edge["health"], "desired_revision": edge["desired_revision"], "active_revision": edge["active_revision"], "last_heartbeat": edge["last_heartbeat"], "outbox_pending": edge["outbox_pending"]}
-
-
 @app.get("/api/v1/edges/{edge_id}/deployments")
 async def deployments(edge_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
@@ -681,9 +962,41 @@ async def latest(signal_ids: str, principal: dict[str, Any] = Depends(admin), se
 
 
 @app.get("/api/v1/observations/history")
-async def history(signal_id: str, start: str, end: str, limit: int = 500, cursor: str | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+async def history(
+    signal_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    from_time: str | None = Query(None, alias="from"),
+    limit: int = 500,
+    cursor: str | None = None,
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
-    return await telemetry.history(session, tenant_id, signal_id=parse_uuid(signal_id), start=_time(start), end=_time(end), limit=limit, cursor=cursor)
+    now = utcnow()
+    raw_start = start or from_time
+    if raw_start:
+        if raw_start.startswith("now-"):
+            offset_str = raw_start[4:]
+            if offset_str.endswith("m"):
+                start_dt = now - timedelta(minutes=int(offset_str[:-1]))
+            elif offset_str.endswith("h"):
+                start_dt = now - timedelta(hours=int(offset_str[:-1]))
+            elif offset_str.endswith("d"):
+                start_dt = now - timedelta(days=int(offset_str[:-1]))
+            else:
+                start_dt = now - timedelta(minutes=15)
+        else:
+            start_dt = _time(raw_start)
+    else:
+        start_dt = now - timedelta(minutes=15)
+
+    if end:
+        end_dt = _time(end)
+    else:
+        end_dt = now
+
+    return await telemetry.history(session, tenant_id, signal_id=parse_uuid(signal_id), start=start_dt, end=end_dt, limit=limit, cursor=cursor)
 
 
 @app.get("/api/v1/observations/aggregate")
@@ -844,10 +1157,56 @@ async def publish_dashboard(dashboard_id: str, request: Request, principal: dict
 
 
 @app.get("/api/v1/audit-events")
-async def audit_events(limit: int = 100, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+async def audit_events(
+    limit: int = 50,
+    severity: str | None = None,
+    entity_type: str | None = None,
+    entity_id: UUID | None = None,
+    cursor: str | None = None,
+    principal: dict[str, Any] = Depends(admin),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
-    items = await fetch_all(session, "SELECT id, event_type, actor_id, entity_type, entity_id, before_json, after_json, correlation_id, occurred_at FROM audit_events WHERE tenant_id = :tenant_id ORDER BY occurred_at DESC LIMIT :limit", {"tenant_id": tenant_id, "limit": min(limit, 500)})
-    return {"items": items}
+    limit = min(max(limit, 1), 500)
+    clauses = ["tenant_id = :tenant_id"]
+    params: dict[str, Any] = {"tenant_id": tenant_id, "limit": limit + 1}
+    if severity:
+        clauses.append("severity = :severity")
+        params["severity"] = severity.upper()
+    if entity_type:
+        clauses.append("entity_type = :entity_type")
+        params["entity_type"] = entity_type
+    if entity_id:
+        clauses.append("entity_id = :entity_id")
+        params["entity_id"] = entity_id
+    if cursor:
+        try:
+            cursor_dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
+            clauses.append("occurred_at < :cursor_dt")
+            params["cursor_dt"] = cursor_dt
+        except Exception:
+            pass
+
+    where_sql = " AND ".join(clauses)
+    rows = await fetch_all(
+        session,
+        f"""
+        SELECT id, event_type, actor_id, entity_type, entity_id,
+               before_json, after_json, correlation_id, occurred_at, severity
+        FROM audit_events
+        WHERE {where_sql}
+        ORDER BY occurred_at DESC
+        LIMIT :limit
+        """,
+        params,
+    )
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = None
+    if has_more and items:
+        last = items[-1]
+        next_cursor = last["occurred_at"].isoformat() if hasattr(last["occurred_at"], "isoformat") else str(last["occurred_at"])
+    return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
 
 
 @app.get("/api/v1/overview")
@@ -856,15 +1215,26 @@ async def overview(principal: dict[str, Any] = Depends(admin), session: AsyncSes
     resources_count = await fetch_one(session, "SELECT count(*) AS count FROM resources WHERE tenant_id = :tenant_id AND archived_at IS NULL", {"tenant_id": tenant_id})
     machines = await fetch_one(session, "SELECT count(*) AS count FROM resources r JOIN resource_types t ON t.id = r.type_id WHERE r.tenant_id = :tenant_id AND t.key = 'machine' AND r.archived_at IS NULL", {"tenant_id": tenant_id})
     connections = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status = 'ACTIVE'", {"tenant_id": tenant_id})
+    conn_total_row = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status <> 'ARCHIVED'", {"tenant_id": tenant_id})
+    conn_online_row = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status = 'ACTIVE' AND health = 'ONLINE'", {"tenant_id": tenant_id})
     edges = await fetch_all(session, "SELECT id, name, health, active_revision, desired_revision, last_heartbeat, outbox_pending FROM edge_nodes WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
-    healthy = sum(1 for edge in edges if edge["health"] in {"HEALTHY", "ACTIVE"})
+    healthy = sum(1 for edge in edges if edge["health"] in {"HEALTHY", "ACTIVE", "ONLINE"})
     storage = await telemetry.storage_overview(session, tenant_id)
+    last_obs = await fetch_one(session, "SELECT max(received_at) AS last_at FROM observations_current WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
+    last_data_at = last_obs["last_at"].isoformat().replace("+00:00", "Z") if last_obs and last_obs["last_at"] else None
+
     return {
         "resources": int(resources_count["count"]) if resources_count else 0,
         "machines": int(machines["count"]) if machines else 0,
         "active_connections": int(connections["count"]) if connections else 0,
+        "connections_online": int(conn_online_row["count"]) if conn_online_row else 0,
+        "connections_total": int(conn_total_row["count"]) if conn_total_row else 0,
         "healthy_edges": healthy,
+        "edges_online": healthy,
+        "edges_total": len(edges),
+        "last_data_at": last_data_at,
         "ingest_per_minute": storage["ingest_per_minute"],
+        "messages_per_min": storage["ingest_per_minute"],
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "edges": edges,
         "connection_health": await fetch_all(session, "SELECT health, count(*) AS count FROM connections WHERE tenant_id = :tenant_id GROUP BY health", {"tenant_id": tenant_id}),
@@ -1011,8 +1381,10 @@ def _mount_spa() -> None:
     async def spa(full_path: str) -> FileResponse:
         candidate = (root / full_path).resolve()
         if candidate.is_file() and candidate.is_relative_to(root):
+            if candidate.name == "index.html" or candidate.suffix in {".html", ".htm"}:
+                return FileResponse(candidate, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
             return FileResponse(candidate)
-        return FileResponse(index)
+        return FileResponse(index, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 _mount_spa()

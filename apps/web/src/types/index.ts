@@ -1,4 +1,16 @@
-export type ResourceType = 'enterprise' | 'site' | 'plant' | 'zone' | 'line' | 'machine' | 'sensor';
+export type ResourceType =
+  | 'enterprise'
+  | 'site'
+  | 'plant'
+  | 'area'
+  | 'zone'
+  | 'line'
+  | 'workshop'
+  | 'cell'
+  | 'utility_system'
+  | 'machine'
+  | 'sensor'
+  | 'physical_asset';
 
 export interface ResourceNode {
   id: string;
@@ -7,6 +19,9 @@ export interface ResourceNode {
   code: string;
   status: 'running' | 'idle' | 'warning' | 'offline';
   parentId?: string;
+  parent_id?: string;
+  pathCode?: string;
+  path_code?: string;
   plantId?: string;
   childrenCount?: number;
   signalsCount?: number;
@@ -45,20 +60,30 @@ export interface ConnectionItem {
   name: string;
   protocol: ProtocolType;
   endpoint: string;
-  status: 'connected' | 'disconnected' | 'warning' | 'testing';
+  status: 'connected' | 'disconnected' | 'warning' | 'testing' | string;
   plantId?: string;
+  siteId?: string;
+  site_id?: string;
+  edgeId?: string;
+  edge_id?: string;
+  health?: string;
   latencyMs: number;
   lastConnected: string;
   signalsCount: number;
   throughputPerSec: number;
   errorRate: number;
   config: Record<string, any>;
+  lastError?: string;
+  lastErrorTimestamp?: string;
+  updatedAt?: string;
   lastTestResult?: {
     overallStatus: TestExecutionState;
     timestamp: string;
     steps: TestStepResult[];
   };
 }
+
+export type Connection = ConnectionItem;
 
 export type SignalDataType = 'analog' | 'boolean' | 'integer' | 'string' | 'calculated';
 
@@ -67,16 +92,31 @@ export type SignalBindingType = 'modbus_register' | 'opcua_node' | 'mqtt_jsonpat
 export interface SignalItem {
   id: string;
   name: string;
+  key?: string;
   tag: string;
+  display_name?: string;
+  displayName?: string;
+  type?: string;
+  enabled?: boolean;
+  qualityReason?: string;
+  expectedIntervalMs?: number;
+  description?: string;
+  connectionId?: string;
+  connection_id?: string;
+  topic?: string;
+  address?: string;
   sourceConnectionId: string;
   sourceConnectionName: string;
   resourceId: string;
+  resource_id?: string;
   resourcePath: string;
   plantId?: string;
-  dataType: SignalDataType;
+  dataType: SignalDataType | string;
+  data_type?: string;
   unit?: string;
-  currentValue: number | string | boolean;
-  quality: 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE';
+  currentValue?: number | string | boolean | null;
+  value?: number | string | boolean | null;
+  quality: 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE' | 'UNKNOWN' | string;
   lastUpdated: string;
   sampleIntervalMs: number;
   bindingType?: SignalBindingType;
@@ -93,6 +133,8 @@ export interface ActivityEvent {
   source: string;
   eventType: string;
   message: string;
+  title?: string;
+  description?: string;
   details?: Record<string, any>;
 }
 
@@ -140,10 +182,16 @@ export interface EdgeItem {
   id: string;
   name: string;
   siteId: string;
+  site_id?: string;
   enrollmentStatus: string;
+  enrollment_status?: string;
   health: string;
   desiredRevision: number;
+  desired_revision?: number;
   activeRevision: number;
+  active_revision?: number;
   lastHeartbeat: string;
+  last_heartbeat?: string;
   softwareVersion?: string;
+  software_version?: string;
 }

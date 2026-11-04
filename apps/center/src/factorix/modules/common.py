@@ -67,7 +67,7 @@ def as_uuid(value: Any) -> UUID:
     except (TypeError, ValueError) as exc:
         from factorix.platform.errors import AppError
 
-        raise AppError(422, "INVALID_ID", "Định danh không hợp lệ.") from exc
+        raise AppError(422, "INVALID_ID", "Invalid identifier.") from exc
 
 
 def parse_uuid(value: str, code: str = "INVALID_ID") -> UUID:
@@ -86,16 +86,24 @@ async def audit(
     before: Any,
     after: Any,
     correlation_id: str,
+    severity: str | None = None,
 ) -> None:
+    if severity is None:
+        if event_type in {"EDGE_OFFLINE", "COMMISSION_FAILED", "MAIL_FAILED", "REVERT_TO_ZERO", "CONNECTION_DEGRADED"}:
+            severity = "WARN"
+        elif "FAIL" in event_type or "ERROR" in event_type:
+            severity = "ERROR"
+        else:
+            severity = "INFO"
     await execute(
         session,
         """
         INSERT INTO audit_events (
             id, tenant_id, event_type, actor_id, entity_type, entity_id,
-            before_json, after_json, correlation_id, occurred_at
+            before_json, after_json, correlation_id, occurred_at, severity
         ) VALUES (
             gen_random_uuid(), :tenant_id, :event_type, :actor_id, :entity_type, :entity_id,
-            CAST(:before_json AS jsonb), CAST(:after_json AS jsonb), :correlation_id, :occurred_at
+            CAST(:before_json AS jsonb), CAST(:after_json AS jsonb), :correlation_id, :occurred_at, :severity
         )
         """,
         {
@@ -108,6 +116,7 @@ async def audit(
             "after_json": None if after is None else jsonb(after),
             "correlation_id": correlation_id,
             "occurred_at": utcnow(),
+            "severity": severity,
         },
     )
 

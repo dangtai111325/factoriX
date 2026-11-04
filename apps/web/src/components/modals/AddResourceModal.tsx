@@ -1,48 +1,94 @@
 import React, { useEffect, useState } from 'react';
-import { X, Plus, FolderPlus, Trash2 } from 'lucide-react';
+import { X, FolderPlus, AlertCircle } from 'lucide-react';
 import { translateApiError } from '../../utils/apiErrors';
-import { codePreviewFromName, validateResourceName } from '../../utils/resourceHierarchy';
+import { slugifyResourceCode } from '../../utils/slugify';
+import { api } from '../../api/client';
 
 export interface AddResourceModalProps {
   isOpen: boolean;
   onClose: () => void;
+  parentId?: string | null;
+  parentName?: string;
   parentPath?: string;
-  allowedTypes?: string[];
+  recommendedTypes?: string[];
+  hierarchyMode?: 'guided' | 'strict';
   onAddResource?: (newResource: {
     name: string;
+    code: string;
     type: string;
-    parentPath: string;
+    parent_id?: string | null;
     description: string;
     properties: Record<string, string>;
   }) => void | Promise<void>;
 }
 
+interface ResourceTypeOption {
+  key: string;
+  name: string;
+  category: string;
+  recommended_children?: string[];
+}
+
 export const AddResourceModal: React.FC<AddResourceModalProps> = ({
   isOpen,
   onClose,
+  parentId = null,
+  parentName,
   parentPath = '(root)',
-  allowedTypes = ['Enterprise', 'Site', 'Plant', 'Zone', 'Line', 'Workshop', 'Machine', 'Sensor'],
+  recommendedTypes = [],
+  hierarchyMode = 'guided',
   onAddResource,
 }) => {
   const [name, setName] = useState('');
-  const [type, setType] = useState(allowedTypes[0] || 'Machine');
-  const [currentPath, setCurrentPath] = useState(parentPath);
+  const [code, setCode] = useState('');
+  const [codeUserEdited, setCodeUserEdited] = useState(false);
+  const [type, setType] = useState('line');
+  const [availableTypes, setAvailableTypes] = useState<ResourceTypeOption[]>([]);
   const [description, setDescription] = useState('');
-  const [properties, setProperties] = useState<Array<{ key: string; value: string }>>([]);
   const [error, setError] = useState('');
+  const [codeError, setCodeError] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const allowedKey = allowedTypes.join('|');
 
   useEffect(() => {
     if (!isOpen) return;
     setName('');
-    setType(allowedTypes[0] || 'Machine');
-    setCurrentPath(parentPath);
+    setCode('');
+    setCodeUserEdited(false);
     setDescription('');
-    setProperties([]);
     setError('');
+    setCodeError('');
     setSubmitting(false);
-  }, [isOpen, parentPath, allowedKey]);
+
+    // Fetch types from API
+    api<{ types: ResourceTypeOption[] }>('/api/v1/resource-types')
+      .then((res) => {
+        const types = res?.types || [];
+        setAvailableTypes(types);
+        if (recommendedTypes.length > 0) {
+          setType(recommendedTypes[0]);
+        } else if (types.length > 0) {
+          setType(types[0].key);
+        }
+      })
+      .catch(() => {
+        // Fallback standard types
+        setAvailableTypes([
+          { key: 'enterprise', name: 'Enterprise', category: 'ENTERPRISE' },
+          { key: 'site', name: 'Site', category: 'SITE' },
+          { key: 'area', name: 'Area', category: 'AREA' },
+          { key: 'zone', name: 'Zone', category: 'AREA' },
+          { key: 'line', name: 'Line', category: 'LINE' },
+          { key: 'machine', name: 'Machine', category: 'MACHINE' },
+        ]);
+        setType('line');
+      });
+  }, [isOpen, parentId]);
+
+  useEffect(() => {
+    if (!codeUserEdited) {
+      setCode(slugifyResourceCode(name));
+    }
+  }, [name, codeUserEdited]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -58,50 +104,58 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
 
   if (!isOpen) return null;
 
-  const codePreview = codePreviewFromName(name);
-
-  const handleAddProperty = () => {
-    setProperties([...properties, { key: '', value: '' }]);
-  };
-
-  const handleRemoveProperty = (index: number) => {
-    setProperties(properties.filter((_, i) => i !== index));
-  };
-
-  const handlePropertyChange = (index: number, field: 'key' | 'value', val: string) => {
-    const next = [...properties];
-    next[index][field] = val;
-    setProperties(next);
-  };
+  const isRecommended = recommendedTypes.length === 0 || recommendedTypes.includes(type);
+  const isStrictBlocked = hierarchyMode === 'strict' && !isRecommended;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const nameError = validateResourceName(name);
-    if (nameError) {
-      setError(nameError);
+    setError('');
+    setCodeError('');
+
+    if (!name.trim()) {
+      setError('Enter a name.');
       return;
     }
-    const chosen = allowedTypes.includes(type) ? type : allowedTypes[0];
-    if (!chosen) return;
 
-    const propsMap = properties.reduce<Record<string, string>>((acc, item) => {
-      if (item.key.trim()) acc[item.key.trim()] = item.value.trim();
-      return acc;
-    }, {});
+    if (/[/#+$]/.test(name) || /[\x00-\x1F\x7F]/.test(name)) {
+      setError('Names cannot contain / # + $ or control characters.');
+      return;
+    }
+
+    const trimmedCode = code.trim();
+    if (!trimmedCode) {
+      setCodeError('Code is required.');
+      return;
+    }
+
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(trimmedCode)) {
+      setCodeError('Code must start with a letter or digit and use only letters, digits, . _ -');
+      return;
+    }
+
+    if (isStrictBlocked) {
+      setError(`Cannot add '${type}' under '${parentName || 'root'}' in strict hierarchy mode.`);
+      return;
+    }
 
     setSubmitting(true);
-    setError('');
     try {
       await onAddResource?.({
         name: name.trim(),
-        type: chosen,
-        parentPath: currentPath,
+        code: trimmedCode,
+        type,
+        parent_id: parentId,
         description: description.trim(),
-        properties: propsMap,
+        properties: {},
       });
       onClose();
-    } catch (caught) {
-      setError(translateApiError(caught));
+    } catch (caught: any) {
+      const resp = caught?.response?.data;
+      if (resp?.error?.code === 'DUPLICATE') {
+        setCodeError(resp.error.message || `Code '${trimmedCode}' already exists under '${parentName || 'root'}'.`);
+      } else {
+        setError(translateApiError(caught));
+      }
     } finally {
       setSubmitting(false);
     }
@@ -141,55 +195,107 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
         </div>
 
         {/* Modal Body */}
-        <form onSubmit={handleSubmit} className="p-6 space-y-5 overflow-y-auto flex-1 text-sm">
+        <form onSubmit={handleSubmit} className="p-6 space-y-4 overflow-y-auto flex-1 text-sm">
+          {error && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-red-700 text-xs">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+
           {/* Context Path */}
           <div>
             <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">
-              Context Path (Parent)
+              Parent Resource
             </label>
-            <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 break-all">
-              {currentPath}
+            <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 break-all flex items-center justify-between">
+              <span>{parentName ? `${parentName} (${parentPath})` : '(Root - No Parent)'}</span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-slate-200 text-slate-600 uppercase">
+                {hierarchyMode} Mode
+              </span>
             </div>
           </div>
 
-          {/* Resource Name and Type */}
+          {/* Resource Name and Code */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Resource Name <span className="text-[#EF1B24]">*</span>
-              </label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-xs font-semibold text-slate-700">
+                  Resource Name <span className="text-[#EF1B24]">*</span>
+                </label>
+                <span className="text-[11px] text-slate-400">{name.length}/200</span>
+              </div>
               <input
                 type="text"
                 required
+                autoFocus
+                maxLength={200}
                 value={name}
                 onChange={(e) => {
                   setName(e.target.value);
                   if (error) setError('');
                 }}
-                placeholder="e.g. CNC-03, Line 04, Packaging Line"
+                placeholder={parentId ? "e.g. Assembly Line 01" : "e.g. Acme Corp"}
                 className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
               />
-              <p className="mt-1.5 text-[11px] text-slate-500 font-mono">
-                Code preview:{' '}
-                <span className="text-slate-700 font-semibold">{codePreview || '—'}</span>
-              </p>
             </div>
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Code (Unique Identifier) <span className="text-[#EF1B24]">*</span>
+              </label>
+              <input
+                type="text"
+                required
+                value={code}
+                onChange={(e) => {
+                  setCode(e.target.value);
+                  setCodeUserEdited(true);
+                  if (codeError) setCodeError('');
+                }}
+                placeholder="e.g. ASSY-01"
+                className={`w-full px-3 py-2 bg-white border rounded-lg font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 ${
+                  codeError ? 'border-red-500 bg-red-50/50' : 'border-slate-200 focus:border-[#EF1B24]'
+                }`}
+              />
+              {codeError && (
+                <p className="mt-1 text-xs text-red-600 font-medium flex items-center gap-1">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                  <span>{codeError}</span>
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Resource Type */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-xs font-semibold text-slate-700">
                 Resource Type <span className="text-[#EF1B24]">*</span>
               </label>
-              <select
-                value={type}
-                onChange={(e) => setType(e.target.value)}
-                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
-              >
-                {allowedTypes.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
-                  </option>
-                ))}
-              </select>
+              {isRecommended ? (
+                <span className="text-[11px] font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                  Recommended placement
+                </span>
+              ) : (
+                <span className="text-[11px] font-medium text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
+                  {hierarchyMode === 'strict' ? 'Strict mode: Not allowed' : 'Non-standard placement'}
+                </span>
+              )}
             </div>
+            <select
+              value={type}
+              onChange={(e) => setType(e.target.value)}
+              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
+            >
+              {availableTypes.map((t) => {
+                const rec = recommendedTypes.length === 0 || recommendedTypes.includes(t.key);
+                return (
+                  <option key={t.key} value={t.key} disabled={hierarchyMode === 'strict' && !rec}>
+                    {t.name} ({t.category}) {rec ? '— Recommended' : '— Non-standard'}
+                  </option>
+                );
+              })}
+            </select>
           </div>
 
           {/* Description */}
@@ -199,75 +305,31 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
               rows={2}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Operational purpose, physical location, or maintenance notes..."
+              placeholder="Optional notes or details about this resource"
               className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
             />
           </div>
 
-          {/* Key-Value Properties */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-xs font-semibold text-slate-700">
-                Resource Metadata & Technical Attributes
-              </label>
-              <button
-                type="button"
-                onClick={handleAddProperty}
-                className="text-xs font-medium text-[#EF1B24] hover:text-red-700 flex items-center gap-1"
-              >
-                <Plus className="w-3.5 h-3.5" /> Add Property
-              </button>
-            </div>
-            <div className="space-y-2 max-h-36 overflow-y-auto pr-1">
-              {properties.map((prop, idx) => (
-                <div key={idx} className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    placeholder="Key (e.g. SerialNum)"
-                    value={prop.key}
-                    onChange={(e) => handlePropertyChange(idx, 'key', e.target.value)}
-                    className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs text-slate-800 focus:outline-none focus:border-[#EF1B24]"
-                  />
-                  <input
-                    type="text"
-                    placeholder="Value"
-                    value={prop.value}
-                    onChange={(e) => handlePropertyChange(idx, 'value', e.target.value)}
-                    className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs text-slate-800 focus:outline-none focus:border-[#EF1B24]"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveProperty(idx)}
-                    className="p-1.5 text-slate-400 hover:text-red-600 rounded"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-              ))}
-            </div>
+          <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-600">
+            Resource code uniqueness is strictly scoped to its siblings under{' '}
+            <span className="font-semibold text-slate-800">{parentName || 'Root'}</span>. Identical codes under different parents are permitted.
           </div>
 
-          {error && (
-            <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-              {error}
-            </p>
-          )}
-
-          {/* Footer Actions */}
-          <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
+          <div className="pt-2 flex items-center justify-end gap-3">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+              disabled={submitting}
+              className="px-4 py-2 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
             >
               Cancel
             </button>
             <button
               type="submit"
-              disabled={submitting}
-              className="px-5 py-2 text-xs font-semibold text-white bg-[#EF1B24] hover:bg-[#d0171f] rounded-lg shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50"
+              disabled={submitting || isStrictBlocked}
+              className="px-4 py-2 bg-[#EF1B24] hover:bg-[#D9151E] text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 flex items-center gap-2"
             >
-              <Plus className="w-4 h-4" /> {submitting ? 'Creating…' : 'Create Resource'}
+              {submitting ? 'Creating...' : 'Create Resource'}
             </button>
           </div>
         </form>

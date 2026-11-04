@@ -1,186 +1,274 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import {
   Search,
   Bell,
-  Play,
-  Pause,
   UserRound,
-  Radio,
   ChevronDown,
-  Building2,
   Check,
-  Activity,
-  Cpu,
-  Layers,
-  HardDrive,
+  Radio,
+  Lock,
   Info,
-  Sparkles,
-  AlertTriangle,
-  RotateCw,
+  LogOut,
+  AlertCircle,
 } from 'lucide-react';
 import { useApp } from '../../store/AppContext';
 import { useAuth } from '../../features/auth';
-import { useNavigate } from 'react-router-dom';
-import { DemoScenario } from '../../types';
+import { ChangePasswordModal } from '../modals/ChangePasswordModal';
+import { AboutFactorixModal } from '../modals/AboutFactorixModal';
+
+const ROUTE_BREADCRUMBS: Record<string, { group?: string; title: string }> = {
+  '/overview': { title: 'Overview' },
+  '/factory/structure': { group: 'Factory Model', title: 'Hierarchy Structure' },
+  '/factory/layout': { group: 'Factory Model', title: 'Layout Designer' },
+  '/factory/graph': { group: 'Factory Model', title: 'Knowledge Graph' },
+  '/collector/connections': { group: 'Data Collector', title: 'Add Connection' },
+  '/collector/signals': { group: 'Data Collector', title: 'Add Data' },
+  '/collector/edges': { group: 'Data Collector', title: 'Edge Collectors' },
+  '/collector/diagnostics': { group: 'Data Collector', title: 'Diagnostics' },
+  '/collector/add-data': { group: 'Data Collector', title: 'Add Data' },
+  '/models': { group: 'Data Models', title: 'Model Catalog' },
+  '/dashboards': { group: 'Coming soon', title: 'Dashboards' },
+  '/historian': { group: 'Coming soon', title: 'Historian & Storage' },
+  '/alarms': { group: 'Coming soon', title: 'Alarms & Events' },
+  '/analytics': { group: 'Coming soon', title: 'Analytics' },
+  '/reports': { group: 'Coming soon', title: 'Reports' },
+  '/administration': { group: 'Coming soon', title: 'Administration' },
+};
 
 export const Topbar: React.FC = () => {
-  const {
-    isStreaming,
-    setIsStreaming,
-    setSearchOpen,
-    availablePlants,
-    currentPlant,
-    setCurrentPlant,
-    demoScenario,
-    setDemoScenario,
-    isDemoMode,
-    collectorLabel,
-  } = useApp();
-  const { state } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { setSearchOpen, resources, edges } = useApp();
+  const { state, signOut } = useAuth();
+
+  const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [changePasswordOpen, setChangePasswordOpen] = useState(false);
+  const [aboutModalOpen, setAboutModalOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const siteDropdownRef = useRef<HTMLDivElement>(null);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+
   const operatorName =
     state.status === 'authenticated'
       ? state.user.full_name || state.user.login
       : 'Administrator';
 
-  const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
-  const [daemonPopoverOpen, setDaemonPopoverOpen] = useState(false);
-  const [browserOnline, setBrowserOnline] = useState(
-    typeof navigator === 'undefined' ? true : navigator.onLine,
-  );
-  const [lastOnlineAt, setLastOnlineAt] = useState(() => new Date());
+  // Breadcrumbs
+  const breadcrumb = useMemo(() => {
+    const matched = ROUTE_BREADCRUMBS[location.pathname];
+    if (matched) return matched;
+    if (location.pathname.startsWith('/factory/structure')) {
+      return { group: 'Factory Model', title: 'Hierarchy Structure' };
+    }
+    if (location.pathname.startsWith('/collector/signals')) {
+      return { group: 'Data Collector', title: 'Signals' };
+    }
+    if (location.pathname.startsWith('/collector/diagnostics')) {
+      return { group: 'Data Collector', title: 'Diagnostics' };
+    }
+    if (location.pathname.startsWith('/collector/connections')) {
+      return { group: 'Data Collector', title: 'Connections' };
+    }
+    if (location.pathname.startsWith('/models')) {
+      return { group: 'Data Models', title: 'Model Catalog' };
+    }
+    return { title: 'FactoriX' };
+  }, [location.pathname]);
 
-  const siteDropdownRef = useRef<HTMLDivElement>(null);
-  const daemonRef = useRef<HTMLDivElement>(null);
-  const navigate = useNavigate();
+  // Sites and Scope
+  const sites = useMemo(() => {
+    return resources.filter((r) => r.type === 'site');
+  }, [resources]);
 
-  const collectorLower = collectorLabel.toLowerCase();
-  const collectorEnrolled =
-    !collectorLower.includes('waiting') &&
-    !collectorLower.includes('not enrolled') &&
-    !collectorLower.includes('no site');
-  const collectorOffline =
-    collectorLower.includes('offline') ||
-    collectorLower.includes('unreachable') ||
-    collectorLower.includes('down');
-  const collectorHealthy =
-    collectorEnrolled &&
-    (collectorLower.includes('healthy') || collectorLower.includes('normal'));
-  const collectorPidLabel = collectorEnrolled ? 'ENROLLED' : 'NOT ENROLLED';
+  const [selectedScope, setSelectedScope] = useState<string>(() => {
+    try {
+      return localStorage.getItem('fx.scope') || 'all';
+    } catch {
+      return 'all';
+    }
+  });
 
-  // Close dropdowns on outside click
+  const handleSelectScope = (scopeId: string) => {
+    setSelectedScope(scopeId);
+    try {
+      localStorage.setItem('fx.scope', scopeId);
+    } catch {}
+    setSiteDropdownOpen(false);
+  };
+
+  const selectedSite = useMemo(() => {
+    if (selectedScope === 'all') return null;
+    return sites.find((s) => s.id === selectedScope) || null;
+  }, [selectedScope, sites]);
+
+  // Count resources for current scope
+  const scopedResourceCount = useMemo(() => {
+    if (selectedScope === 'all') {
+      return resources.length;
+    }
+    // Count site and descendants
+    const site = sites.find((s) => s.id === selectedScope);
+    if (!site) return resources.length;
+    const found = new Set<string>([site.id]);
+    let added = true;
+    while (added) {
+      added = false;
+      for (const r of resources) {
+        if (r.parentId && found.has(r.parentId) && !found.has(r.id)) {
+          found.add(r.id);
+          added = true;
+        }
+      }
+    }
+    return found.size;
+  }, [selectedScope, sites, resources]);
+
+  // Data Collection Edge status (TC-UI-NAV-08)
+  const enrolledEdges = useMemo(() => {
+    return edges.filter((e) => e.enrollmentStatus === 'ENROLLED');
+  }, [edges]);
+
+  const onlineEdges = useMemo(() => {
+    return enrolledEdges.filter(
+      (e) => e.health === 'ONLINE' || e.health === 'HEALTHY' || e.health === 'ACTIVE',
+    );
+  }, [enrolledEdges]);
+
+  const offlineEdge = useMemo(() => {
+    return enrolledEdges.find(
+      (e) => e.health === 'OFFLINE' || e.health === 'DEGRADED',
+    );
+  }, [enrolledEdges]);
+
+  // Close dropdowns on click outside
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (siteDropdownRef.current && !siteDropdownRef.current.contains(e.target as Node)) {
         setSiteDropdownOpen(false);
       }
-      if (daemonRef.current && !daemonRef.current.contains(e.target as Node)) {
-        setDaemonPopoverOpen(false);
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
+        setUserMenuOpen(false);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  // Toast timer
   useEffect(() => {
-    const goOffline = () => setBrowserOnline(false);
-    const goOnline = () => {
-      setBrowserOnline(true);
-      setLastOnlineAt(new Date());
-    };
-    window.addEventListener('offline', goOffline);
-    window.addEventListener('online', goOnline);
-    return () => {
-      window.removeEventListener('offline', goOffline);
-      window.removeEventListener('online', goOnline);
-    };
-  }, []);
+    if (!toastMessage) return;
+    const t = setTimeout(() => setToastMessage(null), 3000);
+    return () => clearTimeout(t);
+  }, [toastMessage]);
 
   return (
     <>
-    {!browserOnline && (
-      <div className="bg-[#111B37] text-white text-[12px] font-semibold px-4 py-2 text-center">
-        Connection to appliance lost — data may be stale (last update{' '}
-        {lastOnlineAt.toLocaleTimeString()})
-      </div>
-    )}
-    <header className="fx-topbar select-none relative z-30">
-      {/* Left: Breadcrumbs / Interactive Plant Switcher */}
-      <div className="flex items-center gap-3">
-        <div className="flex items-center gap-2 text-[13px] text-[#657794]">
-          <span className="font-semibold text-[#111B37]">FactoriX Industrial IoT</span>
-          <span className="text-[#CBD5E1]">/</span>
+      {/* Offline banner if an enrolled edge is offline */}
+      {offlineEdge && (
+        <div className="bg-[#EF1B24] text-white text-[12px] font-semibold px-4 py-1.5 flex items-center justify-between shadow-xs">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span>
+              Data collection for{' '}
+              {sites.find((s) => s.id === offlineEdge.siteId)?.name || offlineEdge.name}{' '}
+              is offline
+              {offlineEdge.lastHeartbeat
+                ? ` since ${new Date(offlineEdge.lastHeartbeat).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                : ''}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => navigate('/collector/edges')}
+            className="underline hover:text-white/80 text-[11px] font-bold"
+          >
+            Open Edge Collectors →
+          </button>
+        </div>
+      )}
 
-          {/* Interactive Plant / Site Switcher Dropdown (From Images 32 & 46) */}
+      <header className="fx-topbar select-none relative z-30">
+        {/* Left: Breadcrumbs & Plant Selector */}
+        <div className="flex items-center gap-3">
+          {/* Breadcrumbs */}
+          <div className="flex items-center gap-2 text-[13px] text-[#657794]">
+            {breadcrumb.group && (
+              <>
+                <span className="font-medium text-[#475569]">{breadcrumb.group}</span>
+                <span className="text-[#CBD5E1]">›</span>
+              </>
+            )}
+            <span className="font-bold text-[#111B37]">{breadcrumb.title}</span>
+          </div>
+
+          <span className="text-[#CBD5E1] mx-1">|</span>
+
+          {/* Plant / Scope Selector */}
           <div className="relative" ref={siteDropdownRef}>
             <button
               type="button"
               onClick={() => setSiteDropdownOpen(!siteDropdownOpen)}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#EEF5FF] text-[#1D63BD] hover:bg-[#E1EDFC] text-[12px] font-semibold border border-[#BED7F7] transition-colors shadow-2xs"
-              title="Click to switch physical plant or line"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#EEF5FF] text-[#0B2545] hover:bg-[#E1EDFC] text-[12px] font-semibold border border-[#BED7F7] transition-colors shadow-2xs"
+              title="Filter by industrial site or view all sites"
             >
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  currentPlant.status === 'operational'
-                    ? 'bg-[#0DBA67]'
-                    : currentPlant.status === 'warning'
-                    ? 'bg-[#FFAA23]'
-                    : 'bg-[#94A3B8]'
-                }`}
-              />
-              <span>{currentPlant.name}</span>
-              <ChevronDown className="w-3.5 h-3.5 text-[#1D63BD]" />
+              <span className="text-[#64748B] font-normal">Plant:</span>
+              <span className="font-bold">
+                {selectedSite ? `${selectedSite.name}` : 'All sites'}
+              </span>
+              <ChevronDown className="w-3.5 h-3.5 text-[#0B2545]" />
             </button>
 
-            {/* Dropdown Menu */}
+            {/* Scope Dropdown */}
             {siteDropdownOpen && (
-              <div className="absolute left-0 top-full mt-1.5 w-72 rounded-xl bg-white border border-[#D4DFEC] shadow-xl py-2 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
+              <div className="absolute left-0 top-full mt-1.5 w-64 rounded-xl bg-white border border-[#D4DFEC] shadow-xl py-2 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
                 <div className="px-3 pb-2 mb-1 border-b border-[#E3EAF3] flex items-center justify-between">
                   <span className="text-[11px] font-bold uppercase tracking-wider text-[#94A3B8]">
-                    Select Industrial Facility
+                    Scope
                   </span>
                   <span className="text-[10px] bg-[#F1F5FA] px-1.5 py-0.5 rounded text-[#657794] font-semibold">
-                    {availablePlants.length} Sites
+                    {sites.length} {sites.length === 1 ? 'site' : 'sites'} · {scopedResourceCount}{' '}
+                    {scopedResourceCount === 1 ? 'resource' : 'resources'}
                   </span>
                 </div>
 
                 <div className="space-y-0.5 px-1">
-                  {availablePlants.map((site) => {
-                    const isCurrent = site.id === currentPlant.id;
+                  <button
+                    type="button"
+                    onClick={() => handleSelectScope('all')}
+                    className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between transition-colors ${
+                      selectedScope === 'all'
+                        ? 'bg-[#EEF5FF] text-[#0B2545] font-semibold'
+                        : 'hover:bg-[#F9FAFD] text-[#334568]'
+                    }`}
+                  >
+                    <div>
+                      <p className="text-[12px] font-bold">All sites</p>
+                      <p className="text-[10px] text-[#94A3B8]">Entire enterprise model</p>
+                    </div>
+                    {selectedScope === 'all' && <Check className="w-4 h-4 text-[#0B2545]" />}
+                  </button>
+
+                  {sites.map((site) => {
+                    const isSelected = selectedScope === site.id;
                     return (
                       <button
                         key={site.id}
                         type="button"
-                        onClick={() => {
-                          setCurrentPlant(site);
-                          setSiteDropdownOpen(false);
-                        }}
+                        onClick={() => handleSelectScope(site.id)}
                         className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between transition-colors ${
-                          isCurrent
-                            ? 'bg-[#EEF5FF] text-[#1D63BD]'
+                          isSelected
+                            ? 'bg-[#EEF5FF] text-[#0B2545] font-semibold'
                             : 'hover:bg-[#F9FAFD] text-[#334568]'
                         }`}
                       >
-                        <div className="flex items-center gap-2.5">
-                          <span
-                            className={`w-2 h-2 rounded-full ${
-                              site.status === 'operational'
-                                ? 'bg-[#0DBA67]'
-                                : site.status === 'warning'
-                                ? 'bg-[#FFAA23]'
-                                : 'bg-[#94A3B8]'
-                            }`}
-                          />
-                          <div>
-                            <p className="text-[12px] font-bold leading-snug">{site.name}</p>
-                            <p className="text-[10px] text-[#94A3B8] leading-tight">{site.zone}</p>
-                          </div>
+                        <div>
+                          <p className="text-[12px] font-bold">{site.name}</p>
+                          <p className="text-[10px] text-[#94A3B8]">{site.code}</p>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-[11px] text-[#657794] font-medium">
-                            {site.assetsCount} assets
-                          </span>
-                          {isCurrent && <Check className="w-3.5 h-3.5 text-[#1D63BD]" />}
-                        </div>
+                        {isSelected && <Check className="w-4 h-4 text-[#0B2545]" />}
                       </button>
                     );
                   })}
@@ -188,211 +276,146 @@ export const Topbar: React.FC = () => {
               </div>
             )}
           </div>
-        </div>
 
-        {/* Global Demo Mode Pill (Review Section 10.A & FX-01) */}
-        {isDemoMode && (
-          <div className="flex items-center gap-1.5 pl-2 border-l border-[#E2E8F0]">
-            <span
-              className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-[#FFF8E7] text-[#B96B00] text-[11px] font-bold border border-[#FFE2A4] shadow-2xs"
-              title="Application is running with deterministic simulated telemetry"
-            >
-              <Sparkles className="w-3 h-3 text-[#B96B00]" />
-              DEMO MODE
-            </span>
-          </div>
-        )}
-
-        {/* Visualization stream pause button (Review FX-17) */}
-        <div className="flex items-center gap-2 pl-2 border-l border-[#E2E8F0]">
-          <span
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide ${
-              !isStreaming
-                ? 'bg-[#FFF3DA] text-[#B96B00] border border-[#FFE2A4]'
-                : collectorHealthy
-                ? 'bg-[#E9FBF1] text-[#0DBA67] border border-[#B6F0D1]'
-                : 'bg-[#F1F5FA] text-[#657794] border border-[#D4DFEC]'
-            }`}
-            title={
-              !isStreaming
-                ? 'Visualization paused'
-                : collectorHealthy
-                ? 'UI refresh active with enrolled collector'
-                : 'UI refresh active — collector not confirmed healthy'
-            }
-          >
-            <Radio
-              className={`w-3.5 h-3.5 ${
-                isStreaming && collectorHealthy ? 'animate-pulse text-[#0DBA67]' : ''
-              }`}
-            />
-            {!browserOnline ? 'OFFLINE' : isStreaming ? 'LIVE REFRESH' : 'PAUSED'}
-          </span>
-
+          {/* Data Collection Edge Status Chip (TC-UI-NAV-08) */}
           <button
             type="button"
-            onClick={() => setIsStreaming(!isStreaming)}
-            className="p-1 rounded-md text-[#657794] hover:text-[#111B37] hover:bg-[#F1F5FA] transition-colors"
-            title={isStreaming ? 'Pause Visualization (Freezes UI charts)' : 'Resume Live Visualization'}
-          >
-            {isStreaming ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 text-[#0DBA67]" />}
-          </button>
-        </div>
-
-        {/* Global Collector Daemon Telemetry Health Pill (From Images 30, 34, 40, 42) */}
-        <div className="relative hidden xl:block" ref={daemonRef}>
-          <button
-            type="button"
-            onClick={() => setDaemonPopoverOpen(!daemonPopoverOpen)}
-            className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-[11px] transition-colors border ${
-              collectorOffline
-                ? 'bg-[#FFF5F5] hover:bg-[#FFEBEB] border-[#FAC6C9] text-[#EF1B24]'
-                : 'bg-[#F6F8FC] hover:bg-[#EDF2F7] border-[#D4DFEC] text-[#334568]'
-            }`}
-            title="Click to view Edge Collector Daemon health"
+            onClick={() => navigate('/collector/edges')}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide border border-[#D4DFEC] bg-white hover:bg-[#F8FAFC] transition-colors"
+            title="Click to view Edge Collectors status"
           >
             <span
               className={`w-2 h-2 rounded-full ${
-                collectorHealthy
-                  ? 'bg-[#0DBA67] animate-pulse'
-                  : collectorOffline
-                  ? 'bg-[#EF1B24]'
-                  : 'bg-[#94A3B8]'
+                enrolledEdges.length > 0 && onlineEdges.length === enrolledEdges.length
+                  ? 'bg-[#10B981]'
+                  : 'bg-[#EF1B24]'
               }`}
             />
-            <span className="font-semibold text-[#111B37]">{collectorLabel}</span>
+            <span className="text-[#334568]">
+              {onlineEdges.length}/{enrolledEdges.length || 0} edges online
+            </span>
+          </button>
+        </div>
+
+        {/* Right Controls */}
+        <div className="flex items-center gap-3">
+          {/* Global Search Bar (Ctrl+K) */}
+          <button
+            type="button"
+            onClick={() => setSearchOpen(true)}
+            className="w-[260px] h-[36px] px-3 rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-between text-[13px] text-[#94A3B8] hover:border-[#0B2545] hover:text-[#334568] transition-colors shadow-2xs"
+          >
+            <div className="flex items-center gap-2">
+              <Search className="w-4 h-4 text-[#657794]" />
+              <span>Search model, signals…</span>
+            </div>
+            <kbd className="px-1.5 py-0.5 text-[10px] font-mono bg-[#F1F5FA] border border-[#CBD5E1] rounded text-[#657794]">
+              Ctrl K
+            </kbd>
           </button>
 
-          {/* Popover Card */}
-          {daemonPopoverOpen && (
-            <div className="absolute left-0 top-full mt-2 w-88 rounded-xl bg-white border border-[#D4DFEC] shadow-2xl p-4 z-50 animate-in fade-in slide-in-from-top-1 duration-150">
-              <div className="flex items-center justify-between pb-2 border-b border-[#E3EAF3]">
-                <div className="flex items-center gap-2">
-                  <Activity
-                    className={`w-4 h-4 ${collectorHealthy ? 'text-[#0DBA67]' : 'text-[#94A3B8]'}`}
-                  />
-                  <span className="text-[13px] font-bold text-[#111B37]">Collector</span>
-                </div>
-                <span
-                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                    collectorEnrolled
-                      ? 'bg-[#E9FBF1] text-[#0DBA67]'
-                      : 'bg-[#F1F5FA] text-[#657794]'
-                  }`}
-                >
-                  {collectorPidLabel}
+          {/* Activity / Notification Bell */}
+          <button
+            type="button"
+            onClick={() => navigate('/collector/diagnostics?tab=activity')}
+            className="w-9 h-9 rounded-lg border border-[#E3EAF3] bg-white hover:bg-[#F9FAFD] flex items-center justify-center text-[#334568] transition-colors"
+            title="System activity & audit log"
+            aria-label="Activity log"
+          >
+            <Bell className="w-4 h-4" />
+          </button>
+
+          {/* User Menu Dropdown */}
+          <div className="relative pl-2 border-l border-[#E2E8F0]" ref={userMenuRef}>
+            <button
+              type="button"
+              onClick={() => setUserMenuOpen(!userMenuOpen)}
+              className="flex items-center gap-2.5 p-1 rounded-lg hover:bg-[#F8FAFC] transition-colors"
+            >
+              <div className="w-8 h-8 rounded-full bg-[#0B2545] text-white flex items-center justify-center text-[12px] font-bold">
+                <UserRound className="w-4 h-4" />
+              </div>
+              <div className="flex flex-col text-left">
+                <span className="text-[12px] font-bold text-[#111B37] leading-tight">
+                  {operatorName}
                 </span>
+                <span className="text-[10px] text-[#657794]">Administrator</span>
               </div>
+              <ChevronDown className="w-3.5 h-3.5 text-[#64748B]" />
+            </button>
 
-              {/* Demo Scenario Controller (Review FX-06) */}
-              {isDemoMode && <div className="mt-2.5 p-2.5 rounded-lg bg-[#F8FAFC] border border-[#E2E8F0]">
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-[11px] font-bold text-[#475569] uppercase tracking-wider">
-                    Test Scenario Mode
-                  </span>
-                  <span className="text-[10px] text-[#64748B]">Deterministic Simulation</span>
+            {userMenuOpen && (
+              <div className="absolute right-0 top-full mt-1.5 w-52 rounded-xl bg-white border border-[#D4DFEC] shadow-xl py-1.5 z-50 animate-in fade-in slide-in-from-top-1 duration-150 text-[13px]">
+                <div className="px-3 py-2 border-b border-[#F1F5F9]">
+                  <p className="font-semibold text-[#111B37] truncate">{operatorName}</p>
+                  <p className="text-[11px] text-[#64748B] truncate">Administrator</p>
                 </div>
-                <select
-                  value={demoScenario}
-                  onChange={(e) => setDemoScenario(e.target.value as DemoScenario)}
-                  className="w-full text-[12px] font-semibold bg-white border border-[#CBD5E1] rounded-md px-2 py-1 text-[#1E293B] focus:outline-none focus:border-[#2A82E7]"
-                >
-                  <option value="healthy">🟢 Healthy (All Gateways Online)</option>
-                  <option value="degraded_modbus">🟡 Modbus Exception (Illegal Address 0x02)</option>
-                  <option value="timeout_opcua">🔴 OPC UA Browse Timeout (5000ms)</option>
-                  <option value="auth_fail_mqtt">🔴 MQTT Auth Error (CONNACK 0x05)</option>
-                  <option value="offline">⚫ Network Host Unreachable (ECONNREFUSED)</option>
-                </select>
-              </div>}
 
-              <div className="grid grid-cols-2 gap-2.5 py-3 text-[12px]">
-                <div className="p-2.5 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3]">
-                  <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Throughput</span>
-                  <span className="text-[15px] font-extrabold text-[#111B37] font-mono">
-                    —
-                  </span>
-                  <span className="text-[10px] text-[#657794] block">msgs / second</span>
+                <div className="py-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUserMenuOpen(false);
+                      setChangePasswordOpen(true);
+                    }}
+                    className="w-full text-left px-3 py-2 flex items-center gap-2 text-[#334568] hover:bg-[#F8FAFC]"
+                  >
+                    <Lock className="w-4 h-4 text-[#64748B]" />
+                    <span>Change password</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUserMenuOpen(false);
+                      setAboutModalOpen(true);
+                    }}
+                    className="w-full text-left px-3 py-2 flex items-center gap-2 text-[#334568] hover:bg-[#F8FAFC]"
+                  >
+                    <Info className="w-4 h-4 text-[#64748B]" />
+                    <span>About FactoriX</span>
+                  </button>
                 </div>
-                <div className="p-2.5 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3]">
-                  <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Queue Depth</span>
-                  <span className="text-[15px] font-extrabold text-[#0DBA67] font-mono">
-                    —
-                  </span>
-                  <span className="text-[10px] text-[#657794] block">Ring Buffer</span>
-                </div>
-                <div className="p-2.5 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3]">
-                  <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Latency</span>
-                  <span className="text-[15px] font-extrabold text-[#111B37] font-mono">
-                    —
-                  </span>
-                  <span className="text-[10px] text-[#657794] block">Roundtrip Time</span>
-                </div>
-                <div className="p-2.5 rounded-lg bg-[#F9FAFD] border border-[#E3EAF3]">
-                  <span className="text-[10px] text-[#94A3B8] uppercase font-bold block">Daemon Uptime</span>
-                  <span className="text-[15px] font-extrabold text-[#111B37] font-mono">—</span>
-                  <span className="text-[10px] text-[#0DBA67] font-bold block">Edge</span>
+
+                <div className="pt-1 border-t border-[#F1F5F9]">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUserMenuOpen(false);
+                      void signOut().then(() => {
+                        window.location.assign('/login');
+                      });
+                    }}
+                    className="w-full text-left px-3 py-2 flex items-center gap-2 text-[#EF1B24] hover:bg-[#FFF5F5]"
+                  >
+                    <LogOut className="w-4 h-4 text-[#EF1B24]" />
+                    <span>Sign out</span>
+                  </button>
                 </div>
               </div>
-
-              <div className="pt-2 border-t border-[#E3EAF3] flex items-center justify-between text-[11px] text-[#657794]">
-                <span>{collectorLabel}</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setDaemonPopoverOpen(false);
-                    navigate('/live/diagnostics');
-                  }}
-                  className="text-[#1D63BD] font-semibold hover:underline"
-                >
-                  View Diagnostics →
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Right Controls */}
-      <div className="flex items-center gap-3.5">
-        {/* Global Search Bar */}
-        <button
-          type="button"
-          onClick={() => setSearchOpen(true)}
-          className="w-[280px] h-[38px] px-3 rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-between text-[13px] text-[#94A3B8] hover:border-[#2A82E7] hover:text-[#334568] transition-colors shadow-2xs"
-        >
-          <div className="flex items-center gap-2">
-            <Search className="w-4 h-4 text-[#657794]" />
-            <span>Search signals, tags, assets...</span>
-          </div>
-          <kbd className="px-1.5 py-0.5 text-[11px] font-mono bg-[#F1F5FA] border border-[#CBD5E1] rounded text-[#657794]">
-            Ctrl K
-          </kbd>
-        </button>
-
-        {/* Notification Bell */}
-        <button
-          type="button"
-          onClick={() => navigate('/live/activity')}
-          className="relative w-10 h-10 rounded-lg border border-[#E3EAF3] bg-white hover:bg-[#F9FAFD] flex items-center justify-center text-[#334568] transition-colors"
-          title="System notifications & activity log"
-        >
-          <Bell className="w-4 h-4" />
-        </button>
-
-        {/* User Identity Profile */}
-        <div className="flex items-center gap-3 pl-2 border-l border-[#E2E8F0]">
-          <div className="w-9 h-9 rounded-full bg-[#FFF0F1] border border-[#FAC6C9] flex items-center justify-center text-[#EF1B24] font-bold text-[13px]">
-            <UserRound className="w-4 h-4" />
-          </div>
-          <div className="flex flex-col text-left">
-            <span className="text-[13px] font-semibold text-[#111B37] leading-tight">
-              {operatorName || 'Administrator'}
-            </span>
-            <span className="text-[11px] text-[#657794]">Administrator</span>
+            )}
           </div>
         </div>
-      </div>
-    </header>
+      </header>
+
+      {/* Modals */}
+      <ChangePasswordModal
+        isOpen={changePasswordOpen}
+        onClose={() => setChangePasswordOpen(false)}
+        onSuccessToast={(msg) => setToastMessage(msg)}
+      />
+
+      <AboutFactorixModal
+        isOpen={aboutModalOpen}
+        onClose={() => setAboutModalOpen(false)}
+      />
+
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div className="fixed bottom-5 right-5 z-50 bg-[#0B2545] text-white text-[13px] font-semibold px-4 py-2.5 rounded-lg shadow-xl animate-in fade-in duration-200">
+          {toastMessage}
+        </div>
+      )}
     </>
   );
 };

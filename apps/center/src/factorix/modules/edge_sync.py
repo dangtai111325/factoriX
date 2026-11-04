@@ -64,11 +64,13 @@ async def heartbeat(session: AsyncSession, edge: dict[str, Any], body: dict[str,
     health = str(body.get("health") or "HEALTHY")
     if health not in {"HEALTHY", "DEGRADED", "OFFLINE", "ACTIVE", "CONFIG_PENDING"}:
         health = "DEGRADED"
+    queues = body.get("queues")
     await execute(
         session,
         """
         UPDATE edge_nodes
-        SET last_heartbeat = :now, health = :health, software_version = :version, outbox_pending = :pending
+        SET last_heartbeat = :now, health = :health, software_version = :version, outbox_pending = :pending,
+            queues_json = CAST(:queues AS jsonb)
         WHERE id = :id
         """,
         {
@@ -76,10 +78,11 @@ async def heartbeat(session: AsyncSession, edge: dict[str, Any], body: dict[str,
             "health": health,
             "version": str(body.get("software_version") or "")[:40],
             "pending": int(body.get("outbox_pending") or 0),
+            "queues": jsonb(queues if isinstance(queues, dict) else {}),
             "id": as_uuid(edge["id"]),
         },
     )
-    fresh = await fetch_one(session, "SELECT desired_revision, active_revision, health FROM edge_nodes WHERE id = :id", {"id": as_uuid(edge["id"])})
+    fresh = await fetch_one(session, "SELECT desired_revision, active_revision, health, queues_json FROM edge_nodes WHERE id = :id", {"id": as_uuid(edge["id"])})
     assert fresh is not None
     return fresh
 
@@ -106,9 +109,9 @@ async def desired_config(session: AsyncSession, edge: dict[str, Any]) -> dict[st
 
 async def acknowledge(session: AsyncSession, edge: dict[str, Any], revision: int, state: str, diagnostic: str) -> dict[str, Any]:
     if state not in {"ACTIVE", "FAILED"}:
-        raise AppError(422, "STATE", "Trạng thái kích hoạt không hợp lệ.")
+        raise AppError(422, "STATE", "Invalid activation state.")
     if revision != int(edge["desired_revision"]) and state == "ACTIVE":
-        raise AppError(409, "REVISION", "Revision không khớp cấu hình mong muốn.")
+        raise AppError(409, "REVISION", "Revision does not match expected configuration.")
     if state == "ACTIVE":
         await execute(
             session,
@@ -191,18 +194,20 @@ async def finish_command(session: AsyncSession, edge: dict[str, Any], job_id: UU
         raise AppError(404, "NOT_FOUND", "Commissioning command not found.")
     status = body.get("status")
     if status not in {"PASSED", "FAILED", "CANCELLED"}:
-        raise AppError(422, "STATE", "Kết quả kiểm thử không hợp lệ.")
+        raise AppError(422, "STATE", "Invalid commissioning test status.")
     await execute(
         session,
         """
         UPDATE commissioning_jobs
         SET status = :status, stages_json = CAST(:stages AS jsonb), completed_at = :now,
-            error_code = :error_code, diagnostic = :diagnostic
+            error_code = :error_code, diagnostic = :diagnostic,
+            samples_json = CAST(:samples AS jsonb)
         WHERE id = :id
         """,
         {
             "status": status,
             "stages": jsonb(body.get("stages") or []),
+            "samples": jsonb(body.get("samples") or {}),
             "now": utcnow(),
             "error_code": body.get("error_code"),
             "diagnostic": str(body.get("diagnostic") or "")[:1000],

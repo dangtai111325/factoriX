@@ -49,26 +49,26 @@ def parse_allowlist(entries: list[str]) -> list[AllowedEndpoint]:
         if "://" in item:
             url = urlparse(item)
             if not url.hostname or not url.port:
-                raise NetworkPolicyError("ALLOWLIST", "Allowlist URL phải có host và port.")
+                raise NetworkPolicyError("ALLOWLIST", "Allowlist URL must include host and port.")
             parsed.append(AllowedEndpoint(url.hostname, url.port, url.scheme))
             continue
         if ":" not in item:
-            raise NetworkPolicyError("ALLOWLIST", "Allowlist phải có dạng host:port.")
+            raise NetworkPolicyError("ALLOWLIST", "Allowlist must be in host:port format.")
         host, _, port_text = item.rpartition(":")
         if not host or not port_text.isdigit():
-            raise NetworkPolicyError("ALLOWLIST", "Allowlist host:port không hợp lệ.")
+            raise NetworkPolicyError("ALLOWLIST", "Allowlist host:port is invalid.")
         port = int(port_text)
         if port < 1 or port > 65535:
-            raise NetworkPolicyError("ALLOWLIST", "Cổng không hợp lệ.")
+            raise NetworkPolicyError("ALLOWLIST", "Invalid port.")
         parsed.append(AllowedEndpoint(host.strip("[]"), port, None))
     return parsed
 
 
 def assert_allowed(host: str, port: int, allowlist: list[AllowedEndpoint], *, scheme: str | None = None) -> None:
     if port < 1 or port > 65535:
-        raise NetworkPolicyError("PORT", "Cổng không hợp lệ.")
+        raise NetworkPolicyError("PORT", "Invalid port.")
     if not allowlist:
-        raise NetworkPolicyError("ALLOWLIST", "Chưa cấu hình allowlist mạng OT.")
+        raise NetworkPolicyError("ALLOWLIST", "OT network allowlist is not configured.")
     normalized = host.strip().lower().rstrip(".")
     if normalized in {"localhost", "metadata.google.internal"} or normalized.endswith(".local"):
         matched = any(item.host.lower() == normalized and item.port == port for item in allowlist)
@@ -78,31 +78,31 @@ def assert_allowed(host: str, port: int, allowlist: list[AllowedEndpoint], *, sc
     for address in addresses:
         ip = ipaddress.ip_address(address)
         if any(ip in network for network in BLOCKED_NETWORKS):
-            raise NetworkPolicyError("BLOCKED", "Địa chỉ nằm trong dải bị cấm.")
+            raise NetworkPolicyError("BLOCKED", "Address is in blocked range.")
     permitted = [
         item
         for item in allowlist
         if item.host.lower() == normalized and item.port == port and (scheme is None or item.scheme in {None, scheme})
     ]
     if not permitted:
-        raise NetworkPolicyError("NOT_ALLOWLISTED", "Endpoint không nằm trong allowlist của Edge.")
+        raise NetworkPolicyError("NOT_ALLOWLISTED", "Endpoint is not in edge allowlist.")
     for address in addresses:
         ip = ipaddress.ip_address(address)
         private = any(ip in network for network in PRIVATE_NETWORKS)
         if private and not permitted:
-            raise NetworkPolicyError("NOT_ALLOWLISTED", "Mạng riêng chưa được phép.")
+            raise NetworkPolicyError("NOT_ALLOWLISTED", "Private network is not permitted.")
 
 
 def assert_url(url: str, allowlist: list[AllowedEndpoint]) -> tuple[str, int]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https", "opc.tcp", "mqtt", "mqtts", "tcp"}:
-        raise NetworkPolicyError("SCHEME", "Giao thức URL không được phép.")
+        raise NetworkPolicyError("SCHEME", "URL scheme is not permitted.")
     if parsed.username or parsed.password:
         raise NetworkPolicyError("URL_SECRET", "Do not put secrets in the URL.")
     host = parsed.hostname
     port = parsed.port or _default_port(parsed.scheme)
     if not host or port is None:
-        raise NetworkPolicyError("URL", "URL thiếu host hoặc cổng.")
+        raise NetworkPolicyError("URL", "URL is missing host or port.")
     assert_allowed(host, port, allowlist, scheme=parsed.scheme)
     return host, port
 

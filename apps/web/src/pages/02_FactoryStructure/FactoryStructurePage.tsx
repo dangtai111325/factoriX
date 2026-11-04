@@ -13,6 +13,7 @@ import {
   Copy,
   Archive,
   Layers,
+  UploadCloud,
 } from 'lucide-react';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
@@ -22,6 +23,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ResourceNode } from '../../types';
 import { AddResourceModal } from '../../components/modals/AddResourceModal';
 import { MoveResourceModal } from '../../components/modals/MoveResourceModal';
+import { ImportTopicsModal } from '../../components/modals/ImportTopicsModal';
 import { translateApiError } from '../../utils/apiErrors';
 import {
   allowedChildTypes,
@@ -207,6 +209,7 @@ export const FactoryStructurePage: React.FC = () => {
 
   const [isAddModalOpen, setIsAddModalOpen] = useState(searchParams.get('modal') === 'add');
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
 
   const navigate = useNavigate();
 
@@ -324,8 +327,9 @@ export const FactoryStructurePage: React.FC = () => {
 
   const handleCreateResource = async (data: {
     name: string;
+    code: string;
     type: string;
-    parentPath: string;
+    parent_id?: string | null;
     description: string;
     properties: Record<string, string>;
   }) => {
@@ -333,7 +337,8 @@ export const FactoryStructurePage: React.FC = () => {
     try {
       const result = await addResource({
         name: data.name,
-        parentId: selectedResource?.id,
+        code: data.code,
+        parentId: data.parent_id || selectedResource?.id || undefined,
         type: (data.type.toLowerCase() || 'enterprise') as ResourceNode['type'],
         description: data.description,
         attributes: data.properties,
@@ -341,7 +346,7 @@ export const FactoryStructurePage: React.FC = () => {
       if (result?.edgeCreated) {
         setMoveToast({
           message: `Edge "${result.edgeName || 'collector'}" was created and needs enrollment before commissioning.`,
-          linkTo: '/acquisition/edges',
+          linkTo: '/collector/edges',
         });
         setTimeout(() => setMoveToast(null), 8000);
       }
@@ -434,7 +439,7 @@ export const FactoryStructurePage: React.FC = () => {
   if (!selectedResource) {
     return (
       <div className="space-y-4">
-        <h1 className="fx-page-title">Factory Structure</h1>
+        <h1 className="fx-page-title">Hierarchy Structure</h1>
         <p className="fx-page-subtitle">
           The model is empty. Create an enterprise, then a site, plant, line and machine. Each step
           is checked by the server.
@@ -455,7 +460,8 @@ export const FactoryStructurePage: React.FC = () => {
           isOpen={isAddModalOpen}
           onClose={() => setIsAddModalOpen(false)}
           parentPath="(root)"
-          allowedTypes={['Enterprise']}
+          parentName="Root"
+          recommendedTypes={['enterprise']}
           onAddResource={handleCreateResource}
         />
       </div>
@@ -467,7 +473,7 @@ export const FactoryStructurePage: React.FC = () => {
       {/* Region 1 & 2: Heading & Actions Toolbar */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="fx-page-title">Factory Structure</h1>
+          <h1 className="fx-page-title">Hierarchy Structure</h1>
           <p className="fx-page-subtitle">
             Enterprise asset topology, functional locations, and resource hierarchy.
           </p>
@@ -483,6 +489,13 @@ export const FactoryStructurePage: React.FC = () => {
               className="fx-input !pl-9 h-9 text-[13px]"
             />
           </div>
+          <Button
+            variant="secondary"
+            icon={<UploadCloud className="w-4 h-4" />}
+            onClick={() => setIsImportModalOpen(true)}
+          >
+            Import Topics
+          </Button>
           <Button
             variant="primary"
             icon={<Plus className="w-4 h-4" />}
@@ -598,7 +611,13 @@ export const FactoryStructurePage: React.FC = () => {
                           {getIconForType(child.type)}
                           <span className="text-[13px] font-bold text-[#111B37]">{child.name}</span>
                         </div>
-                        <Badge variant={childStatus.variant}>{childStatus.label}</Badge>
+                        {(child.signalsCount ?? 0) > 0 ? (
+                          <Badge variant={childStatus.variant}>{childStatus.label}</Badge>
+                        ) : (
+                          <span className="text-[10px] text-slate-400 font-medium px-2 py-0.5 rounded bg-slate-100">
+                            NO SIGNALS
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center justify-between text-[11px] text-[#657794] font-mono">
                         <span>{child.code || 'ASSET-NODE'}</span>
@@ -621,7 +640,13 @@ export const FactoryStructurePage: React.FC = () => {
                   <h2 className="text-[18px] font-extrabold text-[#111B37]">
                     {selectedResource.name}
                   </h2>
-                  <Badge variant={selectedStatus.variant}>{selectedStatus.label}</Badge>
+                  {(selectedResource.signalsCount ?? 0) > 0 ? (
+                    <Badge variant={selectedStatus.variant}>{selectedStatus.label}</Badge>
+                  ) : (
+                    <span className="text-[10px] text-slate-400 font-medium px-2 py-0.5 rounded bg-slate-100">
+                      NO SIGNALS
+                    </span>
+                  )}
                 </div>
                 <div className="text-[12px] font-mono text-[#657794] mt-1">
                   ID:{' '}
@@ -646,7 +671,7 @@ export const FactoryStructurePage: React.FC = () => {
                   variant="primary"
                   icon={<Activity className="w-3.5 h-3.5" />}
                   onClick={() =>
-                    navigate(`/acquisition/add-data?resourceId=${selectedResource.id}`)
+                    navigate(`/collector/add-data?resourceId=${selectedResource.id}`)
                   }
                 >
                   Add Signals
@@ -739,15 +764,19 @@ export const FactoryStructurePage: React.FC = () => {
       <AddResourceModal
         isOpen={isAddModalOpen}
         onClose={() => setIsAddModalOpen(false)}
+        parentId={selectedResource?.id || null}
+        parentName={selectedResource?.name}
         parentPath={
           selectedResource ? `${selectedResource.code} · ${selectedResource.name}` : '(root)'
         }
-        allowedTypes={
-          allowedTypesForSelected.length
-            ? allowedTypesForSelected
-            : ['Machine']
-        }
+        recommendedTypes={allowedTypesForSelected}
         onAddResource={handleCreateResource}
+      />
+
+      <ImportTopicsModal
+        isOpen={isImportModalOpen}
+        onClose={() => setIsImportModalOpen(false)}
+        onSuccess={() => window.location.reload()}
       />
 
       <MoveResourceModal

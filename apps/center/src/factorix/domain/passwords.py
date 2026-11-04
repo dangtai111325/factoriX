@@ -31,24 +31,24 @@ class PasswordPolicyError(ValueError):
 
 def validate_password(password: str, login: str) -> None:
     if len(password) < 12 or len(password) > 128:
-        raise PasswordPolicyError("WEAK_PASSWORD", "Mật khẩu phải từ 12 đến 128 ký tự.")
+        raise PasswordPolicyError("WEAK_PASSWORD", "Password must be 12–128 characters.")
     if password.lower() in _BLOCKED or login.lower() in password.lower():
-        raise PasswordPolicyError("WEAK_PASSWORD", "Mật khẩu quá dễ đoán.")
+        raise PasswordPolicyError("WEAK_PASSWORD", "Password is too predictable.")
     if sum(1 for pattern in _CLASSES if pattern.search(password)) < 3:
         raise PasswordPolicyError("WEAK_PASSWORD", "Password needs at least 3 character classes.")
     if password != password.strip() or any(ch in password for ch in ("\n", "\r", "\x00")):
-        raise PasswordPolicyError("WEAK_PASSWORD", "Mật khẩu chứa ký tự không hợp lệ.")
+        raise PasswordPolicyError("WEAK_PASSWORD", "Password contains invalid characters.")
 
 
 def validate_email(email: str) -> str:
     cleaned = email.strip().lower()
     if len(cleaned) > 254 or not _EMAIL.fullmatch(cleaned):
-        raise PasswordPolicyError("INVALID_EMAIL", "Email không hợp lệ.")
+        raise PasswordPolicyError("INVALID_EMAIL", "Enter a valid email address.")
     return cleaned
 
 
 def validate_login(login: str) -> str:
     cleaned = login.strip()
     if not re.fullmatch(r"[A-Za-z0-9._-]{3,64}", cleaned):
-        raise PasswordPolicyError("INVALID_LOGIN", "Tên đăng nhập không hợp lệ.")
+        raise PasswordPolicyError("INVALID_LOGIN", "Username must be 3–64 characters: letters, numbers, . _ -")
     return cleaned

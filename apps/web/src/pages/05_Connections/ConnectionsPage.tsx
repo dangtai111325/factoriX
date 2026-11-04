@@ -1,348 +1,476 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Plus,
   Search,
   Network,
-  Cable,
   RadioTower,
+  Cable,
   Cloud,
-  CheckCircle2,
-  RefreshCw,
+  MoreVertical,
+  Activity,
+  Play,
+  Pause,
   Edit2,
   Trash2,
   ExternalLink,
-  ShieldCheck,
-  Zap,
-  Activity,
-  FileDown,
-  Cpu,
+  PlusCircle,
+  AlertCircle,
 } from 'lucide-react';
-import { Button } from '../../components/common/Button';
-import { Card } from '../../components/common/Card';
-import { Badge } from '../../components/common/Badge';
-import { Tabs } from '../../components/common/Tabs';
 import { useApp } from '../../store/AppContext';
 import { ConnectionItem, ProtocolType } from '../../types';
-import { useNavigate, useSearchParams } from 'react-router-dom';
-import { ConnectionTestModal } from '../../components/modals/ConnectionTestModal';
+import { ConnectionDetailDrawer } from './ConnectionDetailDrawer';
+import { ConnectionFormModal } from './ConnectionFormModal';
+import { ConfirmDialog } from '../../components/common/ConfirmDialog';
+import { api } from '../../api/client';
 
 export const ConnectionsPage: React.FC = () => {
-  const { connections, selectedConnectionId, setSelectedConnectionId, testConnection, deleteConnection } = useApp();
-  const [searchParams] = useSearchParams();
-  const [filterProtocol, setFilterProtocol] = useState<string>('all');
-  const [searchTerm, setSearchTerm] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<string>('config');
-  const [testingId, setTestingId] = useState<string | null>(null);
+  const {
+    connections,
+    signals,
+    scopedResources,
+    edges,
+    refresh,
+    testConnection,
+  } = useApp();
 
-  // Modals (supports query param deep-linking)
-  const [isTestModalOpen, setIsTestModalOpen] = useState(searchParams.get('modal') === 'test');
-
+  const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
 
+  // Selected connection for Drawer
+  const [selectedConnId, setSelectedConnId] = useState<string | null>(null);
+
+  // Filter & Search states
+  const [kpiFilter, setKpiFilter] = useState<'all' | 'online' | 'degraded' | 'paused'>('all');
+  const [protocolFilter, setProtocolFilter] = useState<string>('all');
+  const [searchTerm, setSearchTerm] = useState('');
+
+  // Modals state
+  const [isFormOpen, setIsFormOpen] = useState(false);
+  const [editingConn, setEditingConn] = useState<ConnectionItem | null>(null);
+  const [archivingConn, setArchivingConn] = useState<ConnectionItem | null>(null);
+  const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
+
+  // Sync deep link `?connectionId=` (TC-UI-CN-12)
   useEffect(() => {
-    const connectionId = searchParams.get('connectionId');
-    if (connectionId && connections.some((item) => item.id === connectionId)) {
-      setSelectedConnectionId(connectionId);
+    const qId = searchParams.get('connectionId');
+    if (qId) {
+      setSelectedConnId(qId);
     }
-  }, [connections, searchParams, setSelectedConnectionId]);
+  }, [searchParams]);
 
-  const selectedConn =
-    connections.find((c) => c.id === selectedConnectionId) || connections[0];
+  const selectedConn = useMemo(() => {
+    return connections.find((c) => c.id === selectedConnId) || null;
+  }, [connections, selectedConnId]);
 
-  const filteredConnections = connections.filter((c) => {
-    const matchesProto = filterProtocol === 'all' || c.protocol === filterProtocol;
-    const matchesSearch =
-      c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      c.endpoint.toLowerCase().includes(searchTerm.toLowerCase());
-    return matchesProto && matchesSearch;
-  });
+  // KPI Calculations
+  const totalCount = connections.length;
+  const onlineCount = connections.filter(
+    (c) => c.status === 'connected' || (c as any).health === 'ONLINE' || (c as any).health === 'HEALTHY'
+  ).length;
+  const pausedCount = connections.filter(
+    (c) => (c as any).status === 'PAUSED' || (c as any).lifecycle_status === 'PAUSED'
+  ).length;
+  const degradedCount = connections.filter(
+    (c) => (c as any).health === 'DEGRADED' || (c as any).health === 'OFFLINE'
+  ).length;
+
+  // Filtered connections list (TC-UI-CN-24)
+  const filteredConnections = useMemo(() => {
+    return connections.filter((conn) => {
+      // Protocol filter
+      if (protocolFilter !== 'all' && conn.protocol !== protocolFilter) return false;
+
+      // KPI pill filter
+      if (kpiFilter === 'online') {
+        const isOnline =
+          conn.status === 'connected' ||
+          (conn as any).health === 'ONLINE' ||
+          (conn as any).health === 'HEALTHY';
+        if (!isOnline) return false;
+      } else if (kpiFilter === 'paused') {
+        if ((conn as any).status !== 'PAUSED' && (conn as any).lifecycle_status !== 'PAUSED')
+          return false;
+      } else if (kpiFilter === 'degraded') {
+        const isDegraded =
+          (conn as any).health === 'DEGRADED' || (conn as any).health === 'OFFLINE';
+        if (!isDegraded) return false;
+      }
+
+      // Search query
+      if (searchTerm.trim()) {
+        const q = searchTerm.toLowerCase();
+        return (
+          conn.name.toLowerCase().includes(q) ||
+          conn.endpoint.toLowerCase().includes(q) ||
+          conn.protocol.toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+  }, [connections, protocolFilter, kpiFilter, searchTerm]);
+
+  const handlePauseResume = async (id: string, currentStatus: string) => {
+    const isPaused = currentStatus === 'disconnected' || currentStatus === 'PAUSED';
+    const action = isPaused ? 'resume' : 'pause';
+    try {
+      await api(`/api/v1/connections/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
+      await refresh();
+    } catch {
+      // error handled
+    }
+  };
+
+  const handleArchive = async () => {
+    if (!archivingConn) return;
+    try {
+      // If currently active, pause first if required
+      if (archivingConn.status === 'connected') {
+        await api(`/api/v1/connections/${encodeURIComponent(archivingConn.id)}/pause`, {
+          method: 'POST',
+        });
+      }
+      await api(`/api/v1/connections/${encodeURIComponent(archivingConn.id)}`, {
+        method: 'DELETE',
+      });
+      setArchivingConn(null);
+      if (selectedConnId === archivingConn.id) {
+        setSelectedConnId(null);
+        setSearchParams({});
+      }
+      await refresh();
+    } catch {
+      setArchivingConn(null);
+    }
+  };
 
   const getProtocolIcon = (proto: ProtocolType) => {
     switch (proto) {
+      case 'mqtt':
+        return <RadioTower className="w-4 h-4 text-[#149580]" />;
       case 'modbus':
         return <Network className="w-4 h-4 text-[#1D63BD]" />;
       case 'opcua':
         return <Cable className="w-4 h-4 text-[#7B3AE0]" />;
-      case 'mqtt':
-        return <RadioTower className="w-4 h-4 text-[#149580]" />;
       case 'http':
         return <Cloud className="w-4 h-4 text-[#C76114]" />;
     }
   };
 
-  const handleTest = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setTestingId(id);
-    await testConnection(id);
-    setTestingId(null);
-    setIsTestModalOpen(true);
-  };
-
   return (
-    <div className="space-y-4 animate-in fade-in duration-200">
-      {/* Region 1: Heading & Action Bar */}
+    <div className="space-y-4 animate-in fade-in duration-200 select-none pb-8">
+      {/* Top Header & New Connection Button */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="fx-page-title">Industrial Connections</h1>
-          <p className="fx-page-subtitle">
-            Hardware gateways, PLC adapters, and protocol channel management.
+          <h1 className="text-xl md:text-2xl font-black text-[#0B2545] tracking-tight">
+            Data Connections
+          </h1>
+          <p className="text-xs text-[#64748B]">
+            Hardware gateways, PLCs, broker channels, and REST endpoints across sites.
           </p>
         </div>
-        <div className="flex items-center gap-2.5">
-          <Button
-            variant="primary"
-            icon={<Plus className="w-4 h-4" />}
-            onClick={() => navigate('/acquisition/add-data')}
-          >
-            New Connection
-          </Button>
-          <Button
-            variant="secondary"
-            icon={<FileDown className="w-4 h-4" />}
-            disabled
-            title="Connection templates are not available yet"
-          >
-            Import Template
-          </Button>
-          <Button
-            variant="secondary"
-            icon={<Activity className="w-4 h-4" />}
-            onClick={() => setIsTestModalOpen(true)}
-          >
-            Test Diagnostics
-          </Button>
-        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setEditingConn(null);
+            setIsFormOpen(true);
+          }}
+          className="py-2 px-4 rounded-xl bg-[#0B2545] hover:bg-[#134074] text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all shrink-0"
+        >
+          <Plus className="w-4 h-4" />
+          <span>New Connection</span>
+        </button>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">Total Connections</span>
-          <span className="text-2xl font-black text-slate-900 mt-1 block">{connections.length}</span>
-          <span className="text-[11px] text-emerald-600 font-semibold mt-0.5 block">
-            {connections.filter((item) => item.status === 'connected').length} healthy
-          </span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">Modbus TCP</span>
-          <span className="text-2xl font-black text-[#1D63BD] mt-1 block">
-            {connections.filter((item) => item.protocol === 'modbus').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">From the model</span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">OPC UA</span>
-          <span className="text-2xl font-black text-[#7B3AE0] mt-1 block">
-            {connections.filter((item) => item.protocol === 'opcua').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">From the model</span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">MQTT / Sparkplug</span>
-          <span className="text-2xl font-black text-[#149580] mt-1 block">
-            {connections.filter((item) => item.protocol === 'mqtt').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">From the model</span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">HTTP / REST</span>
-          <span className="text-2xl font-black text-[#C76114] mt-1 block">
-            {connections.filter((item) => item.protocol === 'http').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">From the model</span>
-        </div>
-        <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-sm">
-          <span className="text-xs font-semibold text-slate-500 block">Warnings</span>
-          <span className="text-2xl font-black text-[#EF1B24] mt-1 block">
-            {connections.filter((item) => item.status !== 'connected').length}
-          </span>
-          <span className="text-[11px] text-slate-500 mt-0.5 block">Need attention</span>
-        </div>
-      </div>
-
-      {/* Region 2 & 3: Protocol Filter Tabs and Search Toolbar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-[#E3EAF3]">
-        <div className="flex items-center gap-2">
-          {[
-            { id: 'all', label: 'All Protocols' },
-            { id: 'opcua', label: 'OPC UA' },
-            { id: 'modbus', label: 'Modbus TCP' },
-            { id: 'mqtt', label: 'MQTT' },
-            { id: 'http', label: 'HTTP / API' },
-          ].map((tab) => (
+      {/* KPI Filter Pills (§6.1 & TC-UI-CN-24) */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {[
+          { key: 'all', label: 'Total Connections', count: totalCount },
+          { key: 'online', label: 'Online', count: onlineCount, color: 'text-[#10B981]' },
+          { key: 'degraded', label: 'Degraded / Offline', count: degradedCount, color: 'text-[#EF4444]' },
+          { key: 'paused', label: 'Paused', count: pausedCount, color: 'text-[#64748B]' },
+        ].map((kpi) => {
+          const active = kpiFilter === kpi.key;
+          return (
             <button
-              key={tab.id}
+              key={kpi.key}
               type="button"
-              onClick={() => setFilterProtocol(tab.id)}
-              className={`px-3 py-1.5 rounded-lg text-[13px] font-semibold transition-all ${
-                filterProtocol === tab.id
-                  ? 'bg-[#FFF0F1] text-[#EF1B24] border border-[#FAC6C9]'
-                  : 'bg-white text-[#657794] border border-[#D4DFEC] hover:text-[#111B37]'
+              onClick={() => setKpiFilter(kpi.key as any)}
+              className={`p-3.5 rounded-2xl border text-left transition-all ${
+                active
+                  ? 'bg-white border-[#134074] ring-2 ring-[#134074]/10 shadow-sm'
+                  : 'bg-white border-[#E2E8F0] hover:border-[#CBD5E1]'
               }`}
             >
-              {tab.label}
+              <div className="text-[11px] font-bold text-[#64748B] uppercase tracking-wider truncate">
+                {kpi.label}
+              </div>
+              <div className={`text-2xl font-black mt-1 font-mono ${kpi.color || 'text-[#0B2545]'}`}>
+                {kpi.count}
+              </div>
             </button>
-          ))}
-        </div>
+          );
+        })}
+      </div>
 
-        <div className="relative w-64">
-          <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#94A3B8]" />
-          <input
-            type="text"
-            placeholder="Search endpoint or name..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="fx-input pl-9 h-9 text-[13px]"
-          />
+      {/* Toolbar: Search + Protocol Filter */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          {/* Search Input */}
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-[#CBD5E1] bg-white text-xs shadow-sm w-64">
+            <Search className="w-3.5 h-3.5 text-[#64748B]" />
+            <input
+              type="text"
+              placeholder="Search connections…"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full text-xs font-medium text-[#0B2545] outline-none placeholder:text-[#94A3B8]"
+            />
+          </div>
+
+          {/* Protocol filter chips */}
+          <div className="flex items-center gap-1 bg-[#F1F5F9] p-1 rounded-xl border border-[#E2E8F0] text-xs">
+            {['all', 'mqtt', 'modbus', 'opcua', 'http'].map((proto) => (
+              <button
+                key={proto}
+                type="button"
+                onClick={() => setProtocolFilter(proto)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all uppercase ${
+                  protocolFilter === proto
+                    ? 'bg-white text-[#0B2545] shadow-sm'
+                    : 'text-[#64748B] hover:text-[#0B2545]'
+                }`}
+              >
+                {proto}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      {/* Region 4: Connection Table */}
-      <Card className="p-0 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="fx-table">
-            <thead>
-              <tr>
-                <th>Protocol</th>
-                <th>Gateway / Connection Name</th>
-                <th>Target Endpoint</th>
-                <th>Signals</th>
-                <th>Latency</th>
-                <th>Throughput</th>
-                <th>Status</th>
-                <th className="text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredConnections.map((conn) => {
-                const isSelected = conn.id === selectedConn.id;
-                return (
-                  <tr
-                    key={conn.id}
-                    onClick={() => setSelectedConnectionId(conn.id)}
-                    data-selected={isSelected}
-                    className="cursor-pointer"
-                  >
-                    <td>
-                      <Badge variant={conn.protocol as any}>
-                        <div className="flex items-center gap-1.5">
-                          {getProtocolIcon(conn.protocol)}
-                          <span>{conn.protocol.toUpperCase()}</span>
-                        </div>
-                      </Badge>
-                    </td>
-                    <td className="font-bold text-[#111B37] text-[13px]">{conn.name}</td>
-                    <td className="font-mono text-[#657794] text-[12px]">{conn.endpoint}</td>
-                    <td className="font-semibold text-[#111B37]">{conn.signalsCount} tags</td>
-                    <td className="font-mono text-[12px] text-[#657794]">{conn.latencyMs} ms</td>
-                    <td className="font-mono text-[12px] text-[#111B37] font-semibold">
-                      {conn.throughputPerSec} msg/s
-                    </td>
-                    <td>
-                      <Badge
-                        variant={
-                          conn.status === 'connected'
-                            ? 'good'
-                            : conn.status === 'warning'
-                            ? 'warning'
-                            : conn.status === 'testing'
-                            ? 'info'
-                            : 'error'
-                        }
-                      >
-                        {conn.status.toUpperCase()}
-                      </Badge>
-                    </td>
-                    <td className="text-right">
-                      <div className="flex items-center justify-end gap-1.5">
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          className="text-[11px] h-7 px-2"
-                          onClick={(e) => handleTest(conn.id, e)}
-                          loading={testingId === conn.id}
-                        >
-                          Test
-                        </Button>
-                        <button
-                          type="button"
-                          className="p-1 rounded text-[#94A3B8] hover:text-[#111B37]"
-                          title="Edit connection settings in Add Data wizard"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            navigate(`/acquisition/add-data?resourceId=${encodeURIComponent(conn.plantId || '')}`);
-                          }}
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          className="p-1 rounded text-[#94A3B8] hover:text-[#F2343B]"
-                          title="Archive / delete draft connection"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (!window.confirm(`Archive connection "${conn.name}"?`)) return;
-                            void deleteConnection(conn.id).catch((err) => {
-                              window.alert(err instanceof Error ? err.message : 'Delete failed');
-                            });
-                          }}
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </Card>
-
-      {selectedConn ? (
-        <Card title={`Connection Profile: ${selectedConn.name}`}>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
-            <div>
-              <span className="text-slate-500 block mb-1">Target Endpoint</span>
-              <span className="font-mono font-bold text-slate-800 text-sm">{selectedConn.endpoint}</span>
+      {/* Connections Table (§6.1 & TC-UI-CN-10..12) */}
+      <div className="bg-white rounded-2xl border border-[#E2E8F0] shadow-sm overflow-hidden">
+        {filteredConnections.length === 0 ? (
+          <div className="p-12 text-center space-y-3">
+            <div className="w-12 h-12 rounded-full bg-[#F1F5F9] flex items-center justify-center mx-auto text-[#64748B]">
+              <Network className="w-6 h-6" />
             </div>
-            <div>
-              <span className="text-slate-500 block mb-1">Polling / Keep-Alive</span>
-              <span className="font-mono text-slate-800">
-                {selectedConn.config?.interval_ms ? `Interval: ${selectedConn.config.interval_ms}ms` : 'Interval not recorded'}
-              </span>
-            </div>
-            <div>
-              <span className="text-slate-500 block mb-1">Telemetry Throughput</span>
-              <span className="font-semibold text-slate-400">Not measured</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="secondary"
-                className="w-full text-xs"
-                icon={<Activity className="w-3.5 h-3.5" />}
-                onClick={() => setIsTestModalOpen(true)}
-              >
-                Run Handshake Test
-              </Button>
-            </div>
+            <h3 className="text-sm font-bold text-[#0B2545]">No connections found</h3>
+            <p className="text-xs text-[#64748B] max-w-sm mx-auto">
+              No industrial connections match your filters. Click "New Connection" to connect a broker or PLC.
+            </p>
           </div>
-        </Card>
-      ) : (
-        <Card title="Connection Profile">
-          <p className="py-8 text-center text-sm text-slate-500">
-            No connection yet. Use Add Data after you create a machine in the factory model.
-          </p>
-        </Card>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs border-collapse">
+              <thead>
+                <tr className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-[11px] font-bold text-[#475569] uppercase tracking-wider">
+                  <th className="py-3 px-4">Name & Protocol</th>
+                  <th className="py-3 px-4">Endpoint</th>
+                  <th className="py-3 px-4">Edge</th>
+                  <th className="py-3 px-4">Signals</th>
+                  <th className="py-3 px-4">Last Data</th>
+                  <th className="py-3 px-4">Status</th>
+                  <th className="py-3 px-4 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#F1F5F9]">
+                {filteredConnections.map((conn) => {
+                  const connSigCount = signals.filter(
+                    (s) => s.sourceConnectionId === conn.id
+                  ).length;
+                  const isOnline =
+                    conn.status === 'connected' || (conn as any).health === 'ONLINE';
+
+                  return (
+                    <tr
+                      key={conn.id}
+                      onClick={() => {
+                        setSelectedConnId(conn.id);
+                        setSearchParams({ connectionId: conn.id });
+                      }}
+                      className="hover:bg-[#F8FAFC] cursor-pointer transition-colors group"
+                    >
+                      <td className="py-3.5 px-4">
+                        <div className="flex items-center gap-2.5">
+                          <div className="p-1.5 rounded-lg bg-[#F1F5F9]">
+                            {getProtocolIcon(conn.protocol)}
+                          </div>
+                          <div>
+                            <div className="font-bold text-[#0B2545] group-hover:text-[#134074] transition-colors">
+                              {conn.name}
+                            </div>
+                            <div className="text-[10px] font-mono uppercase text-[#64748B]">
+                              {conn.protocol}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+
+                      <td className="py-3.5 px-4 font-mono text-xs text-[#475569] truncate max-w-[200px]">
+                        {conn.endpoint}
+                      </td>
+
+                      <td className="py-3.5 px-4 text-xs font-semibold text-[#0B2545]">
+                        {(conn as any).edge_name || 'Edge Collector'}
+                      </td>
+
+                      <td className="py-3.5 px-4 font-mono font-bold text-xs text-[#0B2545]">
+                        {(conn as any).signal_count ?? connSigCount}
+                      </td>
+
+                      <td className="py-3.5 px-4 text-xs text-[#64748B]">
+                        {conn.lastConnected || '—'}
+                      </td>
+
+                      <td className="py-3.5 px-4">
+                        <div className="flex items-center gap-1.5">
+                          <span
+                            className={`w-2 h-2 rounded-full ${
+                              isOnline ? 'bg-[#10B981]' : 'bg-[#EF4444]'
+                            }`}
+                          />
+                          <span className="font-bold text-[11px] text-[#0B2545] capitalize">
+                            {conn.status}
+                          </span>
+                        </div>
+                      </td>
+
+                      {/* Actions Menu (TC-UI-CN-13..19) */}
+                      <td className="py-3.5 px-4 text-right" onClick={(e) => e.stopPropagation()}>
+                        <div className="relative inline-block">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setActiveMenuId(activeMenuId === conn.id ? null : conn.id)
+                            }
+                            className="p-1.5 rounded-lg text-[#64748B] hover:text-[#0B2545] hover:bg-[#E2E8F0] transition-colors"
+                          >
+                            <MoreVertical className="w-4 h-4" />
+                          </button>
+
+                          {activeMenuId === conn.id && (
+                            <div className="absolute right-0 top-full mt-1 w-52 bg-white border border-[#CBD5E1] rounded-xl shadow-xl z-30 p-1 space-y-0.5 text-left text-xs font-semibold animate-in fade-in duration-100">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveMenuId(null);
+                                  void testConnection(conn.id);
+                                }}
+                                className="w-full px-3 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-[#0B2545] flex items-center gap-2"
+                              >
+                                <Activity className="w-3.5 h-3.5 text-[#134074]" />
+                                <span>Test connection</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveMenuId(null);
+                                  navigate(`/collector/add-data?connectionId=${encodeURIComponent(conn.id)}`);
+                                }}
+                                className="w-full px-3 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-[#0B2545] flex items-center gap-2"
+                              >
+                                <PlusCircle className="w-3.5 h-3.5 text-[#10B981]" />
+                                <span>Add data from this</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveMenuId(null);
+                                  setEditingConn(conn);
+                                  setIsFormOpen(true);
+                                }}
+                                className="w-full px-3 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-[#0B2545] flex items-center gap-2"
+                              >
+                                <Edit2 className="w-3.5 h-3.5 text-[#64748B]" />
+                                <span>Edit</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveMenuId(null);
+                                  void handlePauseResume(conn.id, conn.status);
+                                }}
+                                className="w-full px-3 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-[#0B2545] flex items-center gap-2"
+                              >
+                                {conn.status === 'disconnected' ? (
+                                  <>
+                                    <Play className="w-3.5 h-3.5 text-[#10B981]" />
+                                    <span>Resume</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Pause className="w-3.5 h-3.5 text-[#F59E0B]" />
+                                    <span>Pause</span>
+                                  </>
+                                )}
+                              </button>
+                              <div className="h-px bg-[#F1F5F9] my-1" />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActiveMenuId(null);
+                                  setArchivingConn(conn);
+                                }}
+                                className="w-full px-3 py-1.5 rounded-lg hover:bg-red-50 text-red-600 flex items-center gap-2"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Archive</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Connection Detail Drawer (TC-UI-CN-12) */}
+      {selectedConn && (
+        <ConnectionDetailDrawer
+          connection={selectedConn}
+          signals={signals}
+          resources={scopedResources}
+          onClose={() => {
+            setSelectedConnId(null);
+            setSearchParams({});
+          }}
+          onTest={(id) => void testConnection(id)}
+          onPauseResume={(id, status) => void handlePauseResume(id, status)}
+          onEdit={(conn) => {
+            setEditingConn(conn);
+            setIsFormOpen(true);
+          }}
+        />
       )}
 
-      <ConnectionTestModal
-        isOpen={isTestModalOpen}
-        onClose={() => setIsTestModalOpen(false)}
-        connectionId={selectedConn?.id}
-        connectionName={selectedConn?.name}
-        protocol={selectedConn?.protocol?.toUpperCase()}
-        endpoint={selectedConn?.endpoint}
+      {/* Connection New / Edit Modal */}
+      <ConnectionFormModal
+        isOpen={isFormOpen}
+        onClose={() => setIsFormOpen(false)}
+        connectionToEdit={editingConn}
+        onSuccess={() => void refresh()}
+        sites={scopedResources.filter((r) => r.type === 'site' || r.type === 'plant')}
+        edges={edges}
+      />
+
+      {/* Archive Confirmation Dialog (§9.7 TC-UI-CN-17) */}
+      <ConfirmDialog
+        isOpen={Boolean(archivingConn)}
+        title={`Pause and archive "${archivingConn?.name}"?`}
+        message={`Its ${
+          signals.filter((s) => s.sourceConnectionId === archivingConn?.id).length
+        } signals stop collecting.`}
+        confirmText="Pause and archive"
+        cancelText="Cancel"
+        variant="danger"
+        onConfirm={handleArchive}
+        onCancel={() => setArchivingConn(null)}
       />
     </div>
   );

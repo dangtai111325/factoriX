@@ -22,7 +22,7 @@ class OpcUaConnector:
         try:
             await self.client.connect()
         except Exception as exc:
-            raise ConnectorError("PROTOCOL", "Không mở được phiên OPC UA.") from exc
+            raise ConnectorError("PROTOCOL", "Cannot establish OPC UA session.") from exc
 
     async def read_values(self, node_ids: list[str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -30,7 +30,7 @@ class OpcUaConnector:
             try:
                 data = await self.client.get_node(node_id).read_data_value()
             except Exception as exc:
-                raise ConnectorError("ADDRESS", "Không đọc được node OPC UA.") from exc
+                raise ConnectorError("ADDRESS", "Cannot read OPC UA node.") from exc
             rows.append(
                 {
                     "node_id": node_id,
@@ -67,7 +67,7 @@ class OpcUaConnector:
         await asyncio.sleep(timeout_s)
         await subscription.delete()
         if len(handler.rows) < len(node_ids):
-            raise ConnectorError("SUBSCRIBE", "OPC UA chưa giao đủ MonitoredItem.")
+            raise ConnectorError("SUBSCRIBE", "OPC UA did not create all requested MonitoredItems.")
         return handler.rows[: len(node_ids)]
 
     async def close(self) -> None:

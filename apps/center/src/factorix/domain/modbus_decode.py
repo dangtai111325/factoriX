@@ -62,16 +62,16 @@ def plan_reads(
     allow_gap: int = 0,
 ) -> list[ReadBlock]:
     if max_registers < 1 or max_registers > MAX_REGISTERS:
-        raise ModbusPlanError("LIMIT", "Giới hạn block register không hợp lệ.")
+        raise ModbusPlanError("LIMIT", "Invalid register block limit.")
     groups: dict[tuple, list[SourceSpan]] = {}
     for span in spans:
         if span.offset < 0 or span.count < 1:
-            raise ModbusPlanError("ADDRESS", "Địa chỉ hoặc độ dài register không hợp lệ.")
+            raise ModbusPlanError("ADDRESS", "Invalid register address or length.")
         if span.unit_id < 0 or span.unit_id > 247:
-            raise ModbusPlanError("UNIT", "Unit ID phải trong khoảng 0–247.")
+            raise ModbusPlanError("UNIT", "Unit ID must be between 0 and 247.")
         limit = max_bits if span.area in {"coil", "discrete"} else max_registers
         if span.count > limit:
-            raise ModbusPlanError("ADDRESS", "Span vượt quá kích thước một lần đọc.")
+            raise ModbusPlanError("ADDRESS", "Span exceeds single read limit.")
         key = (span.unit_id, span.area, span.poll_group, span.word_order)
         groups.setdefault(key, []).append(span)
 
@@ -92,7 +92,7 @@ def plan_reads(
             gap = span.offset - end
             merged_count = span_end - start
             if gap < 0:
-                raise ModbusPlanError("OVERLAP", "Các field chồng địa chỉ trong cùng poll group.")
+                raise ModbusPlanError("OVERLAP", "Fields have overlapping registers in poll group.")
             if gap <= allow_gap and merged_count <= limit:
                 current.append(span)
                 end = max(end, span_end)
@@ -137,7 +137,7 @@ def decode_registers(
     offset: float = 0.0,
 ) -> bool | int | float:
     if any(word < 0 or word > 0xFFFF for word in words):
-        raise ModbusPlanError("DECODE", "Register nằm ngoài 16 bit.")
+        raise ModbusPlanError("DECODE", "Register value exceeds 16 bits.")
     ordered = list(words)
     if word_order == "little" and len(ordered) > 1:
         ordered = list(reversed(ordered))
@@ -148,7 +148,7 @@ def decode_registers(
     kind = native_type.lower()
     if kind in {"bool", "bit"}:
         if len(words) != 1:
-            raise ModbusPlanError("DECODE", "Bit cần đúng 1 register hoặc coil.")
+            raise ModbusPlanError("DECODE", "Bit requires exactly 1 register or coil.")
         return bool(words[0] & 1)
     if kind == "uint16":
         _expect(raw, 2)
@@ -166,16 +166,16 @@ def decode_registers(
         _expect(raw, 4)
         value = struct.unpack(endian + "f", raw)[0]
         if not math.isfinite(value):
-            raise ModbusPlanError("NON_FINITE", "Float32 không hữu hạn.")
+            raise ModbusPlanError("NON_FINITE", "Float32 value is not finite.")
     elif kind == "float64":
         _expect(raw, 8)
         value = struct.unpack(endian + "d", raw)[0]
         if not math.isfinite(value):
-            raise ModbusPlanError("NON_FINITE", "Float64 không hữu hạn.")
+            raise ModbusPlanError("NON_FINITE", "Float64 value is not finite.")
     else:
-        raise ModbusPlanError("DECODE", "Kiểu native không hỗ trợ.")
+        raise ModbusPlanError("DECODE", "Native type is not supported.")
     if not math.isfinite(scale) or not math.isfinite(offset):
-        raise ModbusPlanError("SCALE", "Scale/offset không hữu hạn.")
+        raise ModbusPlanError("SCALE", "Scale or offset is not finite.")
     if kind.startswith("float") or scale != 1.0 or offset != 0.0:
         return float(value) * scale + offset
     return int(value)
@@ -183,10 +183,10 @@ def decode_registers(
 
 def decode_bits(bits: list[bool], index: int) -> bool:
     if index < 0 or index >= len(bits):
-        raise ModbusPlanError("ADDRESS", "Bit nằm ngoài block đã đọc.")
+        raise ModbusPlanError("ADDRESS", "Bit is outside read block.")
     return bool(bits[index])
 
 
 def _expect(raw: bytes, size: int) -> None:
     if len(raw) != size:
-        raise ModbusPlanError("DECODE", "Số register không khớp kiểu dữ liệu.")
+        raise ModbusPlanError("DECODE", "Register count does not match data type.")

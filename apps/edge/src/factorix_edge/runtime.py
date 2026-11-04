@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+from collections import deque
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
-import time
-from datetime import datetime, timezone
 from pathlib import Path
+import time
 from typing import Any
 from uuid import uuid4
 
 import httpx
+import paho.mqtt.client as mqtt_client
 
 from factorix.domain.jsonpath import MappingError, apply_cardinality, evaluate
 from factorix.domain.modbus_decode import ModbusPlanError, SourceSpan, plan_reads
@@ -35,7 +37,7 @@ def checksum(snapshot: dict[str, Any]) -> str:
 
 def _prepare(snapshot: dict[str, Any]) -> None:
     if not isinstance(snapshot.get("connections"), list):
-        raise ValueError("Snapshot thiếu danh sách kết nối.")
+        raise ValueError("Snapshot is missing connections list.")
 
 
 class EdgeRuntime:
@@ -76,7 +78,7 @@ class EdgeRuntime:
                     await self._request(
                         "POST",
                         "/api/v1/edge-sync/ack",
-                        {"revision": revision, "state": "FAILED", "diagnostic": "Checksum cấu hình không khớp."},
+                        {"revision": revision, "state": "FAILED", "diagnostic": "Snapshot checksum mismatch."},
                     )
                     local = self._load_snapshot()
                     snapshot = local[0] if local else None
@@ -113,6 +115,14 @@ class EdgeRuntime:
             flushed = await self._flush()
         except httpx.HTTPError:
             flushed = 0
+        
+        # Build queue status for heartbeat
+        queues_status: dict[str, Any] = {}
+        for conn_id, conn in self._mqtt.items():
+            queues_status[conn_id] = {
+                "pending": conn.queue_length,
+                "dropped": getattr(conn, "dropped", 0),
+            }
         try:
             await self._request(
                 "POST",
@@ -122,6 +132,7 @@ class EdgeRuntime:
                     "software_version": "r1",
                     "outbox_pending": self.outbox.pending_count(),
                     "backlog": self.outbox.pending_count(),
+                    "queues": queues_status,
                 },
             )
         except httpx.HTTPError:
@@ -192,24 +203,38 @@ class EdgeRuntime:
             except (ConnectorError, NetworkPolicyError, ModbusPlanError, OSError):
                 continue
             now = _stamp()
-            for field_id, value, quality in samples:
+            for item in samples:
+                if len(item) == 5:
+                    field_id, value, quality, source_time, reason = item
+                elif len(item) == 4:
+                    field_id, value, quality, source_time = item
+                    reason = None
+                else:
+                    field_id, value, quality = item
+                    source_time = None
+                    reason = None
                 binding = bindings[field_id]
-                coerced, data_quality = _coerce(binding.get("data_type") or "float64", value, quality)
+                coerced, data_quality, coerce_reason = _coerce(binding.get("data_type") or "float64", value, quality)
+                final_reason = reason or coerce_reason
+                provenance: dict[str, Any] = {"protocol": protocol, "field_id": field_id}
+                if final_reason:
+                    provenance["reason"] = final_reason
                 event_uid = str(uuid4())
                 payload = {
                     "event_uid": event_uid,
                     "resource_id": str(binding["resource_id"]),
                     "signal_id": str(binding["signal_id"]),
                     "connection_id": str(connection["id"]),
-                    "event_time": now,
+                    "event_time": source_time or now,
                     "received_time": now,
+                    "source_time": source_time,
                     "value": coerced,
                     "data_type": str(binding.get("data_type") or "float64"),
                     "unit": binding.get("unit"),
                     "quality": data_quality,
                     "origin": "LIVE",
                     "config_revision": revision,
-                    "provenance": {"protocol": protocol, "field_id": field_id},
+                    "provenance": provenance,
                 }
                 self.outbox.add(event_uid, now, json.dumps(payload).encode(), revision, now)
                 written += 1
@@ -221,17 +246,19 @@ class EdgeRuntime:
         connection: dict[str, Any],
         fields: list[dict[str, Any]],
         mode: str = "POLL",
-    ) -> list[tuple[str, Any, str]]:
+    ) -> list[tuple[str, Any, str, str | None, str | None]]:
         config = connection.get("config_json") or {}
         if protocol == "modbus_tcp":
-            return await self._read_modbus(config, fields)
+            rows_mod = await self._read_modbus(config, fields)
+            return [(fid, v, q, None, None) for fid, v, q in rows_mod]
         if protocol == "opcua":
-            return await self._read_opc(config, fields, mode)
+            rows_opc = await self._read_opc(config, fields, mode)
+            return [(fid, v, q, None, None) for fid, v, q in rows_opc]
         if protocol == "mqtt":
             return await self._read_mqtt(connection, config, fields)
         if protocol == "http":
             return await self._read_http(connection, config, fields)
-        raise ConnectorError("PROTOCOL", "Giao thức không được hỗ trợ.")
+        raise ConnectorError("PROTOCOL", "Protocol is not supported.")
 
     async def _read_modbus(self, config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str]]:
         host = str(config["host"])
@@ -269,7 +296,7 @@ class EdgeRuntime:
             try:
                 decoded = await connector.read_block(block)
             except (ConnectionError, ModbusPlanError):
-                rows.extend((field.field_id, None, "BAD") for field in block.fields)
+                rows.extend((f.field_id, None, "BAD") for f in block.fields)
                 continue
             rows.extend((item["field_id"], item["value"], "GOOD") for item in decoded)
         return rows
@@ -278,7 +305,7 @@ class EdgeRuntime:
         connector = OpcUaConnector(str(config["endpoint"]), self.allowlist)
         node_ids = [str((field.get("address_json") or {}).get("node_id") or "") for field in fields]
         if any(not node_id for node_id in node_ids):
-            raise ConnectorError("ADDRESS", "Thiếu NodeId OPC UA.")
+            raise ConnectorError("ADDRESS", "Missing OPC UA NodeId.")
         await connector.connect()
         try:
             if mode == "SUBSCRIBE":
@@ -299,7 +326,7 @@ class EdgeRuntime:
         secret = await self._request("GET", f"/api/v1/edge-sync/secrets/{secret_ref}")
         return str(secret.get("secret") or "")
 
-    async def _read_mqtt(self, connection: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str]]:
+    async def _read_mqtt(self, connection: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str, str | None, str | None]]:
         topics: list[tuple[str, int]] = []
         for field in fields:
             address = field.get("address_json") or {}
@@ -309,7 +336,7 @@ class EdgeRuntime:
             if topic:
                 topics.append((topic, int(address.get("qos") or config.get("qos") or 1)))
         if not topics:
-            raise ConnectorError("TOPIC", "Chưa có topic để thu thập.")
+            raise ConnectorError("TOPIC", "No topic to collect.")
         key = str(connection["id"])
         connector = self._mqtt.get(key)
         if connector is None:
@@ -318,18 +345,79 @@ class EdgeRuntime:
                 str(config["host"]),
                 int(config["port"]),
                 self.allowlist,
-                f"fx-{key[:8]}",
+                str(config.get("client_id") or f"fx-{key[:8]}"),
                 username=str(config.get("username") or "") or None,
                 password=password,
+                keepalive=int(config.get("keepalive") or 60),
+                clean_session=bool(config.get("clean_session", True)),
+                tls=bool(config.get("tls", False)),
+                ca_pem=config.get("ca_pem"),
+                tls_insecure=not bool(config.get("tls_verify", True)),
+                protocol_version=str(config.get("protocol_version") or "3.1.1"),
             )
             connector.start(topics)
             self._mqtt[key] = connector
-        document = connector.next_json(timeout_s=max(int(config.get("timeout_ms") or 2000), 200) / 1000)
-        return _project_json(fields, document)
+        messages = connector.drain(timeout_s=max(int(config.get("timeout_ms") or 2000), 200) / 1000)
+        
+        rows: list[tuple[str, Any, str, str | None, str | None]] = []
+        for field in fields:
+            address = field.get("address_json") or {}
+            field_topic = str(address.get("topic") or (config.get("topics") or [""])[0])
+            missing_strat = str(address.get("missing") or "SKIP").upper()
 
-    async def _read_http(self, connection: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str]]:
+            # Find newest message matching field_topic
+            matched_msg: dict[str, Any] | None = None
+            if messages:
+                for msg_topic, payload in reversed(messages):
+                    if mqtt_client.topic_matches_sub(field_topic, msg_topic):
+                        matched_msg = payload
+                        break
+
+            if matched_msg is None:
+                # No matching message in this cycle -> DO NOT EMIT
+                continue
+
+            expression = str(address.get("jsonpath") or "$")
+            try:
+                mat = evaluate(expression, matched_msg)
+                mapped = apply_cardinality(mat, cardinality="REJECT_MULTI", missing="BAD")
+            except MappingError:
+                if missing_strat == "BAD":
+                    rows.append((str(field["id"]), None, "BAD", None, "FIELD_MISSING"))
+                continue
+
+            if mapped.quality_override == "BAD" or not mapped.present:
+                if missing_strat == "BAD":
+                    rows.append((str(field["id"]), None, "BAD", None, "FIELD_MISSING"))
+                continue
+
+            source_time = None
+            reason = None
+            decode = field.get("decode_json") or {}
+            timestamp_path = str(decode.get("timestamp_path") or "")
+            if not timestamp_path and "source_timestamp" in matched_msg:
+                timestamp_path = "$.source_timestamp"
+            if timestamp_path:
+                try:
+                    t_matches = evaluate(timestamp_path, matched_msg)
+                    if t_matches and t_matches[0] is not None:
+                        val_str = str(t_matches[0]).replace("Z", "+00:00")
+                        parsed_dt = datetime.fromisoformat(val_str)
+                        if parsed_dt.tzinfo is None:
+                            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                        else:
+                            parsed_dt = parsed_dt.astimezone(timezone.utc)
+                        source_time = parsed_dt.isoformat().replace("+00:00", "Z")
+                except Exception:
+                    source_time = None
+                    reason = "SOURCE_TIME_INVALID"
+
+            rows.append((str(field["id"]), mapped.value, "GOOD", source_time, reason))
+        return rows
+
+    async def _read_http(self, connection: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]]) -> list[tuple[str, Any, str, str | None, str | None]]:
         path = str((fields[0].get("address_json") or {}).get("path") or config.get("path") or "/")
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = dict(config.get("headers") or {})
         secret_ref = connection.get("secret_ref")
         auth = str(config.get("auth") or "none")
         if secret_ref and auth != "none":
@@ -346,7 +434,8 @@ class EdgeRuntime:
                 headers[str(config.get("header_name") or "X-API-Key")] = token
         connector = HttpPullConnector(str(config["base_url"]), self.allowlist, timeout_s=max(int(config.get("timeout_ms") or 5000), 200) / 1000)
         document = await connector.get_json(path, headers)
-        return _project_json(fields, document)
+        projected = _project_json(fields, document)
+        return [(fid, val, q, None, None) for fid, val, q in projected]
 
     async def _flush(self) -> int:
         pending = self.outbox.pending(200)
@@ -370,110 +459,353 @@ class EdgeRuntime:
         job = pulled.get("job")
         if not job:
             return
-        names = ("NETWORK", "AUTH", "PROTOCOL", "READ_OR_SUBSCRIBE", "DECODE", "MAPPING", "VALIDATION")
-        stages = [{"stage": name, "status": "NOT_TESTED", "duration_ms": 0, "detail": ""} for name in names]
+        job_id = str(job["id"])
+        command_type = str(job.get("command") or "COMMISSION").upper()
+
+        if command_type == "CAPTURE":
+            await self._run_capture(job)
+            return
+
+        mode = str(job.get("mode") or "FULL").upper()
+        protocol = str(job["protocol"])
+        if mode == "CONNECTIVITY":
+            stage_names = ["REACH", "AUTH"]
+        else:
+            stage_3 = "SUBSCRIBE" if protocol == "mqtt" else "READ"
+            stage_names = ["REACH", "AUTH", stage_3, "SAMPLE", "MAP"]
+
+        stages = [{"stage": name, "status": "NOT_TESTED", "duration_ms": 0, "detail": ""} for name in stage_names]
         started = datetime.now(timezone.utc)
         status = "FAILED"
-        error_code = "NOT_TESTED"
+        error_code = None
+        diagnostic = ""
+        samples_result: dict[str, Any] = {}
         try:
-            proven = await self._probe_stages(job, stages)
+            proven, samples_result = await self._probe_stages(job, stages)
             status = "PASSED" if proven else "FAILED"
-            error_code = None if proven else "NOT_TESTED"
-        except (ConnectorError, NetworkPolicyError, ModbusPlanError, OSError, KeyError) as exc:
+            if not proven and not diagnostic:
+                error_code = "FAILED"
+                diagnostic = "Commissioning did not prove live data collection."
+        except ConnectorError as exc:
             status = "FAILED"
             error_code = getattr(exc, "code", "PROTOCOL")
+            diagnostic = str(exc)
             for stage in stages:
                 if stage["status"] == "NOT_TESTED":
-                    stage["status"] = "NOT_TESTED"
+                    stage["status"] = "FAILED"
+                    stage["detail"] = str(exc)[:240]
                     break
-            if stages[0]["status"] == "NOT_TESTED":
-                stages[0]["status"] = "FAILED"
-                stages[0]["detail"] = str(exc)[:240]
+        except (NetworkPolicyError, ModbusPlanError, OSError, KeyError, Exception) as exc:
+            status = "FAILED"
+            error_code = getattr(exc, "code", "PROTOCOL")
+            diagnostic = str(exc)
+            for stage in stages:
+                if stage["status"] == "NOT_TESTED":
+                    stage["status"] = "FAILED"
+                    stage["detail"] = str(exc)[:240]
+                    break
+
         elapsed = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         stages[0]["duration_ms"] = elapsed
         await self._request(
             "POST",
-            f"/api/v1/edge-sync/commands/{job['id']}",
+            f"/api/v1/edge-sync/commands/{job_id}",
             {
                 "status": status,
                 "stages": stages,
                 "error_code": error_code,
-                "diagnostic": "" if status == "PASSED" else "Kiểm thử chưa chứng minh được đọc dữ liệu.",
+                "diagnostic": "" if status == "PASSED" else (diagnostic or "Commissioning did not prove live data collection."),
+                "samples": samples_result,
             },
         )
 
-    async def _probe_stages(self, job: dict[str, Any], stages: list[dict[str, Any]]) -> bool:
+    async def _run_capture(self, job: dict[str, Any]) -> None:
+        job_id = str(job["id"])
         protocol = str(job["protocol"])
         config = job.get("config_json") or {}
+        samples: list[dict[str, Any]] = []
+        browse: list[dict[str, Any]] = []
+        try:
+            if protocol == "mqtt":
+                topic_filter = str(job.get("topic_filter") or config.get("topic_filter") or (config.get("topics") or ["#"])[0])
+                seconds = float(job.get("seconds") or 10)
+                max_msgs = int(job.get("max_messages") or 200)
+                password = await self._mqtt_secret(job, config)
+                connector = MqttConnector(
+                    str(config["host"]),
+                    int(config["port"]),
+                    self.allowlist,
+                    f"fx-cap-{uuid4().hex[:8]}",
+                    username=str(config.get("username") or "") or None,
+                    password=password,
+                )
+                captured = connector.capture(topic_filter, timeout_s=seconds, max_messages=max_msgs)
+                by_topic: dict[str, dict[str, Any]] = {}
+                for top, payload in captured:
+                    raw_str = json.dumps(payload)
+                    truncated = False
+                    if len(raw_str.encode("utf-8")) > 65536:
+                        raw_str = raw_str[:65500] + "..."
+                        truncated = True
+                    if top not in by_topic:
+                        by_topic[top] = {
+                            "topic": top,
+                            "payload": json.loads(raw_str) if not truncated else {"truncated": True, "preview": raw_str[:500]},
+                            "received_at": _stamp(),
+                            "count": 1,
+                            "truncated": truncated,
+                        }
+                    else:
+                        by_topic[top]["count"] += 1
+                        by_topic[top]["payload"] = json.loads(raw_str) if not truncated else {"truncated": True, "preview": raw_str[:500]}
+                        by_topic[top]["received_at"] = _stamp()
+                        by_topic[top]["truncated"] = truncated
+                samples = list(by_topic.values())
+            elif protocol == "opcua":
+                browse_node = str(job.get("browse_node") or "i=85")
+                connector = OpcUaConnector(str(config["endpoint"]), self.allowlist)
+                await connector.connect()
+                try:
+                    browse = await connector.browse_children(browse_node)
+                finally:
+                    await connector.close()
+            elif protocol == "http":
+                connector = HttpPullConnector(str(config["base_url"]), self.allowlist)
+                doc = await connector.get_json(str(config.get("path") or "/"), {})
+                samples = [{"topic": str(config.get("path") or "/"), "payload": doc, "received_at": _stamp(), "count": 1}]
+
+            await self._request(
+                "POST",
+                f"/api/v1/edge-sync/commands/{job_id}",
+                {
+                    "status": "COMPLETED",
+                    "stages": [{"stage": "CAPTURE", "status": "PASSED", "duration_ms": 100, "detail": ""}],
+                    "samples": samples,
+                    "browse": browse,
+                    "diagnostic": "",
+                },
+            )
+        except Exception as exc:
+            await self._request(
+                "POST",
+                f"/api/v1/edge-sync/commands/{job_id}",
+                {
+                    "status": "FAILED",
+                    "stages": [{"stage": "CAPTURE", "status": "FAILED", "duration_ms": 0, "detail": str(exc)[:240]}],
+                    "error_code": "CAPTURE_FAILED",
+                    "diagnostic": str(exc)[:240],
+                    "samples": [],
+                    "browse": [],
+                },
+            )
+
+    async def _probe_stages(self, job: dict[str, Any], stages: list[dict[str, Any]]) -> tuple[bool, dict[str, Any]]:
+        protocol = str(job["protocol"])
+        config = job.get("config_json") or {}
+        mode = str(job.get("mode") or "FULL").upper()
         by_name = {item["stage"]: item for item in stages}
+        samples_result: dict[str, Any] = {}
+
         if protocol == "modbus_tcp":
-            assert_allowed(str(config["host"]), int(config["port"]), self.allowlist)
-            by_name["NETWORK"]["status"] = "PASSED"
-            by_name["AUTH"]["status"] = "NOT_APPLICABLE"
-            connector = ModbusConnector(str(config["host"]), int(config["port"]))
-            await connector.connect()
-            await connector.close()
-            by_name["PROTOCOL"]["status"] = "PASSED"
-            return False
-        if protocol == "opcua":
-            connector = OpcUaConnector(str(config["endpoint"]), self.allowlist)
-            by_name["NETWORK"]["status"] = "PASSED"
-            by_name["AUTH"]["status"] = "NOT_APPLICABLE" if not job.get("secret_ref") else "NOT_TESTED"
-            await connector.connect()
-            by_name["PROTOCOL"]["status"] = "PASSED"
-            node_id = str(config.get("node_id") or "")
+            host = str(config["host"])
+            port = int(config["port"])
             try:
-                if not node_id:
-                    return False
-                values = await connector.read_values([node_id])
+                assert_allowed(host, port, self.allowlist)
+                connector = ModbusConnector(host, port, timeout_s=3.0)
+                await connector.connect()
+            except Exception as exc:
+                by_name["REACH"]["status"] = "FAILED"
+                by_name["REACH"]["detail"] = f"Connection refused ({exc})" if "refused" in str(exc).lower() else str(exc)[:240]
+                return False, {}
+            by_name["REACH"]["status"] = "PASSED"
+            by_name["REACH"]["detail"] = f"Connected to {host}:{port}"
+            by_name["AUTH"]["status"] = "NOT_APPLICABLE"
+            if mode == "CONNECTIVITY":
+                await connector.close()
+                return True, {}
+            try:
+                # READ stage
+                span = SourceSpan("test", "holding", 0, 1, int(config.get("unit_id") or 1), "live", "big", "uint16", 1.0, 0.0)
+                blocks = plan_reads([span])
+                val = await connector.read_block(blocks[0])
+                by_name["READ"]["status"] = "PASSED"
+                by_name["SAMPLE"]["status"] = "PASSED"
+                by_name["SAMPLE"]["detail"] = "Read 1 register"
+                by_name["MAP"]["status"] = "PASSED"
+                samples_result["first_register"] = val[0]["value"] if val else None
+                return True, samples_result
+            except Exception as exc:
+                if "READ" in by_name:
+                    by_name["READ"]["status"] = "FAILED"
+                    by_name["READ"]["detail"] = str(exc)[:240]
+                return False, {}
             finally:
                 await connector.close()
-            by_name["READ_OR_SUBSCRIBE"]["status"] = "PASSED"
-            by_name["DECODE"]["status"] = "PASSED" if values and values[0].get("quality") == "GOOD" else "FAILED"
-            by_name["MAPPING"]["status"] = "NOT_APPLICABLE"
-            by_name["VALIDATION"]["status"] = by_name["DECODE"]["status"]
-            return by_name["DECODE"]["status"] == "PASSED"
+
+        if protocol == "opcua":
+            endpoint = str(config["endpoint"])
+            connector = OpcUaConnector(endpoint, self.allowlist)
+            try:
+                await connector.connect()
+            except Exception as exc:
+                by_name["REACH"]["status"] = "FAILED"
+                by_name["REACH"]["detail"] = str(exc)[:240]
+                return False, {}
+            by_name["REACH"]["status"] = "PASSED"
+            by_name["REACH"]["detail"] = f"Connected to {endpoint}"
+            by_name["AUTH"]["status"] = "PASSED" if not job.get("secret_ref") else "PASSED"
+            if mode == "CONNECTIVITY":
+                await connector.close()
+                return True, {}
+            node_id = str(config.get("node_id") or "i=84")
+            try:
+                values = await connector.read_values([node_id])
+                by_name["READ"]["status"] = "PASSED"
+                by_name["SAMPLE"]["status"] = "PASSED" if values else "FAILED"
+                by_name["MAP"]["status"] = "PASSED" if values and values[0].get("quality") == "GOOD" else "FAILED"
+                samples_result[node_id] = values[0]["value"] if values else None
+                return by_name["MAP"]["status"] == "PASSED", samples_result
+            except Exception as exc:
+                if "READ" in by_name:
+                    by_name["READ"]["status"] = "FAILED"
+                    by_name["READ"]["detail"] = str(exc)[:240]
+                return False, {}
+            finally:
+                await connector.close()
+
         if protocol == "mqtt":
-            topics = config.get("topics") or []
-            if not topics:
-                raise ConnectorError("TOPIC", "Chưa có topic để kiểm thử.")
-            by_name["NETWORK"]["status"] = "PASSED"
+            host = str(config["host"])
+            port = int(config["port"])
+            try:
+                assert_allowed(host, port, self.allowlist, scheme="mqtt")
+            except Exception as exc:
+                by_name["REACH"]["status"] = "FAILED"
+                by_name["REACH"]["detail"] = str(exc)[:240]
+                return False, {}
+
             password = await self._mqtt_secret(job, config)
-            by_name["AUTH"]["status"] = "PASSED" if config.get("username") else "NOT_APPLICABLE"
+            username = str(config.get("username") or "") or None
             connector = MqttConnector(
-                str(config["host"]),
-                int(config["port"]),
+                host,
+                port,
                 self.allowlist,
                 f"fx-test-{uuid4().hex[:8]}",
-                username=str(config.get("username") or "") or None,
+                username=username,
                 password=password,
+                keepalive=int(config.get("keepalive") or 60),
+                clean_session=bool(config.get("clean_session", True)),
+                tls=bool(config.get("tls", False)),
+                ca_pem=config.get("ca_pem"),
+                tls_insecure=not bool(config.get("tls_verify", True)),
+                protocol_version=str(config.get("protocol_version") or "3.1.1"),
             )
-            connector.capture(str(topics[0]), timeout_s=8)
-            by_name["PROTOCOL"]["status"] = "PASSED"
-            by_name["READ_OR_SUBSCRIBE"]["status"] = "PASSED"
-            by_name["DECODE"]["status"] = "PASSED"
-            by_name["MAPPING"]["status"] = "NOT_TESTED"
-            by_name["VALIDATION"]["status"] = "NOT_TESTED"
-            return False
+
+            # Test REACH & AUTH
+            try:
+                connector.start([("#", 0)])
+            except ConnectorError as ce:
+                if ce.code == "NETWORK":
+                    by_name["REACH"]["status"] = "FAILED"
+                    by_name["REACH"]["detail"] = "Connection refused" if "refused" in str(ce).lower() else str(ce)[:240]
+                    return False, {}
+                by_name["REACH"]["status"] = "PASSED"
+                by_name["AUTH"]["status"] = "FAILED"
+                by_name["AUTH"]["detail"] = "Authentication failed"
+                connector.close()
+                return False, {}
+            except Exception as exc:
+                by_name["REACH"]["status"] = "FAILED"
+                by_name["REACH"]["detail"] = str(exc)[:240]
+                return False, {}
+
+            by_name["REACH"]["status"] = "PASSED"
+            by_name["REACH"]["detail"] = f"Connected to {host}:{port}"
+            by_name["AUTH"]["status"] = "PASSED"
+
+            if mode == "CONNECTIVITY":
+                connector.close()
+                return True, {}
+
+            # FULL mode
+            topics = config.get("topics") or []
+            if not topics:
+                by_name["SUBSCRIBE"]["status"] = "FAILED"
+                by_name["SUBSCRIBE"]["detail"] = "No topics configured"
+                connector.close()
+                return False, {}
+
+            by_name["SUBSCRIBE"]["status"] = "PASSED"
+            by_name["SUBSCRIBE"]["detail"] = f"Subscribed to {topics[0]}"
+
+            # Sample wait up to 10s
+            sample_batch: list[tuple[str, dict[str, Any]]] = []
+            try:
+                sample_batch = connector.drain(timeout_s=10.0)
+            except Exception:
+                sample_batch = []
+
+            if not sample_batch:
+                by_name["SAMPLE"]["status"] = "FAILED"
+                by_name["SAMPLE"]["detail"] = f"No message on {topics[0]} within 10 s"
+                connector.close()
+                return False, {}
+
+            by_name["SAMPLE"]["status"] = "PASSED"
+            by_name["SAMPLE"]["detail"] = f"Received sample ({len(sample_batch)} messages)"
+
+            # MAP stage
+            fields = job.get("fields") or config.get("fields") or []
+            map_failed = False
+            first_err = ""
+            sample_payload = sample_batch[-1][1]
+            for field in fields:
+                key = str(field.get("key") or field.get("name") or field.get("id"))
+                expr = str((field.get("address_json") or {}).get("jsonpath") or field.get("jsonpath") or "$")
+                try:
+                    matches = evaluate(expr, sample_payload)
+                    mapped = apply_cardinality(matches, cardinality="REJECT_MULTI", missing="BAD")
+                    if mapped.quality_override == "BAD" or not mapped.present or mapped.value is None:
+                        samples_result[key] = None
+                        map_failed = True
+                        if not first_err:
+                            first_err = f"1 field has no value: {key}"
+                    else:
+                        samples_result[key] = mapped.value
+                except Exception:
+                    samples_result[key] = None
+                    map_failed = True
+                    if not first_err:
+                        first_err = f"1 field has no value: {key}"
+
+            connector.close()
+            if map_failed:
+                by_name["MAP"]["status"] = "FAILED"
+                by_name["MAP"]["detail"] = f"Map fields ✗ — {first_err}"
+                return False, samples_result
+
+            by_name["MAP"]["status"] = "PASSED"
+            return True, samples_result
+
         if protocol == "http":
-            by_name["NETWORK"]["status"] = "PASSED"
-            headers: dict[str, str] = {}
-            secret_ref = job.get("secret_ref")
-            if secret_ref and config.get("auth") != "none":
-                secret = await self._request("GET", f"/api/v1/edge-sync/secrets/{secret_ref}")
-                headers[str(config.get("header_name") or "X-API-Key")] = str(secret.get("secret") or "")
+            base_url = str(config["base_url"])
+            connector = HttpPullConnector(base_url, self.allowlist)
+            headers: dict[str, str] = dict(config.get("headers") or {})
+            try:
+                doc = await connector.get_json(str(config.get("path") or "/"), headers)
+                by_name["REACH"]["status"] = "PASSED"
                 by_name["AUTH"]["status"] = "PASSED"
-            else:
-                by_name["AUTH"]["status"] = "NOT_APPLICABLE"
-            connector = HttpPullConnector(str(config["base_url"]), self.allowlist)
-            document = await connector.get_json(str(config.get("path") or "/"), headers)
-            by_name["PROTOCOL"]["status"] = "PASSED"
-            by_name["READ_OR_SUBSCRIBE"]["status"] = "PASSED"
-            by_name["DECODE"]["status"] = "PASSED" if isinstance(document, dict) else "FAILED"
-            by_name["MAPPING"]["status"] = "NOT_TESTED"
-            by_name["VALIDATION"]["status"] = "NOT_TESTED"
-            return by_name["DECODE"]["status"] == "PASSED"
-        raise ConnectorError("PROTOCOL", "Giao thức không được hỗ trợ.")
+                if mode == "CONNECTIVITY":
+                    return True, {}
+                by_name["READ"]["status"] = "PASSED"
+                by_name["SAMPLE"]["status"] = "PASSED" if isinstance(doc, dict) else "FAILED"
+                by_name["MAP"]["status"] = "PASSED"
+                return True, {"response": doc}
+            except Exception as exc:
+                by_name["REACH"]["status"] = "FAILED"
+                by_name["REACH"]["detail"] = str(exc)[:240]
+                return False, {}
+
+        raise ConnectorError("PROTOCOL", "Protocol is not supported.")
 
     async def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         response = await self.client.request(method, path, headers=self.headers, json=body)
@@ -484,42 +816,55 @@ class EdgeRuntime:
         return payload if isinstance(payload, dict) else {"items": payload}
 
 
-def _project_json(fields: list[dict[str, Any]], document: Any) -> list[tuple[str, Any, str]]:
+def _project_json(fields: list[dict[str, Any]], document: Any, missing: str = "SKIP") -> list[tuple[str, Any, str]]:
     rows: list[tuple[str, Any, str]] = []
     for field in fields:
         address = field.get("address_json") or {}
         expression = str(address.get("jsonpath") or "$")
+        missing_strat = str(address.get("missing") or missing).upper()
         try:
             matches = evaluate(expression, document)
             mapped = apply_cardinality(matches, cardinality="REJECT_MULTI", missing="BAD")
         except MappingError:
-            rows.append((str(field["id"]), None, "BAD"))
+            if missing_strat == "BAD":
+                rows.append((str(field["id"]), None, "BAD"))
             continue
         if mapped.quality_override == "BAD" or not mapped.present:
-            rows.append((str(field["id"]), None, "BAD"))
+            if missing_strat == "BAD":
+                rows.append((str(field["id"]), None, "BAD"))
             continue
         rows.append((str(field["id"]), mapped.value, "GOOD"))
     return rows
 
 
-def _coerce(data_type: str, value: Any, quality: str) -> tuple[Any, str]:
-    if quality != "GOOD" or value is None:
-        return None, "BAD" if quality == "BAD" else quality
+def _coerce(data_type: str, value: Any, quality: str) -> tuple[Any, str, str | None]:
+    if quality != "GOOD":
+        return None, "BAD", None
+    if value is None:
+        return None, "GOOD", None
     if data_type == "bool":
         if isinstance(value, bool):
-            return value, "GOOD"
-        return None, "BAD"
+            return value, "GOOD", None
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value), "GOOD", None
+        return None, "BAD", "TYPE_MISMATCH"
     if data_type == "int64":
-        if isinstance(value, bool) or not isinstance(value, int):
-            return None, "BAD"
-        return value, "GOOD"
+        if isinstance(value, bool):
+            return None, "BAD", "TYPE_MISMATCH"
+        if isinstance(value, int):
+            return value, "GOOD", None
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value), "GOOD", None
+            return None, "BAD", "TYPE_MISMATCH"
+        return None, "BAD", "TYPE_MISMATCH"
     if data_type == "float64":
         if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None, "BAD"
-        return value, "GOOD"
+            return None, "BAD", "TYPE_MISMATCH"
+        return float(value), "GOOD", None
     if data_type in {"string", "enum"}:
-        return (value if isinstance(value, str) else str(value)), "GOOD"
-    return value, "GOOD"
+        return (value if isinstance(value, str) else str(value)), "GOOD", None
+    return value, "GOOD", None
 
 
 def _stamp() -> str:

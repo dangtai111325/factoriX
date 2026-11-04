@@ -1,7 +1,7 @@
 import React from 'react';
 
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: 'primary' | 'secondary' | 'danger' | 'ghost' | 'icon';
+  variant?: 'primary' | 'secondary' | 'outline' | 'danger' | 'ghost' | 'icon';
   size?: 'sm' | 'md' | 'lg';
   icon?: React.ReactNode;
   loading?: boolean;
@@ -31,6 +31,8 @@ export const Button: React.FC<ButtonProps> = ({
       'bg-[#EF1B24] text-white hover:bg-[#D9141D] active:bg-[#C7111A] border border-[#EF1B24] shadow-sm',
     secondary:
       'bg-white text-[#334568] hover:bg-[#F9FAFD] hover:text-[#111B37] border border-[#D4DFEC]',
+    outline:
+      'bg-white text-[#334568] hover:bg-[#F9FAFD] hover:text-[#111B37] border border-[#D4DFEC]',
     danger:
       'bg-white text-[#F2343B] hover:bg-[#FFF0F1] border border-[#FAC6C9]',
     ghost:
@@ -50,7 +52,7 @@ export const Button: React.FC<ButtonProps> = ({
       ) : (
         icon && <span className="flex-shrink-0">{icon}</span>
       )}
-      {children && <span>{children}</span>}
+      {children}
     </button>
   );
 };

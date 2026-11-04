@@ -63,7 +63,7 @@ async def ingest_observations(
     items: list[dict[str, Any]],
 ) -> dict[str, Any]:
     if len(items) > 1000:
-        raise AppError(422, "BATCH", "Lô quan sát vượt quá 1000 bản ghi.")
+        raise AppError(422, "BATCH", "Observation batch exceeds 1000 records.")
     results: list[dict[str, str]] = []
     for item in items:
         event_uid = str(item.get("event_uid", ""))[:256]
@@ -288,10 +288,34 @@ def _to_observation(item: dict[str, Any], tenant_id: UUID, edge_id: UUID) -> Obs
             raise ObservationError("TIMEZONE", "timestamps must be timezone-aware")
         return parsed.astimezone(timezone.utc)
 
-    event_time = parse_time(item.get("event_time") or item.get("source_timestamp"))
+    provenance = dict(item.get("provenance") or item.get("source") or {})
+    source_time = None
+    source_raw = item.get("source_time") or item.get("source_timestamp")
+    if source_raw is not None:
+        try:
+            source_time = parse_time(str(source_raw))
+        except Exception:
+            source_time = None
+            provenance["reason"] = "SOURCE_TIME_INVALID"
+
     received = parse_time(item.get("received_time") or item.get("received_timestamp")) or utcnow()
-    if event_time is None:
+    event_time = parse_time(item.get("event_time"))
+
+    quality_val = str(item.get("quality") or "GOOD")
+    if source_time is not None:
+        delta = abs((source_time - received).total_seconds())
+        if delta <= 86400:
+            event_time = source_time
+        else:
+            event_time = received
+            quality_val = "UNCERTAIN"
+            provenance["reason"] = "SOURCE_TIME_SKEW"
+    elif event_time is None:
         event_time = received
+
+    if "reason" in item and "reason" not in provenance:
+        provenance["reason"] = item["reason"]
+
     return Observation(
         event_uid=str(item["event_uid"]),
         tenant_id=tenant_id,
@@ -302,14 +326,14 @@ def _to_observation(item: dict[str, Any], tenant_id: UUID, edge_id: UUID) -> Obs
         value=item.get("value", None),
         data_type=str(item.get("data_type") or "float64"),
         unit=item.get("unit"),
-        quality=Quality(str(item.get("quality") or "GOOD")),
+        quality=Quality(quality_val),
         origin=Origin(str(item.get("origin") or "LIVE")),
         config_revision=int(item.get("config_revision") or 1),
         site_id=as_uuid(str(item["site_id"])) if item.get("site_id") else None,
         edge_id=edge_id,
         connection_id=as_uuid(str(item["connection_id"])) if item.get("connection_id") else None,
-        source_time=parse_time(item.get("source_timestamp") or item.get("source_time")),
-        provenance=item.get("provenance") or item.get("source") or {},
+        source_time=source_time,
+        provenance=provenance,
     )
 
 
@@ -410,7 +434,8 @@ def _freshness(row: dict[str, Any]) -> str:
     if not isinstance(event_time, datetime):
         return "UNKNOWN"
     interval = timedelta(milliseconds=int(row.get("expected_interval_ms") or 5000))
-    if utcnow() - event_time > interval * 2:
+    stale_delta = max(interval * 2, timedelta(seconds=10))
+    if utcnow() - event_time > stale_delta:
         return "STALE"
     if row.get("quality") == "BAD":
         return "UNKNOWN"
@@ -428,7 +453,7 @@ async def history(
     cursor: str | None,
 ) -> dict[str, Any]:
     if end <= start:
-        raise AppError(422, "RANGE", "Khoảng thời gian không hợp lệ.")
+        raise AppError(422, "RANGE", "Invalid time range.")
     if end - start > timedelta(days=31):
         raise AppError(422, "RANGE", "Query window is limited to 31 days. Narrow the range or use aggregation.")
     limit = min(max(limit, 1), 2000)
@@ -479,9 +504,9 @@ async def aggregate(
     fn: str,
 ) -> dict[str, Any]:
     if fn not in AGGREGATES:
-        raise AppError(422, "AGGREGATE", "Hàm tổng hợp không được hỗ trợ.")
+        raise AppError(422, "AGGREGATE", "Unsupported aggregate function.")
     if bucket_ms < 1000 or bucket_ms > 86_400_000:
-        raise AppError(422, "BUCKET", "Bucket phải từ 1 giây đến 1 ngày.")
+        raise AppError(422, "BUCKET", "Bucket must be between 1 second and 1 day.")
     if len(signal_ids) > 20:
         raise AppError(422, "LIMIT", "At most 20 signals per aggregation query.")
     sql_fn = {"min": "min", "max": "max", "avg": "avg", "sum": "sum", "count": "count"}[fn]
@@ -602,7 +627,7 @@ async def preview_retention(session: AsyncSession, tenant_id: UUID, policy_id: U
 async def enable_retention(session: AsyncSession, tenant_id: UUID, actor: UUID, policy_id: UUID, correlation_id: str) -> dict[str, Any]:
     policy = await _policy(session, tenant_id, policy_id)
     if policy["legal_hold"]:
-        raise AppError(409, "LEGAL_HOLD", "Legal hold đang bật, không thể xóa dữ liệu.")
+        raise AppError(409, "LEGAL_HOLD", "Legal hold is active, cannot purge data.")
     await execute(session, "UPDATE retention_policies SET enabled = TRUE, version = version + 1 WHERE id = :id", {"id": policy_id})
     await audit(session, tenant_id=tenant_id, event_type="RETENTION_ENABLE", actor_id=actor, entity_type="retention", entity_id=policy_id, before={"enabled": False}, after={"enabled": True}, correlation_id=correlation_id)
     updated = await _policy(session, tenant_id, policy_id)
@@ -612,7 +637,7 @@ async def enable_retention(session: AsyncSession, tenant_id: UUID, actor: UUID, 
 async def execute_retention(session: AsyncSession, tenant_id: UUID, actor: UUID, policy_id: UUID, correlation_id: str) -> dict[str, Any]:
     policy = await _policy(session, tenant_id, policy_id)
     if not policy["enabled"] or policy["legal_hold"] or await _scope_held(session, tenant_id, policy):
-        raise AppError(409, "RETENTION_BLOCKED", "Chính sách chưa được bật hoặc đang legal hold.")
+        raise AppError(409, "RETENTION_BLOCKED", "Policy is disabled or legal hold is active.")
     preview = await preview_retention(session, tenant_id, policy_id)
     cutoff = utcnow() - timedelta(days=int(policy["keep_days"]))
     clause, params = retention_scope(policy)
@@ -916,7 +941,7 @@ async def patch_dashboard(session: AsyncSession, tenant_id: UUID, actor: UUID, d
 
 async def _validate_widgets(session: AsyncSession, tenant_id: UUID, widgets: list[dict[str, Any]]) -> None:
     if len(widgets) > 40:
-        raise AppError(422, "LIMIT", "Tối đa 40 widget trên một dashboard.")
+        raise AppError(422, "LIMIT", "Maximum 40 widgets per dashboard.")
     for widget in widgets:
         if widget.get("type") not in WIDGETS:
             raise AppError(422, "WIDGET", "Unsupported widget type.")

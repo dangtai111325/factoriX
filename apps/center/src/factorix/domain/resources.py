@@ -74,7 +74,7 @@ def assert_single_installation(
         if overlaps(start, end, valid_from, valid_to):
             raise ResourceInvariantError(
                 "INSTALLATION_OVERLAP",
-                "Đã có vị trí lắp đặt hiệu lực trong khoảng thời gian này.",
+                "An installation position is already active during this time window.",
             )
 
 

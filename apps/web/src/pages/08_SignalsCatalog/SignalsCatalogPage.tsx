@@ -1,118 +1,147 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import {
   Search,
-  Plus,
   Filter,
-  Activity,
-  Edit2,
-  Trash2,
-  ArrowUpDown,
   Download,
-  X,
-  Sigma,
-  Zap,
+  Plus,
+  RefreshCw,
+  LayoutGrid,
+  Table as TableIcon,
+  Check,
+  Trash2,
+  Square,
+  CheckSquare,
+  AlertCircle,
 } from 'lucide-react';
+import { useSearchParams, useNavigate } from 'react-router-dom';
+import { useApp } from '../../store/AppContext';
+import { SignalItem } from '../../types';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
-import { Badge } from '../../components/common/Badge';
-import { useApp } from '../../store/AppContext';
-import { SignalItem, SignalDataType } from '../../types';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { StatusBadge } from '../../components/common/StatusBadge';
+import { ConfirmDialog } from '../../components/common/ConfirmDialog';
+import { TrendChart } from './TrendChart';
+import { SignalSparkline } from './SignalSparkline';
+import { SignalInspector } from './SignalInspector';
+import { SignalEditDialog } from './SignalEditDialog';
+import { api } from '../../api/client';
 
-const MicroSparkline: React.FC<{ value: number; quality: string }> = ({ quality }) => {
-  const strokeColor = quality === 'GOOD' ? '#0DBA67' : '#94A3B8';
-  const pointsStr = '0,9 80,9';
+function timeAgo(isoString: string | null | undefined): string {
+  if (!isoString) return '—';
+  const diffSec = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
+  if (diffSec < 0 || isNaN(diffSec)) return 'just now';
+  if (diffSec < 60) return `${diffSec} s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin} min ago`;
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour < 24) return `${diffHour} h ago`;
+  return `${Math.floor(diffHour / 24)} d ago`;
+}
 
-  return (
-    <svg className="w-20 h-4 overflow-visible" viewBox="0 0 80 18" aria-label="No history yet">
-      <polyline
-        fill="none"
-        stroke={strokeColor}
-        strokeWidth="1.6"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        points={pointsStr}
-      />
-      <circle cx={80} cy={9} r="2" fill={strokeColor} />
-    </svg>
-  );
-};
+function classifyType(typeStr: string | undefined): 'number' | 'integer' | 'boolean' | 'text' {
+  const t = (typeStr || '').toLowerCase();
+  if (t === 'integer' || t === 'int' || t === 'int64' || t === 'uint16' || t === 'int32') return 'integer';
+  if (t === 'boolean' || t === 'bool') return 'boolean';
+  if (t === 'text' || t === 'string') return 'text';
+  return 'number';
+}
 
 export const SignalsCatalogPage: React.FC = () => {
-  const {
-    signals,
-    selectedSignalId,
-    setSelectedSignalId,
-    outputGroups,
-  } = useApp();
-  const [searchParams] = useSearchParams();
-  const [filterType, setFilterType] = useState<string>('all');
-  const [searchTerm, setSearchTerm] = useState<string>('');
-  const [drawerOpen, setDrawerOpen] = useState<boolean>(true);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [assignModalOpen, setAssignModalOpen] = useState<boolean>(false);
-  const [selectedGroupId, setSelectedGroupId] = useState<string>('');
-  const [undoDelete, setUndoDelete] = useState<(() => void) | null>(null);
-  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
+  const { signals, resources, connections, edges, refresh } = useApp();
 
+  // URL Query Sync
+  const viewMode = searchParams.get('view') === 'live' ? 'live' : 'table';
+  const resourceFilter = searchParams.get('resourceId') || 'all';
+  const connectionFilter = searchParams.get('connectionId') || 'all';
+  const initialSignalId = searchParams.get('signalId') || null;
+
+  // Local Filter States
+  const [searchTerm, setSearchTerm] = useState('');
+  const [typeFilter, setTypeFilter] = useState<'all' | 'number' | 'integer' | 'boolean' | 'text'>('all');
+  const [qualityFilter, setQualityFilter] = useState<'all' | 'good' | 'uncertain' | 'bad' | 'stale' | 'disabled'>('all');
+
+  // Inspector & Edit Dialog State
+  const [selectedSignal, setSelectedSignal] = useState<SignalItem | null>(null);
+  const [editTarget, setEditTarget] = useState<SignalItem | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<SignalItem | null>(null);
+
+  // Bulk Selection
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [trendSignals, setTrendSignals] = useState<SignalItem[]>([]);
+  const [timeframe, setTimeframe] = useState<'15m' | '1h' | '6h'>('15m');
+
+  // Toast / Feedback
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [undoAction, setUndoAction] = useState<(() => void) | null>(null);
+
+  const showToast = (msg: string, undo?: () => void) => {
+    setToastMessage(msg);
+    setUndoAction(undo ? () => undo : null);
+    setTimeout(() => {
+      setToastMessage(null);
+      setUndoAction(null);
+    }, 4000);
+  };
+
+  // Open initial signal inspector from URL (TC-UI-SG-19)
   useEffect(() => {
-    const signalId = searchParams.get('signalId');
-    if (signalId && signals.some((item) => item.id === signalId)) {
-      setSelectedSignalId(signalId);
-      setDrawerOpen(true);
+    if (initialSignalId) {
+      const match = signals.find((s) => s.id === initialSignalId);
+      if (match) setSelectedSignal(match);
     }
-  }, [searchParams, setSelectedSignalId, signals]);
+  }, [initialSignalId, signals]);
 
-  const handleExportCSV = (signalsToExport: SignalItem[]) => {
-    const headers = ['Tag', 'Parameter Name', 'Resource Path', 'Data Type', 'Live Value', 'Unit', 'Quality', 'Last Updated'];
-    const rows = signalsToExport.map((s) => [
-      `"${s.tag}"`,
-      `"${s.name}"`,
-      `"${s.resourcePath}"`,
-      `"${s.dataType}"`,
-      `"${s.currentValue}"`,
-      `"${s.unit || ''}"`,
-      `"${s.quality}"`,
-      `"${s.lastUpdated}"`,
-    ]);
-    const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `factorix_signals_${Date.now()}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setToastMsg(`Downloaded CSV with ${signalsToExport.length} signals`);
-    setTimeout(() => setToastMsg(null), 4000);
+  // View toggle helper
+  const setViewMode = (mode: 'table' | 'live') => {
+    const nextParams = new URLSearchParams(searchParams);
+    if (mode === 'live') nextParams.set('view', 'live');
+    else nextParams.delete('view');
+    setSearchParams(nextParams);
   };
 
-  const handleDeleteSelected = () => {
-    setToastMsg('Signal delete is not available in this appliance build. Archive the parent connection or resource instead.');
-    setTimeout(() => setToastMsg(null), 5000);
-  };
+  // Filtered Signals
+  const filteredSignals = useMemo(() => {
+    return signals.filter((s) => {
+      // Resource Filter
+      if (resourceFilter !== 'all' && s.resourceId !== resourceFilter) {
+        const res = resources.find((r) => r.id === s.resourceId);
+        if (res?.code !== resourceFilter && res?.id !== resourceFilter) return false;
+      }
+      // Connection Filter
+      if (connectionFilter !== 'all' && s.connectionId !== connectionFilter) {
+        return false;
+      }
+      // Type Filter
+      if (typeFilter !== 'all') {
+        const cType = classifyType(s.dataType || s.type);
+        if (cType !== typeFilter) return false;
+      }
+      // Quality Filter
+      if (qualityFilter !== 'all') {
+        const isEnabled = s.enabled !== false;
+        if (qualityFilter === 'disabled') {
+          if (isEnabled) return false;
+        } else {
+          if (!isEnabled) return false;
+          const q = (s.quality || 'NO_DATA').toLowerCase();
+          if (q !== qualityFilter) return false;
+        }
+      }
+      // Search
+      if (searchTerm) {
+        const term = searchTerm.toLowerCase();
+        const name = (s.displayName || s.name || '').toLowerCase();
+        const key = (s.key || '').toLowerCase();
+        if (!name.includes(term) && !key.includes(term)) return false;
+      }
+      return true;
+    });
+  }, [signals, resourceFilter, connectionFilter, typeFilter, qualityFilter, searchTerm, resources]);
 
-  const handleConfirmAssign = () => {
-    setAssignModalOpen(false);
-    setToastMsg('Assign to output group from the Output Groups page. Bulk assign is not wired yet.');
-    setTimeout(() => setToastMsg(null), 5000);
-  };
-
-  const selectedSignal =
-    signals.find((s) => s.id === selectedSignalId) || signals[0] || null;
-
-  const filteredSignals = signals.filter((s) => {
-    const matchesType = filterType === 'all' || s.dataType === filterType;
-    const matchesSearch =
-      s.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      s.tag.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      s.resourcePath.toLowerCase().includes(searchTerm.toLowerCase());
-    return matchesType && matchesSearch;
-  });
-
-  const toggleSelectAll = () => {
+  // Bulk selection handlers
+  const handleSelectAll = () => {
     if (selectedIds.length === filteredSignals.length) {
       setSelectedIds([]);
     } else {
@@ -120,372 +149,539 @@ export const SignalsCatalogPage: React.FC = () => {
     }
   };
 
-  const toggleSelectOne = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleToggleSelect = (id: string) => {
     setSelectedIds((prev) =>
-      prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
     );
   };
 
-  if (!selectedSignal) {
-    return (
-      <div className="space-y-3">
-        <h1 className="fx-page-title">Signals Catalog</h1>
-        <p className="fx-page-subtitle">No signals yet. Activate a connection from Add Data and they will be listed here.</p>
-      </div>
-    );
-  }
+  // Trend selection for Live View (max 4)
+  const handleToggleTrend = (signal: SignalItem) => {
+    if (trendSignals.some((s) => s.id === signal.id)) {
+      setTrendSignals((prev) => prev.filter((s) => s.id !== signal.id));
+    } else {
+      if (trendSignals.length >= 4) {
+        showToast('Up to 4 signals can be plotted together.');
+        return;
+      }
+      setTrendSignals((prev) => [...prev, signal]);
+    }
+  };
+
+  // Single Actions
+  const handleToggleEnabled = async (signal: SignalItem) => {
+    const nextState = signal.enabled === false;
+    try {
+      await api(`/api/v1/signals/${signal.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: nextState }),
+      });
+      await refresh();
+      showToast(`Signal ${nextState ? 'enabled' : 'disabled'}`);
+      if (selectedSignal?.id === signal.id) {
+        setSelectedSignal({ ...signal, enabled: nextState });
+      }
+    } catch {
+      showToast('Could not update signal');
+    }
+  };
+
+  const handleDeleteSignal = async () => {
+    if (!deleteTarget) return;
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    try {
+      await api(`/api/v1/signals/${target.id}`, { method: 'DELETE' });
+      await refresh();
+      showToast('Signal deleted');
+      if (selectedSignal?.id === target.id) setSelectedSignal(null);
+    } catch {
+      showToast('Could not delete signal');
+    }
+  };
+
+  // Bulk Actions (TC-UI-SG-13..14)
+  const handleBulkDisable = async () => {
+    if (selectedIds.length === 0) return;
+    const count = selectedIds.length;
+    const idsToDisable = [...selectedIds];
+    try {
+      await api('/api/v1/signals/bulk-action', {
+        method: 'POST',
+        body: JSON.stringify({ ids: idsToDisable, action: 'disable' }),
+      });
+      await refresh();
+      setSelectedIds([]);
+      showToast(`${count} signals disabled`, async () => {
+        await api('/api/v1/signals/bulk-action', {
+          method: 'POST',
+          body: JSON.stringify({ ids: idsToDisable, action: 'enable' }),
+        });
+        await refresh();
+        showToast('Restored disabled signals');
+      });
+    } catch {
+      showToast('Bulk disable failed');
+    }
+  };
+
+  const handleBulkDelete = async () => {
+    if (selectedIds.length === 0) return;
+    const count = selectedIds.length;
+    try {
+      await api('/api/v1/signals/bulk-action', {
+        method: 'POST',
+        body: JSON.stringify({ ids: selectedIds, action: 'delete' }),
+      });
+      await refresh();
+      setSelectedIds([]);
+      showToast(`${count} signals deleted`);
+      if (selectedSignal && selectedIds.includes(selectedSignal.id)) {
+        setSelectedSignal(null);
+      }
+    } catch {
+      showToast('Bulk delete failed');
+    }
+  };
+
+  const handleExportCsv = () => {
+    const listToExport = selectedIds.length > 0
+      ? filteredSignals.filter((s) => selectedIds.includes(s.id))
+      : filteredSignals;
+
+    const rows = [
+      ['signal', 'resource_path', 'value', 'unit', 'quality', 'source_time', 'received_time'],
+      ...listToExport.map((s) => {
+        const res = resources.find((r) => r.id === s.resourceId);
+        const sigName = s.displayName || s.name || s.key || '';
+        return [
+          `"${sigName.replace(/"/g, '""')}"`,
+          `"${(res?.name || s.resourcePath || '').replace(/"/g, '""')}"`,
+          s.value !== null && s.value !== undefined ? String(s.value) : '',
+          `"${(s.unit || '').replace(/"/g, '""')}"`,
+          s.quality || 'NO_DATA',
+          s.lastUpdated || '',
+          s.lastUpdated || '',
+        ];
+      }),
+    ];
+    const csvContent = 'data:text/csv;charset=utf-8,' + rows.map((e) => e.join(',')).join('\n');
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement('a');
+    link.setAttribute('href', encodedUri);
+    link.setAttribute('download', `signals_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   return (
-    <div className="space-y-4 animate-in fade-in duration-200">
-      {/* Region 1: Heading */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+    <div className="space-y-4">
+      {/* Top Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="fx-page-title">Signals Catalog</h1>
-          <p className="fx-page-subtitle">
-            Central tag inventory, real-time measurements, engineering units, and signal bindings.
+          <h1 className="text-[20px] font-bold text-[#111B37]">Signals</h1>
+          <p className="text-[13px] text-[#657794]">
+            Unified signal catalog and live real-time observation stream
           </p>
         </div>
-        <div className="flex items-center gap-2.5">
-          <Button
-            variant="primary"
-            icon={<Plus className="w-4 h-4" />}
-            onClick={() => navigate('/acquisition/add-data')}
-          >
-            Create Signal
-          </Button>
-          <Button
-            variant="secondary"
-            icon={<Download className="w-4 h-4" />}
-            onClick={() => handleExportCSV(filteredSignals)}
-          >
-            Export CSV
-          </Button>
-        </div>
-      </div>
 
-      {/* Region 2: Filter Toolbar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2 border-b border-[#E3EAF3]">
         <div className="flex items-center gap-2">
-          {[
-            { id: 'all', label: 'All Signals' },
-            { id: 'analog', label: 'Analog' },
-            { id: 'boolean', label: 'Discrete' },
-            { id: 'integer', label: 'Integer' },
-            { id: 'calculated', label: 'Calculated' },
-          ].map((t) => (
+          {/* View Mode Toggle */}
+          <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
             <button
-              key={t.id}
-              type="button"
-              onClick={() => setFilterType(t.id)}
-              className={`px-3 py-1.5 rounded-lg text-[13px] font-semibold transition-all ${
-                filterType === t.id
-                  ? 'bg-[#FFF0F1] text-[#EF1B24] border border-[#FAC6C9]'
-                  : 'bg-white text-[#657794] border border-[#D4DFEC] hover:text-[#111B37]'
+              onClick={() => setViewMode('table')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-semibold rounded-md transition ${
+                viewMode === 'table'
+                  ? 'bg-white text-[#111B37] shadow-xs'
+                  : 'text-[#657794] hover:text-[#111B37]'
               }`}
             >
-              {t.label}
+              <TableIcon className="w-3.5 h-3.5" />
+              Table
             </button>
-          ))}
-        </div>
+            <button
+              onClick={() => setViewMode('live')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-semibold rounded-md transition ${
+                viewMode === 'live'
+                  ? 'bg-white text-[#111B37] shadow-xs'
+                  : 'text-[#657794] hover:text-[#111B37]'
+              }`}
+            >
+              <LayoutGrid className="w-3.5 h-3.5" />
+              Live
+            </button>
+          </div>
 
-        <div className="relative w-72">
-          <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#94A3B8]" />
-          <input
-            type="text"
-            placeholder="Search tags or parameters..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="fx-input pl-9 h-9 text-[13px]"
-          />
+          <Button variant="outline" size="sm" onClick={() => void refresh()}>
+            <RefreshCw className="w-3.5 h-3.5 mr-1.5" />
+            Refresh
+          </Button>
+
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => navigate('/collector/add-data')}
+          >
+            <Plus className="w-3.5 h-3.5 mr-1.5" />
+            Add data
+          </Button>
         </div>
       </div>
 
-      {/* Main Grid: Signals Table (Reg 3) & Inspector Drawer (Reg 4) */}
-      <div className="grid grid-cols-12 gap-3.5">
-        <div className={drawerOpen ? 'col-span-12 lg:col-span-8' : 'col-span-12'}>
-          <Card className="p-0 overflow-hidden">
+      {/* Filter Bar */}
+      <Card className="p-4 border border-[#CBD5E1] bg-white space-y-3">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          {/* Search */}
+          <div className="relative flex-1 max-w-sm">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+            <input
+              type="text"
+              placeholder="Search signals by name or key…"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full pl-9 pr-3 py-1.5 border border-slate-300 rounded text-[12px] focus:outline-none focus:border-blue-500"
+            />
+          </div>
+
+          {/* Resource & Connection Pickers */}
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              value={resourceFilter}
+              onChange={(e) => {
+                const next = new URLSearchParams(searchParams);
+                if (e.target.value === 'all') next.delete('resourceId');
+                else next.set('resourceId', e.target.value);
+                setSearchParams(next);
+              }}
+              className="px-2.5 py-1.5 border border-slate-300 rounded text-[12px] bg-white text-slate-700 focus:outline-none focus:border-blue-500"
+            >
+              <option value="all">All Resources</option>
+              {resources.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.name} ({r.type})
+                </option>
+              ))}
+            </select>
+
+            <select
+              value={connectionFilter}
+              onChange={(e) => {
+                const next = new URLSearchParams(searchParams);
+                if (e.target.value === 'all') next.delete('connectionId');
+                else next.set('connectionId', e.target.value);
+                setSearchParams(next);
+              }}
+              className="px-2.5 py-1.5 border border-slate-300 rounded text-[12px] bg-white text-slate-700 focus:outline-none focus:border-blue-500"
+            >
+              <option value="all">All Connections</option>
+              {connections.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} ({c.protocol})
+                </option>
+              ))}
+            </select>
+
+            <Button variant="outline" size="sm" onClick={handleExportCsv} className="h-8 text-[11px]">
+              <Download className="w-3 h-3 mr-1" />
+              Export CSV
+            </Button>
+          </div>
+        </div>
+
+        {/* Filter Pills: Type & Quality */}
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 text-[12px]">
+          {/* Data Type Pills */}
+          <div className="flex items-center gap-1">
+            <span className="text-[#657794] mr-1 text-[11px] font-semibold uppercase">Type:</span>
+            {(['all', 'number', 'integer', 'boolean', 'text'] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setTypeFilter(t)}
+                className={`px-2 py-0.5 rounded text-[11px] font-medium capitalize transition ${
+                  typeFilter === t
+                    ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                    : 'text-[#657794] hover:text-[#111B37]'
+                }`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+
+          {/* Quality Pills */}
+          <div className="flex items-center gap-1">
+            <span className="text-[#657794] mr-1 text-[11px] font-semibold uppercase">Quality:</span>
+            {(['all', 'good', 'uncertain', 'bad', 'stale', 'disabled'] as const).map((q) => (
+              <button
+                key={q}
+                onClick={() => setQualityFilter(q)}
+                className={`px-2 py-0.5 rounded text-[11px] font-medium capitalize transition ${
+                  qualityFilter === q
+                    ? 'bg-slate-800 text-white'
+                    : 'text-[#657794] hover:text-[#111B37]'
+                }`}
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+        </div>
+      </Card>
+
+      {/* Bulk Action Floating Bar */}
+      {selectedIds.length > 0 && (
+        <div className="p-3 bg-blue-50 border border-blue-200 rounded-xl flex items-center justify-between text-[12px]">
+          <span className="font-semibold text-blue-900">
+            {selectedIds.length} signal{selectedIds.length > 1 ? 's' : ''} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="outline" onClick={handleBulkDisable}>
+              Disable
+            </Button>
+            <Button size="sm" variant="danger" onClick={handleBulkDelete}>
+              Delete
+            </Button>
+            <Button size="sm" variant="outline" onClick={handleExportCsv}>
+              <Download className="w-3 h-3 mr-1" />
+              Export
+            </Button>
+            <button
+              onClick={() => setSelectedIds([])}
+              className="text-blue-700 font-medium hover:underline ml-2"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* VIEW: LIVE OPERATIONS (TC-UI-SG-15..17) */}
+      {viewMode === 'live' && (
+        <div className="space-y-4">
+          {/* Trend Chart for up to 4 selected signals */}
+          <TrendChart
+            selectedSignals={trendSignals}
+            timeframe={timeframe}
+            onTimeframeChange={setTimeframe}
+          />
+
+          {/* Cards Grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+            {filteredSignals.map((sig) => {
+              const res = resources.find((r) => r.id === sig.resourceId);
+              const isSelectedForTrend = trendSignals.some((s) => s.id === sig.id);
+              const formattedVal =
+                sig.value === null || sig.value === undefined
+                  ? '—'
+                  : typeof sig.value === 'number'
+                  ? Number.isInteger(sig.value)
+                    ? String(sig.value)
+                    : sig.value.toFixed(2)
+                  : String(sig.value);
+
+              return (
+                <div
+                  key={sig.id}
+                  onClick={() => setSelectedSignal(sig)}
+                  className={`p-4 rounded-xl border bg-white cursor-pointer transition hover:shadow-sm ${
+                    isSelectedForTrend
+                      ? 'border-blue-500 ring-2 ring-blue-100'
+                      : 'border-[#CBD5E1] hover:border-slate-400'
+                  }`}
+                >
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <div className="text-[13px] font-bold text-[#111B37] truncate max-w-[150px]">
+                        {sig.displayName || sig.name || sig.key}
+                      </div>
+                      <div className="text-[11px] text-[#657794] font-mono truncate max-w-[150px]">
+                        {res?.name || sig.resourcePath || '—'}
+                      </div>
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleToggleTrend(sig);
+                      }}
+                      className={`p-1 rounded text-[11px] font-semibold transition ${
+                        isSelectedForTrend
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                      }`}
+                      title="Plot on trend chart (up to 4)"
+                    >
+                      Trend
+                    </button>
+                  </div>
+
+                  <div className="mt-3">
+                    <div className="text-[24px] font-extrabold text-[#111B37] tabular-nums truncate">
+                      {formattedVal}{' '}
+                      {sig.unit && <span className="text-[13px] font-normal text-[#657794]">{sig.unit}</span>}
+                    </div>
+                  </div>
+
+                  <div className="mt-3 pt-2.5 border-t border-slate-100 flex items-center justify-between text-[11px]">
+                    <StatusBadge status={sig.quality || 'NO_DATA'} />
+                    <span className="text-[#657794]" title={sig.lastUpdated ? new Date(sig.lastUpdated).toLocaleString() : ''}>
+                      {timeAgo(sig.lastUpdated)}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* VIEW: TABLE */}
+      {viewMode === 'table' && (
+        <Card className="border border-[#CBD5E1] bg-white overflow-hidden">
+          {filteredSignals.length === 0 ? (
+            <div className="p-12 text-center text-[#657794]">
+              <Search className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+              <p className="text-[13px] font-semibold text-[#111B37]">No signals found</p>
+              <p className="text-[12px] text-[#657794] mt-1">
+                Try adjusting your search filters or add a new signal.
+              </p>
+            </div>
+          ) : (
             <div className="overflow-x-auto">
-              <table className="fx-table">
+              <table className="w-full text-left text-[12px]">
                 <thead>
-                  <tr>
-                    <th className="w-10 text-center">
+                  <tr className="border-b border-slate-100 bg-slate-50/50 text-[#657794] font-semibold">
+                    <th className="py-2.5 px-3 w-8">
                       <input
                         type="checkbox"
-                        checked={selectedIds.length > 0 && selectedIds.length === filteredSignals.length}
-                        onChange={toggleSelectAll}
-                        className="rounded text-[#EF1B24]"
+                        checked={selectedIds.length === filteredSignals.length && filteredSignals.length > 0}
+                        onChange={handleSelectAll}
+                        className="rounded border-slate-300 text-blue-600 focus:ring-0"
                       />
                     </th>
-                    <th>Signal Tag</th>
-                    <th>Parameter Name</th>
-                    <th>Asset Location</th>
-                    <th>Type</th>
-                    <th>Live Value</th>
-                    <th className="w-24">Trend (60s)</th>
-                    <th>Quality</th>
-                    <th>Updated</th>
+                    <th className="py-2.5 px-3">Signal</th>
+                    <th className="py-2.5 px-3">Resource</th>
+                    <th className="py-2.5 px-3">Value</th>
+                    <th className="py-2.5 px-3">Trend 15 min</th>
+                    <th className="py-2.5 px-3">Quality</th>
+                    <th className="py-2.5 px-3 text-right">Updated</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody className="divide-y divide-slate-100">
                   {filteredSignals.map((sig) => {
-                    const isSelected = sig.id === selectedSignal.id;
                     const isChecked = selectedIds.includes(sig.id);
+                    const res = resources.find((r) => r.id === sig.resourceId);
+                    const formattedVal =
+                      sig.value === null || sig.value === undefined
+                        ? '—'
+                        : typeof sig.value === 'number'
+                        ? Number.isInteger(sig.value)
+                          ? String(sig.value)
+                          : sig.value.toFixed(2)
+                        : String(sig.value);
+
                     return (
                       <tr
                         key={sig.id}
-                        onClick={() => {
-                          setSelectedSignalId(sig.id);
-                          setDrawerOpen(true);
-                        }}
-                        data-selected={isSelected}
-                        className="cursor-pointer"
+                        onClick={() => setSelectedSignal(sig)}
+                        className={`hover:bg-slate-50 cursor-pointer transition ${
+                          isChecked ? 'bg-blue-50/30' : ''
+                        }`}
                       >
-                        <td className="text-center" onClick={(e) => e.stopPropagation()}>
+                        <td
+                          className="py-2.5 px-3 w-8"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleToggleSelect(sig.id);
+                          }}
+                        >
                           <input
                             type="checkbox"
                             checked={isChecked}
-                            onChange={(e) => toggleSelectOne(sig.id, e as any)}
-                            className="rounded text-[#EF1B24]"
+                            onChange={() => handleToggleSelect(sig.id)}
+                            className="rounded border-slate-300 text-blue-600 focus:ring-0"
                           />
                         </td>
-                        <td className="font-mono font-bold text-[#111B37] text-[12px]">{sig.tag}</td>
-                        <td className="font-semibold text-[#334568]">{sig.name}</td>
-                        <td className="text-[#657794] text-[12px] truncate max-w-[180px]">
-                          {sig.resourcePath}
+                        <td className="py-2.5 px-3 font-semibold text-[#111B37]">
+                          <div>{sig.displayName || sig.name || sig.key}</div>
+                          {sig.displayName && sig.key && (
+                            <div className="text-[10px] text-[#657794] font-mono">{sig.key}</div>
+                          )}
                         </td>
-                        <td>
-                          <span
-                            className={`inline-block px-2 py-0.5 rounded text-[11px] font-bold uppercase ${
-                              sig.dataType === 'calculated'
-                                ? 'bg-[#F5F0FF] text-[#7B3AE0]'
-                                : 'bg-[#F1F5FA] text-[#657794]'
-                            }`}
-                          >
-                            {sig.dataType}
-                          </span>
+                        <td className="py-2.5 px-3 text-[#657794] font-mono text-[11px]">
+                          {res?.name || sig.resourcePath || '—'}
                         </td>
-                        <td className="font-extrabold text-[#111B37] tabular-nums text-[13px]">
-                          {String(sig.currentValue)}{' '}
-                          <span className="font-normal text-[11px] text-[#657794]">{sig.unit}</span>
+                        <td className="py-2.5 px-3 font-semibold text-[#111B37] tabular-nums">
+                          {formattedVal}{' '}
+                          {sig.unit && <span className="font-normal text-[#657794] text-[11px]">{sig.unit}</span>}
                         </td>
-                        <td className="w-24">
-                          <MicroSparkline
-                            value={Number.isFinite(Number(sig.currentValue)) ? Number(sig.currentValue) : 0}
-                            quality={sig.quality}
-                          />
+                        <td className="py-2.5 px-3">
+                          <SignalSparkline signalId={sig.id} quality={sig.quality || 'NO_DATA'} />
                         </td>
-                        <td>
-                          <Badge variant={sig.quality === 'GOOD' ? 'good' : 'warning'}>{sig.quality}</Badge>
+                        <td className="py-2.5 px-3">
+                          <StatusBadge status={sig.quality || 'NO_DATA'} />
                         </td>
-                        <td className="text-[#94A3B8] font-mono text-[11px]">{sig.lastUpdated}</td>
+                        <td className="py-2.5 px-3 text-right text-[#657794] whitespace-nowrap" title={sig.lastUpdated ? new Date(sig.lastUpdated).toLocaleString() : ''}>
+                          {timeAgo(sig.lastUpdated)}
+                        </td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
             </div>
-
-            {/* Region 5: Summary & Pagination */}
-            <div className="px-5 py-3 border-t border-[#E3EAF3] bg-[#F9FAFD] flex items-center justify-between text-[12px] text-[#657794]">
-              <span>
-                Showing <strong className="text-[#111B37]">{filteredSignals.length}</strong> of{' '}
-                <strong className="text-[#111B37]">{signals.length}</strong> collected signals
-              </span>
-              <div className="flex items-center gap-3">
-                <span className="text-[#0DBA67] font-bold">
-                  {signals.filter((s) => s.quality === 'GOOD').length} Good
-                </span>
-                <span>·</span>
-                <span className="text-[#FFAA23] font-bold">
-                  {signals.filter((s) => s.quality === 'STALE' || s.quality === 'UNCERTAIN').length} Stale
-                </span>
-                <span>·</span>
-                <span className="text-[#F2343B] font-bold">
-                  {signals.filter((s) => s.quality === 'BAD').length} Bad
-                </span>
-              </div>
-            </div>
-          </Card>
-        </div>
-
-        {/* Region 4: Selected Signal Inspector Drawer */}
-        {drawerOpen && (
-          <div className="col-span-12 lg:col-span-4">
-            <Card className="h-full p-4 flex flex-col justify-between">
-              <div>
-                <div className="flex items-start justify-between pb-3 border-b border-[#E3EAF3]">
-                  <div>
-                    <h3 className="text-[16px] font-extrabold text-[#111B37]">{selectedSignal.name}</h3>
-                    <p className="font-mono text-[12px] text-[#EF1B24] font-bold mt-0.5">{selectedSignal.tag}</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setDrawerOpen(false)}
-                    className="p-1 rounded-md text-[#94A3B8] hover:text-[#111B37]"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-
-                <div className="space-y-3 pt-3 text-[12px]">
-                  <div className="p-3 rounded-xl bg-[#F9FAFD] border border-[#E3EAF3]">
-                    <span className="text-[#657794] block text-[11px] uppercase font-bold">Current Measurement</span>
-                    <div className="text-[28px] font-extrabold text-[#111B37] mt-1 tabular-nums">
-                      {String(selectedSignal.currentValue)}{' '}
-                      <span className="text-[14px] font-bold text-[#657794]">{selectedSignal.unit}</span>
-                    </div>
-                    <div className="flex items-center gap-2 mt-1">
-                      <Badge variant="good">{selectedSignal.quality}</Badge>
-                      <span className="text-[#94A3B8] font-mono text-[11px]">Updated {selectedSignal.lastUpdated}</span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2 pt-2 border-t border-[#E3EAF3]">
-                    <div className="flex justify-between">
-                      <span className="text-[#657794]">Source Gateway:</span>
-                      <span className="font-semibold text-[#111B37]">{selectedSignal.sourceConnectionName}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-[#657794]">Resource Binding:</span>
-                      <span className="font-semibold text-[#111B37]">{selectedSignal.resourcePath}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-[#657794]">Sample Rate:</span>
-                      <span className="font-mono font-bold text-[#111B37]">{selectedSignal.sampleIntervalMs} ms</span>
-                    </div>
-                    {selectedSignal.formula && (
-                      <div className="pt-2">
-                        <span className="text-[#657794] block mb-1">AST Expression:</span>
-                        <code className="block p-2 rounded bg-[#111B2E] text-[#0DBA67] font-mono text-[11px] overflow-x-auto">
-                          {selectedSignal.formula}
-                        </code>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div className="pt-4 border-t border-[#E3EAF3] flex gap-2">
-                <Button size="sm" variant="secondary" className="w-full" icon={<Edit2 className="w-3.5 h-3.5" />}>
-                  Edit Signal
-                </Button>
-                <Button size="sm" variant="danger" icon={<Trash2 className="w-3.5 h-3.5" />}>
-                  Delete
-                </Button>
-              </div>
-            </Card>
-          </div>
-        )}
-      </div>
-
-      {/* Floating Sticky Bulk Action Bar (From Images 27 & 39) */}
-      {selectedIds.length > 0 && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 rounded-2xl bg-[#0F172A] text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
-          <span className="text-[13px] font-bold text-white flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-[#34D399] animate-pulse" />
-            {selectedIds.length} signal{selectedIds.length > 1 ? 's' : ''} selected
-          </span>
-          <div className="h-4 w-px bg-slate-700" />
-          <button
-            type="button"
-            onClick={() => setAssignModalOpen(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1E293B] hover:bg-[#334155] text-[12px] font-semibold text-slate-200 transition-colors"
-          >
-            <Zap className="w-3.5 h-3.5 text-[#38BDF8]" />
-            Assign Output Group
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const selectedSigs = signals.filter((s) => selectedIds.includes(s.id));
-              handleExportCSV(selectedSigs);
-            }}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1E293B] hover:bg-[#334155] text-[12px] font-semibold text-slate-200 transition-colors"
-          >
-            <Download className="w-3.5 h-3.5 text-[#34D399]" />
-            Export CSV ({selectedIds.length})
-          </button>
-          <button
-            type="button"
-            onClick={handleDeleteSelected}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#EF1B24]/20 hover:bg-[#EF1B24]/30 text-[12px] font-semibold text-[#F87171] transition-colors"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            Delete Selected
-          </button>
-          <div className="h-4 w-px bg-slate-700" />
-          <button
-            type="button"
-            onClick={() => setSelectedIds([])}
-            className="p-1 rounded-md text-slate-400 hover:text-white"
-            title="Clear selection"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
+          )}
+        </Card>
       )}
 
-      {/* Assign Output Group Modal (Review FX-07, FX-11) */}
-      {assignModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-in fade-in duration-150">
-          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-md p-5 space-y-4">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-100">
-              <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                <Zap className="w-4 h-4 text-[#2A82E7]" />
-                Assign Signals to Output Group
-              </h3>
-              <button
-                type="button"
-                onClick={() => setAssignModalOpen(false)}
-                className="text-slate-400 hover:text-slate-600"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <p className="text-xs text-slate-500">
-              Select an existing output group to bundle the <strong>{selectedIds.length}</strong> selected signals
-              for automated MQTT/Kafka publishing.
-            </p>
-            <div className="space-y-2">
-              <label className="block text-xs font-semibold text-slate-700">Target Output Group</label>
-              <select
-                value={selectedGroupId || outputGroups[0]?.id}
-                onChange={(e) => setSelectedGroupId(e.target.value)}
-                className="w-full text-xs p-2.5 rounded-lg border border-slate-300 bg-white text-slate-800 font-semibold"
-              >
-                {outputGroups.map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name} ({g.topicTemplate})
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
-              <Button size="sm" variant="secondary" onClick={() => setAssignModalOpen(false)}>
-                Cancel
-              </Button>
-              <Button size="sm" variant="primary" onClick={handleConfirmAssign}>
-                Confirm Assignment
-              </Button>
-            </div>
-          </div>
-        </div>
+      {/* Inspector Drawer */}
+      <SignalInspector
+        signal={selectedSignal}
+        isOpen={Boolean(selectedSignal)}
+        onClose={() => setSelectedSignal(null)}
+        onEdit={(sig) => setEditTarget(sig)}
+        onToggleEnabled={(sig) => void handleToggleEnabled(sig)}
+        onDelete={(sig) => setDeleteTarget(sig)}
+        resourceName={resources.find((r) => r.id === selectedSignal?.resourceId)?.name}
+        connectionName={connections.find((c) => c.id === selectedSignal?.connectionId)?.name}
+        edgeName={edges[0]?.name}
+      />
+
+      {/* Edit Signal Modal */}
+      {editTarget && (
+        <SignalEditDialog
+          signal={editTarget}
+          isOpen={Boolean(editTarget)}
+          onClose={() => setEditTarget(null)}
+          onSaved={() => {
+            void refresh();
+            showToast('Signal updated');
+          }}
+        />
       )}
 
-      {/* Undo Toast Notification (Review FX-07) */}
-      {toastMsg && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-900 text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
-          <span className="text-xs font-semibold">{toastMsg}</span>
-          {undoDelete && (
+      {/* Delete Confirmation Modal */}
+      <ConfirmDialog
+        isOpen={Boolean(deleteTarget)}
+        title={`Delete signal "${deleteTarget?.displayName || deleteTarget?.name || deleteTarget?.key}"?`}
+        message="This signal will be archived and will stop collecting data. This key can be reused later."
+        confirmLabel="Delete"
+        variant="danger"
+        onConfirm={handleDeleteSignal}
+        onCancel={() => setDeleteTarget(null)}
+      />
+
+      {/* Toast Feedback */}
+      {toastMessage && (
+        <div className="fixed bottom-6 right-6 bg-[#111B37] text-white px-4 py-3 rounded-xl shadow-xl flex items-center gap-3 z-50 text-[13px] animate-fade-in">
+          <span>{toastMessage}</span>
+          {undoAction && (
             <button
-              type="button"
               onClick={() => {
-                undoDelete();
-                setToastMsg('Deletion undone! Signals restored.');
-                setUndoDelete(null);
+                undoAction();
+                setToastMessage(null);
               }}
-              className="text-xs font-bold text-amber-400 hover:text-amber-300 underline ml-2"
+              className="font-bold text-blue-400 hover:text-blue-300 underline ml-2"
             >
               Undo
             </button>

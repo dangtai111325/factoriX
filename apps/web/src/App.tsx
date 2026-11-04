@@ -1,5 +1,5 @@
 import React from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import {
   ForgotPasswordPage,
   GuestOnly,
@@ -21,12 +21,27 @@ import { KnowledgeGraphPage } from './pages/04_KnowledgeGraph/KnowledgeGraphPage
 import { ConnectionsPage } from './pages/05_Connections/ConnectionsPage';
 import { AddDataWizardPage } from './pages/06_AddDataWizard/AddDataWizardPage';
 import { SignalsCatalogPage } from './pages/08_SignalsCatalog/SignalsCatalogPage';
-import { LiveOperationsPage } from './pages/10_LiveOperations/LiveOperationsPage';
 import { DiagnosticsPage } from './pages/11_Diagnostics/DiagnosticsPage';
-import { ActivityLogPage } from './pages/12_ActivityLog/ActivityLogPage';
 import { OutputGroupsPage } from './pages/13_OutputGroups/OutputGroupsPage';
 import { EdgesPage } from './pages/16_Edges/EdgesPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
+
+// Query-preserving redirect helper (TC-UI-NAV-06)
+const RedirectWithQuery: React.FC<{ to: string; extraParams?: Record<string, string> }> = ({
+  to,
+  extraParams,
+}) => {
+  const location = useLocation();
+  const searchParams = new URLSearchParams(location.search);
+  if (extraParams) {
+    for (const [key, val] of Object.entries(extraParams)) {
+      searchParams.set(key, val);
+    }
+  }
+  const query = searchParams.toString();
+  const destination = query ? `${to}?${query}` : to;
+  return <Navigate to={destination} replace />;
+};
 
 const ProtectedAppShell: React.FC = () => (
   <AppProvider>
@@ -37,28 +52,52 @@ const ProtectedAppShell: React.FC = () => (
         <main className="fx-main">
           <div className="fx-content">
             <Routes>
+              {/* Canonical Routes */}
               <Route path="/" element={<Navigate to="/overview" replace />} />
               <Route path="/overview" element={<OverviewPage />} />
               <Route path="/factory/structure" element={<FactoryStructurePage />} />
               <Route path="/factory/layout" element={<FactoryLayoutPage />} />
               <Route path="/factory/graph" element={<KnowledgeGraphPage />} />
-              <Route path="/acquisition/connections" element={<ConnectionsPage />} />
-              <Route path="/acquisition/edges" element={<EdgesPage />} />
-              <Route path="/acquisition/add-data" element={<AddDataWizardPage />} />
-              <Route path="/acquisition/studio/opcua" element={<ComingSoonPage />} />
-              <Route path="/signals" element={<SignalsCatalogPage />} />
-              <Route path="/signals/calculated" element={<ComingSoonPage />} />
-              <Route path="/live/monitor" element={<LiveOperationsPage />} />
-              <Route path="/live/diagnostics" element={<DiagnosticsPage />} />
-              <Route path="/live/activity" element={<ActivityLogPage />} />
-              <Route path="/signals/output-groups" element={<OutputGroupsPage />} />
-              <Route path="/acquisition/studio/mqtt" element={<ComingSoonPage />} />
-              <Route path="/acquisition/studio/http" element={<ComingSoonPage />} />
+              <Route path="/collector/connections" element={<ConnectionsPage />} />
+              <Route path="/collector/signals" element={<SignalsCatalogPage />} />
+              <Route path="/collector/edges" element={<EdgesPage />} />
+              <Route path="/collector/diagnostics" element={<DiagnosticsPage />} />
+              <Route path="/collector/add-data" element={<AddDataWizardPage />} />
+              <Route path="/models" element={<OutputGroupsPage />} />
+
+              {/* Coming soon routes */}
+              <Route path="/dashboards/*" element={<ComingSoonPage />} />
               <Route path="/dashboards" element={<ComingSoonPage />} />
-              <Route path="/storage" element={<ComingSoonPage />} />
+              <Route path="/historian/*" element={<ComingSoonPage />} />
+              <Route path="/historian" element={<ComingSoonPage />} />
+              <Route path="/alarms/*" element={<ComingSoonPage />} />
               <Route path="/alarms" element={<ComingSoonPage />} />
+              <Route path="/analytics/*" element={<ComingSoonPage />} />
+              <Route path="/analytics" element={<ComingSoonPage />} />
+              <Route path="/reports/*" element={<ComingSoonPage />} />
               <Route path="/reports" element={<ComingSoonPage />} />
+              <Route path="/administration/*" element={<ComingSoonPage />} />
               <Route path="/administration" element={<ComingSoonPage />} />
+
+              {/* Legacy Route Redirects with preserved Query Parameters (§2.3 & TC-UI-NAV-06) */}
+              <Route path="/topology" element={<RedirectWithQuery to="/factory/structure" />} />
+              <Route path="/factory-layout" element={<RedirectWithQuery to="/factory/layout" />} />
+              <Route path="/knowledge-graph" element={<RedirectWithQuery to="/factory/graph" />} />
+              <Route path="/acquisition/connections" element={<RedirectWithQuery to="/collector/connections" />} />
+              <Route path="/acquisition/edges" element={<RedirectWithQuery to="/collector/edges" />} />
+              <Route path="/acquisition/add-data" element={<RedirectWithQuery to="/collector/add-data" />} />
+              <Route path="/acquisition/studio/mqtt" element={<RedirectWithQuery to="/collector/connections" />} />
+              <Route path="/acquisition/studio/opc" element={<RedirectWithQuery to="/collector/connections" />} />
+              <Route path="/acquisition/studio/opcua" element={<RedirectWithQuery to="/collector/connections" />} />
+              <Route path="/acquisition/studio/http" element={<RedirectWithQuery to="/collector/connections" />} />
+              <Route path="/signals" element={<RedirectWithQuery to="/collector/signals" />} />
+              <Route path="/live/monitor" element={<RedirectWithQuery to="/collector/signals" extraParams={{ view: 'live' }} />} />
+              <Route path="/live/diagnostics" element={<RedirectWithQuery to="/collector/diagnostics" extraParams={{ tab: 'health' }} />} />
+              <Route path="/live/activity" element={<RedirectWithQuery to="/collector/diagnostics" extraParams={{ tab: 'activity' }} />} />
+              <Route path="/signals/output-groups" element={<RedirectWithQuery to="/models" />} />
+              <Route path="/signals/calculated" element={<RedirectWithQuery to="/models" extraParams={{ tab: 'calculations' }} />} />
+              <Route path="/storage" element={<RedirectWithQuery to="/historian" />} />
+
               <Route path="*" element={<Navigate to="/overview" replace />} />
             </Routes>
           </div>

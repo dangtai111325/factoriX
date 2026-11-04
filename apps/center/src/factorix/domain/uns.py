@@ -17,17 +17,17 @@ class TopicError(ValueError):
 def slug_segment(value: str) -> str:
     cleaned = value.strip()
     if not cleaned or any(ch in cleaned for ch in _FORBIDDEN):
-        raise TopicError("ILLEGAL_SEGMENT", "Segment topic chứa ký tự cấm.")
+        raise TopicError("ILLEGAL_SEGMENT", "Topic segment contains forbidden characters.")
     slug = _SEGMENT.sub("-", cleaned).strip("-._")
     if not slug or slug in {".", ".."}:
-        raise TopicError("ILLEGAL_SEGMENT", "Segment topic không hợp lệ.")
+        raise TopicError("ILLEGAL_SEGMENT", "Topic segment is invalid.")
     return slug[:80]
 
 
 def render_topic(template: str, context: dict[str, str | None]) -> str:
     """Render `{name}` placeholders. Missing optional segments are omitted, not left empty."""
     if "#" in template or "+" in template:
-        raise TopicError("WILDCARD", "Template không được chứa wildcard MQTT.")
+        raise TopicError("WILDCARD", "Template must not contain MQTT wildcards.")
 
     def replace(match: re.Match[str]) -> str:
         key = match.group(1)
@@ -41,7 +41,7 @@ def render_topic(template: str, context: dict[str, str | None]) -> str:
     rendered = re.sub(r"\{([a-zA-Z0-9_]+)\}", replace, template)
     parts = [part for part in rendered.split("/") if part]
     if not parts:
-        raise TopicError("EMPTY_TOPIC", "Topic rỗng.")
+        raise TopicError("EMPTY_TOPIC", "Topic is empty.")
     return "/".join(parts)
 
 
