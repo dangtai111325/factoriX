@@ -253,20 +253,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       latest = new Map((page.items || []).map((row) => [text(row.signal_id), row]))
     }
     const connectionName = new Map((connectionPage.items || []).map((row) => [text(row.id), text(row.name)]))
+    const signalCountsByConn = new Map<string, number>()
+    for (const s of (signalPage.items || [])) {
+      const cid = text(s.connection_id)
+      if (cid) {
+        signalCountsByConn.set(cid, (signalCountsByConn.get(cid) || 0) + 1)
+      }
+    }
     setConnections(
       (connectionPage.items || []).map((row) => {
-        const health = text(row.health)
-        const status = health === 'HEALTHY' ? 'connected' : health === 'DEGRADED' ? 'warning' : 'disconnected'
+        const health = text(row.health).toUpperCase()
+        const rawStatus = text(row.status).toUpperCase()
+        const isOnline =
+          health === 'HEALTHY' ||
+          health === 'ONLINE' ||
+          rawStatus === 'ACTIVE' ||
+          rawStatus === 'CONNECTED' ||
+          (!row.last_error && health !== 'OFFLINE' && health !== 'DEGRADED')
+        const status = isOnline ? 'connected' : 'disconnected'
         return {
           id: text(row.id),
           name: text(row.name),
           protocol: protocolOf(text(row.protocol)),
           endpoint: text(row.endpoint_redacted),
           status,
+          health: isOnline ? 'HEALTHY' : 'DEGRADED',
+          lastError: text(row.last_error),
           plantId: text(row.site_id),
           latencyMs: 0,
           lastConnected: text(row.last_success_at),
-          signalsCount: 0,
+          signalsCount: signalCountsByConn.get(text(row.id)) || 0,
           throughputPerSec: 0,
           errorRate: 0,
           config: (row.config as Record<string, unknown>) || {},
@@ -276,19 +292,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSignals(
       (signalPage.items || []).map((row) => {
         const state = latest.get(text(row.id))
-        const value = (state?.value_json as { v?: unknown } | undefined)?.v
+        const rawVal = state?.value !== undefined ? state.value : (state?.value_json as { v?: unknown } | undefined)?.v;
+        const value = rawVal;
         const dataType = text(row.data_type)
         return {
           id: text(row.id),
-          name: text(row.display_name || row.key),
+          key: text(row.key),
+          name: text(row.key),
+          displayName: text(row.display_name || row.key),
           tag: text(row.key),
-          sourceConnectionId: '',
+          connectionId: text(row.connection_id),
+          sourceConnectionId: text(row.connection_id),
           sourceConnectionName: connectionName.get(text(row.connection_id)) || 'Collector',
           resourceId: text(row.resource_id),
           resourcePath: text(row.resource_name || row.resource_code),
           dataType: dataType === 'boolean' || dataType === 'bool' ? 'boolean' : signalType(dataType),
           unit: text(row.unit),
           currentValue: value == null ? '—' : (value as string | number | boolean),
+          value: value == null ? null : (value as string | number | boolean),
           quality: (text(state?.quality || 'UNKNOWN') as SignalItem['quality']) || 'UNKNOWN',
           lastUpdated: text(state?.event_time),
           sampleIntervalMs: Number(row.expected_interval_ms || 1000),
@@ -439,16 +460,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     })
     if (typeKey === 'site') {
       const edgeName = `Edge ${name}`
-      const edge = await api<{ id: string }>('/api/v1/edges', {
-        method: 'POST',
-        body: JSON.stringify({ site_id: siteId, name: edgeName }),
-      })
       try {
-        await api(`/api/v1/edges/${edge.id}/appliance`, { method: 'POST' })
-      } catch {
-        // Appliance mode may be off; Edge still needs manual enrollment.
+        const edge = await api<{ id: string }>('/api/v1/edges', {
+          method: 'POST',
+          body: JSON.stringify({ site_id: siteId, name: edgeName }),
+        })
+        try {
+          await api(`/api/v1/edges/${edge.id}/appliance`, { method: 'POST' })
+        } catch {
+          // Appliance mode may be off; Edge still needs manual enrollment.
+        }
+        edgeCreated = { id: edge.id, name: edgeName }
+      } catch (e) {
+        console.warn('Edge creation note:', e)
       }
-      edgeCreated = { id: edge.id, name: edgeName }
     }
     await refresh()
     setSelectedResourceId(created.id)

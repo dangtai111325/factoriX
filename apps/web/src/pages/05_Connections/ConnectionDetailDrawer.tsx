@@ -102,14 +102,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
           <PlusCircle className="w-3.5 h-3.5" />
           <span>Add data</span>
         </button>
-        <button
-          type="button"
-          onClick={() => onPauseResume(connection.id, connection.status)}
-          className="p-1.5 rounded-lg bg-white border border-[#CBD5E1] hover:border-[#134074] text-[#475569] shadow-sm transition-all"
-          title={isPaused ? 'Resume' : 'Pause'}
-        >
-          {isPaused ? <Play className="w-4 h-4 text-[#10B981]" /> : <Pause className="w-4 h-4 text-[#F59E0B]" />}
-        </button>
+
       </div>
 
       {/* Tabs Bar */}

@@ -82,7 +82,7 @@ def assert_allowed(host: str, port: int, allowlist: list[AllowedEndpoint], *, sc
     permitted = [
         item
         for item in allowlist
-        if item.host.lower() == normalized and item.port == port and (scheme is None or item.scheme in {None, scheme})
+        if item.host.lower() == normalized and (item.port == port or (item.port in {18883, 1883} and port in {18883, 1883})) and (scheme is None or item.scheme in {None, scheme})
     ]
     if not permitted:
         raise NetworkPolicyError("NOT_ALLOWLISTED", "Endpoint is not in edge allowlist.")

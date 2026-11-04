@@ -104,6 +104,7 @@ interface TreeRowProps {
   expandedNodes: Record<string, boolean>;
   onToggle: (id: string) => void;
   onSelect: (id: string) => void;
+  onSelectData?: (id: string) => void;
   onKeyNavigate: (event: React.KeyboardEvent, node: HierarchyTreeNode) => void;
 }
 
@@ -114,13 +115,15 @@ const TreeRow: React.FC<TreeRowProps> = ({
   expandedNodes,
   onToggle,
   onSelect,
+  onSelectData,
   onKeyNavigate,
 }) => {
   const { resource, children } = node;
   const isSelected = resource.id === selectedId;
-  const hasKids = children.length > 0;
-  const isExpanded = expandedNodes[resource.id] ?? true;
   const signalCount = resource.signalsCount ?? 0;
+  const hasDirectData = signalCount > 0;
+  const hasKids = children.length > 0 || hasDirectData;
+  const isExpanded = expandedNodes[resource.id] ?? true;
 
   return (
     <>
@@ -167,8 +170,30 @@ const TreeRow: React.FC<TreeRowProps> = ({
           {signalCount}
         </span>
       </div>
-      {children.length > 0 && isExpanded ? (
+      {isExpanded && (
         <div role="group">
+          {/* Distinct Data Nav Child */}
+          {hasDirectData && (
+            <div
+              style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}
+              className="flex items-center justify-between py-1 px-2 rounded-lg cursor-pointer text-[12px] transition-colors text-emerald-700 hover:bg-emerald-50/70"
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelect(resource.id);
+                if (onSelectData) onSelectData(resource.id);
+              }}
+            >
+              <div className="flex items-center gap-2 truncate min-w-0">
+                <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse shrink-0" />
+                <span className="truncate font-bold">
+                  📊 {resource.type === 'line' ? 'Line Data' : 'Machine Data'}
+                </span>
+              </div>
+              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded font-extrabold bg-emerald-100 text-emerald-800">
+                {signalCount}
+              </span>
+            </div>
+          )}
           {children.map((child) => (
             <TreeRow
               key={child.resource.id}
@@ -178,11 +203,12 @@ const TreeRow: React.FC<TreeRowProps> = ({
               expandedNodes={expandedNodes}
               onToggle={onToggle}
               onSelect={onSelect}
+              onSelectData={onSelectData}
               onKeyNavigate={onKeyNavigate}
             />
           ))}
         </div>
-      ) : null}
+      )}
     </>
   );
 };
@@ -214,6 +240,7 @@ export const FactoryStructurePage: React.FC = () => {
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [rightPanelTab, setRightPanelTab] = useState<'children' | 'telemetry'>('children');
 
   const navigate = useNavigate();
 
@@ -242,16 +269,23 @@ export const FactoryStructurePage: React.FC = () => {
     return order;
   }, [tree, expandedNodes]);
 
-  // Default-expand all parents once resources load
+  // Default-expand all parents whenever resources update
   useEffect(() => {
-    if (!resources.length || expandedInitialized) return;
-    const next: Record<string, boolean> = {};
-    for (const r of resources) {
-      if (hasChildren(resources, r.id)) next[r.id] = true;
-    }
-    setExpandedNodes(next);
-    setExpandedInitialized(true);
-  }, [resources, expandedInitialized]);
+    if (!resources.length) return;
+    setExpandedNodes((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const r of resources) {
+        if (hasChildren(resources, r.id) && next[r.id] !== false) {
+          if (!next[r.id]) {
+            next[r.id] = true;
+            changed = true;
+          }
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [resources]);
 
   // Expand path to deep-linked resource
   useEffect(() => {
@@ -504,7 +538,6 @@ export const FactoryStructurePage: React.FC = () => {
             variant="primary"
             icon={<Plus className="w-4 h-4" />}
             onClick={() => setIsAddModalOpen(true)}
-            disabled={allowedTypesForSelected.length === 0}
           >
             Add Resource
           </Button>
@@ -572,6 +605,10 @@ export const FactoryStructurePage: React.FC = () => {
                     expandedNodes={expandedNodes}
                     onToggle={toggleExpand}
                     onSelect={setSelectedResourceId}
+                    onSelectData={(id) => {
+                      setSelectedResourceId(id);
+                      setRightPanelTab('telemetry');
+                    }}
                     onKeyNavigate={handleTreeKeyNavigate}
                   />
                 ))
@@ -580,58 +617,173 @@ export const FactoryStructurePage: React.FC = () => {
           </Card>
         </div>
 
-        {/* Region 4: Resources List in current container */}
+        {/* Region 4: Child Units & Real-time Telemetry Synchronization */}
         <div className="col-span-12 lg:col-span-4">
           <Card className="h-[760px] flex flex-col p-0">
-            <div className="px-4 py-3 border-b border-[#E3EAF3] flex items-center justify-between bg-[#F9FAFD]">
-              <span className="text-[12px] font-bold text-[#111B37] uppercase tracking-wider">
-                Child Units ({childResources.length})
-              </span>
-              <Button
-                size="sm"
-                variant="ghost"
-                icon={<Plus className="w-3.5 h-3.5" />}
-                onClick={() => setIsAddModalOpen(true)}
-                disabled={allowedTypesForSelected.length === 0}
-              >
-                Add Child
-              </Button>
+            {/* Header Tabs: Sub-units vs Telemetry Data */}
+            <div className="px-3 py-2.5 border-b border-[#E3EAF3] flex items-center justify-between bg-[#F9FAFD]">
+              {(() => {
+                const unitSignals = signals.filter((s) => s.resourceId === selectedResource.id);
+                return (
+                  <div className="flex items-center gap-1 bg-slate-200/70 p-0.5 rounded-lg">
+                    {childResources.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setRightPanelTab('children')}
+                        className={`px-2.5 py-1 text-xs font-bold rounded-md transition ${
+                          rightPanelTab === 'children'
+                            ? 'bg-white text-[#0B2545] shadow-xs'
+                            : 'text-[#64748B] hover:text-[#0B2545]'
+                        }`}
+                      >
+                        Sub-units ({childResources.length})
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setRightPanelTab('telemetry')}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-bold rounded-md transition ${
+                        rightPanelTab === 'telemetry' || childResources.length === 0
+                          ? 'bg-emerald-700 text-white shadow-xs'
+                          : 'text-emerald-800 hover:bg-emerald-50'
+                      }`}
+                    >
+                      <Activity className="w-3.5 h-3.5" />
+                      <span>📊 Telemetry Data ({unitSignals.length})</span>
+                    </button>
+                  </div>
+                );
+              })()}
+
+              <div className="flex items-center gap-1">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon={<Plus className="w-3.5 h-3.5" />}
+                  onClick={() => navigate(`/collector/add-data?resourceId=${encodeURIComponent(selectedResource.id)}`)}
+                >
+                  Add Data
+                </Button>
+                {allowedTypesForSelected.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={<Plus className="w-3.5 h-3.5" />}
+                    onClick={() => setIsAddModalOpen(true)}
+                  >
+                    Add Child
+                  </Button>
+                )}
+              </div>
             </div>
-            <div className="p-3 overflow-y-auto flex-1 space-y-2">
-              {childResources.length === 0 ? (
-                <div className="text-center py-12 text-[#94A3B8] text-[13px]">
-                  No sub-resources configured under this unit.
-                </div>
-              ) : (
-                childResources.map((child) => {
+
+            <div className="p-3 overflow-y-auto flex-1 space-y-2.5">
+              {(() => {
+                const unitSignals = signals.filter((s) => s.resourceId === selectedResource.id);
+                const isTelemetryView = rightPanelTab === 'telemetry' || childResources.length === 0;
+
+                if (isTelemetryView) {
+                  if (unitSignals.length === 0) {
+                    return (
+                      <div className="text-center py-12 space-y-2">
+                        <div className="text-[#94A3B8] text-[13px] font-medium">
+                          No direct telemetry signals bound under {selectedResource.name}.
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => navigate(`/collector/add-data?resourceId=${encodeURIComponent(selectedResource.id)}`)}
+                        >
+                          Bind Data / Signals
+                        </Button>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="space-y-2">
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-[#657794] px-1 flex items-center justify-between">
+                        <span className="flex items-center gap-1.5">
+                          <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
+                          <span>{selectedResource.name} Telemetry Tags ({unitSignals.length})</span>
+                        </span>
+                        <span className="font-mono text-emerald-600">● 1 Hz stream</span>
+                      </div>
+                      <div className="grid grid-cols-1 gap-2">
+                        {unitSignals.map((sig) => {
+                          const isGood = sig.quality === 'GOOD';
+                          const val = sig.value !== null && sig.value !== undefined ? sig.value : (sig.currentValue ?? '—');
+                          return (
+                            <div
+                              key={sig.id}
+                              className="p-2.5 rounded-xl border border-[#E3EAF3] bg-white hover:border-emerald-500 transition-all shadow-sm"
+                            >
+                              <div className="flex items-center justify-between mb-1">
+                                <div className="text-xs font-bold font-mono text-[#0B2545] truncate">
+                                  {sig.key || sig.tag || sig.name}
+                                </div>
+                                <span
+                                  className={`text-[9px] font-bold px-1.5 py-0.5 rounded font-mono uppercase ${
+                                    isGood ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-500'
+                                  }`}
+                                >
+                                  {sig.quality || 'GOOD'}
+                                </span>
+                              </div>
+                              <div className="flex items-baseline justify-between mt-1">
+                                <div className="text-lg font-black font-mono text-[#0B2545]">
+                                  {String(val)}
+                                  {sig.unit && <span className="text-xs font-normal text-[#657794] ml-1">{sig.unit}</span>}
+                                </div>
+                                <div className="text-[10px] font-mono text-[#94A3B8] truncate max-w-[130px]">
+                                  {sig.tag}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                }
+
+                return childResources.map((child) => {
                   const childStatus = statusPresentation(child.status);
+                  const childSignals = signals.filter((s) => s.resourceId === child.id);
+                  const statusSig = childSignals.find((s) => s.tag === 'status');
                   return (
                     <div
                       key={child.id}
                       onClick={() => setSelectedResourceId(child.id)}
-                      className="p-3 rounded-xl border border-[#E3EAF3] hover:border-[#EF1B24] cursor-pointer bg-white transition-all shadow-sm"
+                      className="p-3 rounded-xl border border-[#E3EAF3] hover:border-[#134074] cursor-pointer bg-white transition-all shadow-sm space-y-2 group"
                     >
-                      <div className="flex items-center justify-between mb-1.5">
-                        <div className="flex items-center gap-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 min-w-0">
                           {getIconForType(child.type)}
-                          <span className="text-[13px] font-bold text-[#111B37]">{child.name}</span>
-                        </div>
-                        {(child.signalsCount ?? 0) > 0 ? (
-                          <Badge variant={childStatus.variant}>{childStatus.label}</Badge>
-                        ) : (
-                          <span className="text-[10px] text-slate-400 font-medium px-2 py-0.5 rounded bg-slate-100">
-                            NO SIGNALS
+                          <span className="text-[13px] font-bold text-[#111B37] group-hover:text-[#134074] truncate transition-colors">
+                            {child.name}
                           </span>
-                        )}
+                        </div>
+                        {statusSig && statusSig.currentValue !== '—' ? (
+                          <Badge variant="good">
+                            {Number(statusSig.currentValue) === 2 ? 'RUNNING' : Number(statusSig.currentValue) === 0 ? 'IDLE' : 'ONLINE'}
+                          </Badge>
+                        ) : childSignals.length > 0 ? (
+                          <Badge variant={childStatus.variant}>{childStatus.label}</Badge>
+                        ) : null}
                       </div>
-                      <div className="flex items-center justify-between text-[11px] text-[#657794] font-mono">
-                        <span>{child.code || 'ASSET-NODE'}</span>
-                        <span>{child.signalsCount ?? 0} signals linked</span>
+                      <div className="flex items-center justify-between text-xs text-[#657794]">
+                        <span className="font-mono text-[11px] uppercase bg-slate-100 px-1.5 py-0.2 rounded">
+                          {child.type}
+                        </span>
+                        <span className="font-mono font-semibold text-emerald-700">
+                          {childSignals.length} telemetry tags
+                        </span>
                       </div>
                     </div>
                   );
-                })
-              )}
+                });
+              })()}
             </div>
           </Card>
         </div>

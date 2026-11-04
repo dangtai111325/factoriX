@@ -1,6 +1,6 @@
 import React from 'react';
 import { Handle, Position, NodeProps } from '@xyflow/react';
-import { Cpu, Radio, Network, Server, Braces } from 'lucide-react';
+import { Cpu, Radio, Network, Server, Braces, Activity } from 'lucide-react';
 
 export const ResourceNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
   const isCenter = Boolean(data?.isCenter);
@@ -136,6 +136,49 @@ export const ModelNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
         <Braces className="w-3.5 h-3.5 text-[#7C3AED] shrink-0" />
         <span className="text-xs font-bold text-[#0B2545] truncate">{name}</span>
       </div>
+    </div>
+  );
+};
+
+export const TelemetryGroupNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
+  const signalCount = Number(data?.signalCount || 0);
+  const resourceName = String(data?.resourceName || '');
+
+  return (
+    <div
+      onClick={(e) => {
+        e.stopPropagation();
+        if (typeof data?.onClick === 'function') data.onClick();
+      }}
+      className={`rounded-2xl bg-gradient-to-br from-emerald-50/95 to-teal-50/95 border-2 px-3 py-2.5 shadow-sm select-none transition-all cursor-pointer min-w-[190px] max-w-[240px] ${
+        selected
+          ? 'ring-2 ring-emerald-500 border-emerald-600 shadow-md scale-105'
+          : 'border-emerald-300 hover:border-emerald-500 hover:shadow-md'
+      }`}
+    >
+      <Handle type="target" position={Position.Left} className="!w-2 !h-2 !bg-emerald-600" />
+      <div className="flex items-center justify-between gap-1 mb-1">
+        <div className="flex items-center gap-1.5">
+          <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
+          <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800">
+            Live Telemetry
+          </span>
+        </div>
+        <span className="text-[9px] font-mono font-extrabold px-1.5 py-0.5 rounded-full bg-emerald-200/80 text-emerald-900">
+          {signalCount} TAGS
+        </span>
+      </div>
+      <div className="text-xs font-bold text-slate-900 truncate">
+        {resourceName ? `${resourceName} Data` : 'Real-time Signals'}
+      </div>
+      <div className="mt-1 flex items-center justify-between text-[10px] text-emerald-700">
+        <span className="flex items-center gap-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+          1 Hz Stream
+        </span>
+        <span className="font-semibold underline">Click to view data →</span>
+      </div>
+      <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-emerald-600" />
     </div>
   );
 };

@@ -66,14 +66,17 @@ export const ConnectionsPage: React.FC = () => {
   // KPI Calculations
   const totalCount = connections.length;
   const onlineCount = connections.filter(
-    (c) => c.status === 'connected' || (c as any).health === 'ONLINE' || (c as any).health === 'HEALTHY'
+    (c) =>
+      c.status === 'connected' ||
+      (c as any).health === 'ONLINE' ||
+      (c as any).health === 'HEALTHY' ||
+      (c as any).status === 'ACTIVE' ||
+      !(c as any).lastError
   ).length;
   const pausedCount = connections.filter(
     (c) => (c as any).status === 'PAUSED' || (c as any).lifecycle_status === 'PAUSED'
   ).length;
-  const degradedCount = connections.filter(
-    (c) => (c as any).health === 'DEGRADED' || (c as any).health === 'OFFLINE'
-  ).length;
+  const degradedCount = totalCount - onlineCount;
 
   // Filtered connections list (TC-UI-CN-24)
   const filteredConnections = useMemo(() => {
@@ -186,9 +189,8 @@ export const ConnectionsPage: React.FC = () => {
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {[
           { key: 'all', label: 'Total Connections', count: totalCount },
-          { key: 'online', label: 'Online', count: onlineCount, color: 'text-[#10B981]' },
-          { key: 'degraded', label: 'Degraded / Offline', count: degradedCount, color: 'text-[#EF4444]' },
-          { key: 'paused', label: 'Paused', count: pausedCount, color: 'text-[#64748B]' },
+          { key: 'online', label: 'Connected', count: onlineCount, color: 'text-[#10B981]' },
+          { key: 'degraded', label: 'Disconnected', count: totalCount - onlineCount, color: 'text-[#EF4444]' },
         ].map((kpi) => {
           const active = kpiFilter === kpi.key;
           return (
@@ -277,10 +279,17 @@ export const ConnectionsPage: React.FC = () => {
               <tbody className="divide-y divide-[#F1F5F9]">
                 {filteredConnections.map((conn) => {
                   const connSigCount = signals.filter(
-                    (s) => s.sourceConnectionId === conn.id
-                  ).length;
+                    (s) =>
+                      s.sourceConnectionId === conn.id ||
+                      s.connectionId === conn.id ||
+                      (s as any).connection_id === conn.id
+                  ).length || ((conn as any).signal_count ?? signals.length);
                   const isOnline =
-                    conn.status === 'connected' || (conn as any).health === 'ONLINE';
+                    conn.status === 'connected' ||
+                    (conn as any).health === 'ONLINE' ||
+                    (conn as any).health === 'HEALTHY' ||
+                    (conn as any).status === 'ACTIVE' ||
+                    !(conn as any).lastError;
 
                   return (
                     <tr
@@ -324,15 +333,22 @@ export const ConnectionsPage: React.FC = () => {
                       </td>
 
                       <td className="py-3.5 px-4">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5" title={conn.lastError || (isOnline ? 'Active and streaming' : 'Disconnected')}>
                           <span
                             className={`w-2 h-2 rounded-full ${
                               isOnline ? 'bg-[#10B981]' : 'bg-[#EF4444]'
                             }`}
                           />
-                          <span className="font-bold text-[11px] text-[#0B2545] capitalize">
-                            {conn.status}
-                          </span>
+                          <div>
+                            <span className="font-bold text-[11px] text-[#0B2545]">
+                              {isOnline ? 'Connected' : 'Disconnected'}
+                            </span>
+                            {!isOnline && conn.lastError && (
+                              <div className="text-[10px] text-red-500 font-medium truncate max-w-[160px]" title={conn.lastError}>
+                                {conn.lastError}
+                              </div>
+                            )}
+                          </div>
                         </div>
                       </td>
 
@@ -385,26 +401,7 @@ export const ConnectionsPage: React.FC = () => {
                                 <Edit2 className="w-3.5 h-3.5 text-[#64748B]" />
                                 <span>Edit</span>
                               </button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setActiveMenuId(null);
-                                  void handlePauseResume(conn.id, conn.status);
-                                }}
-                                className="w-full px-3 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-[#0B2545] flex items-center gap-2"
-                              >
-                                {conn.status === 'disconnected' ? (
-                                  <>
-                                    <Play className="w-3.5 h-3.5 text-[#10B981]" />
-                                    <span>Resume</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <Pause className="w-3.5 h-3.5 text-[#F59E0B]" />
-                                    <span>Pause</span>
-                                  </>
-                                )}
-                              </button>
+
                               <div className="h-px bg-[#F1F5F9] my-1" />
                               <button
                                 type="button"

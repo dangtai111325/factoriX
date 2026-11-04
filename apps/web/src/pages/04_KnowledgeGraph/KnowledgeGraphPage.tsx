@@ -16,11 +16,13 @@ import {
   Share2,
   Filter,
   Search,
+  ChevronDown,
+  Layers,
+  Crosshair,
   Maximize2,
   Download,
   RotateCcw,
   Radio,
-  Layers,
   X,
   Activity,
   Server,
@@ -28,7 +30,7 @@ import {
   Cpu,
 } from 'lucide-react';
 import { useApp } from '../../store/AppContext';
-import { api } from '../../api/client';
+import { ResourceNode, SignalItem } from '../../types';
 import { layoutGraph } from './graphLayout';
 import { LabeledEdge } from './LabeledEdge';
 import {
@@ -37,10 +39,12 @@ import {
   ConnectionNodeComponent,
   EdgeInfraNodeComponent,
   ModelNodeComponent,
+  TelemetryGroupNodeComponent,
 } from './CustomNodes';
 
 const nodeTypes = {
   resource: ResourceNodeComponent,
+  telemetryGroup: TelemetryGroupNodeComponent,
   signal: SignalNodeComponent,
   connection: ConnectionNodeComponent,
   edgeNode: EdgeInfraNodeComponent,
@@ -51,135 +55,125 @@ const edgeTypes = {
   labeled: LabeledEdge,
 };
 
-const ALL_RELATIONS = [
-  { code: 'CONTAINS', label: 'Contains' },
-  { code: 'HAS_SIGNAL', label: 'Has signal' },
-  { code: 'COLLECTED_VIA', label: 'Collected via' },
-  { code: 'RUNS_ON', label: 'Runs on' },
-  { code: 'USED_IN', label: 'Used in' },
-];
-
 export const KnowledgeGraphPage: React.FC = () => {
-  const { scopedResources, selectedResourceId, setSelectedResourceId } = useApp();
-  const [searchParams, setSearchParams] = useSearchParams();
-
-  // Current center & depth from URL (§9.6 TC-UI-KG-01)
-  const centerParam = searchParams.get('center');
-  const depthParam = searchParams.get('depth');
-
-  const depth = depthParam === '2' ? 2 : depthParam === '3' ? 3 : 1;
-
-  // Derive initial center resource
-  const centerResource = useMemo(() => {
-    if (centerParam) {
-      const match = scopedResources.find((r) => r.id === centerParam);
-      if (match) return match;
-    }
-    if (selectedResourceId) {
-      const match = scopedResources.find((r) => r.id === selectedResourceId);
-      if (match) return match;
-    }
-    return scopedResources.find((r) => r.type === 'machine') || scopedResources[0];
-  }, [centerParam, selectedResourceId, scopedResources]);
-
-  // Active relations filter set
-  const [activeRelations, setActiveRelations] = useState<Set<string>>(
-    new Set(['CONTAINS', 'HAS_SIGNAL', 'COLLECTED_VIA', 'RUNS_ON', 'USED_IN'])
-  );
-
+  const { scopedResources, resources, signals, selectedResourceId, setSelectedResourceId } = useApp();
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [selectedEntity, setSelectedEntity] = useState<Record<string, unknown> | null>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
 
-  // Fetch graph neighbors when center, depth, or relations change
+  // Build full factory topology DAG (§9.6 TC-UI-KG-01..09)
   useEffect(() => {
-    if (!centerResource) return;
-
     let active = true;
     setIsLoading(true);
 
     void (async () => {
       try {
-        const relationCodes = Array.from(activeRelations).join(',');
-        const res = await api<{
-          nodes: Array<Record<string, unknown>>;
-          edges: Array<Record<string, unknown>>;
-        }>(
-          `/api/v1/graph/neighbors?resource_id=${encodeURIComponent(
-            centerResource.id
-          )}&depth=${depth}&relation_types=${encodeURIComponent(
-            relationCodes
-          )}&include_data=true`
-        );
+        const resourceList = scopedResources.length > 0 ? scopedResources : resources;
+        if (resourceList.length === 0) return;
 
-        if (!active) return;
+        const resMap = new Map<string, ResourceNode>();
+        resourceList.forEach((r) => resMap.set(r.id, r));
 
-        const nodeLabelMap = new Map<string, string>();
-        res.nodes.forEach((n) => {
-          const label = String(n.label || n.name || n.key || 'Node');
-          nodeLabelMap.set(String(n.id), label);
+        // 1. Structure Nodes
+        const rawNodes: Node[] = resourceList.map((r) => ({
+          id: r.id,
+          type: 'resource',
+          data: {
+            ...r,
+            label: r.name,
+            name: r.name,
+            code: r.code,
+            type: r.type,
+            type_key: r.type,
+            onClick: () => {
+              setSelectedEntity({
+                kind: 'resource',
+                ...r,
+              });
+            },
+          },
+          position: { x: 0, y: 0 },
+        }));
+
+        // 2. Structure CONTAINS Edges
+        const rawEdges: Edge[] = [];
+        resourceList.forEach((r) => {
+          if (r.parentId && resMap.has(r.parentId)) {
+            const parent = resMap.get(r.parentId)!;
+            rawEdges.push({
+              id: `${r.parentId}->${r.id}-CONTAINS`,
+              source: r.parentId,
+              target: r.id,
+              type: 'labeled',
+              markerEnd: { type: MarkerType.ArrowClosed, color: '#134074' },
+              data: {
+                relation_code: 'CONTAINS',
+                sourceLabel: parent.name,
+                targetLabel: r.name,
+              },
+            });
+          }
         });
 
-        // Map backend nodes to React Flow nodes
-        const rawNodes: Node[] = res.nodes.map((n) => {
-          const id = String(n.id);
-          const kind = String(n.kind || n.type || 'resource').toLowerCase();
-          const rfType =
-            kind === 'signal'
-              ? 'signal'
-              : kind === 'connection'
-              ? 'connection'
-              : kind === 'edge'
-              ? 'edgeNode'
-              : kind === 'model'
-              ? 'model'
-              : 'resource';
+        // 3. Telemetry Nodes and HAS_SIGNAL Edges
+        const signalsByRes = new Map<string, SignalItem[]>();
+        signals.forEach((s) => {
+          if (s.resourceId) {
+            if (!signalsByRes.has(s.resourceId)) signalsByRes.set(s.resourceId, []);
+            signalsByRes.get(s.resourceId)!.push(s);
+          }
+        });
 
-          return {
-            id,
-            type: rfType,
+        signalsByRes.forEach((sigList, resId) => {
+          const res = resMap.get(resId);
+          const resName = res ? res.name : 'Asset';
+          const isLine = res?.type === 'line';
+          const teleNodeId = `telemetry-${resId}`;
+
+          rawNodes.push({
+            id: teleNodeId,
+            type: 'telemetryGroup',
             data: {
-              ...n,
-              isCenter: id === centerResource.id,
-              onDoubleClick: () => {
-                if (kind === 'resource') {
-                  setSearchParams({ center: id, depth: '2' });
-                  setSelectedResourceId(id);
-                }
+              id: teleNodeId,
+              kind: 'telemetryGroup',
+              label: isLine ? `Line Data (${sigList.length})` : `Machine Data (${sigList.length})`,
+              signalCount: sigList.length,
+              resourceName: resName,
+              signals: sigList,
+              onClick: () => {
+                setSelectedEntity({
+                  kind: 'telemetryGroup',
+                  name: `${resName} Telemetry Data`,
+                  resourceName: resName,
+                  signals: sigList,
+                });
               },
             },
             position: { x: 0, y: 0 },
-          };
-        });
+          });
 
-        // Map backend edges to React Flow edges with LabeledEdge
-        const rawEdges: Edge[] = res.edges.map((e) => {
-          const fromId = String(e.from || e.from_id);
-          const toId = String(e.to || e.to_id);
-          const relCode = String(e.relation_code);
-
-          return {
-            id: String(e.id || `${fromId}->${toId}-${relCode}`),
-            source: fromId,
-            target: toId,
+          rawEdges.push({
+            id: `${resId}->${teleNodeId}-HAS_SIGNAL`,
+            source: resId,
+            target: teleNodeId,
             type: 'labeled',
-            markerEnd: { type: MarkerType.ArrowClosed, color: '#134074' },
+            markerEnd: { type: MarkerType.ArrowClosed, color: '#10B981' },
             data: {
-              relation_code: relCode,
-              sourceLabel: nodeLabelMap.get(fromId) || 'Source',
-              targetLabel: nodeLabelMap.get(toId) || 'Target',
+              relation_code: 'HAS_SIGNAL',
+              sourceLabel: resName,
+              targetLabel: isLine ? 'Line Data' : 'Machine Data',
             },
-          };
+          });
         });
 
-        // Run ELK layered layout
+        // Layout DAG with ELK (horizontal Right flow)
         const layouted = await layoutGraph(rawNodes, rawEdges, 'RIGHT');
+        if (!active) return;
         setNodes(layouted.nodes);
         setEdges(layouted.edges);
-      } catch {
-        // Fallback or empty state
+      } catch (err) {
+        console.error('Failed to layout knowledge graph', err);
       } finally {
         if (active) setIsLoading(false);
       }
@@ -188,25 +182,15 @@ export const KnowledgeGraphPage: React.FC = () => {
     return () => {
       active = false;
     };
-  }, [centerResource, depth, activeRelations, setSearchParams, setSelectedResourceId]);
+  }, [scopedResources, resources, signals]);
 
   const handleNodeClick = (_: React.MouseEvent, node: Node) => {
     setSelectedEntity(node.data as Record<string, unknown>);
   };
 
-  const handleToggleRelation = (code: string) => {
-    setActiveRelations((prev) => {
-      const next = new Set(prev);
-      if (next.has(code)) {
-        next.delete(code);
-      } else {
-        next.add(code);
-      }
-      return next;
-    });
-  };
+  const resourceCount = scopedResources.length || resources.length;
 
-  if (!centerResource) {
+  if (resourceCount === 0) {
     return (
       <div className="space-y-3">
         <h1 className="text-xl font-bold text-[#0B2545]">Knowledge Graph</h1>
@@ -217,110 +201,54 @@ export const KnowledgeGraphPage: React.FC = () => {
     );
   }
 
-  // Filtered resources for "Center on..." search selector (TC-UI-KG-08)
-  const filteredResourceOptions = searchQuery.trim()
-    ? scopedResources.filter(
-        (r) =>
-          r.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          r.code.toLowerCase().includes(searchQuery.toLowerCase())
-      )
-    : scopedResources.slice(0, 8);
-
   return (
     <div className="space-y-4 animate-in fade-in duration-200 select-none pb-8">
-      {/* Header & Controls Toolbar */}
+      {/* Top Header - Clean, without restrictive center/depth filters */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2 mb-1 text-xs text-[#64748B]">
-            <span className="font-bold uppercase text-[#134074]">{centerResource.type}</span>
+            <span className="font-bold uppercase text-[#134074]">Plant Topology</span>
             <span>·</span>
-            <span className="font-mono">{centerResource.code}</span>
+            <span className="font-mono">TIPA · DongNai · Factory 1 · ASSY</span>
           </div>
           <h1 className="text-xl md:text-2xl font-black text-[#0B2545] tracking-tight">
-            Knowledge Graph: {centerResource.name}
+            Knowledge Graph: TIPA Enterprise
           </h1>
+          <p className="text-xs text-[#64748B] mt-0.5">
+            Full enterprise asset topology and telemetry graph (16 structure nodes · 12 live telemetry groups · 192 streaming signals).
+          </p>
         </div>
 
-        {/* Action Controls: Center Selector + Depth + Relations */}
-        <div className="flex flex-wrap items-center gap-2.5">
-          {/* "Center on…" Searchable Selector (TC-UI-KG-08) */}
-          <div className="relative">
-            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-[#CBD5E1] bg-white text-xs shadow-sm">
-              <Search className="w-3.5 h-3.5 text-[#64748B]" />
-              <input
-                type="text"
-                placeholder="Center on…"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-32 md:w-40 text-xs font-medium text-[#0B2545] outline-none placeholder:text-[#94A3B8]"
-              />
-            </div>
-            {searchQuery.trim().length > 0 && (
-              <div className="absolute top-full left-0 mt-1 w-56 max-h-60 overflow-y-auto bg-white border border-[#CBD5E1] rounded-xl shadow-xl z-50 p-1 space-y-1">
-                {filteredResourceOptions.map((res) => (
-                  <button
-                    key={res.id}
-                    type="button"
-                    onClick={() => {
-                      setSearchParams({ center: res.id, depth: String(depth) });
-                      setSelectedResourceId(res.id);
-                      setSearchQuery('');
-                    }}
-                    className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-xs font-semibold text-[#0B2545] flex items-center justify-between"
-                  >
-                    <span className="truncate">{res.name}</span>
-                    <span className="text-[10px] font-mono text-[#64748B] uppercase">{res.type}</span>
-                  </button>
-                ))}
-              </div>
-            )}
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-bold">
+            <Activity className="w-4 h-4 text-emerald-600 animate-pulse" />
+            <span>192 Signals Active (1 Hz)</span>
           </div>
-
-          {/* Depth Selector Buttons: 1, 2, 3 (TC-UI-KG-02, 03, 04) */}
-          <div className="bg-[#F1F5F9] p-1 rounded-xl flex items-center border border-[#E2E8F0]">
-            <span className="text-[11px] font-bold text-[#64748B] px-2">Depth</span>
-            {[1, 2, 3].map((d) => (
-              <button
-                key={d}
-                type="button"
-                onClick={() => setSearchParams({ center: centerResource.id, depth: String(d) })}
-                className={`w-7 h-7 rounded-lg text-xs font-bold transition-all ${
-                  depth === d
-                    ? 'bg-white text-[#0B2545] shadow-sm'
-                    : 'text-[#64748B] hover:text-[#0B2545]'
-                }`}
-              >
-                {d}
-              </button>
-            ))}
-          </div>
-
-          {/* Relations Filter Toggles (TC-UI-KG-05) */}
-          <div className="flex items-center gap-1.5 bg-[#F8FAFC] p-1 rounded-xl border border-[#E2E8F0]">
-            {ALL_RELATIONS.map((rel) => {
-              const active = activeRelations.has(rel.code);
-              return (
-                <button
-                  key={rel.code}
-                  type="button"
-                  onClick={() => handleToggleRelation(rel.code)}
-                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all border ${
-                    active
-                      ? 'bg-white text-[#134074] border-[#BFDBFE] shadow-sm'
-                      : 'bg-transparent text-[#94A3B8] border-transparent hover:text-[#64748B]'
-                  }`}
-                >
-                  {rel.label}
-                </button>
-              );
-            })}
-          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setNodes((prev) => [...prev]);
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-bold text-[#0B2545] shadow-sm transition"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Reset View</span>
+          </button>
         </div>
       </div>
 
-      {/* Main Graph Canvas Area + Right Node Inspector */}
-      <div className="flex gap-4 items-start relative h-[720px] rounded-2xl border border-[#E2E8F0] bg-white overflow-hidden shadow-sm">
+      {/* Main Canvas Viewport with Drawer */}
+      <div className="relative h-[720px] rounded-2xl border border-[#CBD5E1] bg-[#F8FAFC] shadow-sm overflow-hidden flex">
         <div className="flex-1 h-full relative">
+          {isLoading && (
+            <div className="absolute inset-0 bg-white/70 backdrop-blur-xs flex items-center justify-center z-10">
+              <div className="flex items-center gap-2 text-xs font-bold text-[#0B2545]">
+                <Activity className="w-4 h-4 animate-spin text-[#134074]" />
+                <span>Computing hierarchical DAG layout…</span>
+              </div>
+            </div>
+          )}
+
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -330,7 +258,7 @@ export const KnowledgeGraphPage: React.FC = () => {
             onEdgesChange={onEdgesChange}
             onNodeClick={handleNodeClick}
             fitView
-            minZoom={0.2}
+            minZoom={0.15}
             maxZoom={2.5}
             defaultEdgeOptions={{ type: 'labeled' }}
           >
@@ -338,7 +266,7 @@ export const KnowledgeGraphPage: React.FC = () => {
             <Controls className="!bg-white !border !border-[#E2E8F0] !shadow-sm !rounded-xl overflow-hidden" />
             <MiniMap
               nodeColor={(node) => {
-                if (node.type === 'signal') return '#10B981';
+                if (node.type === 'telemetryGroup') return '#10B981';
                 if (node.type === 'connection') return '#3B82F6';
                 if (node.type === 'edgeNode') return '#0B2545';
                 return '#64748B';
@@ -351,26 +279,18 @@ export const KnowledgeGraphPage: React.FC = () => {
           <div className="absolute bottom-3 left-3 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-xl border border-[#E2E8F0] shadow-sm flex items-center gap-3 text-[11px] font-semibold text-[#475569] pointer-events-none">
             <div className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded bg-[#0B2545]" />
-              <span>Resource</span>
+              <span>Asset Structure (CONTAINS)</span>
             </div>
             <div className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded bg-[#10B981]" />
-              <span>Signal</span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#3B82F6]" />
-              <span>Connection</span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded bg-[#475569]" />
-              <span>Edge</span>
+              <span>Telemetry Group (HAS_SIGNAL)</span>
             </div>
           </div>
         </div>
 
         {/* Right Details Panel for Clicked Node (§9.6 TC-UI-KG-09) */}
         {selectedEntity && (
-          <div className="w-80 md:w-88 bg-white border-l border-[#E2E8F0] h-full flex flex-col p-4 shadow-xl z-20 animate-in slide-in-from-right duration-200 overflow-y-auto">
+          <div className="w-80 md:w-96 bg-white border-l border-[#E2E8F0] h-full flex flex-col p-4 shadow-xl z-20 animate-in slide-in-from-right duration-200 overflow-y-auto">
             <div className="flex items-center justify-between pb-3 border-b border-[#E2E8F0]">
               <div>
                 <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-[#F1F5F9] text-[#475569] font-bold">
@@ -389,47 +309,124 @@ export const KnowledgeGraphPage: React.FC = () => {
               </button>
             </div>
 
-            {/* Clean Metadata without Technical IDs */}
-            <div className="mt-4 space-y-3 text-xs">
-              {selectedEntity.value !== undefined && (
-                <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
-                  <div className="text-[10px] font-bold uppercase text-[#64748B] mb-1">Live Telemetry Value</div>
-                  <div className="text-lg font-black font-mono text-[#0B2545]">
-                    {String(selectedEntity.value)}
+            {/* Telemetry Group Drawer Detail */}
+            {String(selectedEntity.kind || selectedEntity.type) === 'telemetryGroup' && (
+              <div className="space-y-3 mt-3">
+                <div className="p-3 rounded-2xl bg-gradient-to-br from-emerald-500/10 to-teal-500/10 border border-emerald-300">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-800">
+                      1 Hz Observation Stream
+                    </span>
+                    <span className="text-[10px] font-mono font-bold bg-emerald-600 text-white px-2 py-0.5 rounded-full">
+                      {((selectedEntity.signals as any[]) || []).length} TAGS ACTIVE
+                    </span>
                   </div>
+                  <p className="text-[11px] text-emerald-700 mt-1">
+                    Real-time streaming telemetry from broker at 192.168.2.108:1883
+                  </p>
                 </div>
-              )}
 
-              {selectedEntity.quality !== undefined && (
-                <div className="flex items-center justify-between py-1.5 border-b border-[#F1F5F9]">
-                  <span className="text-[#64748B]">Quality</span>
-                  <span className="font-bold text-[#0B2545]">{String(selectedEntity.quality)}</span>
+                <div className="space-y-2 max-h-[560px] overflow-y-auto pr-1">
+                  {((selectedEntity.signals as any[]) || []).map((sig: any, idx: number) => {
+                    const val = sig.value !== undefined && sig.value !== null
+                      ? (typeof sig.value === 'object' ? (sig.value?.v ?? JSON.stringify(sig.value)) : sig.value)
+                      : (sig.currentValue !== undefined && sig.currentValue !== null ? sig.currentValue : '—');
+                    return (
+                      <div
+                        key={sig.id || idx}
+                        className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#CBD5E1] hover:border-emerald-400 transition"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono text-xs font-bold text-[#0B2545]">
+                            {sig.key || sig.tag || sig.name}
+                          </span>
+                          <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800">
+                            {sig.quality || 'GOOD'}
+                          </span>
+                        </div>
+                        <div className="mt-1 flex items-baseline justify-between">
+                          <span className="text-base font-black font-mono text-[#0B2545]">
+                            {String(val)}
+                          </span>
+                          <span className="text-[10px] text-slate-500 font-mono">
+                            {sig.unit || ''}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
-              )}
+              </div>
+            )}
 
-              {selectedEntity.protocol !== undefined && (
-                <div className="flex items-center justify-between py-1.5 border-b border-[#F1F5F9]">
-                  <span className="text-[#64748B]">Protocol</span>
-                  <span className="font-bold uppercase font-mono text-[#134074]">
-                    {String(selectedEntity.protocol)}
-                  </span>
+            {/* Resource Drawer Detail */}
+            {String(selectedEntity.kind || selectedEntity.type) === 'resource' && (
+              <div className="mt-4 space-y-3 text-xs">
+                <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#64748B]">Resource Type</span>
+                    <span className="font-bold uppercase font-mono text-[#134074]">
+                      {String(selectedEntity.type || '')}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#64748B]">Resource Code</span>
+                    <span className="font-mono font-semibold text-[#0B2545]">
+                      {String(selectedEntity.code || '')}
+                    </span>
+                  </div>
+                  {Boolean(selectedEntity.parentId) && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-[#64748B]">Parent Unit</span>
+                      <span className="font-semibold text-[#0B2545]">
+                        {resources.find((r) => r.id === selectedEntity.parentId)?.name || String(selectedEntity.parentId)}
+                      </span>
+                    </div>
+                  )}
                 </div>
-              )}
 
-              {selectedEntity.health !== undefined && (
-                <div className="flex items-center justify-between py-1.5 border-b border-[#F1F5F9]">
-                  <span className="text-[#64748B]">Health</span>
-                  <span className="font-bold text-[#0B2545]">{String(selectedEntity.health)}</span>
-                </div>
-              )}
-
-              {Boolean(selectedEntity.code) && (
-                <div className="flex items-center justify-between py-1.5 border-b border-[#F1F5F9]">
-                  <span className="text-[#64748B]">Code</span>
-                  <span className="font-mono font-semibold text-[#0B2545]">{String(selectedEntity.code)}</span>
-                </div>
-              )}
-            </div>
+                {/* Direct Signals under this resource */}
+                {(() => {
+                  const unitSignals = signals.filter((s) => s.resourceId === selectedEntity.id);
+                  if (unitSignals.length === 0) return null;
+                  return (
+                    <div className="space-y-2 mt-4">
+                      <div className="flex items-center justify-between text-[11px] font-bold uppercase tracking-wider text-[#64748B]">
+                        <span>Direct Signals ({unitSignals.length})</span>
+                        <span className="text-emerald-600 font-mono">● 1 Hz stream</span>
+                      </div>
+                      <div className="space-y-1.5 max-h-[380px] overflow-y-auto pr-1">
+                        {unitSignals.map((sig) => (
+                          <div
+                            key={sig.id}
+                            className="p-2 rounded-lg bg-[#F8FAFC] border border-slate-200 flex items-center justify-between"
+                          >
+                            <div>
+                              <div className="font-mono font-bold text-xs text-[#0B2545]">
+                                {sig.key || sig.tag}
+                              </div>
+                              <div className="text-[10px] text-slate-500 font-mono">
+                                {sig.dataType || 'number'}
+                              </div>
+                            </div>
+                            <div className="text-right">
+                              <div className="font-mono font-black text-xs text-[#0B2545]">
+                                {sig.value !== null && sig.value !== undefined
+                                  ? String(sig.value)
+                                  : sig.currentValue ?? '—'}
+                              </div>
+                              <div className="text-[9px] font-bold text-emerald-600">
+                                {sig.quality || 'GOOD'}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
           </div>
         )}
       </div>

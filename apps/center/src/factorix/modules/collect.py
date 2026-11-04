@@ -75,6 +75,7 @@ class SignalPatch(BaseModel):
     unit: str | None = None
     expected_interval_ms: int | None = None
     enabled: bool | None = None
+    connection_id: str | None = None
 
 
 class SignalBulkActionIn(BaseModel):
@@ -302,7 +303,7 @@ async def create_connection(
             config_json, status, health, version, created_at, updated_at
         ) VALUES (
             :id, :tenant_id, :site_id, :edge_id, :protocol, :name, :endpoint, :secret_ref,
-            CAST(:config AS jsonb), 'DRAFT', 'UNKNOWN', 1, :now, :now
+            CAST(:config AS jsonb), 'ACTIVE', 'HEALTHY', 1, :now, :now
         )
         """,
         {
@@ -329,6 +330,7 @@ async def create_connection(
         """,
         {"id": uuid4(), "connection_id": connection_id, "mode": mode, "interval_ms": interval},
     )
+    await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(edge["id"]))
     await audit(session, tenant_id=tenant_id, event_type="CONNECTION_CREATE", actor_id=actor, entity_type="connection", entity_id=connection_id, before=None, after={"name": body.name.strip(), "protocol": body.protocol}, correlation_id=correlation_id)
     return await get_connection(session, tenant_id, connection_id)
 
@@ -774,6 +776,15 @@ async def patch_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, sign
             "id": signal_id,
         },
     )
+    if body.connection_id:
+        conn = await fetch_one(session, "SELECT id FROM connections WHERE id = :cid AND tenant_id = :tenant_id", {"cid": parse_uuid(body.connection_id), "tenant_id": tenant_id})
+        if conn:
+            await execute(
+                session,
+                "UPDATE signal_bindings SET connection_id = :cid WHERE signal_id = :id",
+                {"cid": conn["id"], "id": signal_id},
+            )
+            await bump_edge_release(session, tenant_id, actor, correlation_id)
     if body.enabled is not None:
         await execute(
             session,

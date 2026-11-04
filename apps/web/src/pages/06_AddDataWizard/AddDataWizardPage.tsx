@@ -19,6 +19,8 @@ import {
   FolderTree,
   ExternalLink,
   ChevronRight,
+  ChevronDown,
+  Braces,
 } from 'lucide-react';
 import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { useApp } from '../../store/AppContext';
@@ -28,6 +30,7 @@ import { Card } from '../../components/common/Card';
 import { StatusBadge } from '../../components/common/StatusBadge';
 import { ConfirmDialog } from '../../components/common/ConfirmDialog';
 import { validateTopicFilter } from '../../utils/mqttTopic';
+import { sanitizeVariableName, validateVariableName, flattenJsonPayload } from '../../utils/variableNaming';
 import { api, ApiError } from '../../api/client';
 
 interface FieldRow {
@@ -40,6 +43,35 @@ interface FieldRow {
   sample: unknown;
   error?: string;
   warning?: string;
+}
+
+
+interface WizardTreeNode {
+  resource: ResourceNode;
+  children: WizardTreeNode[];
+}
+
+function buildWizardTree(items: ResourceNode[]): WizardTreeNode[] {
+  const map = new Map<string, WizardTreeNode>();
+  items.forEach((r) => map.set(r.id, { resource: r, children: [] }));
+  const roots: WizardTreeNode[] = [];
+  items.forEach((r) => {
+    const node = map.get(r.id)!;
+    if (r.parentId && map.has(r.parentId)) {
+      map.get(r.parentId)!.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  });
+  return roots;
+}
+
+function nodeOrDescendantMatches(node: WizardTreeNode, query: string): boolean {
+  if (!query) return true;
+  const q = query.toLowerCase();
+  const selfMatch = (node.resource.name || '').toLowerCase().includes(q) || (node.resource.code || '').toLowerCase().includes(q);
+  if (selfMatch) return true;
+  return node.children.some((child) => nodeOrDescendantMatches(child, query));
 }
 
 interface CapturedTopic {
@@ -65,6 +97,29 @@ export const AddDataWizardPage: React.FC = () => {
   // Step 1: Target
   const [selectedTargetId, setSelectedTargetId] = useState<string>('');
   const [targetSearch, setTargetSearch] = useState<string>('');
+  const [expandedTargetNodes, setExpandedTargetNodes] = useState<Record<string, boolean>>({});
+
+  const toggleTargetExpand = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setExpandedTargetNodes((prev) => ({
+      ...prev,
+      [id]: prev[id] === undefined ? false : !prev[id],
+    }));
+  };
+
+  const expandAllTargets = () => {
+    const exp: Record<string, boolean> = {};
+    resources.forEach((r) => { exp[r.id] = true; });
+    setExpandedTargetNodes(exp);
+  };
+
+  const collapseAllTargets = () => {
+    const exp: Record<string, boolean> = {};
+    resources.forEach((r) => { exp[r.id] = false; });
+    setExpandedTargetNodes(exp);
+  };
+
+  const wizardTree = useMemo(() => buildWizardTree(resources), [resources]);
 
   // Step 2: Source
   const [selectedConnectionId, setSelectedConnectionId] = useState<string>('');
@@ -94,6 +149,9 @@ export const AddDataWizardPage: React.FC = () => {
   const [capturedTopics, setCapturedTopics] = useState<CapturedTopic[]>([]);
   const [selectedCapturedTopic, setSelectedCapturedTopic] = useState<string | null>(null);
   const [fields, setFields] = useState<FieldRow[]>([]);
+  const [isPasteModalOpen, setIsPasteModalOpen] = useState<boolean>(false);
+  const [pastedJsonText, setPastedJsonText] = useState<string>('');
+  const [pastedJsonError, setPastedJsonError] = useState<string | null>(null);
   const [timestampField, setTimestampField] = useState<string>('$.source_timestamp');
   const [showSimilarModal, setShowSimilarModal] = useState<boolean>(false);
   const [selectedSimilarResourceIds, setSelectedSimilarResourceIds] = useState<string[]>([]);
@@ -334,6 +392,51 @@ export const AddDataWizardPage: React.FC = () => {
     }, 1000);
   };
 
+
+  const handleApplyPastedJson = () => {
+    setPastedJsonError(null);
+    try {
+      const parsed = JSON.parse(pastedJsonText);
+      const flattened = flattenJsonPayload(parsed);
+      if (flattened.length === 0) {
+        setPastedJsonError('No fields found in JSON object.');
+        return;
+      }
+      const baseTopic = mqttTopicFilter.replace(/#$/, '').replace(/\/$/, '') || 'uns/data';
+      const newFields: FieldRow[] = flattened.map((f) => {
+        let u = '';
+        const lower = f.variableName.toLowerCase();
+        if (lower.includes('temp')) u = '°C';
+        else if (lower.includes('speed') || lower.includes('rpm')) u = 'rpm';
+        else if (lower.includes('power')) u = 'kW';
+        else if (lower.includes('pressure') || lower.includes('bar')) u = 'bar';
+        else if (lower.includes('current')) u = 'A';
+        else if (lower.includes('voltage') || lower.includes('volt')) u = 'V';
+        else if (lower.includes('energy')) u = 'kWh';
+
+        return {
+          id: `f-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          topic: `${baseTopic}/state`,
+          address: f.jsonPath,
+          name: f.variableName,
+          dataType: f.dataType,
+          unit: u,
+          sample: f.value,
+        };
+      });
+
+      setFields((prev) => {
+        const existing = new Set(prev.map((i) => i.name.toLowerCase()));
+        return [...prev, ...newFields.filter((nf) => !existing.has(nf.name.toLowerCase()))];
+      });
+      setIsPasteModalOpen(false);
+      setPastedJsonText('');
+      invalidateTest();
+    } catch (err: any) {
+      setPastedJsonError(err.message || 'Invalid JSON format.');
+    }
+  };
+  
   // Helper to add field from captured payload
   const handleAddFieldFromSample = (key: string, val: unknown, topic: string) => {
     invalidateTest();
@@ -351,7 +454,7 @@ export const AddDataWizardPage: React.FC = () => {
       id: `f-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       topic,
       address: `$.${key}`,
-      name: key,
+      name: sanitizeVariableName(key),
       dataType: guessedType,
       unit: key === 'power' ? 'kW' : key.includes('temp') ? '°C' : '',
       sample: val,
@@ -382,6 +485,12 @@ export const AddDataWizardPage: React.FC = () => {
       // JSONPath must start with $
       if (!f.address.startsWith('$')) {
         error = 'Field paths start with $ (for example $.status).';
+      }
+
+      // Validate variable naming convention
+      const nameErr = validateVariableName(f.name);
+      if (nameErr) {
+        error = nameErr;
       }
 
       // Duplicate in this list
@@ -664,14 +773,33 @@ export const AddDataWizardPage: React.FC = () => {
         ))}
       </div>
 
-      {/* STEP 1: TARGET (TC-UI-AD-01..04) */}
+      {/* STEP 1: TARGET (TC-UI-AD-01..04) - Hierarchical Tree View */}
       {currentStep === 1 && (
         <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
-          <div>
-            <h3 className="text-[14px] font-bold text-[#111B37]">Select target resource</h3>
-            <p className="text-[12px] text-[#657794]">
-              Data can be bound to any level in your hierarchy (Machine, Line, Zone, Cell, or Plant)
-            </p>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <h3 className="text-[14px] font-bold text-[#111B37]">Select target resource</h3>
+              <p className="text-[12px] text-[#657794]">
+                Data can be bound to any level in your hierarchy (Machine, Line, Zone, Cell, or Plant)
+              </p>
+            </div>
+            <div className="flex items-center gap-1.5 self-start sm:self-auto">
+              <button
+                type="button"
+                onClick={expandAllTargets}
+                className="px-2 py-1 text-[11px] font-semibold text-[#134074] hover:bg-[#F1F5F9] rounded-lg transition"
+              >
+                Expand all
+              </button>
+              <span className="text-slate-300">|</span>
+              <button
+                type="button"
+                onClick={collapseAllTargets}
+                className="px-2 py-1 text-[11px] font-semibold text-[#64748B] hover:bg-[#F1F5F9] rounded-lg transition"
+              >
+                Collapse all
+              </button>
+            </div>
           </div>
 
           <div className="relative">
@@ -685,42 +813,103 @@ export const AddDataWizardPage: React.FC = () => {
             />
           </div>
 
-          <div className="border border-slate-200 rounded-lg max-h-72 overflow-y-auto divide-y divide-slate-100">
-            {resources
-              .filter((r) => {
-                if (targetSearch) {
-                  const q = targetSearch.toLowerCase();
-                  return (r.name || '').toLowerCase().includes(q) || r.code.toLowerCase().includes(q);
-                }
-                return true;
-              })
-              .map((r) => (
-                <div
-                  key={r.id}
-                  onClick={() => {
-                    setSelectedTargetId(r.id);
-                    invalidateTest();
-                  }}
-                  className={`p-3 flex items-center justify-between cursor-pointer transition ${
-                    selectedTargetId === r.id ? 'bg-blue-50/70 border-l-4 border-blue-600' : 'hover:bg-slate-50'
-                  }`}
-                >
-                  <div>
-                    <div className="text-[13px] font-semibold text-[#111B37] flex items-center gap-2">
-                      <span>{r.name || r.code}</span>
-                      <span className="text-[10px] uppercase font-bold px-1.5 py-0.2 bg-slate-100 text-slate-600 rounded">
-                        {r.type}
-                      </span>
-                    </div>
-                    <div className="text-[11px] text-[#657794] font-mono mt-0.5">{r.code}</div>
-                  </div>
-                  {selectedTargetId === r.id ? (
-                    <CheckCircle2 className="w-5 h-5 text-blue-600" />
-                  ) : (
-                    <Circle className="w-5 h-5 text-slate-300" />
-                  )}
-                </div>
-              ))}
+          {/* Hierarchical Tree Container */}
+          <div className="border border-slate-200 rounded-xl max-h-96 overflow-y-auto divide-y divide-slate-100 p-2 bg-[#F8FAFC]">
+            {wizardTree.length === 0 ? (
+              <div className="text-center py-8 text-slate-400 text-xs font-medium">No resources found in factory hierarchy.</div>
+            ) : (
+              (() => {
+                const renderTreeNode = (node: WizardTreeNode, depth: number): React.ReactNode => {
+                  if (!nodeOrDescendantMatches(node, targetSearch)) return null;
+                  const hasChildren = node.children.length > 0;
+                  const isExpanded = targetSearch.trim().length > 0 ? true : (expandedTargetNodes[node.resource.id] ?? true);
+                  const isSelected = selectedTargetId === node.resource.id;
+
+                  const getTypeIcon = (type: string) => {
+                    switch (type.toLowerCase()) {
+                      case 'enterprise':
+                        return <Layers className="w-4 h-4 text-blue-600 shrink-0" />;
+                      case 'site':
+                      case 'plant':
+                        return <Network className="w-4 h-4 text-emerald-600 shrink-0" />;
+                      case 'area':
+                        return <FolderTree className="w-4 h-4 text-amber-600 shrink-0" />;
+                      case 'zone':
+                        return <Layers className="w-4 h-4 text-orange-500 shrink-0" />;
+                      case 'line':
+                        return <Cpu className="w-4 h-4 text-indigo-500 shrink-0" />;
+                      case 'machine':
+                        return <Cpu className="w-4 h-4 text-red-500 shrink-0" />;
+                      default:
+                        return <Layers className="w-4 h-4 text-slate-500 shrink-0" />;
+                    }
+                  };
+
+                  return (
+                    <React.Fragment key={node.resource.id}>
+                      <div
+                        onClick={() => {
+                          setSelectedTargetId(node.resource.id);
+                          invalidateTest();
+                        }}
+                        style={{ paddingLeft: depth * 18 + 8 + 'px' }}
+                        className={'py-2 pr-3 flex items-center justify-between cursor-pointer rounded-lg transition mb-0.5 ' + (
+                          isSelected
+                            ? 'bg-white border-2 border-blue-600 shadow-sm text-blue-900 font-bold'
+                            : 'hover:bg-white text-[#111B37]'
+                        )}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          {hasChildren ? (
+                            <button
+                              type="button"
+                              onClick={(e) => toggleTargetExpand(node.resource.id, e)}
+                              className="p-1 rounded hover:bg-slate-200 text-slate-500"
+                            >
+                              {isExpanded ? (
+                                <ChevronDown className="w-3.5 h-3.5" />
+                              ) : (
+                                <ChevronRight className="w-3.5 h-3.5" />
+                              )}
+                            </button>
+                          ) : (
+                            <span className="w-5" />
+                          )}
+
+                          {getTypeIcon(node.resource.type)}
+
+                          <span className="text-[13px] font-semibold truncate">
+                            {node.resource.name || node.resource.code}
+                          </span>
+
+                          <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded">
+                            {node.resource.type}
+                          </span>
+
+                          <span className="text-[11px] text-[#657794] font-mono">
+                            {node.resource.code}
+                          </span>
+                        </div>
+
+                        {isSelected ? (
+                          <CheckCircle2 className="w-5 h-5 text-blue-600 shrink-0" />
+                        ) : (
+                          <Circle className="w-5 h-5 text-slate-300 shrink-0" />
+                        )}
+                      </div>
+
+                      {hasChildren && isExpanded && (
+                        <div>
+                          {node.children.map((child) => renderTreeNode(child, depth + 1))}
+                        </div>
+                      )}
+                    </React.Fragment>
+                  );
+                };
+
+                return wizardTree.map((root) => renderTreeNode(root, 0));
+              })()
+            )}
           </div>
 
           <div className="flex justify-end pt-3 border-t border-slate-100">
@@ -920,7 +1109,7 @@ export const AddDataWizardPage: React.FC = () => {
                 type="text"
                 value={mqttTopicFilter}
                 onChange={(e) => {
-                  const val = e.target.value;
+                  const val = e.target.value.replace(/\s+/g, '_');
                   setMqttTopicFilter(val);
                   setAddressError(validateTopicFilter(val));
                   invalidateTest();
@@ -993,6 +1182,49 @@ export const AddDataWizardPage: React.FC = () => {
         </Card>
       )}
 
+
+      {/* Paste Sample JSON Modal */}
+      {isPasteModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-2xl border border-slate-300 shadow-2xl max-w-lg w-full p-5 space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <Braces className="w-4 h-4 text-blue-600" />
+                <h3 className="text-sm font-bold text-[#111B37]">Paste Sample JSON Payload</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsPasteModalOpen(false)}
+                className="text-slate-400 hover:text-slate-700"
+              >
+                ✕
+              </button>
+            </div>
+            <p className="text-xs text-[#657794]">
+              Paste any JSON payload. FactoriX will automatically unpack nested objects into flattened variables (e.g. c.d → c_d) and bind JSON paths.
+            </p>
+            <textarea
+              rows={8}
+              value={pastedJsonText}
+              onChange={(e) => setPastedJsonText(e.target.value)}
+              placeholder='{\n  "status": 1,\n  "speed": 1050,\n  "motor": {\n    "temp": 45.2,\n    "vibration": 0.8\n  }\n}'
+              className="w-full p-3 font-mono text-xs border border-slate-300 rounded-xl focus:outline-none focus:border-blue-500"
+            />
+            {pastedJsonError && (
+              <p className="text-xs text-red-600 font-semibold">{pastedJsonError}</p>
+            )}
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <Button variant="outline" size="sm" onClick={() => setIsPasteModalOpen(false)}>
+                Cancel
+              </Button>
+              <Button variant="primary" size="sm" onClick={handleApplyPastedJson} disabled={!pastedJsonText.trim()}>
+                Parse & Auto-Map Fields
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+  
       {/* STEP 4: FIELDS (TC-UI-AD-16..28) */}
       {currentStep === 4 && (
         <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
@@ -1005,6 +1237,17 @@ export const AddDataWizardPage: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setPastedJsonError(null);
+                  setIsPasteModalOpen(true);
+                }}
+              >
+                <Braces className="w-3.5 h-3.5 mr-1" />
+                Paste sample JSON
+              </Button>
               <Button
                 size="sm"
                 variant={isCapturing ? 'outline' : 'primary'}

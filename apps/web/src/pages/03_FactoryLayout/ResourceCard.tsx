@@ -139,34 +139,32 @@ export const ResourceCard: React.FC<ResourceCardProps> = ({
         </>
       )}
 
-      {/* Card Header: Type Chip + Code + Drill icon */}
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0 pr-1">
-          <div className="flex items-center gap-1.5 mb-1">
-            <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#F1F5F9] text-[#475569] font-bold">
-              {resource.type}
-            </span>
-            <span className="text-[10px] font-mono text-[#64748B] truncate">{resource.code}</span>
-          </div>
-          <h3 className="text-sm md:text-base font-bold text-[#0B2545] truncate tracking-tight">
-            {resource.name}
-          </h3>
+      {/* Card Header: Type Chip + Code + Drill icon (Centered layout) */}
+      <div className="flex flex-col items-center justify-center text-center relative w-full mb-1">
+        <div className="flex items-center justify-center gap-1.5 mb-1">
+          <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#F1F5F9] text-[#475569] font-bold">
+            {resource.type}
+          </span>
+          <span className="text-[10px] font-mono text-[#64748B] truncate">{resource.code}</span>
         </div>
+        <h3 className="text-sm md:text-base font-bold text-[#0B2545] truncate tracking-tight text-center w-full">
+          {resource.name}
+        </h3>
 
         {hasChildren && (
-          <div className="p-1 rounded-full bg-[#F8FAFC] text-[#64748B] hover:text-[#0B2545] hover:bg-[#E2E8F0] shrink-0">
+          <div className="absolute right-0 top-0 p-1 rounded-full bg-[#F8FAFC] text-[#64748B] hover:text-[#0B2545] hover:bg-[#E2E8F0] shrink-0">
             <ChevronRight className="w-4 h-4" />
           </div>
         )}
       </div>
 
-      {/* Card Body: Live values OR Roll-up statistics OR No data */}
-      <div className="my-2 flex-1 flex flex-col justify-center">
+      {/* Card Body: Live values OR Roll-up statistics OR No data (Centered) */}
+      <div className="my-2 flex-1 flex flex-col items-center justify-center text-center w-full">
         {hasDirectSignals ? (
-          <div className="space-y-1">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-[#0B2545] truncate">
+          <div className="space-y-1 w-full flex flex-col items-center justify-center">
+            <div className="flex items-center justify-center gap-1.5 text-xs font-semibold text-[#0B2545] truncate w-full text-center">
               <span className={`w-2 h-2 rounded-full shrink-0 ${dotColor}`} />
-              <span className="truncate">
+              <span className="truncate text-center">
                 {topSignals
                   .map(
                     (s) =>
@@ -177,30 +175,30 @@ export const ResourceCard: React.FC<ResourceCardProps> = ({
                   .join(' · ')}
               </span>
             </div>
-            <div className="text-[10px] text-[#64748B]">Updated recently</div>
+            <div className="text-[10px] text-[#64748B] text-center">Updated recently</div>
           </div>
         ) : hasChildren && rollup.hasSignals ? (
-          <div className="space-y-1">
-            <div className="flex items-center gap-1.5 text-xs font-bold text-[#0B2545]">
+          <div className="space-y-1 w-full flex flex-col items-center justify-center">
+            <div className="flex items-center justify-center gap-1.5 text-xs font-bold text-[#0B2545] text-center">
               <span className="w-2 h-2 rounded-full bg-[#10B981] shrink-0" />
               <span>
                 {rollup.totalMachines} {childTypeLabel} · {rollup.goodCount} good
                 {rollup.badCount > 0 ? ` · ${rollup.badCount} bad` : ''}
               </span>
             </div>
-            <div className="text-[10px] text-[#64748B]">Active operational telemetry</div>
+            <div className="text-[10px] text-[#64748B] text-center">Active operational telemetry</div>
           </div>
         ) : hasChildren ? (
-          <div className="text-xs text-[#64748B] font-medium">
+          <div className="text-xs text-[#64748B] font-medium text-center">
             {childrenCount} {childTypeLabel}
           </div>
         ) : (
-          <div className="text-xs text-[#94A3B8] italic">No data</div>
+          <div className="text-xs text-[#94A3B8] italic text-center">No data</div>
         )}
       </div>
 
-      {/* Card Footer */}
-      <div className="pt-2 border-t border-[#F1F5F9] flex items-center justify-between text-[11px] text-[#64748B]">
+      {/* Card Footer: Centered */}
+      <div className="pt-2 border-t border-[#F1F5F9] flex items-center justify-center gap-3 text-[11px] text-[#64748B] text-center">
         <span>
           {hasChildren ? `${childrenCount} ${childTypeLabel}` : `${directSignals.length} signals`}
         </span>

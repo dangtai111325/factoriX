@@ -4,6 +4,13 @@ import { ResourceNode } from '../types'
 export const CONTAINS_PAIRS: ReadonlyArray<readonly [string, string]> = [
   ['enterprise', 'site'],
   ['site', 'plant'],
+  ['site', 'area'],
+  ['area', 'zone'],
+  ['area', 'line'],
+  ['area', 'cell'],
+  ['area', 'workshop'],
+  ['area', 'machine'],
+  ['area', 'utility_system'],
   ['plant', 'zone'],
   ['plant', 'line'],
   ['plant', 'workshop'],
