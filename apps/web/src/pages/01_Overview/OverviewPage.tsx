@@ -120,7 +120,7 @@ export const OverviewPage: React.FC = () => {
 
   const onlineEdgesCount = stats ? stats.edges_online : edges.filter((e) => (e.health || '').toUpperCase() === 'ONLINE' || (e.health || '').toUpperCase() === 'HEALTHY').length;
   const totalEdgesCount = stats ? stats.edges_total : edges.length;
-  const onlineConnectionsCount = stats ? stats.connections_online : connections.filter((c) => (c.status || '').toUpperCase() === 'ACTIVE' && (c.health || '').toUpperCase() === 'ONLINE').length;
+  const onlineConnectionsCount = stats ? stats.connections_online : connections.filter((c) => ((c.status || '').toLowerCase() === 'connected' || (c.status || '').toUpperCase() === 'ACTIVE') && ((c.health || '').toUpperCase() === 'HEALTHY' || (c.health || '').toUpperCase() === 'ONLINE')).length;
   const totalConnectionsCount = stats ? stats.connections_total : connections.filter((c) => (c.status || '').toUpperCase() !== 'ARCHIVED').length;
 
   const lastDataText = stats?.last_data_at ? timeAgo(stats.last_data_at) : (signals[0]?.lastUpdated ? timeAgo(signals[0].lastUpdated) : '—');

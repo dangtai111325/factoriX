@@ -63,16 +63,16 @@ export const ConnectionsPage: React.FC = () => {
     return connections.find((c) => c.id === selectedConnId) || null;
   }, [connections, selectedConnId]);
 
-  // KPI Calculations
+  const isConnOnline = (c: any) =>
+    (c.status === 'connected' || c.status === 'ACTIVE') &&
+    c.health !== 'DEGRADED' &&
+    c.health !== 'OFFLINE' &&
+    (c.health === 'HEALTHY' || c.health === 'ONLINE') &&
+    !c.lastError &&
+    !c.last_error;
+
   const totalCount = connections.length;
-  const onlineCount = connections.filter(
-    (c) =>
-      c.status === 'connected' ||
-      (c as any).health === 'ONLINE' ||
-      (c as any).health === 'HEALTHY' ||
-      (c as any).status === 'ACTIVE' ||
-      !(c as any).lastError
-  ).length;
+  const onlineCount = connections.filter(isConnOnline).length;
   const pausedCount = connections.filter(
     (c) => (c as any).status === 'PAUSED' || (c as any).lifecycle_status === 'PAUSED'
   ).length;
@@ -86,18 +86,12 @@ export const ConnectionsPage: React.FC = () => {
 
       // KPI pill filter
       if (kpiFilter === 'online') {
-        const isOnline =
-          conn.status === 'connected' ||
-          (conn as any).health === 'ONLINE' ||
-          (conn as any).health === 'HEALTHY';
-        if (!isOnline) return false;
+        if (!isConnOnline(conn)) return false;
       } else if (kpiFilter === 'paused') {
         if ((conn as any).status !== 'PAUSED' && (conn as any).lifecycle_status !== 'PAUSED')
           return false;
       } else if (kpiFilter === 'degraded') {
-        const isDegraded =
-          (conn as any).health === 'DEGRADED' || (conn as any).health === 'OFFLINE';
-        if (!isDegraded) return false;
+        if (isConnOnline(conn)) return false;
       }
 
       // Search query
@@ -284,12 +278,7 @@ export const ConnectionsPage: React.FC = () => {
                       s.connectionId === conn.id ||
                       (s as any).connection_id === conn.id
                   ).length || ((conn as any).signal_count ?? signals.length);
-                  const isOnline =
-                    conn.status === 'connected' ||
-                    (conn as any).health === 'ONLINE' ||
-                    (conn as any).health === 'HEALTHY' ||
-                    (conn as any).status === 'ACTIVE' ||
-                    !(conn as any).lastError;
+                  const isOnline = isConnOnline(conn);
 
                   return (
                     <tr

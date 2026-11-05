@@ -66,7 +66,7 @@ def evaluate_signal_state(
     last_acquired_at: datetime | None = None,
     expected_interval_ms: int | None = None,
     stale_multiplier: float = 2.0,
-    min_stale_ms: int = 5000,
+    min_stale_ms: int = 12000,
     now: datetime | None = None,
     binding_enabled: bool = True,
     resource_archived: bool = False,

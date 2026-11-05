@@ -788,7 +788,7 @@ class EdgeRuntime:
 
 
 
-            expression = str(address.get("jsonpath") or "$")
+            expression = str(address.get("json_path") or address.get("jsonpath") or "$")
 
             decode = field.get("decode_json") or {}
 
@@ -979,36 +979,26 @@ class EdgeRuntime:
 
 
     async def _flush(self) -> int:
-
-        pending = self.outbox.pending(200)
-
-        if not pending:
-
-            return 0
-
-        items = [json.loads(row["payload"]) for row in pending]
-
-        uids = [str(row["event_uid"]) for row in pending]
-
-        try:
-
-            result = await self._request("POST", "/api/v1/edge-sync/observations", {"observations": items})
-
-        except httpx.HTTPError:
-
-            self.outbox.note_attempt(uids)
-
-            return 0
-
-        acked = [item["event_uid"] for item in result.get("results", []) if item.get("status") in {"committed", "duplicate"}]
-
-        quarantined = [item["event_uid"] for item in result.get("results", []) if item.get("status") == "quarantined"]
-
-        self.outbox.mark_sent(acked)
-
-        self.outbox.mark_state(quarantined, "QUARANTINED")
-
-        return len(acked)
+        total = 0
+        while True:
+            pending = self.outbox.pending(500)
+            if not pending:
+                break
+            items = [json.loads(row["payload"]) for row in pending]
+            uids = [str(row["event_uid"]) for row in pending]
+            try:
+                result = await self._request("POST", "/api/v1/edge-sync/observations", {"observations": items})
+            except httpx.HTTPError:
+                self.outbox.note_attempt(uids)
+                break
+            acked = [item["event_uid"] for item in result.get("results", []) if item.get("status") in {"committed", "duplicate"}]
+            quarantined = [item["event_uid"] for item in result.get("results", []) if item.get("status") == "quarantined"]
+            self.outbox.mark_sent(acked)
+            self.outbox.mark_state(quarantined, "QUARANTINED")
+            total += len(acked)
+            if len(pending) < 500 or not acked:
+                break
+        return total
 
 
 
@@ -1688,7 +1678,7 @@ class EdgeRuntime:
 
                 key = str(field.get("key") or field.get("name") or field.get("id"))
 
-                expr = str((field.get("address_json") or {}).get("jsonpath") or field.get("jsonpath") or "$")
+                expr = str((field.get("address_json") or {}).get("json_path") or (field.get("address_json") or {}).get("jsonpath") or field.get("jsonpath") or "$")
 
                 try:
 
@@ -1808,7 +1798,7 @@ def _project_json(fields: list[dict[str, Any]], document: Any, missing: str = "S
 
         address = field.get("address_json") or {}
 
-        expression = str(address.get("jsonpath") or "$")
+        expression = str(address.get("json_path") or address.get("jsonpath") or "$")
 
         missing_strat = str(address.get("missing") or missing).upper()
 

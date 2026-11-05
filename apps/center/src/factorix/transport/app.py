@@ -254,9 +254,43 @@ async def _background_health_loop() -> None:
             pass
 
 
+
+async def _appliance_auto_enroll() -> None:
+    if not settings.appliance or not settings.data_dir:
+        return
+    try:
+        data_dir = Path(settings.data_dir)
+        cred_file = data_dir / "edge-credential"
+        factory = session_factory()
+        async with factory() as session:
+            edge = await fetch_one(session, "SELECT id, tenant_id FROM edge_nodes ORDER BY created_at ASC LIMIT 1", {})
+            if not edge:
+                return
+            tenant_id = as_uuid(edge["tenant_id"])
+            edge_id = as_uuid(edge["id"])
+            if not (cred_file.is_file() and cred_file.read_text(encoding="utf-8").strip()):
+                admin_row = await fetch_one(session, "SELECT id FROM admin_accounts WHERE tenant_id = :tenant_id ORDER BY created_at ASC LIMIT 1", {"tenant_id": tenant_id})
+                actor = as_uuid(admin_row["id"]) if admin_row else None
+                issued = await collect.issue_enrollment(session, tenant_id, edge_id, actor, "appliance-boot")
+                await session.commit()
+                data_dir.mkdir(parents=True, exist_ok=True)
+                target = data_dir / "enrollment"
+                target.write_text(str(issued["enrollment_token"]), encoding="utf-8")
+
+            active_conns = await fetch_one(session, "SELECT count(*) AS cnt FROM connections WHERE edge_id = :edge_id AND status = 'ACTIVE'", {"edge_id": edge_id})
+            has_release = await fetch_one(session, "SELECT count(*) AS cnt FROM configuration_releases WHERE edge_id = :edge_id AND status = 'PUBLISHED'", {"edge_id": edge_id})
+            if active_conns and int(active_conns.get("cnt") or 0) > 0 and (not has_release or int(has_release.get("cnt") or 0) == 0):
+                admin_row = await fetch_one(session, "SELECT id FROM admin_accounts WHERE tenant_id = :tenant_id ORDER BY created_at ASC LIMIT 1", {"tenant_id": tenant_id})
+                actor = as_uuid(admin_row["id"]) if admin_row else None
+                await collect.publish_release(session, tenant_id, actor, collect.ReleaseIn(edge_id=str(edge_id)), "appliance-boot-release")
+                await session.commit()
+    except Exception:
+        pass
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     task = asyncio.create_task(_background_health_loop())
+    asyncio.create_task(_appliance_auto_enroll())
     try:
         yield
     finally:

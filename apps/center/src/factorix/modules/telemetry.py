@@ -66,6 +66,9 @@ async def ingest_observations(
     if len(items) > 1000:
         raise AppError(422, "BATCH", "Observation batch exceeds 1000 records.")
     results: list[dict[str, str]] = []
+    batch_cache: dict[str, Any] = {}
+    checked_partitions: set[str] = set()
+    healthy_connections: set[tuple[UUID, UUID]] = set()
     for item in items:
         event_uid = str(item.get("event_uid", ""))[:256]
         try:
@@ -97,7 +100,7 @@ async def ingest_observations(
             await _quarantine(session, tenant_id, edge_id, event_uid, "CALCULATED observations are produced by Center.")
             results.append({"event_uid": event_uid, "status": "quarantined"})
             continue
-        owned = await _owned_binding(session, tenant_id, edge_id, observation, item)
+        owned = await _owned_binding(session, tenant_id, edge_id, observation, item, batch_cache)
         if owned is None:
             await _quarantine(session, tenant_id, edge_id, observation.event_uid, "Signal is not bound to this enrolled edge and revision.")
             await audit(
@@ -126,7 +129,10 @@ async def ingest_observations(
         if inserted is None:
             results.append({"event_uid": observation.event_uid, "status": "duplicate"})
             continue
-        await create_partitions_for(session, observation.event_time)
+        month_key = f"{observation.event_time.year}_{observation.event_time.month:02d}"
+        if month_key not in checked_partitions:
+            await create_partitions_for(session, observation.event_time)
+            checked_partitions.add(month_key)
         observation_id = uuid4()
         clock = classify_clock(observation.event_time, observation.received_time)
         quality = clock.value if clock else observation.quality.value
@@ -173,15 +179,7 @@ async def ingest_observations(
             resource_id=as_uuid(owned["resource_id"]),
         )
         if quality == "GOOD":
-            await execute(
-                session,
-                """
-                UPDATE connections
-                SET health = 'HEALTHY', last_success_at = :now, last_error = NULL, updated_at = :now
-                WHERE id = :id AND tenant_id = :tenant_id AND edge_id = :edge_id
-                """,
-                {"now": utcnow(), "id": owned["connection_id"], "tenant_id": tenant_id, "edge_id": edge_id},
-            )
+            healthy_connections.add((as_uuid(owned["connection_id"]), edge_id))
         if replaced:
             queue(
                 session,
@@ -195,6 +193,20 @@ async def ingest_observations(
         await _run_formulas(session, tenant_id, observation.signal_id, observation.event_time, observation.received_time, depth=0)
         await _enqueue_outputs(session, tenant_id, observation.signal_id, observation.event_uid, observation.value, quality)
         results.append({"event_uid": observation.event_uid, "status": "committed"})
+
+    if healthy_connections:
+        now_ts = utcnow()
+        for conn_id, edge_node_id in healthy_connections:
+            await execute(
+                session,
+                """
+                UPDATE connections
+                SET health = 'HEALTHY', last_success_at = :now, last_error = NULL, updated_at = :now
+                WHERE id = :id AND tenant_id = :tenant_id AND edge_id = :edge_id
+                """,
+                {"now": now_ts, "id": conn_id, "tenant_id": tenant_id, "edge_id": edge_node_id},
+            )
+
     return {"results": results}
 
 
@@ -223,24 +235,50 @@ async def _owned_binding(
     edge_id: UUID,
     observation: Observation,
     item: dict[str, Any],
+    cache: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    edge = await fetch_one(
-        session,
-        "SELECT enrollment_status FROM edge_nodes WHERE id = :id AND tenant_id = :tenant_id",
-        {"id": edge_id, "tenant_id": tenant_id},
-    )
-    if edge is None or edge["enrollment_status"] != "ENROLLED":
-        return None
-    release = await fetch_one(
-        session,
-        """
-        SELECT revision FROM configuration_releases
-        WHERE tenant_id = :tenant_id AND edge_id = :edge_id AND revision = :revision AND status <> 'FAILED'
-        """,
-        {"tenant_id": tenant_id, "edge_id": edge_id, "revision": observation.config_revision},
-    )
-    if release is None:
-        return None
+    if cache is not None:
+        if "edge_enrolled" not in cache:
+            edge = await fetch_one(
+                session,
+                "SELECT enrollment_status FROM edge_nodes WHERE id = :id AND tenant_id = :tenant_id",
+                {"id": edge_id, "tenant_id": tenant_id},
+            )
+            cache["edge_enrolled"] = (edge is not None and edge["enrollment_status"] == "ENROLLED")
+        if not cache["edge_enrolled"]:
+            return None
+
+        rel_key = f"rel_{observation.config_revision}"
+        if rel_key not in cache:
+            release = await fetch_one(
+                session,
+                """
+                SELECT revision FROM configuration_releases
+                WHERE tenant_id = :tenant_id AND edge_id = :edge_id AND revision = :revision AND status <> 'FAILED'
+                """,
+                {"tenant_id": tenant_id, "edge_id": edge_id, "revision": observation.config_revision},
+            )
+            cache[rel_key] = release is not None
+        if not cache[rel_key]:
+            return None
+    else:
+        edge = await fetch_one(
+            session,
+            "SELECT enrollment_status FROM edge_nodes WHERE id = :id AND tenant_id = :tenant_id",
+            {"id": edge_id, "tenant_id": tenant_id},
+        )
+        if edge is None or edge["enrollment_status"] != "ENROLLED":
+            return None
+        release = await fetch_one(
+            session,
+            """
+            SELECT revision FROM configuration_releases
+            WHERE tenant_id = :tenant_id AND edge_id = :edge_id AND revision = :revision AND status <> 'FAILED'
+            """,
+            {"tenant_id": tenant_id, "edge_id": edge_id, "revision": observation.config_revision},
+        )
+        if release is None:
+            return None
     row = await fetch_one(
         session,
         """

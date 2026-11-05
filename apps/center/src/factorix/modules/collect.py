@@ -424,6 +424,10 @@ def _signal_type(value: str) -> str:
 
 
 async def bump_edge_release(session: AsyncSession, tenant_id: UUID, actor: UUID, correlation_id: str, edge_id: UUID | None = None) -> None:
+    if actor is None:
+        admin_row = await fetch_one(session, "SELECT id FROM admin_accounts WHERE tenant_id = :tenant_id ORDER BY created_at ASC LIMIT 1", {"tenant_id": tenant_id})
+        if admin_row:
+            actor = as_uuid(admin_row["id"])
     if edge_id is not None:
         edges = [{"id": edge_id}]
     else:
@@ -1358,6 +1362,10 @@ async def publish_release(session: AsyncSession, tenant_id: UUID, actor: UUID, b
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     digest = hashlib.sha256(canonical).hexdigest()
     payload["checksum_sha256"] = digest
+    if actor is None:
+        admin_row = await fetch_one(session, "SELECT id FROM admin_accounts WHERE tenant_id = :tenant_id ORDER BY created_at ASC LIMIT 1", {"tenant_id": tenant_id})
+        if admin_row:
+            actor = as_uuid(admin_row["id"])
     await execute(
         session,
         """
