@@ -6,6 +6,9 @@ if (-not (Test-Path .env)) {
   Write-Error "Missing .env next to this script. Copy your appliance env file first."
 }
 
+Write-Host "Backing up current factorix image tag if exists..."
+docker tag factorix factorix:backup 2>$null | Out-Null
+
 Write-Host "Building factorix image..."
 docker build -t factorix .
 
@@ -22,6 +25,11 @@ for ($i = 0; $i -lt 60; $i++) {
   try {
     $live = Invoke-RestMethod -Uri http://127.0.0.1:8080/health/live -TimeoutSec 2
     if ($live.status -eq 'live') {
+      try {
+        $ready = Invoke-RestMethod -Uri http://127.0.0.1:8080/health/ready -TimeoutSec 2
+      } catch {
+        $ready = $null
+      }
       $auth = Invoke-RestMethod -Uri http://127.0.0.1:8080/api/v1/auth/status -TimeoutSec 2
       Write-Host "Ready at http://127.0.0.1:8080"
       Write-Host ($auth | ConvertTo-Json -Compress)

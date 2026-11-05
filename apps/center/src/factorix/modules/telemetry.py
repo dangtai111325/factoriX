@@ -14,6 +14,7 @@ from factorix.domain.csv_safe import csv_row
 from factorix.domain.formula import FormulaError, bind, evaluate, output_quality, parse_expression
 from factorix.domain.observation import Observation, ObservationError, Quality, classify_clock
 from factorix.domain.quality import Origin
+from factorix.domain.signal_state import evaluate_signal_state
 from factorix.modules.common import as_uuid, audit, create_partitions_for, execute, fetch_all, fetch_one, jsonb, parse_uuid, utcnow
 from factorix.platform.after_commit import queue
 from factorix.platform.errors import AppError
@@ -347,7 +348,7 @@ async def _upsert_latest(
     resource_id: UUID,
 ) -> bool:
     """Insert or replace latest only when the incoming ordering tuple is strictly newer."""
-    good_value = _value_json(observation.value) if quality == "GOOD" else None
+    good_value = _value_json(observation.value) if (quality == "GOOD" and observation.value is not None) else None
     row = await fetch_one(
         session,
         """
@@ -373,11 +374,11 @@ async def _upsert_latest(
             config_revision = EXCLUDED.config_revision,
             origin = EXCLUDED.origin,
             last_good_value_json = CASE
-                WHEN EXCLUDED.quality = 'GOOD' THEN EXCLUDED.value_json
+                WHEN EXCLUDED.quality = 'GOOD' AND EXCLUDED.value_json->>'v' IS NOT NULL THEN EXCLUDED.value_json
                 ELSE latest_signal_state.last_good_value_json
             END,
             last_good_event_time = CASE
-                WHEN EXCLUDED.quality = 'GOOD' THEN EXCLUDED.event_time
+                WHEN EXCLUDED.quality = 'GOOD' AND EXCLUDED.value_json->>'v' IS NOT NULL THEN EXCLUDED.event_time
                 ELSE latest_signal_state.last_good_event_time
             END,
             updated_at = EXCLUDED.updated_at
@@ -400,7 +401,7 @@ async def _upsert_latest(
             "config_revision": observation.config_revision,
             "origin": observation.origin.value,
             "good": good_value,
-            "good_time": observation.event_time if quality == "GOOD" else None,
+            "good_time": observation.event_time if (quality == "GOOD" and observation.value is not None) else None,
             "now": utcnow(),
         },
     )
@@ -424,11 +425,30 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
     )
     for row in rows:
         value_json = row.get("value_json")
-        row["value"] = None if value_json is None else value_json.get("v")
-        freshness = _freshness(row)
-        row["freshness"] = freshness
-        if freshness == "STALE":
-            row["quality"] = "BAD"
+        val = None if value_json is None else value_json.get("v")
+        row["value"] = val
+        last_good_val = None
+        if row.get("last_good_value_json") is not None and isinstance(row["last_good_value_json"], dict):
+            last_good_val = row["last_good_value_json"].get("v")
+
+        eval_result = evaluate_signal_state(
+            has_observation=True,
+            raw_quality=row.get("quality"),
+            raw_value=val,
+            event_time=row.get("event_time"),
+            last_acquired_at=row.get("received_time"),
+            expected_interval_ms=row.get("expected_interval_ms"),
+            last_good_value=last_good_val,
+            last_good_time=row.get("last_good_event_time"),
+        )
+        row["source_quality"] = eval_result.source_quality
+        row["freshness"] = eval_result.freshness
+        row["effective_status"] = eval_result.effective_status
+        row["reason_code"] = eval_result.reason_code
+        row["evaluated_at"] = eval_result.evaluated_at
+        row["stale_after_ms"] = eval_result.stale_after_ms
+        row["last_good"] = eval_result.last_good
+        row["quality"] = eval_result.effective_status
     return rows
 
 

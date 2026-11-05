@@ -30,7 +30,7 @@ test.describe('Overview Page (TC-UI-OV)', () => {
 
     // 2. Signals card -> /collector/signals
     await page.goto(`${BASE}/overview`);
-    await page.getByText('View catalog').click();
+    await page.getByText('View catalog').first().click();
     await expect(page).toHaveURL(/\/collector\/signals/);
 
     // 3. Connections card -> /collector/connections
@@ -38,10 +38,10 @@ test.describe('Overview Page (TC-UI-OV)', () => {
     await page.getByText('Manage connections').click();
     await expect(page).toHaveURL(/\/collector\/connections/);
 
-    // 4. Edges card -> /collector/edges
+    // 4. Data Models card -> /models
     await page.goto(`${BASE}/overview`);
-    await page.getByText('View fleet').click();
-    await expect(page).toHaveURL(/\/collector\/edges/);
+    await page.getByText('View catalog').nth(1).click();
+    await expect(page).toHaveURL(/\/models/);
   });
 
   test('OV-05 data collection summary card metrics without legacy labels', async ({ page }) => {

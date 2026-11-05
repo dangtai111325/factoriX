@@ -4,6 +4,7 @@ import {
   Radio,
   Network,
   Cpu,
+  Database,
   CheckCircle2,
   Circle,
   ArrowRight,
@@ -52,6 +53,7 @@ export const OverviewPage: React.FC = () => {
     connections,
     edges,
     signals,
+    outputGroups,
     activities,
     currentPlant,
     refresh,
@@ -228,8 +230,8 @@ export const OverviewPage: React.FC = () => {
                   <Circle className="w-4 h-4 text-slate-300 flex-shrink-0 mt-0.5" />
                 )}
                 <div>
-                  <div className="text-[12px] font-semibold text-[#111B37]">2. Edge collector online</div>
-                  <div className="text-[11px] text-[#657794] mt-0.5">Connect edge software at your site.</div>
+                  <div className="text-[12px] font-semibold text-[#111B37]">2. Add data connection</div>
+                  <div className="text-[11px] text-[#657794] mt-0.5">Connect MQTT, Modbus, OPC UA or HTTP.</div>
                 </div>
               </div>
               {!step2Complete && (
@@ -237,9 +239,9 @@ export const OverviewPage: React.FC = () => {
                   size="sm"
                   variant="outline"
                   className="mt-3 text-[11px] h-7 w-full justify-between"
-                  onClick={() => navigate('/collector/edges')}
+                  onClick={() => navigate('/collector/connections')}
                 >
-                  View Edge Collectors
+                  View Connections
                   <ArrowRight className="w-3 h-3 ml-1" />
                 </Button>
               )}
@@ -362,22 +364,22 @@ export const OverviewPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Edges */}
+        {/* Data Models */}
         <div
-          onClick={() => navigate('/collector/edges')}
+          onClick={() => navigate('/models')}
           className="bg-white border border-[#CBD5E1] rounded-xl p-4 hover:border-blue-400 hover:shadow-sm cursor-pointer transition"
         >
           <div className="flex items-center justify-between text-[#657794]">
-            <span className="text-[12px] font-semibold uppercase tracking-wider">Edge Collectors</span>
-            <Cpu className="w-4 h-4 text-purple-600" />
+            <span className="text-[12px] font-semibold uppercase tracking-wider">Data Models</span>
+            <Database className="w-4 h-4 text-purple-600" />
           </div>
           <div className="text-[26px] font-extrabold text-[#111B37] mt-2">
-            {onlineEdgesCount} online
+            {outputGroups.length} models
           </div>
           <div className="text-[12px] text-[#657794] mt-1 flex items-center justify-between">
-            <span>{totalEdgesCount} deployed</span>
+            <span>Model Catalog</span>
             <span className="text-blue-600 text-[11px] font-medium flex items-center">
-              View fleet <ArrowRight className="w-3 h-3 ml-0.5" />
+              View catalog <ArrowRight className="w-3 h-3 ml-0.5" />
             </span>
           </div>
         </div>
@@ -441,15 +443,15 @@ export const OverviewPage: React.FC = () => {
 
           <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-[12px]">
             <span className="text-[#657794]">
-              Edge nodes synchronize with the central appliance automatically.
+              Data collector runtime runs internally and synchronizes automatically.
             </span>
             <Button
               size="sm"
               variant="outline"
               className="h-7 text-[11px]"
-              onClick={() => navigate('/collector/diagnostics')}
+              onClick={() => navigate('/collector/connections')}
             >
-              Open Diagnostics
+              View Connections
             </Button>
           </div>
         </Card>
@@ -579,12 +581,6 @@ export const OverviewPage: React.FC = () => {
           <div>
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <h3 className="text-[14px] font-bold text-[#111B37]">Recent activity</h3>
-              <button
-                onClick={() => navigate('/collector/diagnostics?tab=activity')}
-                className="text-[12px] font-semibold text-blue-600 hover:text-blue-700"
-              >
-                View all
-              </button>
             </div>
 
             {recentActivities.length === 0 ? (
@@ -609,13 +605,7 @@ export const OverviewPage: React.FC = () => {
           </div>
 
           <div className="pt-3 border-t border-slate-100 text-[11px] text-[#657794] flex justify-between items-center">
-            <span>Audit log tracked in Center appliance</span>
-            <button
-              onClick={() => navigate('/collector/diagnostics?tab=activity')}
-              className="text-blue-600 font-medium hover:underline flex items-center"
-            >
-              Open log <ExternalLink className="w-3 h-3 ml-1" />
-            </button>
+            <span>Audit events logged securely</span>
           </div>
         </Card>
       </div>

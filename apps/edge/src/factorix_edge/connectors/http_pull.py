@@ -22,13 +22,19 @@ class HttpPullConnector:
         self.base_url = base_url.rstrip("/") + "/"
         self.timeout_s = timeout_s
 
-    async def get_json(self, path: str, headers: dict[str, str] | None = None) -> Any:
+    async def request_json(self, method: str, path: str, headers: dict[str, str] | None = None, body: Any = None) -> Any:
         if "://" in path or path.startswith("//"):
             raise ConnectorError("CONFIG", "HTTP path must be relative.")
         url = urljoin(self.base_url, path.lstrip("/"))
+        m = method.upper()
+        if m not in {"GET", "POST"}:
+            raise ConnectorError("CONFIG", f"Unsupported HTTP method: {method}")
         try:
             async with httpx.AsyncClient(timeout=self.timeout_s, follow_redirects=False) as client:
-                response = await client.get(url, headers=headers or {})
+                if m == "POST":
+                    response = await client.post(url, headers=headers or {}, json=body)
+                else:
+                    response = await client.get(url, headers=headers or {})
         except httpx.HTTPError as exc:
             raise ConnectorError("NETWORK", "Cannot connect to HTTP endpoint.") from exc
         if 300 <= response.status_code < 400:
@@ -43,3 +49,6 @@ class HttpPullConnector:
             return response.json()
         except json.JSONDecodeError as exc:
             raise ConnectorError("DECODE", "HTTP response is not JSON.") from exc
+
+    async def get_json(self, path: str, headers: dict[str, str] | None = None) -> Any:
+        return await self.request_json("GET", path, headers=headers)

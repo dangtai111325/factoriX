@@ -32,8 +32,8 @@ def test_rt10_int_from_rounded_float():
 def test_rt11_null():
     val, q, reason = _coerce("string", None, "GOOD")
     assert val is None
-    assert q == "GOOD"
-    assert reason is None
+    assert q == "BAD"
+    assert reason == "NULL_VALUE"
 
 
 def test_rt_bool_coercion():

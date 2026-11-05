@@ -210,11 +210,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const scopedSignals = signals.filter((item) => !currentPlant.id || resourceIds.has(item.resourceId))
 
   const refresh = useCallback(async () => {
-    const [resourcePage, connectionPage, signalPage, layoutPage, groupPage, auditPage, edgePage] = await Promise.all([
+    const [resourcePage, connectionPage, signalPage, groupPage, auditPage, edgePage] = await Promise.all([
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/resources?view=all&limit=200'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/connections'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/signals?limit=500'),
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/layouts'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/output-groups'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/audit-events?limit=50'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/edges'),
@@ -308,33 +307,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           unit: text(row.unit),
           currentValue: value == null ? '—' : (value as string | number | boolean),
           value: value == null ? null : (value as string | number | boolean),
-          quality: (state && text(state.quality).toUpperCase() === 'GOOD' && (Date.now() - new Date(text(state.event_time)).getTime() < 5000) ? 'Good' : 'Bad') as SignalItem['quality'],
+          quality: (() => {
+            const effStatus = text(state?.effective_status || state?.quality || 'BAD').toUpperCase();
+            return (effStatus === 'GOOD' ? 'Good' : effStatus === 'UNCERTAIN' ? 'Uncertain' : 'Bad') as SignalItem['quality'];
+          })(),
           lastUpdated: text(state?.event_time),
           sampleIntervalMs: Number(row.expected_interval_ms || 1000),
         }
       }),
     )
-    const layout = (layoutPage.items || [])[0]
-    const saved = ((layout?.draft_json as { nodes?: Array<Record<string, unknown>> } | undefined)?.nodes || [])
-    const savedByResource = new Map(saved.map((node) => [text(node.resourceId), node]))
-    const placeable = mappedResources.filter((item) => item.type === 'machine' || item.type === 'line')
-    setLayoutMeta(layout ? { id: text(layout.id), version: Number(layout.version || 1) } : null)
-    setLayoutNodes(
-      placeable.map((item, index) => {
-        const node = savedByResource.get(item.id)
-        return {
-          id: item.id,
-          resourceId: item.id,
-          name: item.name,
-          code: item.code,
-          x: Number(node?.x ?? 40 + (index % 4) * 220),
-          y: Number(node?.y ?? 40 + Math.floor(index / 4) * 150),
-          width: Number(node?.width ?? 180),
-          height: Number(node?.height ?? 100),
-          status: item.status,
-        }
-      }),
-    )
+    setLayoutNodes([])
     setOutputGroups(
       (groupPage.items || []).map((row) => ({
         id: text(row.id),
@@ -447,11 +429,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               obs.value !== undefined
                 ? obs.value
                 : (obs.value_json as { v?: unknown } | undefined)?.v
-            const eventMs = obs.event_time ? new Date(text(obs.event_time)).getTime() : 0
-            const isFresh = eventMs > 0 && (Date.now() - eventMs < 5000)
-            const rawQ = text(obs.quality || 'UNKNOWN').toUpperCase()
-            const isGood = isFresh && rawQ === 'GOOD' && obs.freshness !== 'STALE'
-            const q = (isGood ? 'Good' : 'Bad') as SignalItem['quality']
+            const effStatus = text(obs.effective_status || obs.quality || 'BAD').toUpperCase()
+            const isGood = effStatus === 'GOOD'
+            const q = (isGood ? 'Good' : effStatus === 'UNCERTAIN' ? 'Uncertain' : 'Bad') as SignalItem['quality']
             const t = text(obs.event_time)
 
             if (sig.value === rawVal && sig.quality === q && sig.lastUpdated === t) {
@@ -504,7 +484,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const code = codeFrom(resource.code || name)
     const parent = allResources.find((item) => item.id === resource.parentId)
     let siteId = parent?.attributes?.siteId || ''
-    let edgeCreated: { id: string; name: string } | null = null
+
     if (typeKey === 'site') {
       const site = await api<{ id: string }>('/api/v1/sites', {
         method: 'POST',
@@ -525,23 +505,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         properties: resource.attributes || {},
       }),
     })
-    if (typeKey === 'site') {
-      const edgeName = `Edge ${name}`
-      try {
-        const edge = await api<{ id: string }>('/api/v1/edges', {
-          method: 'POST',
-          body: JSON.stringify({ site_id: siteId, name: edgeName }),
-        })
-        try {
-          await api(`/api/v1/edges/${edge.id}/appliance`, { method: 'POST' })
-        } catch {
-          // Appliance mode may be off; Edge still needs manual enrollment.
-        }
-        edgeCreated = { id: edge.id, name: edgeName }
-      } catch (e) {
-        console.warn('Edge creation note:', e)
-      }
-    }
+    // Site creation does not auto-create fake edge (Review 4 S5.1)
     await refresh()
     setSelectedResourceId(created.id)
     if (typeKey === 'plant') {
@@ -553,9 +517,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         status: 'operational',
         assetsCount: 1,
       })
-    }
-    if (edgeCreated) {
-      return { edgeCreated: true, edgeId: edgeCreated.id, edgeName: edgeCreated.name }
     }
     return {}
   }
@@ -592,37 +553,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }
 
-  const updateLayoutNode = (id: string, updates: Partial<LayoutMachineNode>) => {
-    setLayoutNodes((current) => {
-      const next = current.map((node) => (node.id === id ? { ...node, ...updates } : node))
-      const draft = {
-        nodes: next.map((node) => ({
-          resourceId: node.resourceId,
-          x: node.x,
-          y: node.y,
-          width: node.width,
-          height: node.height,
-        })),
-      }
-      void (async () => {
-        let meta = layoutMeta
-        if (!meta) {
-          const created = await api<{ id: string; version: number }>('/api/v1/layouts', {
-            method: 'POST',
-            body: JSON.stringify({ name: 'Factory floor', scope_resource_id: currentPlant.id || null }),
-          })
-          meta = { id: created.id, version: Number(created.version || 1) }
-          setLayoutMeta(meta)
-        }
-        const saved = await api<{ version: number }>(`/api/v1/layouts/${meta.id}/draft`, {
-          method: 'PATCH',
-          body: JSON.stringify({ version: meta.version, draft }),
-        })
-        setLayoutMeta({ id: meta.id, version: Number(saved.version || meta.version + 1) })
-      })()
-      return next
-    })
-  }
+  const updateLayoutNode = (_id: string, _updates: Partial<LayoutMachineNode>) => undefined
 
   const connectionConfig = (draft: AcquisitionDraft): Record<string, unknown> => {
     const port = Number(draft.port)

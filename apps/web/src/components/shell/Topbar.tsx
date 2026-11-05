@@ -20,14 +20,11 @@ import { AboutFactorixModal } from '../modals/AboutFactorixModal';
 const ROUTE_BREADCRUMBS: Record<string, { group?: string; title: string }> = {
   '/overview': { title: 'Overview' },
   '/factory/structure': { group: 'Factory Model', title: 'Hierarchy Structure' },
-  '/factory/layout': { group: 'Factory Model', title: 'Layout Designer' },
-  '/factory/graph': { group: 'Factory Model', title: 'Factory Graph' },
+  '/factory/graph': { group: 'Factory Model', title: 'Knowledge Graph' },
   '/collector/connections': { group: 'Data Collector', title: 'Connections' },
-  '/collector/signals': { group: 'Data Collector', title: 'Data Acquisition' },
-  '/collector/edges': { group: 'Data Collector', title: 'Edge Collectors' },
-  '/collector/diagnostics': { group: 'Data Collector', title: 'Diagnostics' },
-  '/collector/add-data': { group: 'Data Collector', title: 'Data Acquisition' },
-  '/models': { group: 'Data Models', title: 'All Model' },
+  '/collector/signals': { group: 'Data Collector', title: 'Signals' },
+  '/collector/add-data': { group: 'Data Collector', title: 'Add Data' },
+  '/models': { group: 'Data Models', title: 'Model Catalog' },
   '/dashboards': { group: 'Coming soon', title: 'Dashboards' },
   '/historian': { group: 'Coming soon', title: 'Historian & Storage' },
   '/alarms': { group: 'Coming soon', title: 'Alarms & Events' },
@@ -65,9 +62,6 @@ export const Topbar: React.FC = () => {
     }
     if (location.pathname.startsWith('/collector/signals')) {
       return { group: 'Data Collector', title: 'Signals' };
-    }
-    if (location.pathname.startsWith('/collector/diagnostics')) {
-      return { group: 'Data Collector', title: 'Diagnostics' };
     }
     if (location.pathname.startsWith('/collector/connections')) {
       return { group: 'Data Collector', title: 'Connections' };
@@ -182,10 +176,10 @@ export const Topbar: React.FC = () => {
           </div>
           <button
             type="button"
-            onClick={() => navigate('/collector/edges')}
+            onClick={() => navigate('/collector/connections')}
             className="underline hover:text-white/80 text-[11px] font-bold"
           >
-            Open Edge Collectors →
+            View Connections →
           </button>
         </div>
       )}
@@ -277,12 +271,12 @@ export const Topbar: React.FC = () => {
             )}
           </div>
 
-          {/* Data Collection Edge Status Chip (TC-UI-NAV-08) */}
+          {/* Data Collection Status Chip */}
           <button
             type="button"
-            onClick={() => navigate('/collector/edges')}
+            onClick={() => navigate('/collector/connections')}
             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide border border-[#D4DFEC] bg-white hover:bg-[#F8FAFC] transition-colors"
-            title="Click to view Edge Collectors status"
+            title="Click to view Connections status"
           >
             <span
               className={`w-2 h-2 rounded-full ${
@@ -292,7 +286,7 @@ export const Topbar: React.FC = () => {
               }`}
             />
             <span className="text-[#334568]">
-              {onlineEdges.length}/{enrolledEdges.length || 0} edges online
+              Collector: {onlineEdges.length > 0 ? 'online' : 'offline'}
             </span>
           </button>
         </div>
@@ -317,10 +311,10 @@ export const Topbar: React.FC = () => {
           {/* Activity / Notification Bell */}
           <button
             type="button"
-            onClick={() => navigate('/collector/diagnostics?tab=activity')}
+            onClick={() => navigate('/overview')}
             className="w-9 h-9 rounded-lg border border-[#E3EAF3] bg-white hover:bg-[#F9FAFD] flex items-center justify-center text-[#334568] transition-colors"
-            title="System activity & audit log"
-            aria-label="Activity log"
+            title="Overview & recent activity"
+            aria-label="Activity"
           >
             <Bell className="w-4 h-4" />
           </button>

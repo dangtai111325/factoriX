@@ -9,11 +9,14 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 ROOT = Path(__file__).resolve().parents[2]
-for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, value = line.split("=", 1)
-    os.environ.setdefault(key.strip(), value)
+test_env = ROOT / ".env.test"
+env_file = test_env if test_env.exists() else ROOT / ".env"
+if env_file.exists():
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value)
 os.environ["FACTORIX_BOOTSTRAP_TOKEN"] = "integration-bootstrap-token"
 os.environ["FACTORIX_ENVIRONMENT"] = "test"
 os.environ["FACTORIX_COOKIE_SECURE"] = "false"
@@ -31,9 +34,15 @@ from factorix_edge.runtime import EdgeRuntime
 from factorix_edge.store.outbox import Outbox
 from sqlalchemy import text
 from factorix.platform.db import session_factory
+from tests.safety.test_destructive_guard import check_destructive_test_db_guard
 
 
 async def _wipe() -> None:
+    settings = get_settings()
+    check_destructive_test_db_guard(
+        settings.database_url,
+        os.environ.get("FACTORIX_ENABLE_DESTRUCTIVE_TESTS"),
+    )
     factory = session_factory()
     async with factory() as session:
         await session.execute(
@@ -42,7 +51,7 @@ async def _wipe() -> None:
                 TRUNCATE TABLE
                   tenants, sites, admin_accounts, sessions, login_throttle,
                   resource_types, resources, relation_types, resource_relations, type_adjacency,
-                  hierarchy_templates, hierarchy_views, layout_definitions, layout_revisions,
+                  hierarchy_templates, hierarchy_views,
                   edge_nodes, edge_enrollment_tokens, secret_store, connections, acquisition_jobs,
                   source_fields, signal_definitions, signal_bindings, mapping_definitions,
                   formula_definitions, formula_dependencies, output_groups, output_group_members,
@@ -57,6 +66,7 @@ async def _wipe() -> None:
         await session.commit()
 
 
+@pytest.mark.ot_lab
 @pytest.mark.asyncio
 async def test_edge_reads_live_modbus_into_historian(tmp_path: Path) -> None:
     await _wipe()

@@ -43,6 +43,16 @@ interface FieldRow {
   sample: unknown;
   error?: string;
   warning?: string;
+  qos?: number;
+  nodeId?: string;
+  offset?: number;
+  registerArea?: string;
+  registerCount?: number;
+  unitId?: number;
+  wordOrder?: string;
+  nativeType?: string;
+  path?: string;
+  method?: string;
 }
 
 
@@ -320,76 +330,81 @@ export const AddDataWizardPage: React.FC = () => {
     }
   };
 
-  // Step 4: Capture Sample Simulation/Fetch (10 s)
-  const handleCaptureSample = () => {
+  // Step 4: Real Capture Sample from Edge (10 s)
+  const handleCaptureSample = async () => {
+    if (!selectedConnectionId) {
+      alert('Please select a connection first.');
+      return;
+    }
     setIsCapturing(true);
     setCaptureCountdown(10);
     setCapturedTopics([]);
     setSelectedCapturedTopic(null);
 
-    const timer = setInterval(() => {
-      setCaptureCountdown((prev) => {
-        if (prev <= 1) {
-          clearInterval(timer);
-          setIsCapturing(false);
-          // Populate real simulated topics based on target code
-          const baseTopic = mqttTopicFilter.replace(/#$/, '').replace(/\/$/, '');
-          const sampleTopics: CapturedTopic[] = [
-            {
-              topic: `${baseTopic}/state`,
-              count: 10,
-              samplePayload: {
-                zone_name: 'ASSY',
-                line_name: 'Assembly-AA10-02-AB',
-                machine_name: targetResource?.code || 'AA10-02',
-                source_timestamp: new Date().toISOString(),
-                publish_timestamp: new Date().toISOString(),
-                status: 2,
-                mode: 1,
-                stop_error: 'AS3',
-                employee: '21113185',
-              },
-            },
-            {
-              topic: `${baseTopic}/process`,
-              count: 10,
-              samplePayload: {
-                source_timestamp: new Date().toISOString(),
-                speed_1: 1420.5,
-                feed_rate: 45.2,
-              },
-            },
-            {
-              topic: `${baseTopic}/energy`,
-              count: 10,
-              samplePayload: {
-                source_timestamp: new Date().toISOString(),
-                power: 1.33,
-                voltage: 220.4,
-                current: 6.05,
-              },
-            },
-            {
-              topic: `${baseTopic}/condition`,
-              count: 10,
-              samplePayload: {
-                source_timestamp: new Date().toISOString(),
-                machine_temp_1: 42.8,
-                ambient_temp: 28.5,
-                vibration_1: 0.12,
-                noise: 68.2,
-                humidity: 55.0,
-                status: 1,
-              },
-            },
-          ];
-          setCapturedTopics(sampleTopics);
-          setSelectedCapturedTopic(sampleTopics[0].topic);
-          return 0;
-        }
-        return prev - 1;
-      });
+    const countdownInterval = setInterval(() => {
+      setCaptureCountdown((prev) => (prev > 1 ? prev - 1 : 1));
     }, 1000);
+
+    try {
+      const captureRes = await api<{ job_id: string; status: string; poll_url: string }>(
+        `/api/v1/connections/${selectedConnectionId}/capture`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            topics: mqttTopicFilter ? [mqttTopicFilter] : ['#'],
+            topic_filter: mqttTopicFilter || '#',
+            duration_seconds: 10,
+            max_messages: 100,
+          }),
+        }
+      );
+
+      const jobId = captureRes.job_id;
+      let terminal = false;
+      let attempts = 0;
+      let finalJob: any = null;
+
+      while (!terminal && attempts < 40) {
+        await new Promise((r) => setTimeout(r, 800));
+        attempts++;
+        try {
+          const job = await api<any>(`/api/v1/commissioning/${jobId}`);
+          if (job.status === 'COMPLETED' || job.status === 'PASSED' || job.status === 'FAILED' || job.status === 'CANCELLED') {
+            terminal = true;
+            finalJob = job;
+          }
+        } catch {
+          // continue polling
+        }
+      }
+
+      clearInterval(countdownInterval);
+      setCaptureCountdown(0);
+      setIsCapturing(false);
+
+      if (finalJob && (finalJob.status === 'COMPLETED' || finalJob.status === 'PASSED')) {
+        const samples = finalJob.samples_json?.samples || finalJob.samples_json || [];
+        if (Array.isArray(samples) && samples.length > 0) {
+          const parsedTopics: CapturedTopic[] = samples.map((s: any) => ({
+            topic: s.topic,
+            count: s.count || 1,
+            samplePayload: s.payload || {},
+          }));
+          setCapturedTopics(parsedTopics);
+          setSelectedCapturedTopic(parsedTopics[0].topic);
+        } else {
+          setCapturedTopics([]);
+        }
+      } else {
+        const err = finalJob?.diagnostic || finalJob?.error_code || 'Capture timed out or failed';
+        alert(`Capture result: ${err}`);
+      }
+    } catch (err: any) {
+      clearInterval(countdownInterval);
+      setCaptureCountdown(0);
+      setIsCapturing(false);
+      alert(`Capture failed: ${err.message || 'Network error'}`);
+    }
   };
 
 
@@ -533,78 +548,110 @@ export const AddDataWizardPage: React.FC = () => {
     );
   }, [targetResource, resources]);
 
-  // Step 5: Run Test
+  // Step 5: Real Commissioning Test on Edge
   const handleRunTest = async () => {
+    if (!selectedConnectionId) {
+      alert('Please select a connection first.');
+      return;
+    }
     setIsTesting(true);
     setTestResult(null);
 
-    // Check if edge is offline (TC-UI-AD-33)
-    const siteEdge = siteEdges[0];
-    if (siteEdge && (siteEdge.health || '').toUpperCase() === 'OFFLINE') {
+    try {
+      const testFields = fields.map((f) => ({
+        key: f.name,
+        name: f.name,
+        dataType: f.dataType,
+        address: {
+          topic: f.topic,
+          jsonpath: (f.address || '').trim().startsWith('$') ? (f.address || '').trim() : `$.${(f.address || '').trim()}`,
+          qos: f.qos !== undefined ? Number(f.qos) : (mqttQos !== '' ? Number(mqttQos) : 0),
+          node_id: f.nodeId || f.address,
+          offset: f.offset,
+          register_area: f.registerArea,
+        },
+      }));
+
+      const testRes = await api<{ job_id: string; status: string }>(
+        `/api/v1/connections/${selectedConnectionId}/tests`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            mode: 'FULL',
+            fields: testFields,
+          }),
+        }
+      );
+
+      const jobId = testRes.job_id;
+      let terminal = false;
+      let attempts = 0;
+      let finalJob: any = null;
+
+      while (!terminal && attempts < 40) {
+        await new Promise((r) => setTimeout(r, 800));
+        attempts++;
+        try {
+          const job = await api<any>(`/api/v1/commissioning/${jobId}`);
+          if (job.status === 'COMPLETED' || job.status === 'PASSED' || job.status === 'FAILED' || job.status === 'CANCELLED') {
+            terminal = true;
+            finalJob = job;
+          }
+        } catch {
+          // continue polling
+        }
+      }
+
+      setIsTesting(false);
+      if (finalJob) {
+        const isPassed = finalJob.status === 'COMPLETED' || finalJob.status === 'PASSED';
+        const stagesList = (finalJob.stages_json || []).map((st: any) => ({
+          stage: st.stage,
+          status: st.status,
+          duration_ms: st.duration_ms,
+          detail: st.detail,
+        }));
+        const samplesResult = finalJob.samples_json?.samples || finalJob.samples_json || {};
+
+        setTestResult({
+          passed: isPassed,
+          stages: stagesList,
+          errorMessage: isPassed ? undefined : (finalJob.diagnostic || finalJob.error_code || 'Commissioning test did not pass.'),
+          fieldSamples: typeof samplesResult === 'object' ? samplesResult : {},
+        });
+      } else {
+        setTestResult({
+          passed: false,
+          stages: [{ stage: 'Commissioning', status: 'FAILED', detail: 'Test timed out after 30 seconds.' }],
+          errorMessage: 'Commissioning test timed out.',
+        });
+      }
+    } catch (err: any) {
       setIsTesting(false);
       setTestResult({
         passed: false,
-        stages: [{ stage: 'REACH', status: 'FAILED', detail: 'Edge offline' }],
-        errorMessage: `The edge for ${targetSite?.name || 'site'} is offline. Open Edge Collectors.`,
+        stages: [{ stage: 'Connection', status: 'FAILED', detail: err.message || 'Network error' }],
+        errorMessage: err.message || 'Error running commissioning test',
       });
-      return;
     }
-
-    // Check for bad address $.no_such (TC-UI-AD-31)
-    const badField = fields.find((f) => f.address === '$.no_such');
-    if (badField) {
-      setTimeout(() => {
-        setIsTesting(false);
-        setTestResult({
-          passed: false,
-          stages: [
-            { stage: 'Reach broker', status: 'PASSED', duration_ms: 35 },
-            { stage: 'Sign in', status: 'PASSED', duration_ms: 12 },
-            { stage: 'Subscribe', status: 'PASSED', duration_ms: 18 },
-            { stage: 'Receive sample', status: 'PASSED', duration_ms: 45, detail: '10 messages' },
-            { stage: 'Map fields', status: 'FAILED', detail: '1 field has no value: no_such' },
-          ],
-          errorMessage: 'Map fields ✗ — 1 field has no value: no_such',
-        });
-      }, 1000);
-      return;
-    }
-
-    // Normal pass (TC-UI-AD-30)
-    setTimeout(() => {
-      setIsTesting(false);
-      const samplesMap: Record<string, unknown> = {};
-      fields.forEach((f) => {
-        samplesMap[f.name] = f.sample !== undefined ? f.sample : 2;
-      });
-
-      setTestResult({
-        passed: true,
-        stages: [
-          { stage: 'Reach broker', status: 'PASSED', duration_ms: 38 },
-          { stage: 'Sign in', status: 'PASSED', duration_ms: 15 },
-          { stage: 'Subscribe', status: 'PASSED', duration_ms: 22 },
-          { stage: 'Receive sample', status: 'PASSED', duration_ms: 50, detail: '10 messages' },
-          { stage: 'Map fields', status: 'PASSED', duration_ms: 8 },
-        ],
-        fieldSamples: samplesMap,
-      });
-    }, 1200);
   };
 
-  // Step 5: Start Collecting (Commit signals) (TC-UI-AD-35)
+  // Step 5: Start Collecting (Commit signals)
   const handleStartCollecting = async () => {
     if (!selectedTargetId || fields.length === 0) return;
     setIsSubmitting(true);
 
     try {
-      const conn = connections.find((c) => c.id === selectedConnectionId) || connections[0];
-      if (!conn) throw new Error('No connection selected');
+      const conn = connections.find((c) => c.id === selectedConnectionId);
+      if (!conn) throw new Error('Please select a valid connection');
+
+      const protocol: string = (conn.protocol as string) || 'mqtt';
+      const defaultJobMode = protocol === 'mqtt' ? 'SUBSCRIBE' : 'POLL';
 
       // Ensure we have the acquisition job id for this connection
       let jobId = '';
       try {
-        const connDetail = await api<{ id: string; jobs?: Array<{ id: string }> }>(`/api/v1/connections/${conn.id}`);
+        const connDetail = await api<{ id: string; edge_id?: string; jobs?: Array<{ id: string; mode?: string }> }>(`/api/v1/connections/${conn.id}`);
         if (connDetail?.jobs?.[0]?.id) {
           jobId = connDetail.jobs[0].id;
         }
@@ -617,7 +664,7 @@ export const AddDataWizardPage: React.FC = () => {
           method: 'POST',
           body: JSON.stringify({
             connection_id: conn.id,
-            mode: 'POLL',
+            mode: defaultJobMode,
             interval_ms: Number(pollIntervalMs) || 1000,
           }),
         });
@@ -640,11 +687,46 @@ export const AddDataWizardPage: React.FC = () => {
           let canonType = 'float64';
           if (f.dataType === 'Integer') canonType = 'int64';
           else if (f.dataType === 'Boolean') canonType = 'bool';
-          else if (f.dataType === 'Text') canonType = 'text';
+          else if (f.dataType === 'Text') canonType = 'string';
 
           let jsonPath = (f.address || '').trim();
           if (jsonPath && !jsonPath.startsWith('$')) {
             jsonPath = `$.${jsonPath}`;
+          }
+
+          let addressKind = 'mqtt_jsonpath';
+          let addressPayload: Record<string, any> = {};
+
+          if (protocol === 'mqtt') {
+            addressKind = 'mqtt_jsonpath';
+            const chosenQos = f.qos !== undefined ? Number(f.qos) : (mqttQos !== '' ? Number(mqttQos) : 0);
+            addressPayload = {
+              topic: finalTopic,
+              jsonpath: jsonPath || '$',
+              qos: chosenQos,
+            };
+          } else if (protocol === 'opcua') {
+            addressKind = 'opcua_node';
+            addressPayload = {
+              node_id: f.nodeId || f.address || 'i=84',
+            };
+          } else if (protocol === 'modbus' || protocol === 'modbus_tcp') {
+            addressKind = 'modbus_register';
+            addressPayload = {
+              register_area: f.registerArea || 'holding',
+              offset: f.offset !== undefined ? Number(f.offset) : 0,
+              register_count: f.registerCount !== undefined ? Number(f.registerCount) : 1,
+              unit_id: f.unitId !== undefined ? Number(f.unitId) : ((conn.config as any)?.unit_id || 1),
+              word_order: f.wordOrder || 'big',
+              native_type: f.nativeType || 'uint16',
+            };
+          } else if (protocol === 'http') {
+            addressKind = 'http_jsonpath';
+            addressPayload = {
+              path: f.path || (conn.config as any)?.path || '/',
+              method: f.method || (conn.config as any)?.method || 'GET',
+              jsonpath: jsonPath || '$',
+            };
           }
 
           return {
@@ -652,15 +734,11 @@ export const AddDataWizardPage: React.FC = () => {
             name: f.name,
             data_type: canonType,
             unit: f.unit || undefined,
-            expected_interval_ms: 10000,
+            expected_interval_ms: Number(pollIntervalMs) || 10000,
             source_field: {
               acquisition_job_id: jobId,
-              address_kind: 'mqtt_jsonpath',
-              address: {
-                topic: finalTopic,
-                jsonpath: jsonPath,
-                qos: Number(mqttQos) || 1,
-              },
+              address_kind: addressKind,
+              address: addressPayload,
             },
           };
         });
@@ -675,11 +753,12 @@ export const AddDataWizardPage: React.FC = () => {
         });
       }
 
-      // Publish config to Edge
-      if (siteEdges[0]) {
+      // Publish config to Connection's assigned Edge
+      const targetEdgeId = (conn as any).edge_id || siteEdges[0]?.id;
+      if (targetEdgeId) {
         await api('/api/v1/config-releases/publish', {
           method: 'POST',
-          body: JSON.stringify({ edge_id: siteEdges[0].id }),
+          body: JSON.stringify({ edge_id: targetEdgeId }),
         });
       }
 
@@ -687,7 +766,6 @@ export const AddDataWizardPage: React.FC = () => {
       sessionStorage.removeItem(DRAFT_STORAGE_KEY);
       await refresh();
 
-      const targetName = targetResource?.code || targetResource?.name || 'resource';
       navigate(`/collector/signals?resourceId=${selectedTargetId}`);
     } catch (err: unknown) {
       const apiErr = err as ApiError;

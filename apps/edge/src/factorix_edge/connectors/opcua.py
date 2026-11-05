@@ -70,6 +70,33 @@ class OpcUaConnector:
             raise ConnectorError("SUBSCRIBE", "OPC UA did not create all requested MonitoredItems.")
         return handler.rows[: len(node_ids)]
 
+    async def browse_children(self, node_id: str) -> list[dict[str, Any]]:
+        try:
+            node = self.client.get_node(node_id)
+            children = await node.get_children()
+            results: list[dict[str, Any]] = []
+            for child in children[:100]:
+                try:
+                    b_name = await child.read_browse_name()
+                    b_str = getattr(b_name, "Name", None) or str(b_name)
+                    d_name = await child.read_display_name()
+                    d_str = getattr(d_name, "Text", None) or str(d_name)
+                    n_class = await child.read_node_class()
+                    nc_str = getattr(n_class, "name", None) or str(n_class)
+                    grandkids = await child.get_children()
+                    results.append({
+                        "node_id": child.nodeid.to_string(),
+                        "browse_name": b_str,
+                        "display_name": d_str,
+                        "node_class": nc_str,
+                        "has_children": len(grandkids) > 0,
+                    })
+                except Exception:
+                    continue
+            return results
+        except Exception as exc:
+            raise ConnectorError("ADDRESS", f"Cannot browse OPC UA node '{node_id}': {exc}") from exc
+
     async def close(self) -> None:
         await self.client.disconnect()
 

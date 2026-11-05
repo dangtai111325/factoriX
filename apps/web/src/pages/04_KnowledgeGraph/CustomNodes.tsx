@@ -174,7 +174,7 @@ export const TelemetryGroupNodeComponent: React.FC<NodeProps> = ({ data, selecte
       <div className="mt-1 flex items-center justify-between text-[10px] text-emerald-700">
         <span className="flex items-center gap-1">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-          1 Hz Stream
+          Live Stream
         </span>
         <span className="font-semibold underline">Click to view data →</span>
       </div>

@@ -240,12 +240,13 @@ export const OutputGroupsPage: React.FC = () => {
         setIsNew(false);
         setSelectedModelId(created.id);
       } else if (selectedModelId) {
+        const currentModel = models.find((m) => m.id === selectedModelId);
         await api(`/api/v1/output-groups/${selectedModelId}`, {
           method: 'PATCH',
           body: JSON.stringify({
+            version: currentModel?.version ?? 1,
             display_name: name.trim(),
             topic_template: cleanTopic,
-            resource_id: scopeId,
             members: payloadMembers,
           }),
         });

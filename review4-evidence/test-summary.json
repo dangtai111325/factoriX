@@ -1,0 +1,67 @@
+{
+  "base_commit": "748a3265a838fde59705fbf7d8f0ea5ab7fc0b00",
+  "branch": "fix/review4-release-blockers",
+  "timestamp": "2026-11-05T17:25:00+07:00",
+  "test_suites": {
+    "center_unit": {
+      "passed": 85,
+      "failed": 0,
+      "status": "PASS"
+    },
+    "edge_unit": {
+      "passed": 17,
+      "failed": 0,
+      "status": "PASS"
+    },
+    "safety": {
+      "passed": 3,
+      "failed": 0,
+      "status": "PASS"
+    },
+    "frontend_check": {
+      "typescript_errors": 0,
+      "status": "PASS"
+    },
+    "frontend_build": {
+      "dist_created": true,
+      "build_duration_seconds": 31.5,
+      "status": "PASS"
+    },
+    "playwright_e2e": {
+      "passed": 23,
+      "failed": 0,
+      "duration_seconds": 31.1,
+      "status": "PASS"
+    }
+  },
+  "total_python_tests": 105,
+  "total_e2e_tests": 23,
+  "release_blockers_status": {
+    "R4-01": "FIXED_AND_VERIFIED",
+    "R4-02": "FIXED_AND_VERIFIED",
+    "R4-03": "FIXED_AND_VERIFIED",
+    "R4-04": "FIXED_AND_VERIFIED",
+    "R4-05": "FIXED_AND_VERIFIED",
+    "R4-06": "FIXED_AND_VERIFIED",
+    "R4-07": "FIXED_AND_VERIFIED",
+    "R4-08": "FIXED_AND_VERIFIED",
+    "R4-09": "FIXED_AND_VERIFIED",
+    "R4-10": "FIXED_AND_VERIFIED",
+    "R4-11": "FIXED_AND_VERIFIED",
+    "R4-12": "FIXED_AND_VERIFIED",
+    "R4-14": "FIXED_AND_VERIFIED",
+    "R4-17": "FIXED_AND_VERIFIED",
+    "R4-18": "FIXED_AND_VERIFIED",
+    "R4-19": "FIXED_AND_VERIFIED",
+    "R4-20": "FIXED_AND_VERIFIED",
+    "R4-21": "FIXED_AND_VERIFIED",
+    "R4-24": "FIXED_AND_VERIFIED",
+    "R4-27": "FIXED_AND_VERIFIED",
+    "R4-28": "FIXED_AND_VERIFIED",
+    "R4-29": "REMOVED_AND_VERIFIED",
+    "R4-30": "FIXED_AND_VERIFIED",
+    "R4-35": "REMOVED_AND_VERIFIED",
+    "R4-36": "REMOVED_AND_VERIFIED",
+    "R4-37": "REMOVED_AND_VERIFIED"
+  }
+}

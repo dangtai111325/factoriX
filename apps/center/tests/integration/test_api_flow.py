@@ -31,6 +31,7 @@ db_module._session_factory = None
 from factorix.transport.app import app
 from sqlalchemy import text
 from factorix.platform.db import session_factory
+from tests.safety.test_destructive_guard import check_destructive_test_db_guard
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +45,11 @@ async def _close_pool_between_tests():
 
 
 async def _wipe() -> None:
+    settings = get_settings()
+    check_destructive_test_db_guard(
+        settings.database_url,
+        os.environ.get("FACTORIX_ENABLE_DESTRUCTIVE_TESTS"),
+    )
     factory = session_factory()
     async with factory() as session:
         await session.execute(
@@ -52,7 +58,7 @@ async def _wipe() -> None:
                 TRUNCATE TABLE
                   tenants, sites, admin_accounts, sessions, login_throttle, password_reset_codes,
                   resource_types, resources, relation_types, resource_relations, type_adjacency,
-                  hierarchy_templates, hierarchy_views, layout_definitions, layout_revisions,
+                  hierarchy_templates, hierarchy_views,
                   edge_nodes, edge_enrollment_tokens, secret_store, connections, acquisition_jobs,
                   source_fields, signal_definitions, signal_bindings, mapping_definitions,
                   formula_definitions, formula_dependencies, output_groups, output_group_members,

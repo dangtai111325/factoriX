@@ -229,7 +229,7 @@ export const KnowledgeGraphPage: React.FC = () => {
   if (resourceCount === 0) {
     return (
       <div className="space-y-3">
-        <h1 className="text-xl font-bold text-[#0B2545]">Factory Graph</h1>
+        <h1 className="text-xl font-bold text-[#0B2545]">Knowledge Graph</h1>
         <p className="text-xs text-[#64748B]">
           The graph is populated from the factory model. Create an enterprise and its children in Factory Structure first.
         </p>
@@ -239,7 +239,7 @@ export const KnowledgeGraphPage: React.FC = () => {
 
   return (
     <div className="space-y-4 animate-in fade-in duration-200 select-none pb-8">
-      {/* Top Header - Factory Graph */}
+      {/* Top Header - Knowledge Graph */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2 mb-1 text-xs text-[#64748B]">
@@ -248,7 +248,7 @@ export const KnowledgeGraphPage: React.FC = () => {
             <span className="font-mono">TIPA · DongNai · Factory 1 · ASSY</span>
           </div>
           <h1 className="text-xl md:text-2xl font-black text-[#0B2545] tracking-tight">
-            Factory Graph: TIPA Enterprise
+            Knowledge Graph: TIPA Enterprise
           </h1>
           <p className="text-xs text-[#64748B] mt-0.5">
             Full enterprise asset topology and telemetry graph (16 structure nodes · 12 live data groups · 192 streaming signals).
@@ -351,14 +351,14 @@ export const KnowledgeGraphPage: React.FC = () => {
                 <div className="p-3 rounded-2xl bg-gradient-to-br from-emerald-500/10 to-teal-500/10 border border-emerald-300">
                   <div className="flex items-center justify-between">
                     <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-800">
-                      1 Hz Observation Stream
+                      Live Observation Stream
                     </span>
                     <span className="text-[10px] font-mono font-bold bg-emerald-600 text-white px-2 py-0.5 rounded-full">
                       {drawerSignals.length} TAGS ACTIVE
                     </span>
                   </div>
                   <p className="text-[11px] text-emerald-700 mt-1">
-                    Real-time streaming telemetry from broker at 192.168.2.108:1883
+                    Real-time streaming telemetry from active data connections
                   </p>
                 </div>
 
@@ -390,7 +390,7 @@ export const KnowledgeGraphPage: React.FC = () => {
                                 isGood ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
                               }`}
                             >
-                              {sig.quality || 'GOOD'}
+                              {sig.quality || 'NO_DATA'}
                             </span>
                           </div>
                           <div className="mt-1 flex items-baseline justify-between">
@@ -441,7 +441,7 @@ export const KnowledgeGraphPage: React.FC = () => {
                   <div className="space-y-2 mt-4">
                     <div className="flex items-center justify-between text-[11px] font-bold uppercase tracking-wider text-[#64748B]">
                       <span>Direct Signals ({drawerSignals.length})</span>
-                      <span className="text-emerald-600 font-mono">● 1 Hz stream</span>
+                      <span className="text-emerald-600 font-mono">● Live Stream</span>
                     </div>
                     <div className="space-y-1.5 max-h-[380px] overflow-y-auto pr-1">
                       {drawerSignals.map((sig) => {
@@ -476,7 +476,7 @@ export const KnowledgeGraphPage: React.FC = () => {
                                   isGood ? 'text-emerald-600' : 'text-red-600'
                                 }`}
                               >
-                                {sig.quality || 'GOOD'}
+                                {sig.quality || 'NO_DATA'}
                               </div>
                             </div>
                           </div>

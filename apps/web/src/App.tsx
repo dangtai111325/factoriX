@@ -16,14 +16,11 @@ import { SearchModal } from './components/shell/SearchModal';
 
 import { OverviewPage } from './pages/01_Overview/OverviewPage';
 import { FactoryStructurePage } from './pages/02_FactoryStructure/FactoryStructurePage';
-import { FactoryLayoutPage } from './pages/03_FactoryLayout/FactoryLayoutPage';
 import { KnowledgeGraphPage } from './pages/04_KnowledgeGraph/KnowledgeGraphPage';
 import { ConnectionsPage } from './pages/05_Connections/ConnectionsPage';
 import { AddDataWizardPage } from './pages/06_AddDataWizard/AddDataWizardPage';
 import { SignalsCatalogPage } from './pages/08_SignalsCatalog/SignalsCatalogPage';
-import { DiagnosticsPage } from './pages/11_Diagnostics/DiagnosticsPage';
 import { OutputGroupsPage } from './pages/13_OutputGroups/OutputGroupsPage';
-import { EdgesPage } from './pages/16_Edges/EdgesPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
 
 // Query-preserving redirect helper (TC-UI-NAV-06)
@@ -46,14 +43,11 @@ const RedirectWithQuery: React.FC<{ to: string; extraParams?: Record<string, str
 const ROUTE_TITLES: Record<string, string> = {
   '/overview': 'Overview',
   '/factory/structure': 'Hierarchy Structure',
-  '/factory/layout': 'Layout Designer',
-  '/factory/graph': 'Factory Graph',
+  '/factory/graph': 'Knowledge Graph',
   '/collector/connections': 'Connections',
-  '/collector/add-data': 'Data Acquisition',
-  '/collector/signals': 'Data Acquisition',
-  '/collector/edges': 'Edge Collectors',
-  '/collector/diagnostics': 'Diagnostics',
-  '/models': 'Data Models',
+  '/collector/add-data': 'Add Data',
+  '/collector/signals': 'Signals',
+  '/models': 'Model Catalog',
   '/dashboards': 'Dashboards',
   '/historian': 'Historian & Storage',
   '/alarms': 'Alarms & Events',
@@ -86,14 +80,16 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/" element={<Navigate to="/overview" replace />} />
               <Route path="/overview" element={<OverviewPage />} />
               <Route path="/factory/structure" element={<FactoryStructurePage />} />
-              <Route path="/factory/layout" element={<FactoryLayoutPage />} />
               <Route path="/factory/graph" element={<KnowledgeGraphPage />} />
               <Route path="/collector/connections" element={<ConnectionsPage />} />
               <Route path="/collector/signals" element={<SignalsCatalogPage />} />
-              <Route path="/collector/edges" element={<EdgesPage />} />
-              <Route path="/collector/diagnostics" element={<DiagnosticsPage />} />
               <Route path="/collector/add-data" element={<AddDataWizardPage />} />
               <Route path="/models" element={<OutputGroupsPage />} />
+
+              {/* Safe Redirects for Removed Product Features (Review 4 S5.4 / S5.8) */}
+              <Route path="/factory/layout" element={<Navigate to="/factory/structure" replace />} />
+              <Route path="/collector/edges" element={<Navigate to="/collector/connections" replace />} />
+              <Route path="/collector/diagnostics" element={<Navigate to="/collector/connections" replace />} />
 
               {/* Coming soon routes */}
               <Route path="/dashboards/*" element={<ComingSoonPage />} />
@@ -111,10 +107,10 @@ const ProtectedAppShell: React.FC = () => (
 
               {/* Legacy Route Redirects with preserved Query Parameters (§2.3 & TC-UI-NAV-06) */}
               <Route path="/topology" element={<RedirectWithQuery to="/factory/structure" />} />
-              <Route path="/factory-layout" element={<RedirectWithQuery to="/factory/layout" />} />
+              <Route path="/factory-layout" element={<RedirectWithQuery to="/factory/structure" />} />
               <Route path="/knowledge-graph" element={<RedirectWithQuery to="/factory/graph" />} />
               <Route path="/acquisition/connections" element={<RedirectWithQuery to="/collector/connections" />} />
-              <Route path="/acquisition/edges" element={<RedirectWithQuery to="/collector/edges" />} />
+              <Route path="/acquisition/edges" element={<RedirectWithQuery to="/collector/connections" />} />
               <Route path="/acquisition/add-data" element={<RedirectWithQuery to="/collector/add-data" />} />
               <Route path="/acquisition/studio/mqtt" element={<RedirectWithQuery to="/collector/connections" />} />
               <Route path="/acquisition/studio/opc" element={<RedirectWithQuery to="/collector/connections" />} />
@@ -122,8 +118,8 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/acquisition/studio/http" element={<RedirectWithQuery to="/collector/connections" />} />
               <Route path="/signals" element={<RedirectWithQuery to="/collector/signals" />} />
               <Route path="/live/monitor" element={<RedirectWithQuery to="/collector/signals" extraParams={{ view: 'live' }} />} />
-              <Route path="/live/diagnostics" element={<RedirectWithQuery to="/collector/diagnostics" extraParams={{ tab: 'health' }} />} />
-              <Route path="/live/activity" element={<RedirectWithQuery to="/collector/diagnostics" extraParams={{ tab: 'activity' }} />} />
+              <Route path="/live/diagnostics" element={<RedirectWithQuery to="/collector/connections" />} />
+              <Route path="/live/activity" element={<RedirectWithQuery to="/collector/connections" />} />
               <Route path="/signals/output-groups" element={<RedirectWithQuery to="/models" />} />
               <Route path="/signals/calculated" element={<RedirectWithQuery to="/models" extraParams={{ tab: 'calculations' }} />} />
               <Route path="/storage" element={<RedirectWithQuery to="/historian" />} />

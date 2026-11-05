@@ -85,6 +85,7 @@ class SignalBulkActionIn(BaseModel):
 
 class CaptureIn(BaseModel):
     topics: list[str] = Field(default_factory=list)
+    topic_filter: str | None = None
     duration_seconds: int = 10
     max_messages: int = 100
     browse_node: str | None = None
@@ -554,48 +555,38 @@ async def capture_connection(
     if edge.get("enrollment_status") != "ENROLLED":
         raise AppError(409, "EDGE_NOT_ENROLLED", "No enrolled collector for this site. Enroll the Edge first.")
 
-    samples: dict[str, Any] = {}
-    if conn["protocol"] == "mqtt":
-        topics_to_capture = body.topics or (conn["config_json"].get("topics") if isinstance(conn.get("config_json"), dict) else []) or ["#"]
-        max_msgs = min(max(1, body.max_messages), 100)
-        import asyncio
-        from factorix_edge.connectors.mqtt import MqttConnector
-        cfg = conn["config_json"] or {}
-        host = cfg.get("host", "127.0.0.1")
-        port = int(cfg.get("port", 18883))
-        connector = MqttConnector(host=host, port=port, keepalive=10)
-        try:
-            await connector.start(topics_to_capture)
-            await asyncio.sleep(min(body.duration_seconds, 2))
-            drained = connector.drain()
-            await connector.stop()
-            by_topic: dict[str, list[dict[str, Any]]] = {}
-            for t, p in drained[:max_msgs]:
-                truncated = False
-                payload_str = p.decode("utf-8", errors="replace") if isinstance(p, (bytes, bytearray)) else str(p)
-                if len(payload_str) > 100_000:
-                    payload_str = payload_str[:100_000]
-                    truncated = True
-                try:
-                    parsed = json.loads(payload_str)
-                except Exception:
-                    parsed = payload_str
-                item = {"payload": parsed, "count": 1, "truncated": truncated}
-                by_topic.setdefault(t, []).append(item)
-            for t, items in by_topic.items():
-                samples[t] = {"latest": items[-1]["payload"], "count": len(items), "truncated": items[-1]["truncated"]}
-        except Exception:
-            for t in topics_to_capture:
-                samples[t] = {"latest": {}, "count": 0, "truncated": False}
-    elif conn["protocol"] == "opcua" and body.browse_node:
-        samples = {
-            "nodes": [
-                {"node_id": "ns=2;i=1001", "display_name": "Device", "has_children": True},
-                {"node_id": "ns=2;i=1002", "display_name": "Temperature", "has_children": False},
-                {"node_id": "ns=2;i=1003", "display_name": "Pressure", "has_children": False},
-            ]
-        }
-    return {"connection_id": str(connection_id), "samples": samples}
+    topic_filter = body.topic_filter or (body.topics[0] if body.topics else "#")
+    meta = {
+        "command_type": "CAPTURE",
+        "topic_filter": topic_filter,
+        "topics": body.topics or [topic_filter],
+        "seconds": min(max(1, body.duration_seconds), 60),
+        "max_messages": min(max(1, body.max_messages), 200),
+        "browse_node": body.browse_node,
+    }
+    stages = [{"stage": "CAPTURE", "status": "PENDING", "duration_ms": None, "detail": ""}]
+    job_id = uuid4()
+    await execute(
+        session,
+        """
+        INSERT INTO commissioning_jobs (
+            id, tenant_id, connection_id, requested_by, stages_json, status, diagnostic, samples_json, started_at
+        ) VALUES (
+            :id, :tenant_id, :connection_id, :actor, CAST(:stages AS jsonb), 'PENDING', '', CAST(:samples AS jsonb), :now
+        )
+        """,
+        {
+            "id": job_id,
+            "tenant_id": tenant_id,
+            "connection_id": connection_id,
+            "actor": actor,
+            "stages": jsonb(stages),
+            "samples": jsonb({"meta": meta}),
+            "now": utcnow(),
+        },
+    )
+    await audit(session, tenant_id=tenant_id, event_type="CAPTURE_REQUEST", actor_id=actor, entity_type="connection", entity_id=connection_id, before=None, after={"job_id": str(job_id), "protocol": conn["protocol"]}, correlation_id=correlation_id)
+    return {"job_id": str(job_id), "status": "PENDING", "poll_url": f"/api/v1/commissioning/{job_id}"}
 
 
 async def bulk_signals(
@@ -851,8 +842,23 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
         session,
         f"""
         SELECT s.id, s.key, s.display_name, s.data_type, s.unit, s.category, s.resource_id, s.version, s.expected_interval_ms,
-               r.code AS resource_code, r.name AS resource_name
-        FROM signal_definitions s JOIN resources r ON r.id = s.resource_id
+               r.code AS resource_code, r.name AS resource_name, r.path_code,
+               c.id AS connection_id, c.name AS connection_name, c.protocol AS connection_protocol,
+               e.id AS edge_id, e.name AS edge_name,
+               f.address_kind, f.address_json, j.id AS job_id, b.enabled AS binding_enabled
+        FROM signal_definitions s
+        JOIN resources r ON r.id = s.resource_id
+        LEFT JOIN LATERAL (
+            SELECT b.id, b.source_field_id, b.enabled
+            FROM signal_bindings b
+            WHERE b.signal_id = s.id AND b.enabled = TRUE AND b.valid_to IS NULL
+            ORDER BY b.valid_from DESC, b.revision DESC
+            LIMIT 1
+        ) b ON TRUE
+        LEFT JOIN source_fields f ON f.id = b.source_field_id
+        LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+        LEFT JOIN connections c ON c.id = j.connection_id
+        LEFT JOIN edge_nodes e ON e.id = c.edge_id
         WHERE {' AND '.join(where)}
         ORDER BY r.code, s.key
         LIMIT :limit
@@ -862,6 +868,22 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
     for row in rows:
         if row.get("data_type") == "bool":
             row["data_type"] = "boolean"
+        row["signal_id"] = str(row["id"])
+        conn_id = str(row["connection_id"]) if row.get("connection_id") else None
+        row["connection_id"] = conn_id
+        row["enabled"] = bool(row.get("binding_enabled", True))
+        if conn_id:
+            row["source"] = {
+                "connection_id": conn_id,
+                "connection_name": str(row.get("connection_name") or ""),
+                "edge_id": str(row["edge_id"]) if row.get("edge_id") else None,
+                "edge_name": str(row.get("edge_name") or ""),
+                "protocol": str(row.get("connection_protocol") or ""),
+                "address_kind": str(row.get("address_kind") or ""),
+                "job_id": str(row["job_id"]) if row.get("job_id") else None,
+            }
+        else:
+            row["source"] = None
     return rows
 
 
@@ -1195,16 +1217,35 @@ async def preview_output_group(session: AsyncSession, tenant_id: UUID, group_id:
         """,
         {"id": group_id, "tenant_id": tenant_id},
     )
+    from factorix.domain.signal_state import evaluate_signal_state
+
     policy = group["projection_policy_json"] or {"mode": "rich", "missing": "null"}
     values: dict[str, Any] = {}
     for member in members:
         is_enabled = bool(member.get("binding_enabled"))
         raw = None if member["value_json"] is None or not is_enabled else member["value_json"].get("v")
-        if not is_enabled or raw is None:
-            quality = "NO_DATA"
+        if not is_enabled:
+            eff_status = "DISABLED"
+            freshness = "UNKNOWN"
+            src_quality = "UNKNOWN"
+            val = None
+        elif member["value_json"] is None or raw is None:
+            eff_status = "NO_DATA"
+            freshness = "NO_DATA"
+            src_quality = member["quality"] or "NO_DATA"
             val = None
         else:
-            quality = member["quality"] or "GOOD"
+            state = evaluate_signal_state(
+                raw_quality=member["quality"] or "GOOD",
+                event_time=member["event_time"],
+                expected_interval_ms=10000,
+                is_binding_enabled=is_enabled,
+                has_value=True,
+                now=utcnow(),
+            )
+            eff_status = state.effective_status.value
+            freshness = state.freshness.value
+            src_quality = state.source_quality.value
             val = raw
 
         if raw is None and policy.get("missing") == "omit":
@@ -1215,8 +1256,10 @@ async def preview_output_group(session: AsyncSession, tenant_id: UUID, group_id:
             values[member["output_alias"]] = {
                 "value": val,
                 "unit": member["unit"],
-                "quality": quality,
-                "observed_at": member["event_time"] if is_enabled else None,
+                "quality": eff_status,
+                "source_quality": src_quality,
+                "freshness": freshness,
+                "observed_at": member["event_time"].isoformat() if is_enabled and member["event_time"] else None,
             }
     path = await _resource_path(session, tenant_id, as_uuid(group["resource_id"]))
     try:

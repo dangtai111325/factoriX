@@ -36,8 +36,8 @@ from factorix.modules.collect import (
     SignalPatch,
     TestIn,
 )
-from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, parse_uuid
-from factorix.platform.after_commit import listen
+from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, parse_uuid, utcnow
+from factorix.platform.after_commit import flush, listen
 from factorix.modules.identity import (
     SESSION_COOKIE,
     BootstrapIn,
@@ -61,8 +61,6 @@ from factorix.platform.security import hash_token
 from factorix.modules.resources import (
     HierarchyIn,
     ImportIn,
-    LayoutDraft,
-    LayoutIn,
     MoveIn,
     RelationIn,
     ResourceIn,
@@ -87,9 +85,15 @@ async def db_session() -> AsyncIterator[AsyncSession]:
         try:
             yield session
             await session.commit()
-        except Exception:
+        except BaseException:
             await session.rollback()
+            session.info.pop("fx_events", None)
             raise
+        else:
+            try:
+                await flush(session)
+            except Exception:
+                pass
 
 
 async def admin(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
@@ -598,30 +602,6 @@ async def graph(
     )
 
 
-@app.get("/api/v1/layouts")
-async def layouts(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, _actor = _ids(principal)
-    return {"items": await fetch_all(session, "SELECT id, name, scope_resource_id, draft_json, version, published_revision, updated_at FROM layout_definitions WHERE tenant_id = :tenant_id ORDER BY name", {"tenant_id": tenant_id})}
-
-
-@app.post("/api/v1/layouts", status_code=201)
-async def create_layout(body: LayoutIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await resources.create_layout(session, tenant_id, actor, body, correlation_id(request))
-
-
-@app.patch("/api/v1/layouts/{layout_id}/draft")
-async def layout_draft(layout_id: str, body: LayoutDraft, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await resources.save_layout_draft(session, tenant_id, actor, parse_uuid(layout_id), body, correlation_id(request))
-
-
-@app.post("/api/v1/layouts/{layout_id}/publish")
-async def layout_publish(layout_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await resources.publish_layout(session, tenant_id, actor, parse_uuid(layout_id), correlation_id(request))
-
-
 @app.get("/api/v1/connector-types")
 async def connector_types(principal: dict[str, Any] = Depends(admin)) -> dict[str, Any]:
     del principal
@@ -678,7 +658,7 @@ async def delete_connection(connection_id: str, request: Request, principal: dic
     return await collect.archive_connection(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request))
 
 
-@app.post("/api/v1/connections/{connection_id}/capture")
+@app.post("/api/v1/connections/{connection_id}/capture", status_code=202)
 async def capture_connection(connection_id: str, body: CaptureIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await collect.capture_connection(session, tenant_id, actor, parse_uuid(connection_id), body, correlation_id(request))

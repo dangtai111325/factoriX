@@ -165,7 +165,7 @@ async def pull_commands(session: AsyncSession, edge: dict[str, Any]) -> dict[str
     jobs = await fetch_one(
         session,
         """
-        SELECT j.id, j.connection_id, j.stages_json, c.protocol, c.config_json, c.endpoint_redacted, c.secret_ref
+        SELECT j.id, j.connection_id, j.stages_json, j.samples_json, c.protocol, c.config_json, c.endpoint_redacted, c.secret_ref
         FROM commissioning_jobs j
         JOIN connections c ON c.id = j.connection_id
         WHERE j.status = 'PENDING' AND c.edge_id = :edge_id
@@ -177,7 +177,24 @@ async def pull_commands(session: AsyncSession, edge: dict[str, Any]) -> dict[str
     if jobs is None:
         return {"job": None}
     await execute(session, "UPDATE commissioning_jobs SET status = 'RUNNING', started_at = :now WHERE id = :id", {"now": utcnow(), "id": as_uuid(jobs["id"])})
-    return {"job": jobs}
+    meta = (jobs.get("samples_json") or {}).get("meta", {})
+    job_payload = {
+        "id": str(jobs["id"]),
+        "connection_id": str(jobs["connection_id"]),
+        "stages_json": jobs["stages_json"],
+        "protocol": jobs["protocol"],
+        "config_json": jobs["config_json"],
+        "endpoint_redacted": jobs["endpoint_redacted"],
+        "secret_ref": str(jobs["secret_ref"]) if jobs.get("secret_ref") else None,
+        "command_type": meta.get("command_type") or "COMMISSION",
+        "mode": meta.get("mode") or "FULL",
+        "fields": meta.get("fields") or [],
+        "topic_filter": meta.get("topic_filter"),
+        "seconds": meta.get("seconds"),
+        "max_messages": meta.get("max_messages"),
+        "browse_node": meta.get("browse_node"),
+    }
+    return {"job": job_payload}
 
 
 async def finish_command(session: AsyncSession, edge: dict[str, Any], job_id: UUID, body: dict[str, Any]) -> dict[str, Any]:

@@ -1,23 +1,19 @@
 import { test, expect } from '@playwright/test';
 import { BASE, ensureSignedIn } from './helpers';
 
-test.describe('Edge Collectors (TC-UI-ED)', () => {
+test.describe('Removed Feature: Edge Collectors Management UI (Review 4 S5.8 REMOVE-19..28)', () => {
   test.beforeEach(async ({ page }) => {
     await ensureSignedIn(page);
   });
 
-  test('ED-01..04 edge collector fleet view and actions', async ({ page }) => {
+  test('REMOVE-19..28 /collector/edges redirects to connections, no edge management UI', async ({ page }) => {
     await page.goto(`${BASE}/collector/edges`);
-    await expect(page.getByRole('heading', { name: 'Edge Collectors', exact: true })).toBeVisible();
+    // Should be safely redirected to /collector/connections
+    await expect(page).toHaveURL(new RegExp('/collector/connections'));
+    await expect(page.getByRole('heading', { name: 'Data Connections' })).toBeVisible();
 
-    // Verify empty state or edge list table
-    const emptyHeading = page.getByRole('heading', { name: 'No edge collectors', exact: true });
-    if (await emptyHeading.isVisible()) {
-      await expect(page.getByText('Edges are created automatically when you add a site.')).toBeVisible();
-    } else {
-      await expect(page.getByText('Name').first()).toBeVisible();
-      await expect(page.getByText('Status').first()).toBeVisible();
-      await expect(page.getByText('Site').first()).toBeVisible();
-    }
+    // Verify Edge collectors management screen is absent
+    await expect(page.getByRole('heading', { name: 'Edge Collectors', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('link', { name: 'Edge Collectors' })).toHaveCount(0);
   });
 });

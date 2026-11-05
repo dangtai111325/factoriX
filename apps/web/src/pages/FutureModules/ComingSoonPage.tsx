@@ -68,9 +68,9 @@ const COMING_SOON_MODULES: Record<string, ComingSoonModule> = {
       'Historical alarm frequency analysis and bad actor reporting',
     ],
     inTheMeantime: {
-      text: 'Monitor collector errors and edge health status in Diagnostics.',
-      actionText: 'Open Diagnostics',
-      path: '/collector/diagnostics',
+      text: 'Monitor connection health and live telemetry status in Connections.',
+      actionText: 'Open Connections',
+      path: '/collector/connections',
     },
   },
   '/analytics': {
@@ -116,9 +116,9 @@ const COMING_SOON_MODULES: Record<string, ComingSoonModule> = {
       'Appliance resource monitoring, disk space management, and system updates',
     ],
     inTheMeantime: {
-      text: 'Manage edge collector nodes and site enrollment tokens.',
-      actionText: 'Open Edge Collectors',
-      path: '/collector/edges',
+      text: 'Manage data connections and collector runtimes.',
+      actionText: 'Open Connections',
+      path: '/collector/connections',
     },
   },
 };

@@ -46,8 +46,7 @@ const mainNav: NavGroup[] = [
     icon: Box,
     children: [
       { label: 'Hierarchy Structure', path: '/factory/structure' },
-      { label: 'Layout Designer', path: '/factory/layout' },
-      { label: 'Factory Graph', path: '/factory/graph' },
+      { label: 'Knowledge Graph', path: '/factory/graph' },
     ],
   },
   {
@@ -56,9 +55,7 @@ const mainNav: NavGroup[] = [
     icon: Database,
     children: [
       { label: 'Connections', path: '/collector/connections' },
-      { label: 'Data Acquisition', path: '/collector/signals' },
-      { label: 'Edge Collectors', path: '/collector/edges' },
-      { label: 'Diagnostics', path: '/collector/diagnostics' },
+      { label: 'Signals', path: '/collector/signals' },
     ],
   },
   {
@@ -66,8 +63,7 @@ const mainNav: NavGroup[] = [
     label: 'Data Models',
     icon: Layers,
     children: [
-      { label: 'All Model', path: '/models' },
-      { label: 'Add Model', path: '/models?tab=calculations', soon: true },
+      { label: 'Model Catalog', path: '/models' },
     ],
   },
 ];
@@ -245,21 +241,8 @@ export const Sidebar: React.FC = () => {
         location.pathname === '/acquisition/connections'
       );
     }
-    if (path === '/collector/diagnostics') {
-      return (
-        location.pathname === '/collector/diagnostics' ||
-        location.pathname === '/live/diagnostics' ||
-        location.pathname === '/live/activity'
-      );
-    }
     if (path === '/models') {
-      return (
-        location.pathname === '/models' &&
-        (!location.search || !location.search.includes('calculations'))
-      );
-    }
-    if (path === '/models?tab=calculations') {
-      return location.pathname === '/models' && location.search.includes('calculations');
+      return location.pathname === '/models';
     }
     return location.pathname === path;
   };
