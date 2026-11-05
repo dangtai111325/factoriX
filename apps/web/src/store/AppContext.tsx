@@ -265,11 +265,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const health = text(row.health).toUpperCase()
         const rawStatus = text(row.status).toUpperCase()
         const isOnline =
-          health === 'HEALTHY' ||
-          health === 'ONLINE' ||
-          rawStatus === 'ACTIVE' ||
-          rawStatus === 'CONNECTED' ||
-          (!row.last_error && health !== 'OFFLINE' && health !== 'DEGRADED')
+          (health === 'HEALTHY' || health === 'ONLINE') &&
+          (rawStatus === 'ACTIVE' || rawStatus === 'CONNECTED') &&
+          !row.last_error
         const status = isOnline ? 'connected' : 'disconnected'
         return {
           id: text(row.id),
@@ -310,7 +308,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           unit: text(row.unit),
           currentValue: value == null ? '—' : (value as string | number | boolean),
           value: value == null ? null : (value as string | number | boolean),
-          quality: (text(state?.quality || 'UNKNOWN') as SignalItem['quality']) || 'UNKNOWN',
+          quality: (state && text(state.quality).toUpperCase() === 'GOOD' && (Date.now() - new Date(text(state.event_time)).getTime() < 5000) ? 'Good' : 'Bad') as SignalItem['quality'],
           lastUpdated: text(state?.event_time),
           sampleIntervalMs: Number(row.expected_interval_ms || 1000),
         }
@@ -409,9 +407,78 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!isStreaming) return
     const timer = window.setInterval(() => {
       void refresh().catch(() => undefined)
-    }, 5000)
+    }, 8000)
     return () => window.clearInterval(timer)
   }, [isStreaming, refresh])
+
+  // Fast 1.2s live telemetry polling for real-time 1 Hz stream
+  useEffect(() => {
+    if (!isStreaming || signals.length === 0) return
+    let active = true
+
+    const pollLiveObservations = async () => {
+      try {
+        const ids = signals.map((s) => s.id).filter(Boolean)
+        if (!ids.length) return
+
+        const chunkSize = 195
+        const chunks = []
+        for (let i = 0; i < ids.length; i += chunkSize) {
+          chunks.push(ids.slice(i, i + chunkSize))
+        }
+
+        const allResults = []
+        for (const chunk of chunks) {
+          const res = await api<{ items: Array<Record<string, unknown>> }>('/api/v1/observations/latest?signal_ids=' + chunk.join(','))
+          if (res.items) {
+            allResults.push(...res.items)
+          }
+        }
+
+        if (!active || allResults.length === 0) return
+        const obsMap = new Map(allResults.map((r) => [text(r.signal_id), r]))
+
+        setSignals((prev) => {
+          let changed = false
+          const next = prev.map((sig) => {
+            const obs = obsMap.get(sig.id)
+            if (!obs) return sig
+            const rawVal =
+              obs.value !== undefined
+                ? obs.value
+                : (obs.value_json as { v?: unknown } | undefined)?.v
+            const eventMs = obs.event_time ? new Date(text(obs.event_time)).getTime() : 0
+            const isFresh = eventMs > 0 && (Date.now() - eventMs < 5000)
+            const rawQ = text(obs.quality || 'UNKNOWN').toUpperCase()
+            const isGood = isFresh && rawQ === 'GOOD' && obs.freshness !== 'STALE'
+            const q = (isGood ? 'Good' : 'Bad') as SignalItem['quality']
+            const t = text(obs.event_time)
+
+            if (sig.value === rawVal && sig.quality === q && sig.lastUpdated === t) {
+              return sig
+            }
+            changed = true
+            return {
+              ...sig,
+              value: rawVal == null ? null : (rawVal as string | number | boolean),
+              currentValue: rawVal == null ? '—' : (rawVal as string | number | boolean),
+              quality: q,
+              lastUpdated: t,
+            }
+          })
+          return changed ? next : prev
+        })
+      } catch {
+        // silent fallback
+      }
+    }
+
+    const interval = window.setInterval(pollLiveObservations, 1200)
+    return () => {
+      active = false
+      window.clearInterval(interval)
+    }
+  }, [isStreaming, signals.length])
 
   const revertToZero = async (confirm: string) => {
     await api('/api/v1/admin/revert-to-zero', {

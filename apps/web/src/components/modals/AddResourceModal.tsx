@@ -113,10 +113,8 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
 
   if (!isOpen) return null;
 
-  const isRecommended =
-    recommendedTypes.length === 0 ||
-    recommendedTypes.some((r) => r.toLowerCase() === type.toLowerCase());
-  const isStrictBlocked = hierarchyMode === 'strict' && !isRecommended;
+  const isRecommended = true;
+  const isStrictBlocked = false;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -152,7 +150,7 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
     setSubmitting(true);
     try {
       await onAddResource?.({
-        name: name.trim(),
+        name: name.trim().replace(/\s+/g, '-'),
         code: trimmedCode,
         type,
         parent_id: parentId,
@@ -221,9 +219,7 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
             </label>
             <div className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono text-slate-700 break-all flex items-center justify-between">
               <span>{parentName ? `${parentName} (${parentPath})` : '(Root - No Parent)'}</span>
-              <span className="text-[10px] px-2 py-0.5 rounded bg-slate-200 text-slate-600 uppercase">
-                {hierarchyMode} Mode
-              </span>
+              
             </div>
           </div>
 
@@ -243,7 +239,8 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                 maxLength={200}
                 value={name}
                 onChange={(e) => {
-                  setName(e.target.value);
+                  const sanitized = e.target.value.replace(/\s+/g, '-');
+                  setName(sanitized);
                   if (error) setError('');
                 }}
                 placeholder={parentId ? "e.g. Assembly Line 01" : "e.g. Acme Corp"}
@@ -283,31 +280,17 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
               <label className="text-xs font-semibold text-slate-700">
                 Resource Type <span className="text-[#EF1B24]">*</span>
               </label>
-              {isRecommended ? (
-                <span className="text-[11px] font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                  Recommended placement
-                </span>
-              ) : (
-                <span className="text-[11px] font-medium text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
-                  {hierarchyMode === 'strict' ? 'Strict mode: Not allowed' : 'Non-standard placement'}
-                </span>
-              )}
             </div>
             <select
               value={type}
               onChange={(e) => setType(e.target.value)}
               className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
             >
-              {availableTypes.map((t) => {
-                const rec =
-                  recommendedTypes.length === 0 ||
-                  recommendedTypes.some((r) => r.toLowerCase() === t.key.toLowerCase());
-                return (
-                  <option key={t.key} value={t.key} disabled={hierarchyMode === 'strict' && !rec}>
-                    {t.name} ({t.category}) {rec ? '— Recommended' : '— Non-standard'}
-                  </option>
-                );
-              })}
+              {availableTypes.map((t) => (
+                <option key={t.key} value={t.key}>
+                  {t.name}
+                </option>
+              ))}
             </select>
           </div>
 

@@ -425,7 +425,10 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
     for row in rows:
         value_json = row.get("value_json")
         row["value"] = None if value_json is None else value_json.get("v")
-        row["freshness"] = _freshness(row)
+        freshness = _freshness(row)
+        row["freshness"] = freshness
+        if freshness == "STALE":
+            row["quality"] = "BAD"
     return rows
 
 
@@ -433,8 +436,8 @@ def _freshness(row: dict[str, Any]) -> str:
     event_time = row.get("event_time")
     if not isinstance(event_time, datetime):
         return "UNKNOWN"
-    interval = timedelta(milliseconds=int(row.get("expected_interval_ms") or 5000))
-    stale_delta = max(interval * 2, timedelta(seconds=10))
+    interval = timedelta(milliseconds=int(row.get("expected_interval_ms") or 1000))
+    stale_delta = max(interval * 2, timedelta(seconds=5))
     if utcnow() - event_time > stale_delta:
         return "STALE"
     if row.get("quality") == "BAD":

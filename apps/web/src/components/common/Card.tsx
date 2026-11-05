@@ -17,9 +17,12 @@ export const Card: React.FC<CardProps> = ({
   className = '',
   headerClassName = '',
 }) => {
+  const hasHeader = Boolean(title || action);
+  const isP0 = className.includes('p-0');
+
   return (
     <div className={`fx-card overflow-hidden ${className}`}>
-      {(title || action) && (
+      {hasHeader && (
         <div
           className={`px-5 py-3.5 border-b border-[#E3EAF3] flex items-center justify-between ${headerClassName}`}
         >
@@ -34,7 +37,7 @@ export const Card: React.FC<CardProps> = ({
           {action && <div className="flex items-center gap-2">{action}</div>}
         </div>
       )}
-      <div className="p-5">{children}</div>
+      {isP0 ? children : <div className="p-5">{children}</div>}
     </div>
   );
 };

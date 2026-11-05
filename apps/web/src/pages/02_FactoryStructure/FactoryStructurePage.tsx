@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Plus,
+  ChevronsDown,
+  ChevronsUp,
   Search,
   Building2,
   Factory,
@@ -57,20 +59,21 @@ function getIconForType(type: string) {
   }
 }
 
-function statusPresentation(status?: string): {
+function statusPresentation(status?: string, signalsCount?: number, liveGoodCount?: number): {
   label: string;
   variant: 'good' | 'warning' | 'error' | 'neutral';
 } {
-  switch (status) {
-    case 'running':
-      return { label: 'RUNNING', variant: 'good' };
-    case 'offline':
-      return { label: 'OFFLINE', variant: 'error' };
-    case 'warning':
-      return { label: 'WARNING', variant: 'warning' };
-    default:
-      return { label: 'NO DATA', variant: 'neutral' };
+  const total = signalsCount ?? 0;
+  if (total > 0) {
+    if ((liveGoodCount ?? 0) > 0) {
+      return { label: `ONLINE · ${liveGoodCount}/${total} SIGNALS`, variant: 'good' };
+    }
+    return { label: `OFFLINE · ${total} SIGNALS`, variant: 'error' };
   }
+  const s = (status || '').toLowerCase();
+  if (s === 'offline') return { label: 'OFFLINE', variant: 'error' };
+  if (s === 'warning') return { label: 'WARNING', variant: 'warning' };
+  return { label: 'ACTIVE', variant: 'neutral' };
 }
 
 /** Fill missing childrenCount / signalsCount from the live graph. */
@@ -186,7 +189,7 @@ const TreeRow: React.FC<TreeRowProps> = ({
               <div className="flex items-center gap-2 truncate min-w-0">
                 <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse shrink-0" />
                 <span className="truncate font-bold">
-                  📊 {resource.type === 'line' ? 'Line Data' : 'Machine Data'}
+                  📊 Data
                 </span>
               </div>
               <span className="text-[10px] font-mono px-1.5 py-0.2 rounded font-extrabold bg-emerald-100 text-emerald-800">
@@ -241,6 +244,22 @@ export const FactoryStructurePage: React.FC = () => {
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<'children' | 'telemetry'>('children');
+
+  const handleExpandAll = () => {
+    const next: Record<string, boolean> = {};
+    for (const r of resources) {
+      next[r.id] = true;
+    }
+    setExpandedNodes(next);
+  };
+
+  const handleCollapseAll = () => {
+    const next: Record<string, boolean> = {};
+    for (const r of resources) {
+      next[r.id] = false;
+    }
+    setExpandedNodes(next);
+  };
 
   const navigate = useNavigate();
 
@@ -332,7 +351,9 @@ export const FactoryStructurePage: React.FC = () => {
 
   const selectedResource =
     resources.find((r) => r.id === selectedResourceId) || resources[0];
-  const selectedStatus = statusPresentation(selectedResource?.status);
+  const selectedDirectSignals = signals.filter((s) => s.resourceId === selectedResource?.id);
+  const selectedLiveGood = selectedDirectSignals.filter((s) => (s.quality || '').toLowerCase() === 'good').length;
+  const selectedStatus = statusPresentation(selectedResource?.status, selectedDirectSignals.length, selectedLiveGood);
 
   const childResources = selectedResource
     ? childrenOf(resources, selectedResource.id)
@@ -583,16 +604,36 @@ export const FactoryStructurePage: React.FC = () => {
       <div className="grid grid-cols-12 gap-3.5">
         {/* Region 3: Asset Hierarchy Tree */}
         <div className="col-span-12 lg:col-span-3">
-          <Card className="h-[760px] flex flex-col p-0">
-            <div className="px-4 py-3 border-b border-[#E3EAF3] flex items-center justify-between bg-[#F9FAFD]">
+          <Card className="h-[calc(100vh-210px)] min-h-[620px] flex flex-col p-0">
+            <div className="px-3 py-2.5 border-b border-[#E3EAF3] flex items-center justify-between bg-[#F9FAFD]">
               <span className="text-[12px] font-bold text-[#111B37] uppercase tracking-wider">
                 Hierarchy Tree
               </span>
-              <span className="text-[11px] font-semibold text-[#657794]">
-                {visibleResources.length} nodes
-              </span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleExpandAll}
+                  title="Expand All"
+                  className="px-1.5 py-0.5 rounded text-[11px] font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200/80 transition-colors flex items-center gap-0.5"
+                >
+                  <ChevronsDown className="w-3.5 h-3.5" />
+                  <span>Expand</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCollapseAll}
+                  title="Collapse All"
+                  className="px-1.5 py-0.5 rounded text-[11px] font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200/80 transition-colors flex items-center gap-0.5"
+                >
+                  <ChevronsUp className="w-3.5 h-3.5" />
+                  <span>Collapse</span>
+                </button>
+                <span className="text-[11px] font-semibold text-[#657794] ml-1">
+                  {visibleResources.length}
+                </span>
+              </div>
             </div>
-            <div className="p-3 overflow-y-auto flex-1" role="tree" aria-label="Factory hierarchy">
+            <div className="p-3 overflow-y-auto flex-1 min-h-0" role="tree" aria-label="Factory hierarchy">
               {tree.length === 0 ? (
                 <div className="text-center py-8 text-[#94A3B8] text-[13px]">No matching resources.</div>
               ) : (
@@ -619,7 +660,7 @@ export const FactoryStructurePage: React.FC = () => {
 
         {/* Region 4: Child Units & Real-time Telemetry Synchronization */}
         <div className="col-span-12 lg:col-span-4">
-          <Card className="h-[760px] flex flex-col p-0">
+          <Card className="h-[calc(100vh-210px)] min-h-[620px] flex flex-col p-0">
             {/* Header Tabs: Sub-units vs Telemetry Data */}
             <div className="px-3 py-2.5 border-b border-[#E3EAF3] flex items-center justify-between bg-[#F9FAFD]">
               {(() => {
@@ -677,7 +718,7 @@ export const FactoryStructurePage: React.FC = () => {
               </div>
             </div>
 
-            <div className="p-3 overflow-y-auto flex-1 space-y-2.5">
+            <div className="p-3 overflow-y-auto flex-1 min-h-0 space-y-2.5">
               {(() => {
                 const unitSignals = signals.filter((s) => s.resourceId === selectedResource.id);
                 const isTelemetryView = rightPanelTab === 'telemetry' || childResources.length === 0;
@@ -789,7 +830,7 @@ export const FactoryStructurePage: React.FC = () => {
         </div>
 
         {/* Right Inspector: Details, Specification, Topology, Activity */}
-        <div className="col-span-12 lg:col-span-5 space-y-3.5">
+        <div className="col-span-12 lg:col-span-5 space-y-3.5 h-[calc(100vh-210px)] min-h-[620px] overflow-y-auto pr-1">
           <Card className="p-4">
             <div className="flex items-start justify-between">
               <div>
@@ -798,11 +839,18 @@ export const FactoryStructurePage: React.FC = () => {
                     {selectedResource.name}
                   </h2>
                   {(selectedResource.signalsCount ?? 0) > 0 ? (
-                    <Badge variant={selectedStatus.variant}>{selectedStatus.label}</Badge>
+                    <Badge variant={selectedStatus.variant}>
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full mr-1 inline-block ${
+                          selectedStatus.variant === 'good'
+                            ? 'bg-emerald-500 animate-pulse'
+                            : 'bg-red-500'
+                        }`}
+                      />
+                      {selectedStatus.label}
+                    </Badge>
                   ) : (
-                    <span className="text-[10px] text-slate-400 font-medium px-2 py-0.5 rounded bg-slate-100">
-                      NO SIGNALS
-                    </span>
+                    <Badge variant="good">ACTIVE</Badge>
                   )}
                 </div>
                 <div className="text-[12px] font-mono text-[#657794] mt-1">

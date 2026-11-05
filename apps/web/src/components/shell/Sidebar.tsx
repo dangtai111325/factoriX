@@ -47,7 +47,7 @@ const mainNav: NavGroup[] = [
     children: [
       { label: 'Hierarchy Structure', path: '/factory/structure' },
       { label: 'Layout Designer', path: '/factory/layout' },
-      { label: 'Knowledge Graph', path: '/factory/graph' },
+      { label: 'Factory Graph', path: '/factory/graph' },
     ],
   },
   {
@@ -56,7 +56,7 @@ const mainNav: NavGroup[] = [
     icon: Database,
     children: [
       { label: 'Connections', path: '/collector/connections' },
-      { label: 'Signals', path: '/collector/signals' },
+      { label: 'Data Acquisition', path: '/collector/signals' },
       { label: 'Edge Collectors', path: '/collector/edges' },
       { label: 'Diagnostics', path: '/collector/diagnostics' },
     ],
@@ -66,8 +66,8 @@ const mainNav: NavGroup[] = [
     label: 'Data Models',
     icon: Layers,
     children: [
-      { label: 'Model Catalog', path: '/models' },
-      { label: 'Calculations', path: '/models?tab=calculations', soon: true },
+      { label: 'All Model', path: '/models' },
+      { label: 'Add Model', path: '/models?tab=calculations', soon: true },
     ],
   },
 ];

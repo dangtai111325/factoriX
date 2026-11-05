@@ -84,7 +84,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({
     setError(null);
     setCodeError(null);
 
-    const trimmedName = name.trim();
+    const trimmedName = name.trim().replace(/\s+/g, '-');
     if (!trimmedName) {
       setError('Enter a name.');
       return;
@@ -203,7 +203,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({
                 maxLength={200}
                 value={name}
                 onChange={(e) => {
-                  setName(e.target.value);
+                  setName(e.target.value.replace(/\s+/g, '-'));
                   if (error) setError(null);
                 }}
                 className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"

@@ -3,6 +3,8 @@ import {
   Search,
   ChevronRight,
   ChevronDown,
+  ChevronsDown,
+  ChevronsUp,
   Layers,
   Filter,
   Download,
@@ -118,7 +120,7 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
               <div className="flex items-center gap-1.5 min-w-0 pr-1">
                 <Activity className={`w-3.5 h-3.5 shrink-0 ${isDataSelected ? 'text-white' : 'text-emerald-600 animate-pulse'}`} />
                 <span className="truncate font-bold text-[11px]">
-                  📊 {node.resource.type === 'line' ? 'Line Data' : 'Machine Data'}
+                  📊 Data
                 </span>
               </div>
               <span
@@ -275,6 +277,22 @@ export const SignalsCatalogPage: React.FC = () => {
       ...prev,
       [id]: prev[id] === undefined ? false : !prev[id],
     }));
+  };
+
+  const handleExpandAll = () => {
+    const next: Record<string, boolean> = {};
+    for (const r of resources) {
+      next[r.id] = true;
+    }
+    setExpandedTreeNodes(next);
+  };
+
+  const handleCollapseAll = () => {
+    const next: Record<string, boolean> = {};
+    for (const r of resources) {
+      next[r.id] = false;
+    }
+    setExpandedTreeNodes(next);
   };
 
   // Filtered Signals
@@ -474,24 +492,44 @@ export const SignalsCatalogPage: React.FC = () => {
         {/* Left Column: Hierarchy Tree Filter */}
         <Card className="p-3 border border-[#CBD5E1] bg-white lg:col-span-1 space-y-2.5 sticky top-3">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100">
-            <div className="flex items-center gap-1.5 text-xs font-bold text-[#0B2545]">
+            <div className="flex items-center gap-1 text-xs font-bold text-[#0B2545]">
               <Layers className="w-3.5 h-3.5 text-[#134074]" />
-              <span>Hierarchy Filter</span>
+              <span>Hierarchy</span>
             </div>
-            <button
-              type="button"
-              onClick={() => setSelectedFilter('all')}
-              className={`text-[11px] font-bold transition px-2 py-0.5 rounded ${
-                selectedFilter === 'all'
-                  ? 'bg-[#0B2545] text-white'
-                  : 'text-slate-500 hover:text-slate-800 bg-slate-100'
-              }`}
-            >
-              All ({signals.length})
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={handleExpandAll}
+                title="Expand All"
+                className="px-1.5 py-0.5 rounded text-[10px] font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200 transition-colors flex items-center gap-0.5"
+              >
+                <ChevronsDown className="w-3 h-3" />
+                <span>Expand</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleCollapseAll}
+                title="Collapse All"
+                className="px-1.5 py-0.5 rounded text-[10px] font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200 transition-colors flex items-center gap-0.5"
+              >
+                <ChevronsUp className="w-3 h-3" />
+                <span>Collapse</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedFilter('all')}
+                className={`text-[11px] font-bold transition px-1.5 py-0.5 rounded ${
+                  selectedFilter === 'all'
+                    ? 'bg-[#0B2545] text-white'
+                    : 'text-slate-500 hover:text-slate-800 bg-slate-100'
+                }`}
+              >
+                All ({signals.length})
+              </button>
+            </div>
           </div>
 
-          <div className="max-h-[640px] overflow-y-auto space-y-1 pr-1">
+          <div className="h-[calc(100vh-260px)] min-h-[550px] overflow-y-auto space-y-1 pr-1">
             {(() => {
               // Build tree roots
               const map = new Map<string, any>();

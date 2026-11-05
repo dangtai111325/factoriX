@@ -20,8 +20,26 @@ export async function layoutGraph(
       'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF',
     },
     children: nodes.map((node) => {
-      const width = node.type === 'signal' ? 170 : node.type === 'connection' ? 160 : node.type === 'edgeNode' ? 150 : 190;
-      const height = node.type === 'signal' ? 56 : node.type === 'connection' ? 48 : node.type === 'edgeNode' ? 44 : 64;
+      const width =
+        node.type === 'signal'
+          ? 170
+          : node.type === 'connection'
+          ? 160
+          : node.type === 'edgeNode'
+          ? 150
+          : node.type === 'telemetryGroup'
+          ? 220
+          : 200;
+      const height =
+        node.type === 'signal'
+          ? 56
+          : node.type === 'connection'
+          ? 48
+          : node.type === 'edgeNode'
+          ? 44
+          : node.type === 'telemetryGroup'
+          ? 76
+          : 64;
       return {
         id: node.id,
         width,
