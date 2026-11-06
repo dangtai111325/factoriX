@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -19,6 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import collect, edge_sync, identity, resources, telemetry
+from factorix.modules import models_engine
 from factorix.modules.collect import (
     CaptureIn,
     ConnectionIn,
@@ -36,8 +38,20 @@ from factorix.modules.collect import (
     SignalPatch,
     TestIn,
 )
-from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, parse_uuid, utcnow
+from factorix.domain.health import (
+    EDGE_OFFLINE_AFTER_S,
+    HEARTBEAT_PERIOD_S,
+    appliance_needs_enrollment,
+    collector_status,
+    connection_no_data_due,
+    data_collection_status,
+    edge_config_state,
+    effective_edge_health,
+    no_data_message,
+)
+from factorix.modules.common import as_uuid, audit, execute, execute_rowcount, fetch_all, fetch_one, iso_ms, parse_uuid, queue_stream_event, utcnow
 from factorix.platform.after_commit import flush, listen
+from factorix.transport.hub import Channel, Hub, origin_allowed
 from factorix.modules.identity import (
     SESSION_COOKIE,
     BootstrapIn,
@@ -77,6 +91,14 @@ from factorix.platform.security import hash_password, verify_password
 from factorix.platform.settings import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
+
+
+async def _flush_events(session: AsyncSession) -> None:
+    try:
+        await flush(session)
+    except Exception:  # noqa: BLE001 - push delivery must never turn a committed request into an error
+        logger.exception("After-commit event delivery failed")
 
 
 async def db_session() -> AsyncIterator[AsyncSession]:
@@ -90,10 +112,17 @@ async def db_session() -> AsyncIterator[AsyncSession]:
             session.info.pop("fx_events", None)
             raise
         else:
-            try:
-                await flush(session)
-            except Exception:
-                pass
+            await _flush_events(session)
+
+
+async def _commit_now(session: AsyncSession) -> None:
+    """Commit before the response is sent (FastAPI runs yield-dependency exit after the response).
+
+    Used where the caller acts on the response: the edge marks outbox rows ACKED, so the rows must
+    be durable first. After-commit events are delivered right after the commit.
+    """
+    await session.commit()
+    await _flush_events(session)
 
 
 async def admin(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
@@ -107,198 +136,387 @@ def _ids(row: dict[str, Any]) -> tuple[Any, Any]:
     return as_uuid(row["tenant_id"]), as_uuid(row["admin_id"])
 
 
-class Hub:
-    def __init__(self) -> None:
-        self.sockets: list[tuple[WebSocket, set[str], str]] = []
-
-    async def publish(self, tenant_id: str, signal_id: str, payload: dict[str, Any]) -> None:
-        dead: list[tuple[WebSocket, set[str], str]] = []
-        for socket, signals, owner in self.sockets:
-            if owner != tenant_id:
-                continue
-            if signal_id not in signals:
-                continue
-            try:
-                await socket.send_json(payload)
-            except Exception:
-                dead.append((socket, signals, owner))
-        for item in dead:
-            if item in self.sockets:
-                self.sockets.remove(item)
-
-
 hub = Hub()
 
 
 async def _publish_committed(events: list[dict[str, Any]]) -> None:
-    for event in events:
-        if event.get("kind") != "latest":
-            continue
-        await hub.publish(str(event["tenant_id"]), str(event["signal_id"]), event["payload"])
+    hub.dispatch(events)
 
 
 listen(_publish_committed)
 
-async def _background_health_loop() -> None:
-    while True:
-        try:
-            await asyncio.sleep(10)
-            factory = session_factory()
-            async with factory() as session:
-                now = datetime.now(timezone.utc)
-                cutoff_edge = now - timedelta(seconds=30)
-                cutoff_conn = now - timedelta(seconds=35)
-                cutoff_com = now - timedelta(seconds=30)
+HEALTH_LOOP_PERIOD_S = HEARTBEAT_PERIOD_S
+PRUNE_EVERY_TICKS = 60  # every 5 minutes
+COMMISSION_TIMEOUT_S = 30
+PRUNE_BATCH = 5000
+PRUNE_MAX_BATCHES = 20
+DEDUP_KEEP = timedelta(days=7)
+QUARANTINE_KEEP = timedelta(days=30)
+AUDIT_NOISE_KEEP = timedelta(days=30)
+AUDIT_NOISE_TYPES = ["INGEST_REJECTED", "CONNECTION_DEGRADED", "CONNECTION_RECOVERED", "EDGE_OFFLINE", "EDGE_ONLINE"]
 
-                # 1. Edge offline transition (CR-E02, EDGE-05)
-                stale_edges = await fetch_all(
-                    session,
-                    """
-                    SELECT id, tenant_id, name, health
-                    FROM edge_nodes
-                    WHERE enrollment_status = 'ENROLLED'
-                      AND health NOT IN ('OFFLINE', 'UNKNOWN')
-                      AND (last_heartbeat IS NULL OR last_heartbeat < :cutoff)
-                    """,
-                    {"cutoff": cutoff_edge},
-                )
-                for e in stale_edges:
-                    await execute(
-                        session,
-                        "UPDATE edge_nodes SET health = 'OFFLINE' WHERE id = :id",
-                        {"id": e["id"]},
-                    )
-                    await audit(
-                        session,
-                        tenant_id=as_uuid(e["tenant_id"]),
-                        event_type="EDGE_OFFLINE",
-                        actor_id=None,
-                        entity_type="edge",
-                        entity_id=as_uuid(e["id"]),
-                        before={"health": e["health"]},
-                        after={"health": "OFFLINE"},
-                        correlation_id=f"health-{uuid4().hex[:8]}",
-                        severity="WARN",
-                    )
 
-                # 2. Connection degraded transition (CR-C03, EDGE-09)
-                stale_conns = await fetch_all(
-                    session,
-                    """
-                    SELECT id, tenant_id, name, health
-                    FROM connections
-                    WHERE status = 'ACTIVE'
-                      AND health NOT IN ('DEGRADED', 'PAUSED')
-                      AND (last_success_at IS NULL OR last_success_at < :cutoff)
-                    """,
-                    {"cutoff": cutoff_conn},
-                )
-                for c in stale_conns:
-                    await execute(
-                        session,
-                        "UPDATE connections SET health = 'DEGRADED', last_error = 'No data received for 30 s' WHERE id = :id",
-                        {"id": c["id"]},
-                    )
-                    await audit(
-                        session,
-                        tenant_id=as_uuid(c["tenant_id"]),
-                        event_type="CONNECTION_DEGRADED",
-                        actor_id=None,
-                        entity_type="connection",
-                        entity_id=as_uuid(c["id"]),
-                        before={"health": c["health"]},
-                        after={"health": "DEGRADED", "last_error": "No data received for 30 s"},
-                        correlation_id=f"health-{uuid4().hex[:8]}",
-                        severity="WARN",
-                    )
+async def _run_step(name: str, step: Any) -> None:
+    """Run one background step in its own session; failures are logged and never stop the loop."""
+    try:
+        async with session_factory()() as session:
+            await step(session)
+            await session.commit()
+            await _flush_events(session)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - one failing step must not stop the others
+        logger.exception("Background step %s failed", name)
 
-                # 3. Commissioning timeout reaper (CR-Q06, COM-12)
-                stale_jobs = await fetch_all(
-                    session,
-                    """
-                    SELECT id, tenant_id, connection_id
-                    FROM commissioning_jobs
-                    WHERE status IN ('PENDING', 'RUNNING')
-                      AND started_at < :cutoff
-                    """,
-                    {"cutoff": cutoff_com},
-                )
-                for j in stale_jobs:
-                    await execute(
-                        session,
-                        """
-                        UPDATE commissioning_jobs
-                        SET status = 'FAILED', error_code = 'TIMEOUT',
-                            diagnostic = 'The edge did not answer within 30 seconds.',
-                            completed_at = :now
-                        WHERE id = :id
-                        """,
-                        {"id": j["id"], "now": now},
-                    )
-                    await audit(
-                        session,
-                        tenant_id=as_uuid(j["tenant_id"]),
-                        event_type="COMMISSION_FAILED",
-                        actor_id=None,
-                        entity_type="commissioning",
-                        entity_id=as_uuid(j["id"]),
-                        before={"status": "PENDING"},
-                        after={"status": "FAILED", "error_code": "TIMEOUT"},
-                        correlation_id=f"reaper-{uuid4().hex[:8]}",
-                        severity="WARN",
-                    )
-                await session.commit()
-        except asyncio.CancelledError:
+
+async def _evaluate_edges(session: AsyncSession) -> None:
+    """Edge OFFLINE comes only from heartbeat age (> 3 heartbeat periods)."""
+    now = utcnow()
+    stale = await fetch_all(
+        session,
+        """
+        SELECT id, tenant_id, name, health, enrollment_status, last_heartbeat, desired_revision, active_revision
+        FROM edge_nodes
+        WHERE enrollment_status = 'ENROLLED'
+          AND health <> 'OFFLINE'
+          AND (last_heartbeat IS NULL OR last_heartbeat < :cutoff)
+        FOR UPDATE SKIP LOCKED
+        """,
+        {"cutoff": now - timedelta(seconds=EDGE_OFFLINE_AFTER_S)},
+    )
+    for edge in stale:
+        await execute(session, "UPDATE edge_nodes SET health = 'OFFLINE' WHERE id = :id", {"id": edge["id"]})
+        await audit(
+            session,
+            tenant_id=as_uuid(edge["tenant_id"]),
+            event_type="EDGE_OFFLINE",
+            actor_id=None,
+            entity_type="edge",
+            entity_id=as_uuid(edge["id"]),
+            before={"health": edge["health"]},
+            after={"health": "OFFLINE", "last_heartbeat": iso_ms(edge.get("last_heartbeat"))},
+            correlation_id=f"health-{uuid4().hex[:8]}",
+            severity="WARN",
+        )
+        edge["health"] = "OFFLINE"
+        queue_stream_event(session, "health", edge["tenant_id"], edge_sync.edge_health_payload(edge, now))
+
+
+async def _evaluate_connections(session: AsyncSession) -> None:
+    """Center-side fallback: DEGRADED only when an online, in-sync edge delivers no samples.
+
+    A connection without active bindings is never degraded (its effective health is IDLE). The
+    reference time is the latest of the last sample, the binding change, the connection change
+    and the edge's last configuration activation, so new work is not degraded prematurely.
+    """
+    now = utcnow()
+    rows = await fetch_all(
+        session,
+        """
+        SELECT c.id, c.tenant_id, c.health, c.last_error, c.last_success_at, c.created_at, c.updated_at,
+               e.enrollment_status, e.health AS edge_health, e.last_heartbeat, e.desired_revision, e.active_revision,
+               (SELECT max(d.at) FROM deployment_events d WHERE d.edge_id = e.id AND d.state = 'ACTIVE') AS activated_at,
+               bnd.active_bindings, bnd.bindings_since,
+               (SELECT min(j.interval_ms) FROM acquisition_jobs j WHERE j.connection_id = c.id AND j.enabled = TRUE) AS interval_ms
+        FROM connections c
+        JOIN edge_nodes e ON e.id = c.edge_id
+        JOIN LATERAL (
+            SELECT count(DISTINCT b.signal_id) AS active_bindings, max(b.valid_from) AS bindings_since
+            FROM acquisition_jobs j
+            JOIN source_fields f ON f.acquisition_job_id = j.id
+            JOIN signal_bindings b ON b.source_field_id = f.id
+            JOIN signal_definitions s ON s.id = b.signal_id
+            WHERE j.connection_id = c.id AND b.enabled = TRUE AND b.valid_to IS NULL AND s.status = 'ACTIVE'
+        ) bnd ON TRUE
+        WHERE c.status = 'ACTIVE' AND c.health <> 'DEGRADED'
+        """,
+        {},
+    )
+    for row in rows:
+        if int(row.get("active_bindings") or 0) <= 0:
+            continue
+        edge = {
+            "enrollment_status": row["enrollment_status"],
+            "health": row["edge_health"],
+            "last_heartbeat": row["last_heartbeat"],
+            "desired_revision": row["desired_revision"],
+            "active_revision": row["active_revision"],
+        }
+        if effective_edge_health(edge, now) != "ONLINE" or edge_config_state(edge) == "PENDING":
+            continue
+        since_candidates = [row.get(key) for key in ("bindings_since", "created_at", "updated_at", "activated_at") if row.get(key)]
+        since = max(since_candidates) if since_candidates else None
+        if not connection_no_data_due(last_success_at=row.get("last_success_at"), since=since, interval_ms=row.get("interval_ms"), now=now):
+            continue
+        message = no_data_message(row.get("interval_ms"))
+        changed = await execute_rowcount(
+            session,
+            "UPDATE connections SET health = 'DEGRADED', last_error = :error WHERE id = :id AND status = 'ACTIVE' AND health <> 'DEGRADED'",
+            {"id": row["id"], "error": message},
+        )
+        if not changed:
+            continue
+        await audit(
+            session,
+            tenant_id=as_uuid(row["tenant_id"]),
+            event_type="CONNECTION_DEGRADED",
+            actor_id=None,
+            entity_type="connection",
+            entity_id=as_uuid(row["id"]),
+            before={"health": row["health"]},
+            after={"health": "DEGRADED", "last_error": message, "source": "center"},
+            correlation_id=f"health-{uuid4().hex[:8]}",
+            severity="WARN",
+        )
+        queue_stream_event(
+            session,
+            "health",
+            row["tenant_id"],
+            telemetry.connection_health_payload(
+                connection_id=row["id"],
+                health="DEGRADED",
+                effective_health="DEGRADED",
+                last_error=message,
+                last_success_at=row.get("last_success_at"),
+            ),
+        )
+
+
+async def _reap_commissioning(session: AsyncSession) -> None:
+    now = utcnow()
+    stale_jobs = await fetch_all(
+        session,
+        """
+        SELECT id, tenant_id, connection_id, status
+        FROM commissioning_jobs
+        WHERE status IN ('PENDING', 'RUNNING') AND started_at < :cutoff
+        FOR UPDATE SKIP LOCKED
+        """,
+        {"cutoff": now - timedelta(seconds=COMMISSION_TIMEOUT_S)},
+    )
+    for job in stale_jobs:
+        await execute(
+            session,
+            """
+            UPDATE commissioning_jobs
+            SET status = 'FAILED', error_code = 'TIMEOUT',
+                diagnostic = 'The edge did not answer within 30 seconds.',
+                completed_at = :now
+            WHERE id = :id
+            """,
+            {"id": job["id"], "now": now},
+        )
+        await audit(
+            session,
+            tenant_id=as_uuid(job["tenant_id"]),
+            event_type="COMMISSION_FAILED",
+            actor_id=None,
+            entity_type="commissioning",
+            entity_id=as_uuid(job["id"]),
+            before={"status": job["status"]},
+            after={"status": "FAILED", "error_code": "TIMEOUT"},
+            correlation_id=f"reaper-{uuid4().hex[:8]}",
+            severity="WARN",
+        )
+
+
+async def _delete_in_batches(session: AsyncSession, sql: str, params: dict[str, Any]) -> int:
+    total = 0
+    for _ in range(PRUNE_MAX_BATCHES):
+        deleted = await execute_rowcount(session, sql, {**params, "batch": PRUNE_BATCH})
+        await session.commit()
+        total += deleted
+        if deleted < PRUNE_BATCH:
             break
-        except Exception:
-            pass
+    return total
 
+
+async def _prune(session: AsyncSession) -> None:
+    """Bounded housekeeping: dedup keys > 7 days, quarantine > 30 days, health audit noise > 30 days,
+    and observations past enabled retention policies."""
+    now = utcnow()
+    dedup = await _delete_in_batches(
+        session,
+        "DELETE FROM ingest_dedup WHERE ctid IN (SELECT ctid FROM ingest_dedup WHERE first_seen_at < :cutoff LIMIT :batch)",
+        {"cutoff": now - DEDUP_KEEP},
+    )
+    quarantine = await _delete_in_batches(
+        session,
+        "DELETE FROM observation_quarantine WHERE id IN (SELECT id FROM observation_quarantine WHERE received_time < :cutoff LIMIT :batch)",
+        {"cutoff": now - QUARANTINE_KEEP},
+    )
+    noise = await _delete_in_batches(
+        session,
+        "DELETE FROM audit_events WHERE id IN (SELECT id FROM audit_events WHERE event_type = ANY(:types) AND occurred_at < :cutoff LIMIT :batch)",
+        {"cutoff": now - AUDIT_NOISE_KEEP, "types": AUDIT_NOISE_TYPES},
+    )
+    observations = await telemetry.apply_retention_policies(session, now, batch=PRUNE_BATCH, max_batches=PRUNE_MAX_BATCHES)
+    if dedup or quarantine or noise or observations:
+        logger.info(
+            "Pruned %d dedup keys, %d quarantined samples, %d health audit events, %d observations",
+            dedup,
+            quarantine,
+            noise,
+            observations,
+        )
+
+
+def _appliance_paths() -> tuple[Path, Path]:
+    data_dir = Path(settings.data_dir)
+    token_path = Path(os.environ.get("FACTORIX_ENROLLMENT_FILE") or (data_dir / "enrollment"))
+    credential_path = Path(os.environ.get("FACTORIX_CREDENTIAL_PATH") or (data_dir / "edge-credential"))
+    return token_path, credential_path
+
+
+def _file_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+    except OSError:
+        logger.warning("Cannot read %s", path, exc_info=True)
+        return ""
+
+
+def _write_private(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid4().hex[:8]}.tmp")
+    temp.write_text(content, encoding="utf-8")
+    try:
+        temp.chmod(0o600)
+    except OSError:
+        logger.debug("chmod not supported for %s", temp)
+    os.replace(temp, path)
+
+
+async def _ensure_appliance_enrollment(session: AsyncSession) -> None:
+    """Appliance mode: keep an unused enrollment token in the shared data directory while the local
+    edge is not genuinely enrolled (for example right after Revert-To-Zero, or after the edge
+    discarded a credential that Center rejected)."""
+    if not settings.appliance or not settings.data_dir:
+        return
+    edge = await fetch_one(
+        session,
+        """
+        SELECT id, tenant_id, enrollment_status, credential_hash IS NOT NULL AS has_credential, last_heartbeat
+        FROM edge_nodes WHERE enrollment_status <> 'REVOKED'
+        ORDER BY created_at ASC LIMIT 1
+        """,
+        {},
+    )
+    if edge is None:
+        return
+    token_path, credential_path = _appliance_paths()
+    token = _file_text(token_path)
+    token_state = "MISSING"
+    if token:
+        valid = await fetch_one(
+            session,
+            """
+            SELECT 1 AS ok FROM edge_enrollment_tokens
+            WHERE token_hash = :hash AND edge_id = :edge_id AND used_at IS NULL AND expires_at > :soon
+            """,
+            {"hash": hash_token(token), "edge_id": edge["id"], "soon": utcnow() + timedelta(seconds=60)},
+        )
+        token_state = "VALID" if valid else "INVALID"
+    if not appliance_needs_enrollment(
+        edge=edge,
+        credential_file_present=bool(_file_text(credential_path)),
+        token_file_state=token_state,
+        now=utcnow(),
+    ):
+        return
+    tenant_id = as_uuid(edge["tenant_id"])
+    admin_row = await fetch_one(session, "SELECT id FROM admin_accounts WHERE tenant_id = :tenant_id ORDER BY created_at ASC LIMIT 1", {"tenant_id": tenant_id})
+    actor = as_uuid(admin_row["id"]) if admin_row else None
+    issued = await collect.issue_enrollment(session, tenant_id, as_uuid(edge["id"]), actor, "appliance-enrollment")  # type: ignore[arg-type]
+    await session.commit()  # the token must exist before the edge can read the file
+    _write_private(token_path, str(issued["enrollment_token"]))
+    logger.info("Wrote a new enrollment token for the local edge %s (previous token file: %s)", edge["id"], token_state)
+
+
+async def _ensure_initial_release(session: AsyncSession) -> None:
+    """Appliance boot: an edge with active connections but no published release gets one."""
+    if not settings.appliance:
+        return
+    edge = await fetch_one(session, "SELECT id, tenant_id FROM edge_nodes WHERE enrollment_status <> 'REVOKED' ORDER BY created_at ASC LIMIT 1", {})
+    if edge is None:
+        return
+    edge_id = as_uuid(edge["id"])
+    tenant_id = as_uuid(edge["tenant_id"])
+    active_conns = await fetch_one(session, "SELECT count(*) AS cnt FROM connections WHERE edge_id = :edge_id AND status = 'ACTIVE'", {"edge_id": edge_id})
+    has_release = await fetch_one(session, "SELECT count(*) AS cnt FROM configuration_releases WHERE edge_id = :edge_id AND status = 'PUBLISHED'", {"edge_id": edge_id})
+    if int((active_conns or {}).get("cnt") or 0) > 0 and int((has_release or {}).get("cnt") or 0) == 0:
+        admin_row = await fetch_one(session, "SELECT id FROM admin_accounts WHERE tenant_id = :tenant_id ORDER BY created_at ASC LIMIT 1", {"tenant_id": tenant_id})
+        actor = as_uuid(admin_row["id"]) if admin_row else None
+        await collect.publish_release(session, tenant_id, actor, collect.ReleaseIn(edge_id=str(edge_id)), "appliance-boot-release")  # type: ignore[arg-type]
 
 
 async def _appliance_auto_enroll() -> None:
     if not settings.appliance or not settings.data_dir:
         return
-    try:
-        data_dir = Path(settings.data_dir)
-        cred_file = data_dir / "edge-credential"
-        factory = session_factory()
-        async with factory() as session:
-            edge = await fetch_one(session, "SELECT id, tenant_id FROM edge_nodes ORDER BY created_at ASC LIMIT 1", {})
-            if not edge:
-                return
-            tenant_id = as_uuid(edge["tenant_id"])
-            edge_id = as_uuid(edge["id"])
-            if not (cred_file.is_file() and cred_file.read_text(encoding="utf-8").strip()):
-                admin_row = await fetch_one(session, "SELECT id FROM admin_accounts WHERE tenant_id = :tenant_id ORDER BY created_at ASC LIMIT 1", {"tenant_id": tenant_id})
-                actor = as_uuid(admin_row["id"]) if admin_row else None
-                issued = await collect.issue_enrollment(session, tenant_id, edge_id, actor, "appliance-boot")
-                await session.commit()
-                data_dir.mkdir(parents=True, exist_ok=True)
-                target = data_dir / "enrollment"
-                target.write_text(str(issued["enrollment_token"]), encoding="utf-8")
+    await _run_step("appliance_initial_release", _ensure_initial_release)
+    await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
 
-            active_conns = await fetch_one(session, "SELECT count(*) AS cnt FROM connections WHERE edge_id = :edge_id AND status = 'ACTIVE'", {"edge_id": edge_id})
-            has_release = await fetch_one(session, "SELECT count(*) AS cnt FROM configuration_releases WHERE edge_id = :edge_id AND status = 'PUBLISHED'", {"edge_id": edge_id})
-            if active_conns and int(active_conns.get("cnt") or 0) > 0 and (not has_release or int(has_release.get("cnt") or 0) == 0):
-                admin_row = await fetch_one(session, "SELECT id FROM admin_accounts WHERE tenant_id = :tenant_id ORDER BY created_at ASC LIMIT 1", {"tenant_id": tenant_id})
-                actor = as_uuid(admin_row["id"]) if admin_row else None
-                await collect.publish_release(session, tenant_id, actor, collect.ReleaseIn(edge_id=str(edge_id)), "appliance-boot-release")
+
+async def _background_health_loop() -> None:
+    tick = 0
+    while True:
+        try:
+            await asyncio.sleep(HEALTH_LOOP_PERIOD_S)
+        except asyncio.CancelledError:
+            break
+        tick += 1
+        try:
+            await _run_step("edge_health", _evaluate_edges)
+            await _run_step("connection_health", _evaluate_connections)
+            await _run_step("commissioning_reaper", _reap_commissioning)
+            if settings.appliance:
+                await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
+            if tick % PRUNE_EVERY_TICKS == 0:
+                await _run_step("prune", _prune)
+        except asyncio.CancelledError:
+            break
+
+
+async def _models_background_loop() -> None:
+    """Data models: re-publish STATE bodies (republish_ms), finalise PENDING events, prune events (every 60 s)."""
+    log = logging.getLogger("factorix.models_loop")
+    tick = 0
+    while True:
+        try:
+            await asyncio.sleep(1)
+            tick += 1
+            async with session_factory()() as session:
+                await models_engine.run_maintenance(session, prune=tick % 60 == 0)
                 await session.commit()
-    except Exception:
+                await flush(session)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            log.exception("Data model maintenance tick failed")
+
+
+async def _stop(task: asyncio.Task[Any]) -> None:
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
         pass
+    except Exception:  # noqa: BLE001 - shutdown must continue; the error is logged
+        logger.exception("Background task %s failed during shutdown", task.get_name())
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    task = asyncio.create_task(_background_health_loop())
-    asyncio.create_task(_appliance_auto_enroll())
+    task = asyncio.create_task(_background_health_loop(), name="health-loop")
+    models_task = asyncio.create_task(_models_background_loop(), name="models-loop")
+    enroll_task = asyncio.create_task(_appliance_auto_enroll(), name="appliance-enroll")
+    app.state.background_tasks = (task, models_task, enroll_task)
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+        await _stop(enroll_task)
+        await _stop(models_task)
+        await _stop(task)
 
 
 app = FastAPI(title="FactoriX IIoT Center", version="1.0.0", openapi_url="/api/openapi.json", lifespan=lifespan)
@@ -429,6 +647,7 @@ async def revert_zero(body: RevertIn, response: Response, principal: dict[str, A
     if body.confirm != "REVERT":
         raise AppError(422, "CONFIRM", "Type REVERT exactly to wipe this installation.")
     await identity.revert_to_zero(session)
+    await _commit_now(session)
     if settings.data_dir:
         root = Path(settings.data_dir)
         for name in (
@@ -441,8 +660,15 @@ async def revert_zero(body: RevertIn, response: Response, principal: dict[str, A
             "edge-health.json",
         ):
             target = root / name
-            if target.is_file():
-                target.unlink()
+            try:
+                if target.is_file():
+                    target.unlink()
+            except OSError:
+                logger.warning("Revert-To-Zero could not remove %s", target, exc_info=True)
+    # The running edge now gets 401, discards its credential and waits for a token file. A token
+    # is written as soon as an edge exists again (first connection) by the appliance enrollment
+    # step, which also runs here for completeness.
+    await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
     clear_cookies(response, settings)
     return {"status": "empty"}
 
@@ -659,7 +885,12 @@ async def connections(protocol: str | None = None, site_id: str | None = None, s
 @app.post("/api/v1/connections", status_code=201)
 async def create_connection(body: ConnectionIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
-    return await collect.create_connection(session, tenant_id, actor, body, data_key=settings.data_key, correlation_id=correlation_id(request))
+    created = await collect.create_connection(session, tenant_id, actor, body, data_key=settings.data_key, correlation_id=correlation_id(request))
+    if settings.appliance:
+        # A first connection may have created the local edge: hand it an enrollment token now.
+        await _commit_now(session)
+        await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
+    return created
 
 
 @app.get("/api/v1/connections/{connection_id}")
@@ -703,7 +934,8 @@ async def commission(connection_id: str, request: Request, body: TestIn | None =
     tenant_id, actor = _ids(principal)
     mode = body.mode if body and body.mode else "FULL"
     fields = body.fields if body else None
-    return await collect.request_commission(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request), mode=mode, fields=fields)
+    config = body.config if body else None
+    return await collect.request_commission(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request), mode=mode, fields=fields, config=config)
 
 
 @app.get("/api/v1/commissioning/{job_id}")
@@ -884,16 +1116,64 @@ async def group_preview(group_id: str, principal: dict[str, Any] = Depends(admin
     return await collect.preview_output_group(session, tenant_id, parse_uuid(group_id))
 
 
-@app.post("/api/v1/output-groups/{group_id}/publish")
-async def publish_group(group_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+@app.get("/api/v1/output-groups/{group_id}/latest")
+async def group_latest(group_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
-    from factorix.modules.common import execute
+    return await collect.latest_output_group(session, tenant_id, parse_uuid(group_id))
 
-    row = await fetch_one(session, "SELECT id FROM output_groups WHERE id = :id AND tenant_id = :tenant_id", {"id": parse_uuid(group_id), "tenant_id": tenant_id})
-    if row is None:
-        raise AppError(404, "NOT_FOUND", "Output group not found.")
-    await execute(session, "UPDATE output_groups SET status = 'PUBLISHED', version = version + 1 WHERE id = :id", {"id": parse_uuid(group_id)})
-    return {"id": group_id, "status": "PUBLISHED"}
+
+@app.get("/api/v1/output-groups/{group_id}/events")
+async def group_events(group_id: str, limit: int = 50, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> list[dict[str, Any]]:
+    tenant_id, _actor = _ids(principal)
+    return await collect.output_group_events(session, tenant_id, parse_uuid(group_id), limit=limit)
+
+
+@app.post("/api/v1/output-groups/{group_id}/publish")
+async def publish_group(group_id: str, request: Request, body: collect.OutputGroupPublishIn | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.publish_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
+
+
+@app.post("/api/v1/output-groups/{group_id}/unpublish")
+async def unpublish_group(group_id: str, request: Request, body: collect.OutputGroupPublishIn | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.unpublish_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
+
+
+@app.post("/api/v1/output-groups/{group_id}/duplicate")
+async def duplicate_group(group_id: str, body: collect.OutputGroupDuplicateIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.duplicate_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
+
+
+@app.get("/api/v1/model-templates")
+async def model_templates(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, _actor = _ids(principal)
+    return await collect.list_model_templates(session, tenant_id)
+
+
+@app.post("/api/v1/model-templates", status_code=201)
+async def create_model_template(body: collect.ModelTemplateIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.create_model_template(session, tenant_id, actor, body, correlation_id(request))
+
+
+@app.patch("/api/v1/model-templates/{template_id}")
+async def patch_model_template(template_id: str, body: collect.ModelTemplatePatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.patch_model_template(session, tenant_id, actor, parse_uuid(template_id), body, correlation_id(request))
+
+
+@app.delete("/api/v1/model-templates/{template_id}")
+async def delete_model_template(template_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.delete_model_template(session, tenant_id, actor, parse_uuid(template_id), correlation_id(request))
+
+
+@app.post("/api/v1/model-templates/{template_id}/apply")
+async def apply_model_template(template_id: str, body: collect.TemplateApplyIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.apply_model_template(session, tenant_id, actor, parse_uuid(template_id), body, correlation_id(request))
 
 
 @app.post("/api/v1/edges", status_code=201)
@@ -902,17 +1182,20 @@ async def create_edge(body: EdgeIn, request: Request, principal: dict[str, Any] 
     return await collect.create_edge(session, tenant_id, actor, body, correlation_id(request))
 
 
-def _normalize_edge(row: dict[str, Any]) -> dict[str, Any]:
+def _normalize_edge(row: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """Edge view with the single server-side health rule (domain.health.effective_edge_health).
+
+    ``health`` and ``effective_health`` are NOT_ENROLLED | OFFLINE | DEGRADED | ONLINE; a release
+    being applied is ONLINE with ``config_state`` PENDING. ``health_raw`` keeps the stored value.
+    """
     item = dict(row)
+    item.pop("credential_hash", None)
+    effective = effective_edge_health(item, now or utcnow())
     item["health_raw"] = item.get("health")
-    if item.get("enrollment_status") != "ENROLLED":
-        item["health"] = "NOT_ENROLLED"
-    elif item.get("health") in {"HEALTHY", "ACTIVE", "CONFIG_VALIDATED"}:
-        item["health"] = "ONLINE"
-    elif item.get("health") in {"DEGRADED", "OFFLINE"}:
-        pass
-    else:
-        item["health"] = "OFFLINE"
+    item["health"] = effective
+    item["effective_health"] = effective
+    item["config_state"] = edge_config_state(item)
+    item["last_heartbeat"] = iso_ms(item.get("last_heartbeat"))
     return item
 
 
@@ -973,14 +1256,9 @@ async def appliance_enrollment(edge_id: str, request: Request, principal: dict[s
         raise AppError(404, "NOT_FOUND", "Appliance enrollment is not enabled.")
     tenant_id, actor = _ids(principal)
     issued = await collect.issue_enrollment(session, tenant_id, parse_uuid(edge_id), actor, correlation_id(request))
-    directory = Path(settings.data_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / "enrollment"
-    target.write_text(str(issued["enrollment_token"]), encoding="utf-8")
-    try:
-        target.chmod(0o600)
-    except OSError:
-        pass
+    await _commit_now(session)
+    token_path, _credential_path = _appliance_paths()
+    _write_private(token_path, str(issued["enrollment_token"]))
     return {"status": "queued"}
 
 
@@ -1111,21 +1389,9 @@ async def formulas(principal: dict[str, Any] = Depends(admin), session: AsyncSes
 
 
 @app.get("/api/v1/output-groups")
-async def output_groups(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+async def output_groups(resource_id: str | None = None, include_archived: bool = False, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
-    items = await fetch_all(
-        session,
-        """
-        SELECT g.id, g.resource_id, g.key, g.display_name, g.topic_template, g.status, g.version, r.code AS resource_code,
-               (SELECT count(*) FROM output_group_members m WHERE m.output_group_id = g.id) AS member_count
-        FROM output_groups g
-        JOIN resources r ON r.id = g.resource_id
-        WHERE g.tenant_id = :tenant_id AND g.status <> 'ARCHIVED'
-        ORDER BY r.code, g.key
-        """,
-        {"tenant_id": tenant_id},
-    )
-    return {"items": items}
+    return await collect.list_output_groups(session, tenant_id, resource_id=resource_id, include_archived=include_archived)
 
 
 @app.get("/api/v1/commissioning")
@@ -1226,10 +1492,10 @@ async def audit_events(
     if cursor:
         try:
             cursor_dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
-            clauses.append("occurred_at < :cursor_dt")
-            params["cursor_dt"] = cursor_dt
-        except Exception:
-            pass
+        except ValueError as exc:
+            raise AppError(422, "CURSOR", "Invalid cursor.") from exc
+        clauses.append("occurred_at < :cursor_dt")
+        params["cursor_dt"] = cursor_dt
 
     where_sql = " AND ".join(clauses)
     rows = await fetch_all(
@@ -1256,33 +1522,49 @@ async def audit_events(
 @app.get("/api/v1/overview")
 async def overview(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
+    now = utcnow()
     resources_count = await fetch_one(session, "SELECT count(*) AS count FROM resources WHERE tenant_id = :tenant_id AND archived_at IS NULL", {"tenant_id": tenant_id})
     machines = await fetch_one(session, "SELECT count(*) AS count FROM resources r JOIN resource_types t ON t.id = r.type_id WHERE r.tenant_id = :tenant_id AND t.key = 'machine' AND r.archived_at IS NULL", {"tenant_id": tenant_id})
-    connections = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status = 'ACTIVE'", {"tenant_id": tenant_id})
-    conn_total_row = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status <> 'ARCHIVED'", {"tenant_id": tenant_id})
-    conn_online_row = await fetch_one(session, "SELECT count(*) AS count FROM connections WHERE tenant_id = :tenant_id AND status = 'ACTIVE' AND health IN ('HEALTHY', 'ONLINE')", {"tenant_id": tenant_id})
-    edges = await fetch_all(session, "SELECT id, name, health, active_revision, desired_revision, last_heartbeat, outbox_pending FROM edge_nodes WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
-    healthy = sum(1 for edge in edges if edge["health"] in {"HEALTHY", "ACTIVE", "ONLINE"})
+    edge_rows = await fetch_all(
+        session,
+        "SELECT id, name, health, enrollment_status, active_revision, desired_revision, last_heartbeat, outbox_pending FROM edge_nodes WHERE tenant_id = :tenant_id ORDER BY name",
+        {"tenant_id": tenant_id},
+    )
+    edges = [_normalize_edge(edge, now) for edge in edge_rows]
+    connection_items = await collect.list_connections(session, tenant_id, protocol=None, site_id=None, status=None)
+    connection_states = [str(item["effective_health"]) for item in connection_items]
+    health_counts: dict[str, int] = {}
+    for state in connection_states:
+        health_counts[state] = health_counts.get(state, 0) + 1
+    online_edges = sum(1 for edge in edges if edge["effective_health"] == "ONLINE")
     storage = await telemetry.storage_overview(session, tenant_id)
     last_obs = await fetch_one(session, "SELECT max(received_time) AS last_at FROM latest_signal_state WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
-    last_data_at = last_obs["last_at"].isoformat().replace("+00:00", "Z") if last_obs and last_obs["last_at"] else None
+    recent_errors = [
+        {"id": item["id"], "name": item["name"], "last_error": item["last_error"], "health": item["health"], "effective_health": item["effective_health"]}
+        for item in connection_items
+        if item.get("last_error") and item["effective_health"] in {"DEGRADED", "HEALTHY"}
+    ][:8]
 
     return {
         "resources": int(resources_count["count"]) if resources_count else 0,
         "machines": int(machines["count"]) if machines else 0,
-        "active_connections": int(connections["count"]) if connections else 0,
-        "connections_online": int(conn_online_row["count"]) if conn_online_row else 0,
-        "connections_total": int(conn_total_row["count"]) if conn_total_row else 0,
-        "healthy_edges": healthy,
-        "edges_online": healthy,
+        "active_connections": sum(1 for item in connection_items if item.get("status") == "ACTIVE"),
+        "connections_online": health_counts.get("HEALTHY", 0),
+        "connections_idle": health_counts.get("IDLE", 0),
+        "connections_degraded": health_counts.get("DEGRADED", 0),
+        "connections_total": len(connection_items),
+        "healthy_edges": online_edges,
+        "edges_online": online_edges,
         "edges_total": len(edges),
-        "last_data_at": last_data_at,
+        "collector_status": collector_status([edge["effective_health"] for edge in edges]),
+        "data_collection_status": data_collection_status(connection_states),
+        "last_data_at": iso_ms(last_obs["last_at"]) if last_obs else None,
         "ingest_per_minute": storage["ingest_per_minute"],
         "messages_per_min": storage["ingest_per_minute"],
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "generated_at": iso_ms(now),
         "edges": edges,
-        "connection_health": await fetch_all(session, "SELECT health, count(*) AS count FROM connections WHERE tenant_id = :tenant_id GROUP BY health", {"tenant_id": tenant_id}),
-        "recent_errors": await fetch_all(session, "SELECT id, name, last_error, health FROM connections WHERE tenant_id = :tenant_id AND last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 8", {"tenant_id": tenant_id}),
+        "connection_health": [{"health": state, "count": count} for state, count in sorted(health_counts.items())],
+        "recent_errors": recent_errors,
     }
 
 
@@ -1323,14 +1605,20 @@ def _bearer(request: Request) -> str | None:
 
 @app.post("/api/v1/edge-sync/enroll")
 async def edge_enroll(body: EdgeEnrollIn, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
-    return await edge_sync.enroll(session, body.enrollment_token)
+    result = await edge_sync.enroll(session, body.enrollment_token)
+    await _commit_now(session)
+    return result
 
 
 @app.post("/api/v1/edge-sync/heartbeat")
 async def edge_heartbeat(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     body = await request.json()
-    return await edge_sync.heartbeat(session, edge, body)
+    if not isinstance(body, dict):
+        raise AppError(422, "BODY", "Heartbeat body must be a JSON object.")
+    result = await edge_sync.heartbeat(session, edge, body)
+    await _commit_now(session)
+    return result
 
 
 @app.get("/api/v1/edge-sync/config")
@@ -1342,7 +1630,9 @@ async def edge_config(request: Request, session: AsyncSession = Depends(db_sessi
 @app.post("/api/v1/edge-sync/ack")
 async def edge_ack(body: EdgeAckIn, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
-    return await edge_sync.acknowledge(session, edge, body.revision, body.state, body.diagnostic)
+    result = await edge_sync.acknowledge(session, edge, body.revision, body.state, body.diagnostic)
+    await _commit_now(session)
+    return result
 
 
 @app.get("/api/v1/edge-sync/secrets/{secret_id}")
@@ -1355,62 +1645,144 @@ async def edge_secret(secret_id: str, request: Request, session: AsyncSession = 
 async def edge_observations(body: EdgeBatchIn, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     result = await edge_sync.accept_observations(session, edge, body.observations)
+    # The edge marks rows ACKED as soon as it reads this response: commit first (at-least-once).
+    await _commit_now(session)
     return result
 
 
 @app.get("/api/v1/edge-sync/commands")
 async def edge_commands(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
-    return await edge_sync.pull_commands(session, edge)
+    result = await edge_sync.pull_commands(session, edge)
+    await _commit_now(session)
+    return result
 
 
 @app.post("/api/v1/edge-sync/commands/{job_id}")
 async def edge_command_result(job_id: str, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     body = await request.json()
-    return await edge_sync.finish_command(session, edge, parse_uuid(job_id), body)
+    if not isinstance(body, dict):
+        raise AppError(422, "BODY", "Command result must be a JSON object.")
+    result = await edge_sync.finish_command(session, edge, parse_uuid(job_id), body)
+    await _commit_now(session)
+    return result
+
+
+STREAM_MAX_SIGNALS = 5000
+STREAM_MAX_GROUPS = 500
+
+
+def _stream_ids(values: Any, limit: int) -> list[UUID]:
+    if not isinstance(values, list):
+        return []
+    ids: list[UUID] = []
+    for item in values[:limit]:
+        try:
+            ids.append(UUID(str(item)))
+        except ValueError:
+            continue
+    return ids
+
+
+def _latest_message(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "latest",
+        "signal_id": str(row["signal_id"]),
+        "value": row.get("value"),
+        "quality": row.get("raw_quality"),
+        "effective_status": row.get("effective_status"),
+        "reason_code": row.get("reason_code"),
+        "received_time": row.get("received_time"),
+        "source_time": row.get("source_time"),
+    }
+
+
+async def _stream_subscribe_signals(channel: Channel, tenant_id: UUID, message: dict[str, Any]) -> int:
+    requested = _stream_ids(message.get("signal_ids"), STREAM_MAX_SIGNALS)
+    valid: list[UUID] = []
+    async with session_factory()() as session:
+        if requested:
+            rows = await fetch_all(
+                session,
+                "SELECT id FROM signal_definitions WHERE tenant_id = :tenant_id AND id = ANY(:ids)",
+                {"tenant_id": tenant_id, "ids": requested},
+            )
+            valid = [as_uuid(row["id"]) for row in rows]
+        if message.get("mode") != "add":
+            channel.signals.clear()
+        channel.signals.update(str(item) for item in valid)
+        # Initial snapshot so the page shows current values immediately, then pushes follow.
+        for start in range(0, len(valid), 200):
+            for row in await telemetry.latest_states(session, tenant_id, valid[start : start + 200]):
+                channel.offer(_latest_message(row))
+    return len(channel.signals)
+
+
+async def _stream_subscribe_models(channel: Channel, tenant_id: UUID, message: dict[str, Any]) -> int:
+    requested = _stream_ids(message.get("group_ids"), STREAM_MAX_GROUPS)
+    valid: list[str] = []
+    if requested:
+        async with session_factory()() as session:
+            rows = await fetch_all(
+                session,
+                "SELECT id FROM output_groups WHERE tenant_id = :tenant_id AND id = ANY(:ids)",
+                {"tenant_id": tenant_id, "ids": requested},
+            )
+            valid = [str(row["id"]) for row in rows]
+    if message.get("mode") != "add":
+        channel.groups.clear()
+    channel.groups.update(valid)
+    return len(channel.groups)
 
 
 @app.websocket("/stream")
 async def stream(socket: WebSocket) -> None:
+    allowed = [settings.web_origin] if settings.web_origin else []
+    if not origin_allowed(socket.headers.get("origin"), socket.headers.get("host"), allowed):
+        await socket.close(code=4403)
+        return
     await socket.accept()
-    factory = session_factory()
-    async with factory() as session:
-        cookie = socket.cookies.get(SESSION_COOKIE)
+    async with session_factory()() as session:
         try:
-            principal = await principal_from_token(session, cookie)
+            principal = await principal_from_token(session, socket.cookies.get(SESSION_COOKIE))
         except AppError:
             await socket.close(code=4401)
             return
-        tenant_id = str(principal["tenant_id"])
-    subscribed: set[str] = set()
-    hub.sockets.append((socket, subscribed, tenant_id))
+    tenant_id = as_uuid(principal["tenant_id"])
+    channel = Channel(socket.send_json, str(tenant_id))
+    hub.register(channel)
+    sender = asyncio.create_task(channel.run(), name="stream-sender")
     try:
-        while True:
-            message = await socket.receive_json()
-            if message.get("op") == "subscribe":
-                try:
-                    requested = [parse_uuid(str(item)) for item in message.get("signal_ids", [])[:200]]
-                except AppError:
-                    await socket.send_json({"type": "subscribed", "count": 0})
-                    continue
-                factory = session_factory()
-                async with factory() as session:
-                    rows = await fetch_all(
-                        session,
-                        "SELECT id FROM signal_definitions WHERE tenant_id = :tenant_id AND id = ANY(:ids)",
-                        {"tenant_id": principal["tenant_id"], "ids": requested},
-                    ) if requested else []
-                subscribed.clear()
-                subscribed.update(str(row["id"]) for row in rows)
-                await socket.send_json({"type": "subscribed", "count": len(subscribed)})
-            elif message.get("op") == "ping":
-                await socket.send_json({"type": "pong"})
+        while not channel.closed:
+            try:
+                message = await socket.receive_json()
+            except (ValueError, KeyError):
+                channel.offer({"type": "error", "code": "BAD_MESSAGE", "message": "Messages must be JSON objects."})
+                continue
+            if not isinstance(message, dict):
+                continue
+            op = message.get("op")
+            if op == "subscribe":
+                count = await _stream_subscribe_signals(channel, tenant_id, message)
+                channel.offer({"type": "subscribed", "count": count})
+            elif op == "subscribe_models":
+                count = await _stream_subscribe_models(channel, tenant_id, message)
+                channel.offer({"type": "subscribed_models", "count": count})
+            elif op == "subscribe_health":
+                # Health events are delivered to every socket of the tenant; acknowledged for clients.
+                channel.offer({"type": "subscribed_health"})
+            elif op == "ping":
+                channel.offer({"type": "pong"})
     except WebSocketDisconnect:
         pass
     finally:
-        if (socket, subscribed, tenant_id) in hub.sockets:
-            hub.sockets.remove((socket, subscribed, tenant_id))
+        hub.unregister(channel)
+        sender.cancel()
+        try:
+            await sender
+        except asyncio.CancelledError:
+            pass
 
 
 def _mount_spa() -> None:

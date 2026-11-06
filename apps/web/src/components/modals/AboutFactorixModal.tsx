@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { X, Info, ShieldCheck } from 'lucide-react';
+import { useDialogA11y } from './useDialogA11y';
 
 interface AboutFactorixModalProps {
   isOpen: boolean;
@@ -7,12 +8,16 @@ interface AboutFactorixModalProps {
 }
 
 export const AboutFactorixModal: React.FC<AboutFactorixModalProps> = ({ isOpen, onClose }) => {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useDialogA11y(isOpen, dialogRef, onClose);
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
       <div
-        className="w-full max-w-md bg-white rounded-xl shadow-2xl border border-[#D4DFEC] overflow-hidden"
+        ref={dialogRef}
+        tabIndex={-1}
+        className="w-full max-w-md bg-white rounded-xl shadow-2xl border border-[#D4DFEC] overflow-hidden outline-none"
         role="dialog"
         aria-modal="true"
         aria-labelledby="about-modal-title"

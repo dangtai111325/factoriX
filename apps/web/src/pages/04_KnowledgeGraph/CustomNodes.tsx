@@ -1,10 +1,11 @@
 import React from 'react';
 import { Handle, Position, NodeProps } from '@xyflow/react';
-import { Cpu, Radio, Network, Server, Braces, Activity } from 'lucide-react';
+import { Radio, Server, Braces, Activity, Cable } from 'lucide-react';
+import { ResourceTypeIcon, resourceTypeLabel } from '../../components/common/ResourceTypeIcon';
 
 export const ResourceNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
   const isCenter = Boolean(data?.isCenter);
-  const typeKey = String(data?.type_key || data?.type || 'resource').toUpperCase();
+  const typeKey = String(data?.type_key || data?.type || 'resource');
   const name = String(data?.label || data?.name || 'Resource');
   const code = String(data?.code || '');
 
@@ -26,12 +27,19 @@ export const ResourceNodeComponent: React.FC<NodeProps> = ({ data, selected }) =
     >
       <Handle type="target" position={Position.Left} className="!w-2 !h-2 !bg-[#134074]" />
       <div className="flex items-center justify-between gap-1 mb-1">
-        <span className="text-[9px] font-mono font-black uppercase px-1.5 py-0.5 rounded bg-[#F1F5F9] text-[#475569]">
-          {typeKey}
+        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-[#F1F5F9] text-[#475569]">
+          <ResourceTypeIcon type={typeKey} size={12} />
+          {resourceTypeLabel(typeKey)}
         </span>
-        {code && <span className="text-[10px] font-mono text-[#64748B] truncate">{code}</span>}
+        {code && (
+          <span className="text-[10px] font-mono text-[#64748B] truncate" title={code}>
+            {code}
+          </span>
+        )}
       </div>
-      <div className="text-xs font-bold text-[#0B2545] truncate">{name}</div>
+      <div className="text-xs font-bold text-[#0B2545] truncate" title={name}>
+        {name}
+      </div>
       <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-[#134074]" />
     </div>
   );
@@ -75,10 +83,11 @@ export const SignalNodeComponent: React.FC<NodeProps> = ({ data, selected }) => 
 
 export const ConnectionNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
   const name = String(data?.label || data?.name || 'Connection');
-  const protocol = String(data?.protocol || 'TCP').toUpperCase();
+  const protocol = String(data?.protocolLabel || data?.protocol || '');
   const health = String(data?.health || 'UNKNOWN').toUpperCase();
 
   const isOnline = health === 'ONLINE' || health === 'HEALTHY' || health === 'ACTIVE';
+  const isIdle = health === 'IDLE' || health === 'UNKNOWN' || health === 'PAUSED';
 
   return (
     <div
@@ -89,11 +98,17 @@ export const ConnectionNodeComponent: React.FC<NodeProps> = ({ data, selected })
       }`}
     >
       <Handle type="target" position={Position.Left} className="!w-2 !h-2 !bg-[#134074]" />
-      <span className="text-[9px] font-mono font-bold uppercase px-1.5 py-0.5 rounded bg-[#EFF6FF] text-[#134074]">
-        {protocol}
+      <Cable className="w-3.5 h-3.5 text-[#134074] shrink-0" aria-hidden="true" />
+      {protocol && (
+        <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-[#EFF6FF] text-[#134074] shrink-0">{protocol}</span>
+      )}
+      <span className="text-[11px] font-bold text-[#0B2545] truncate flex-1" title={name}>
+        {name}
       </span>
-      <span className="text-[11px] font-bold text-[#0B2545] truncate flex-1">{name}</span>
-      <span className={`w-2 h-2 rounded-full shrink-0 ${isOnline ? 'bg-[#10B981]' : 'bg-[#EF4444]'}`} />
+      <span
+        className={`w-2 h-2 rounded-full shrink-0 ${isOnline ? 'bg-[#10B981]' : isIdle ? 'bg-[#94A3B8]' : 'bg-[#F59E0B]'}`}
+        title={health.toLowerCase()}
+      />
       <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-[#134074]" />
     </div>
   );
@@ -133,8 +148,10 @@ export const ModelNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
     >
       <Handle type="target" position={Position.Left} className="!w-2 !h-2 !bg-[#7C3AED]" />
       <div className="flex items-center gap-1.5">
-        <Braces className="w-3.5 h-3.5 text-[#7C3AED] shrink-0" />
-        <span className="text-xs font-bold text-[#0B2545] truncate">{name}</span>
+        <Braces className="w-3.5 h-3.5 text-[#7C3AED] shrink-0" aria-hidden="true" />
+        <span className="text-xs font-bold text-[#0B2545] truncate" title={name}>
+          {name}
+        </span>
       </div>
     </div>
   );
@@ -142,41 +159,35 @@ export const ModelNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
 
 export const TelemetryGroupNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
   const signalCount = Number(data?.signalCount || 0);
+  const goodCount = Number(data?.goodCount || 0);
   const resourceName = String(data?.resourceName || '');
+  const tone =
+    signalCount === 0 ? 'bg-[#94A3B8]' : goodCount === signalCount ? 'bg-emerald-500' : goodCount > 0 ? 'bg-amber-500' : 'bg-[#94A3B8]';
 
   return (
     <div
-      onClick={(e) => {
-        e.stopPropagation();
-        if (typeof data?.onClick === 'function') data.onClick();
-      }}
-      className={`rounded-2xl bg-gradient-to-br from-emerald-50/95 to-teal-50/95 border-2 px-3 py-2.5 shadow-sm select-none transition-all cursor-pointer min-w-[190px] max-w-[240px] ${
-        selected
-          ? 'ring-2 ring-emerald-500 border-emerald-600 shadow-md scale-105'
-          : 'border-emerald-300 hover:border-emerald-500 hover:shadow-md'
+      className={`rounded-2xl bg-emerald-50/95 border-2 px-3 py-2.5 shadow-sm select-none transition-all cursor-pointer min-w-[190px] max-w-[240px] ${
+        selected ? 'ring-2 ring-emerald-500 border-emerald-600 shadow-md' : 'border-emerald-300 hover:border-emerald-500 hover:shadow-md'
       }`}
     >
       <Handle type="target" position={Position.Left} className="!w-2 !h-2 !bg-emerald-600" />
       <div className="flex items-center justify-between gap-1 mb-1">
         <div className="flex items-center gap-1.5">
           <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
-          <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800">
-            Live Telemetry
-          </span>
+          <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800">Data</span>
         </div>
-        <span className="text-[9px] font-mono font-extrabold px-1.5 py-0.5 rounded-full bg-emerald-200/80 text-emerald-900">
-          {signalCount} TAGS
+        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-200/80 text-emerald-900">
+          {signalCount} {signalCount === 1 ? 'signal' : 'signals'}
         </span>
       </div>
-      <div className="text-xs font-bold text-slate-900 truncate">
-        {resourceName ? `${resourceName} Data` : 'Real-time Signals'}
+      <div className="text-xs font-bold text-slate-900 truncate" title={resourceName}>
+        {resourceName || 'Signals'}
       </div>
-      <div className="mt-1 flex items-center justify-between text-[10px] text-emerald-700">
-        <span className="flex items-center gap-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-          Live Stream
+      <div className="mt-1 flex items-center gap-1.5 text-[10px] text-emerald-800">
+        <span className={`w-1.5 h-1.5 rounded-full ${tone}`} aria-hidden="true" />
+        <span>
+          {goodCount} of {signalCount} good
         </span>
-        <span className="font-semibold underline">Click to view data →</span>
       </div>
       <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-emerald-600" />
     </div>

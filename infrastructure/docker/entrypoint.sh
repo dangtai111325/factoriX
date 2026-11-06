@@ -15,7 +15,32 @@ python /opt/factorix/infrastructure/docker/bootstrap_db.py
 cd /opt/factorix/apps/center
 alembic upgrade head
 
-python -m factorix_edge &
+# Supervise the edge collector: restart it whenever it exits (backoff 1 s .. 30 s,
+# reset after a run of at least 60 s) so the appliance is never left without an edge.
+supervise_edge() {
+  set +e
+  local child=0
+  local backoff=1
+  trap 'kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM INT
+  while true; do
+    local started=$SECONDS
+    python -m factorix_edge &
+    child=$!
+    wait "$child"
+    local code=$?
+    if [ $((SECONDS - started)) -ge 60 ]; then
+      backoff=1
+    fi
+    echo "factorix-edge exited with code $code; restarting in ${backoff}s" >&2
+    sleep "$backoff" &
+    wait $!
+    if [ "$backoff" -lt 30 ]; then
+      backoff=$((backoff * 2))
+    fi
+  done
+}
+
+supervise_edge &
 EDGE_PID=$!
 python -m uvicorn factorix.transport.app:app --host 0.0.0.0 --port 8080 &
 APP_PID=$!

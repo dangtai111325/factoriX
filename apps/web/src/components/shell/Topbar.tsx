@@ -6,7 +6,6 @@ import {
   UserRound,
   ChevronDown,
   Check,
-  Radio,
   Lock,
   Info,
   LogOut,
@@ -14,6 +13,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../store/AppContext';
 import { useAuth } from '../../features/auth';
+import { CollectorState, useCollectorHealth } from './collectorHealth';
 import { ChangePasswordModal } from '../modals/ChangePasswordModal';
 import { AboutFactorixModal } from '../modals/AboutFactorixModal';
 
@@ -36,7 +36,8 @@ const ROUTE_BREADCRUMBS: Record<string, { group?: string; title: string }> = {
 export const Topbar: React.FC = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { setSearchOpen, resources, edges } = useApp();
+  const { setSearchOpen, resources } = useApp();
+  const collector = useCollectorHealth();
   const { state, signOut } = useAuth();
 
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
@@ -120,22 +121,17 @@ export const Topbar: React.FC = () => {
     return found.size;
   }, [selectedScope, sites, resources]);
 
-  // Data Collection Edge status (TC-UI-NAV-08)
-  const enrolledEdges = useMemo(() => {
-    return edges.filter((e) => e.enrollmentStatus === 'ENROLLED');
-  }, [edges]);
-
-  const onlineEdges = useMemo(() => {
-    return enrolledEdges.filter(
-      (e) => e.health === 'ONLINE' || e.health === 'HEALTHY' || e.health === 'ACTIVE',
-    );
-  }, [enrolledEdges]);
-
-  const offlineEdge = useMemo(() => {
-    return enrolledEdges.find(
-      (e) => e.health === 'OFFLINE' || e.health === 'DEGRADED',
-    );
-  }, [enrolledEdges]);
+  // Data collector status (TC-UI-NAV-08): effective edge health, updated by polling and the live stream.
+  // Only a collector that had reported before and then stopped raises the red banner.
+  const offlineEdge = collector.offlineEdges[0];
+  const pillDot: Record<CollectorState, string> = {
+    loading: 'bg-[#CBD5E1]',
+    not_configured: 'bg-[#94A3B8]',
+    waiting: 'bg-[#94A3B8]',
+    online: 'bg-[#10B981]',
+    degraded: 'bg-[#F59E0B]',
+    offline: 'bg-[#EF1B24]',
+  };
 
   // Close dropdowns on click outside
   useEffect(() => {
@@ -168,9 +164,9 @@ export const Topbar: React.FC = () => {
             <span>
               Data collection for{' '}
               {sites.find((s) => s.id === offlineEdge.siteId)?.name || offlineEdge.name}{' '}
-              is offline
+              stopped
               {offlineEdge.lastHeartbeat
-                ? ` since ${new Date(offlineEdge.lastHeartbeat).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                ? ` (last report at ${new Date(offlineEdge.lastHeartbeat).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})`
                 : ''}
             </span>
           </div>
@@ -179,7 +175,7 @@ export const Topbar: React.FC = () => {
             onClick={() => navigate('/collector/connections')}
             className="underline hover:text-white/80 text-[11px] font-bold"
           >
-            View Connections →
+            View connections
           </button>
         </div>
       )}
@@ -205,6 +201,8 @@ export const Topbar: React.FC = () => {
             <button
               type="button"
               onClick={() => setSiteDropdownOpen(!siteDropdownOpen)}
+              aria-haspopup="listbox"
+              aria-expanded={siteDropdownOpen}
               className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#EEF5FF] text-[#0B2545] hover:bg-[#E1EDFC] text-[12px] font-semibold border border-[#BED7F7] transition-colors shadow-2xs"
               title="Filter by industrial site or view all sites"
             >
@@ -275,19 +273,15 @@ export const Topbar: React.FC = () => {
           <button
             type="button"
             onClick={() => navigate('/collector/connections')}
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide border border-[#D4DFEC] bg-white hover:bg-[#F8FAFC] transition-colors"
-            title="Click to view Connections status"
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide border border-[#D4DFEC] bg-white hover:bg-[#F8FAFC] transition-colors whitespace-nowrap"
+            title={`${collector.detail} Open Connections.`}
+            aria-label={`Collector: ${collector.label}. ${collector.detail} Open Connections.`}
           >
             <span
-              className={`w-2 h-2 rounded-full ${
-                enrolledEdges.length > 0 && onlineEdges.length === enrolledEdges.length
-                  ? 'bg-[#10B981]'
-                  : 'bg-[#EF1B24]'
-              }`}
+              aria-hidden="true"
+              className={`w-2 h-2 rounded-full ${pillDot[collector.state]}`}
             />
-            <span className="text-[#334568]">
-              Collector: {onlineEdges.length > 0 ? 'online' : 'offline'}
-            </span>
+            <span className="text-[#334568]">Collector: {collector.state === 'waiting' ? 'waiting' : collector.label.toLowerCase()}</span>
           </button>
         </div>
 
@@ -297,6 +291,7 @@ export const Topbar: React.FC = () => {
           <button
             type="button"
             onClick={() => setSearchOpen(true)}
+            aria-label="Search the model and signals (Ctrl+K)"
             className="w-[260px] h-[36px] px-3 rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-between text-[13px] text-[#94A3B8] hover:border-[#0B2545] hover:text-[#334568] transition-colors shadow-2xs"
           >
             <div className="flex items-center gap-2">
@@ -313,8 +308,8 @@ export const Topbar: React.FC = () => {
             type="button"
             onClick={() => navigate('/overview')}
             className="w-9 h-9 rounded-lg border border-[#E3EAF3] bg-white hover:bg-[#F9FAFD] flex items-center justify-center text-[#334568] transition-colors"
-            title="Overview & recent activity"
-            aria-label="Activity"
+            title="Overview and recent activity"
+            aria-label="Overview and recent activity"
           >
             <Bell className="w-4 h-4" />
           </button>
@@ -324,6 +319,9 @@ export const Topbar: React.FC = () => {
             <button
               type="button"
               onClick={() => setUserMenuOpen(!userMenuOpen)}
+              aria-haspopup="menu"
+              aria-expanded={userMenuOpen}
+              aria-label={`Account menu for ${operatorName}`}
               className="flex items-center gap-2.5 p-1 rounded-lg hover:bg-[#F8FAFC] transition-colors"
             >
               <div className="w-8 h-8 rounded-full bg-[#0B2545] text-white flex items-center justify-center text-[12px] font-bold">

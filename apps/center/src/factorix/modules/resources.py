@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain.catalog import HIERARCHY_PRESETS
 from factorix.domain.resources import ResourceInvariantError, assert_no_cycle, validate_code
-from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, jsonb, parse_uuid, utcnow
+from factorix.modules.common import as_uuid, audit, execute, execute_rowcount, fetch_all, fetch_one, jsonb, parse_uuid, utcnow
 from factorix.platform.errors import AppError
 
 MAX_PAGE = 200
@@ -109,17 +109,22 @@ async def create_site(session: AsyncSession, tenant_id: UUID, actor: UUID, body:
         raise AppError(422, "TIMEZONE", "Invalid timezone.")
     row_id = uuid4()
     now = utcnow()
-    try:
-        await execute(
-            session,
-            """
-            INSERT INTO sites (id, tenant_id, code, name, timezone, created_at)
-            VALUES (:id, :tenant_id, :code, :name, :timezone, :now)
-            """,
-            {"id": row_id, "tenant_id": tenant_id, "code": code, "name": body.name.strip(), "timezone": body.timezone, "now": now},
-        )
-    except Exception as exc:
-        raise AppError(409, "DUPLICATE", "A site with this code already exists.") from exc
+    # Check first: only a real duplicate is a 409; any other database error stays a server error.
+    existing = await fetch_one(
+        session,
+        "SELECT id FROM sites WHERE tenant_id = :tenant_id AND code = :code",
+        {"tenant_id": tenant_id, "code": code},
+    )
+    if existing is not None:
+        raise AppError(409, "DUPLICATE", "A site with this code already exists.", field_errors=[{"path": "code", "code": "DUPLICATE"}])
+    await execute(
+        session,
+        """
+        INSERT INTO sites (id, tenant_id, code, name, timezone, created_at)
+        VALUES (:id, :tenant_id, :code, :name, :timezone, :now)
+        """,
+        {"id": row_id, "tenant_id": tenant_id, "code": code, "name": body.name.strip(), "timezone": body.timezone, "now": now},
+    )
     created = await fetch_one(session, "SELECT * FROM sites WHERE id = :id", {"id": row_id})
     await audit(session, tenant_id=tenant_id, event_type="SITE_CREATE", actor_id=actor, entity_type="site", entity_id=row_id, before=None, after=created, correlation_id=correlation_id)
     assert created is not None
@@ -484,6 +489,7 @@ async def list_resources(
         where.append("r.code > :cursor")
     sql = f"""
         SELECT r.id, r.code, r.name, r.status, r.version, r.site_id, r.archived_at, t.key AS type_key, t.category AS type_category,
+               r.description, r.properties_json, r.tags_json, r.path_code,
                (
                  SELECT rr.from_id FROM resource_relations rr
                  JOIN relation_types rt ON rt.id = rr.relation_type_id
@@ -551,25 +557,9 @@ async def patch_resource(
         else:
             new_path_code = code
 
-        old_len_plus_one = len(old_path_code) + 1
-        await execute(
-            session,
-            """
-            UPDATE resources
-            SET path_code = :new_prefix || SUBSTRING(path_code FROM :pos)
-            WHERE tenant_id = :tenant_id AND path_code LIKE :like_child
-            """,
-            {
-                "new_prefix": new_path_code,
-                "pos": old_len_plus_one,
-                "tenant_id": tenant_id,
-                "like_child": f"{old_path_code}/%",
-            },
-        )
-
     properties = body.properties if body.properties is not None else current["properties_json"]
     tags = body.tags if body.tags is not None else current["tags_json"]
-    await execute(
+    updated_rows = await execute_rowcount(
         session,
         """
         UPDATE resources
@@ -591,6 +581,26 @@ async def patch_resource(
             "version": body.version,
         },
     )
+    if updated_rows != 1:
+        raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This resource was modified elsewhere. Reload it and try again.")
+    if new_path_code != old_path_code:
+        # Only after the version-guarded update succeeded. Prefix match with left() instead of
+        # LIKE so "_" or "%" in a code cannot act as a wildcard and rewrite a sibling subtree.
+        await execute(
+            session,
+            """
+            UPDATE resources
+            SET path_code = :new_prefix || SUBSTRING(path_code FROM :pos)
+            WHERE tenant_id = :tenant_id AND left(path_code, :prefix_len) = :old_prefix
+            """,
+            {
+                "new_prefix": new_path_code,
+                "pos": len(old_path_code) + 1,
+                "tenant_id": tenant_id,
+                "prefix_len": len(old_path_code) + 1,
+                "old_prefix": f"{old_path_code}/",
+            },
+        )
     updated = await get_resource(session, tenant_id, resource_id)
     await audit(session, tenant_id=tenant_id, event_type="RESOURCE_UPDATE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"name": current["name"], "code": current["code"]}, after={"name": name, "code": code, "path_code": new_path_code}, correlation_id=correlation_id)
     return updated
@@ -820,43 +830,48 @@ async def restore_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
     props = dict(current.get("properties_json") or {})
     prior_state = props.pop("_prior_archive_state", None)
 
+    signals_to_restore: list[UUID]
+    bindings_to_enable: list[UUID]
     if prior_state and isinstance(prior_state, dict):
         signals_to_restore = [as_uuid(sid) for sid in prior_state.get("active_signals", [])]
         bindings_to_enable = [as_uuid(sid) for sid in prior_state.get("enabled_bindings", [])]
-        if signals_to_restore:
-            await execute(
-                session,
-                "UPDATE signal_definitions SET status = 'ACTIVE', updated_at = :now WHERE id = ANY(:ids)",
-                {"now": now, "ids": signals_to_restore},
-            )
-        if bindings_to_enable:
-            await execute(
-                session,
-                "UPDATE signal_bindings SET enabled = TRUE WHERE signal_id = ANY(:ids)",
-                {"ids": bindings_to_enable},
-            )
-            from factorix.modules import collect
-            await collect.bump_edge_release(session, tenant_id, actor, correlation_id)
     else:
+        # Archived before the prior-state snapshot existed: restore exactly the signals the archive
+        # action archived (same timestamp as the resource). Which bindings the user had disabled
+        # is unknown, so no binding is re-enabled; the operator enables them explicitly.
         sig_rows = await fetch_all(
             session,
-            "SELECT id FROM signal_definitions WHERE tenant_id = :tenant_id AND resource_id = :id AND status != 'ARCHIVED'",
-            {"tenant_id": tenant_id, "id": resource_id},
+            """
+            SELECT id FROM signal_definitions
+            WHERE tenant_id = :tenant_id AND resource_id = :id AND status = 'ARCHIVED' AND updated_at = :archived_at
+            """,
+            {"tenant_id": tenant_id, "id": resource_id, "archived_at": current["archived_at"]},
         )
-        if sig_rows:
-            sig_ids = [as_uuid(r["id"]) for r in sig_rows]
-            await execute(
-                session,
-                "UPDATE signal_definitions SET status = 'ACTIVE', updated_at = :now WHERE id = ANY(:ids)",
-                {"now": now, "ids": sig_ids},
+        signals_to_restore = [as_uuid(r["id"]) for r in sig_rows]
+        bindings_to_enable = []
+    restored, skipped = await _restore_signals(session, tenant_id, resource_id, signals_to_restore, now)
+    enabled_now = [sid for sid in bindings_to_enable if sid in set(restored)]
+    if enabled_now:
+        # Only the current binding of each signal, and only if no other binding became active.
+        await execute(
+            session,
+            """
+            UPDATE signal_bindings SET enabled = TRUE
+            WHERE id IN (
+                SELECT DISTINCT ON (signal_id) id FROM signal_bindings
+                WHERE signal_id = ANY(:ids) AND valid_to IS NULL
+                ORDER BY signal_id, valid_from DESC, revision DESC
             )
-            await execute(
-                session,
-                "UPDATE signal_bindings SET enabled = TRUE WHERE signal_id = ANY(:ids)",
-                {"ids": sig_ids},
+            AND NOT EXISTS (
+                SELECT 1 FROM signal_bindings other
+                WHERE other.signal_id = signal_bindings.signal_id AND other.enabled = TRUE AND other.valid_to IS NULL
             )
-            from factorix.modules import collect
-            await collect.bump_edge_release(session, tenant_id, actor, correlation_id)
+            """,
+            {"ids": enabled_now},
+        )
+    if restored:
+        from factorix.modules import collect
+        await collect.bump_edge_release(session, tenant_id, actor, correlation_id)
 
     await execute(
         session,
@@ -866,8 +881,57 @@ async def restore_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         """,
         {"now": now, "props": jsonb(props), "id": resource_id, "tenant_id": tenant_id},
     )
-    await audit(session, tenant_id=tenant_id, event_type="RESOURCE_RESTORE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"status": "ARCHIVED"}, after={"status": "ACTIVE"}, correlation_id=correlation_id)
-    return await get_resource(session, tenant_id, resource_id)
+    await audit(
+        session,
+        tenant_id=tenant_id,
+        event_type="RESOURCE_RESTORE",
+        actor_id=actor,
+        entity_type="resource",
+        entity_id=resource_id,
+        before={"status": "ARCHIVED"},
+        after={"status": "ACTIVE", "restored_signals": len(restored), "skipped_signals": [str(sid) for sid in skipped]},
+        correlation_id=correlation_id,
+    )
+    result = await get_resource(session, tenant_id, resource_id)
+    result["restored_signals"] = len(restored)
+    result["skipped_signals"] = [str(sid) for sid in skipped]
+    return result
+
+
+async def _restore_signals(
+    session: AsyncSession,
+    tenant_id: UUID,
+    resource_id: UUID,
+    signal_ids: list[UUID],
+    now: datetime,
+) -> tuple[list[UUID], list[UUID]]:
+    """Re-activate archived signals unless an ACTIVE signal now uses the same key on the resource.
+
+    Respects the partial unique index signal_key_active instead of failing with an IntegrityError.
+    """
+    if not signal_ids:
+        return [], []
+    rows = await fetch_all(
+        session,
+        """
+        SELECT s.id, EXISTS (
+            SELECT 1 FROM signal_definitions other
+            WHERE other.resource_id = s.resource_id AND other.key = s.key AND other.status = 'ACTIVE' AND other.id <> s.id
+        ) AS key_taken
+        FROM signal_definitions s
+        WHERE s.tenant_id = :tenant_id AND s.resource_id = :resource_id AND s.id = ANY(:ids) AND s.status = 'ARCHIVED'
+        """,
+        {"tenant_id": tenant_id, "resource_id": resource_id, "ids": signal_ids},
+    )
+    restore = [as_uuid(row["id"]) for row in rows if not row["key_taken"]]
+    skipped = [as_uuid(row["id"]) for row in rows if row["key_taken"]]
+    if restore:
+        await execute(
+            session,
+            "UPDATE signal_definitions SET status = 'ACTIVE', version = version + 1, updated_at = :now WHERE id = ANY(:ids)",
+            {"now": now, "ids": restore},
+        )
+    return restore, skipped
 
 
 async def create_type(session: AsyncSession, tenant_id: UUID, actor: UUID, body: TypeIn, correlation_id: str) -> dict[str, Any]:

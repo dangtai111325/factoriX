@@ -1,60 +1,62 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ArrowRight,
+  Braces,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Circle,
-  Clock,
-  Code2,
   Cpu,
+  FolderTree,
   Layers,
   Network,
   Play,
   Plus,
-  Radio,
-  Search,
-  Trash2,
-  AlertTriangle,
   RefreshCw,
-  FolderTree,
-  ExternalLink,
-  ChevronRight,
-  ChevronDown,
-  Braces,
+  Search,
+  X,
 } from 'lucide-react';
-import { useNavigate, useSearchParams, useLocation } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useApp } from '../../store/AppContext';
-import { ResourceNode, Connection, SignalItem } from '../../types';
+import { ProtocolType, ResourceNode } from '../../types';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
-import { StatusBadge } from '../../components/common/StatusBadge';
-import { ConfirmDialog } from '../../components/common/ConfirmDialog';
 import { validateTopicFilter } from '../../utils/mqttTopic';
-import { sanitizeVariableName, validateVariableName, flattenJsonPayload } from '../../utils/variableNaming';
 import { api, ApiError } from '../../api/client';
-
-interface FieldRow {
-  id: string;
-  topic: string;
-  address: string;
-  name: string;
-  dataType: string;
-  unit: string;
-  sample: unknown;
-  error?: string;
-  warning?: string;
-  qos?: number;
-  nodeId?: string;
-  offset?: number;
-  registerArea?: string;
-  registerCount?: number;
-  unitId?: number;
-  wordOrder?: string;
-  nativeType?: string;
-  path?: string;
-  method?: string;
-}
-
+import { BrowseNode, CommissionResult, runCapture, runConnectionTest } from '../../lib/commissioning';
+import { formatValue } from '../../lib/format';
+import { ConnectionFormModal, SavedConnection } from '../05_Connections/ConnectionFormModal';
+import { ConnectionStatusCell } from '../05_Connections/connectionStatus';
+import { TestResultPanel } from '../05_Connections/TestResultPanel';
+import { FieldTable } from './FieldTable';
+import { JsonSampleTree } from './JsonSampleTree';
+import { SimilarResourcesDialog } from './SimilarResourcesDialog';
+import {
+  JNode,
+  JsonParseError,
+  evaluateNode,
+  fromValue,
+  hasSiblingTimestamp,
+  inferDataType,
+  nodePreview,
+  parseOrderedJson,
+} from './jsonTree';
+import {
+  AddressSettings,
+  FieldRow,
+  TargetRewrite,
+  TimestampMode,
+  addressKindFor,
+  applyRewrite,
+  buildAddress,
+  emptyRow,
+  keyFromRawName,
+  nodeIdField,
+  parseRegisterMap,
+  rewriteProblems,
+  validateRows,
+} from './wizardModel';
 
 interface WizardTreeNode {
   resource: ResourceNode;
@@ -67,11 +69,8 @@ function buildWizardTree(items: ResourceNode[]): WizardTreeNode[] {
   const roots: WizardTreeNode[] = [];
   items.forEach((r) => {
     const node = map.get(r.id)!;
-    if (r.parentId && map.has(r.parentId)) {
-      map.get(r.parentId)!.children.push(node);
-    } else {
-      roots.push(node);
-    }
+    if (r.parentId && map.has(r.parentId)) map.get(r.parentId)!.children.push(node);
+    else roots.push(node);
   });
   return roots;
 }
@@ -79,731 +78,725 @@ function buildWizardTree(items: ResourceNode[]): WizardTreeNode[] {
 function nodeOrDescendantMatches(node: WizardTreeNode, query: string): boolean {
   if (!query) return true;
   const q = query.toLowerCase();
-  const selfMatch = (node.resource.name || '').toLowerCase().includes(q) || (node.resource.code || '').toLowerCase().includes(q);
-  if (selfMatch) return true;
+  if ((node.resource.name || '').toLowerCase().includes(q) || (node.resource.code || '').toLowerCase().includes(q)) return true;
   return node.children.some((child) => nodeOrDescendantMatches(child, query));
 }
 
-interface CapturedTopic {
-  topic: string;
-  count: number;
-  samplePayload: Record<string, unknown>;
+const typeIcon = (type: string) => {
+  switch (type.toLowerCase()) {
+    case 'site':
+    case 'plant':
+      return <Network className="w-4 h-4 text-emerald-600 shrink-0" />;
+    case 'area':
+      return <FolderTree className="w-4 h-4 text-amber-600 shrink-0" />;
+    case 'line':
+    case 'machine':
+      return <Cpu className="w-4 h-4 text-slate-600 shrink-0" />;
+    default:
+      return <Layers className="w-4 h-4 text-slate-500 shrink-0" />;
+  }
+};
+
+interface ConnDetail {
+  id: string;
+  name: string;
+  protocol: string;
+  site_id: string;
+  edge_id: string;
+  version: number;
+  config_json?: Record<string, unknown>;
+  jobs?: Array<{ id: string; mode?: string; interval_ms?: number | null }>;
 }
 
-const DRAFT_STORAGE_KEY = 'fx.addData.draft';
+interface SampleView {
+  topic: string;
+  count: number;
+  root: JNode;
+  /** True when the Center returned no original text: key order may differ from the payload. */
+  reordered: boolean;
+}
+
+interface TargetOutcome {
+  resourceId: string;
+  name: string;
+  ok: boolean;
+  message: string;
+}
+
+const PROTOCOL_LABEL: Record<ProtocolType, string> = {
+  mqtt: 'MQTT',
+  modbus: 'Modbus TCP',
+  opcua: 'OPC UA',
+  http: 'HTTP / REST',
+  websocket: 'WebSocket',
+};
+
+const POLLING: ProtocolType[] = ['modbus', 'opcua', 'http', 'websocket'];
+const JSON_PROTOCOLS: ProtocolType[] = ['mqtt', 'http', 'websocket'];
+const DRAFT_KEY = 'fx.addData.draft.v2';
+
+function protocolFromApi(value: string): ProtocolType {
+  const v = value.toLowerCase();
+  if (v.includes('modbus')) return 'modbus';
+  if (v.includes('opc')) return 'opcua';
+  if (v.includes('mqtt')) return 'mqtt';
+  if (v.includes('websocket') || v === 'ws') return 'websocket';
+  return 'http';
+}
+
+interface Draft {
+  step: number;
+  targetId: string;
+  connectionId: string;
+  fields: FieldRow[];
+  mqttTopicFilter: string;
+  mqttQos: number;
+  httpPath: string;
+  intervalMs: number;
+  modbusUnitId: number;
+  timestampMode: TimestampMode;
+  timestampPath: string;
+  opcTimestampNodeId: string;
+  rewrites: TargetRewrite[];
+}
+
+function readDraft(): Partial<Draft> | null {
+  try {
+    const raw = sessionStorage.getItem(DRAFT_KEY);
+    return raw ? (JSON.parse(raw) as Partial<Draft>) : null;
+  } catch (error) {
+    console.warn('Add Data draft could not be read', error);
+    return null;
+  }
+}
 
 export const AddDataWizardPage: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const location = useLocation();
   const { resources, connections, edges, signals, refresh } = useApp();
 
   const queryResourceId = searchParams.get('resourceId');
   const queryConnectionId = searchParams.get('connectionId');
 
-  // Step 1 to 5
-  const [currentStep, setCurrentStep] = useState<number>(1);
+  const [currentStep, setCurrentStep] = useState(1);
 
-  // Step 1: Target
-  const [selectedTargetId, setSelectedTargetId] = useState<string>('');
-  const [targetSearch, setTargetSearch] = useState<string>('');
+  // Step 1
+  const [selectedTargetId, setSelectedTargetId] = useState('');
+  const [targetSearch, setTargetSearch] = useState('');
   const [expandedTargetNodes, setExpandedTargetNodes] = useState<Record<string, boolean>>({});
 
-  const toggleTargetExpand = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setExpandedTargetNodes((prev) => ({
-      ...prev,
-      [id]: prev[id] === undefined ? false : !prev[id],
-    }));
-  };
+  // Step 2
+  const [selectedConnectionId, setSelectedConnectionId] = useState('');
+  const [connDetail, setConnDetail] = useState<ConnDetail | null>(null);
+  const [connDetailError, setConnDetailError] = useState<string | null>(null);
+  const [isConnFormOpen, setIsConnFormOpen] = useState(false);
+  const [newConnCreated, setNewConnCreated] = useState<SavedConnection | null>(null);
 
-  const expandAllTargets = () => {
-    const exp: Record<string, boolean> = {};
-    resources.forEach((r) => { exp[r.id] = true; });
-    setExpandedTargetNodes(exp);
-  };
-
-  const collapseAllTargets = () => {
-    const exp: Record<string, boolean> = {};
-    resources.forEach((r) => { exp[r.id] = false; });
-    setExpandedTargetNodes(exp);
-  };
-
-  const wizardTree = useMemo(() => buildWizardTree(resources), [resources]);
-
-  // Step 2: Source
-  const [selectedConnectionId, setSelectedConnectionId] = useState<string>('');
-  const [isCreatingNewConn, setIsCreatingNewConn] = useState<boolean>(false);
-  const [newConnProtocol, setNewConnProtocol] = useState<'mqtt' | 'modbus' | 'opcua' | 'http'>('mqtt');
-  const [newConnName, setNewConnName] = useState<string>('');
-  const [newConnHost, setNewConnHost] = useState<string>('192.168.2.108');
-  const [newConnPort, setNewConnPort] = useState<string>('1883');
-  const [newConnEdgeId, setNewConnEdgeId] = useState<string>('');
-  const [newConnAuthType, setNewConnAuthType] = useState<string>('none');
-  const [newConnUsername, setNewConnUsername] = useState<string>('');
-  const [newConnPassword, setNewConnPassword] = useState<string>('');
-  const [newConnTls, setNewConnTls] = useState<boolean>(false);
-  const [newConnSaving, setNewConnSaving] = useState<boolean>(false);
-  const [newConnError, setNewConnError] = useState<string | null>(null);
-  const [newConnCreatedId, setNewConnCreatedId] = useState<string | null>(null);
-
-  // Step 3: Address
-  const [mqttTopicFilter, setMqttTopicFilter] = useState<string>('');
-  const [mqttQos, setMqttQos] = useState<string>('1');
-  const [pollIntervalMs, setPollIntervalMs] = useState<string>('1000');
+  // Step 3
+  const [mqttTopicFilter, setMqttTopicFilter] = useState('');
+  const [mqttQos, setMqttQos] = useState(1);
+  const [httpPath, setHttpPath] = useState('');
+  const [intervalMs, setIntervalMs] = useState(1000);
+  const [modbusUnitId, setModbusUnitId] = useState(1);
   const [addressError, setAddressError] = useState<string | null>(null);
+  const [discovering, setDiscovering] = useState(false);
+  const [discovered, setDiscovered] = useState<string[] | null>(null);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
 
-  // Step 4: Fields
-  const [isCapturing, setIsCapturing] = useState<boolean>(false);
-  const [captureCountdown, setCaptureCountdown] = useState<number>(10);
-  const [capturedTopics, setCapturedTopics] = useState<CapturedTopic[]>([]);
-  const [selectedCapturedTopic, setSelectedCapturedTopic] = useState<string | null>(null);
+  // Step 4
   const [fields, setFields] = useState<FieldRow[]>([]);
-  const [isPasteModalOpen, setIsPasteModalOpen] = useState<boolean>(false);
-  const [pastedJsonText, setPastedJsonText] = useState<string>('');
-  const [pastedJsonError, setPastedJsonError] = useState<string | null>(null);
-  const [timestampField, setTimestampField] = useState<string>('$.source_timestamp');
-  const [showSimilarModal, setShowSimilarModal] = useState<boolean>(false);
-  const [selectedSimilarResourceIds, setSelectedSimilarResourceIds] = useState<string[]>([]);
+  const [timestampMode, setTimestampMode] = useState<TimestampMode>('sibling');
+  const [timestampPath, setTimestampPath] = useState('');
+  const [opcTimestampNodeId, setOpcTimestampNodeId] = useState('');
+  const [capturing, setCapturing] = useState(false);
+  const [captureError, setCaptureError] = useState<string | null>(null);
+  const [samples, setSamples] = useState<SampleView[]>([]);
+  const [sampleIndex, setSampleIndex] = useState(0);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const [mapText, setMapText] = useState('');
+  const [mapMessage, setMapMessage] = useState<string | null>(null);
+  const [nodeText, setNodeText] = useState('');
+  const [nodeMessage, setNodeMessage] = useState<string | null>(null);
+  const [browseStack, setBrowseStack] = useState<Array<{ nodeId: string; label: string }>>([]);
+  const [browseNodes, setBrowseNodes] = useState<BrowseNode[] | null>(null);
+  const [browsing, setBrowsing] = useState(false);
+  const [browseError, setBrowseError] = useState<string | null>(null);
+  const [rowsError, setRowsError] = useState<string | null>(null);
 
-  // Step 5: Review & Test
-  const [isTesting, setIsTesting] = useState<boolean>(false);
-  const [testResult, setTestResult] = useState<{
-    passed: boolean;
-    stages: Array<{ stage: string; status: string; duration_ms?: number; detail?: string }>;
-    fieldSamples?: Record<string, unknown>;
-    errorMessage?: string;
-  } | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  // Step 4/5: tests
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<CommissionResult | null>(null);
+  const [liveValues, setLiveValues] = useState<Record<string, string>>({});
+  const [acceptUntested, setAcceptUntested] = useState(false);
 
-  // Discard Dialog
-  const [confirmCancelOpen, setConfirmCancelOpen] = useState<boolean>(false);
+  // Step 5
+  const [rewrites, setRewrites] = useState<TargetRewrite[]>([]);
+  const [similarOpen, setSimilarOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [outcomes, setOutcomes] = useState<TargetOutcome[] | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [confirmCancelOpen, setConfirmCancelOpen] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
-  // 1. Initialize from URL params or sessionStorage
+  /** Connection whose interval / unit id come from the restored draft instead of the server. */
+  const draftConnectionRef = useRef<string | null>(null);
+
+  // Restore draft, then apply deep-link parameters.
   useEffect(() => {
-    const savedDraft = sessionStorage.getItem(DRAFT_STORAGE_KEY);
-    if (savedDraft) {
-      try {
-        const parsed = JSON.parse(savedDraft);
-        if (parsed.targetId) setSelectedTargetId(parsed.targetId);
-        if (parsed.connectionId) setSelectedConnectionId(parsed.connectionId);
-        if (parsed.topicFilter) setMqttTopicFilter(parsed.topicFilter);
-        if (parsed.qos) setMqttQos(parsed.qos);
-        if (parsed.fields) setFields(parsed.fields);
-        if (parsed.step) setCurrentStep(parsed.step);
-      } catch {
-        // ignore draft parse error
-      }
+    const draft = readDraft();
+    if (draft && !queryResourceId && !queryConnectionId) {
+      draftConnectionRef.current = draft.connectionId || null;
+      if (draft.targetId) setSelectedTargetId(draft.targetId);
+      if (draft.connectionId) setSelectedConnectionId(draft.connectionId);
+      if (Array.isArray(draft.fields)) setFields(draft.fields);
+      if (draft.mqttTopicFilter) setMqttTopicFilter(draft.mqttTopicFilter);
+      if (typeof draft.mqttQos === 'number') setMqttQos(draft.mqttQos);
+      if (draft.httpPath) setHttpPath(draft.httpPath);
+      if (typeof draft.intervalMs === 'number') setIntervalMs(draft.intervalMs);
+      if (typeof draft.modbusUnitId === 'number') setModbusUnitId(draft.modbusUnitId);
+      if (draft.timestampMode) setTimestampMode(draft.timestampMode);
+      if (draft.timestampPath) setTimestampPath(draft.timestampPath);
+      if (draft.opcTimestampNodeId) setOpcTimestampNodeId(draft.opcTimestampNodeId);
+      if (Array.isArray(draft.rewrites)) setRewrites(draft.rewrites);
+      if (draft.step) setCurrentStep(draft.step);
     }
-
-    if (queryResourceId) {
-      setSelectedTargetId(queryResourceId);
-    }
+    if (queryResourceId) setSelectedTargetId(queryResourceId);
     if (queryConnectionId) {
       setSelectedConnectionId(queryConnectionId);
-      setCurrentStep((prev) => (prev < 2 ? 2 : prev));
+      setCurrentStep(queryResourceId ? 3 : 1);
     }
   }, [queryResourceId, queryConnectionId]);
 
-  // Save to sessionStorage on changes
   useEffect(() => {
-    if (selectedTargetId || selectedConnectionId || fields.length > 0) {
-      sessionStorage.setItem(
-        DRAFT_STORAGE_KEY,
-        JSON.stringify({
-          targetId: selectedTargetId,
-          connectionId: selectedConnectionId,
-          topicFilter: mqttTopicFilter,
-          qos: mqttQos,
-          fields,
-          step: currentStep,
-        })
-      );
+    if (!selectedTargetId && !selectedConnectionId && fields.length === 0) return;
+    const draft: Draft = {
+      step: currentStep,
+      targetId: selectedTargetId,
+      connectionId: selectedConnectionId,
+      fields,
+      mqttTopicFilter,
+      mqttQos,
+      httpPath,
+      intervalMs,
+      modbusUnitId,
+      timestampMode,
+      timestampPath,
+      opcTimestampNodeId,
+      rewrites,
+    };
+    try {
+      sessionStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+    } catch (error) {
+      console.warn('Add Data draft could not be saved', error);
     }
-  }, [selectedTargetId, selectedConnectionId, mqttTopicFilter, mqttQos, fields, currentStep]);
+  }, [currentStep, selectedTargetId, selectedConnectionId, fields, mqttTopicFilter, mqttQos, httpPath, intervalMs, modbusUnitId, timestampMode, timestampPath, opcTimestampNodeId, rewrites]);
 
-  // Target Resource Resolution & Path
-  const targetResource = useMemo(() => {
-    return resources.find((r) => r.id === selectedTargetId);
-  }, [resources, selectedTargetId]);
+  const clearDraft = () => {
+    try {
+      sessionStorage.removeItem(DRAFT_KEY);
+    } catch (error) {
+      console.warn('Add Data draft could not be cleared', error);
+    }
+  };
+
+  const wizardTree = useMemo(() => buildWizardTree(resources), [resources]);
+  const targetResource = useMemo(() => resources.find((r) => r.id === selectedTargetId), [resources, selectedTargetId]);
+  const targetSiteId = targetResource?.attributes?.siteId || '';
 
   const targetPathString = useMemo(() => {
     if (!targetResource) return '';
     const parts: string[] = [targetResource.name || targetResource.code];
-    let curr: typeof targetResource | undefined = targetResource;
-    while (curr && curr.parentId) {
-      const parent = resources.find((r) => r.id === curr?.parentId);
-      if (parent) {
-        parts.unshift(parent.name || parent.code);
-        curr = parent;
-      } else {
-        break;
-      }
+    let cursor: ResourceNode | undefined = targetResource;
+    while (cursor?.parentId) {
+      const parent = resources.find((r) => r.id === cursor?.parentId);
+      if (!parent) break;
+      parts.unshift(parent.name || parent.code);
+      cursor = parent;
     }
     return parts.join(' / ');
   }, [targetResource, resources]);
 
-  // Target Site Resolution
-  const targetSite = useMemo(() => {
-    if (!targetResource) return null;
-    let curr: typeof targetResource | undefined = targetResource;
-    while (curr) {
-      if (curr.type === 'site') return curr;
-      curr = resources.find((r) => r.id === curr?.parentId);
-    }
-    return resources.find((r) => r.type === 'site') || null;
-  }, [targetResource, resources]);
+  const siteConnections = useMemo(
+    () => (targetSiteId ? connections.filter((c) => !c.siteId || c.siteId === targetSiteId) : connections),
+    [connections, targetSiteId],
+  );
 
-  // Connections belonging to target's site
-  const siteConnections = useMemo(() => {
-    if (!targetSite) return connections;
-    return connections.filter((c) => !c.siteId || c.siteId === targetSite.id || c.siteId === targetSite.attributes?.siteId);
-  }, [connections, targetSite]);
+  const selectedConnection = connections.find((c) => c.id === selectedConnectionId);
+  const protocol: ProtocolType = connDetail ? protocolFromApi(connDetail.protocol) : selectedConnection?.protocol || 'mqtt';
+  const isJson = JSON_PROTOCOLS.includes(protocol);
+  const isPolling = POLLING.includes(protocol);
+  const job = connDetail?.jobs?.[0];
 
-  // Edges belonging to target's site
-  const siteEdges = useMemo(() => {
-    if (!targetSite) return edges;
-    return edges.filter((e) => !e.site_id || e.site_id === targetSite.id || e.site_id === targetSite.attributes?.siteId);
-  }, [edges, targetSite]);
-
-  // Pre-fill MQTT Topic filter when entering Step 3
+  // Load the connection detail (config, job interval, edge) whenever the selection changes.
   useEffect(() => {
-    if (targetResource && !mqttTopicFilter) {
-      const pathCode = targetResource.pathCode || targetResource.code;
-      setMqttTopicFilter(`uns/TIPA/DongNai/Factory-1/ASSY/Assembly-AA10-02-AB/${targetResource.code}/#`);
-    }
-  }, [targetResource, mqttTopicFilter]);
-
-  // Auto-set Edge for new connection
-  useEffect(() => {
-    if (siteEdges.length > 0 && !newConnEdgeId) {
-      setNewConnEdgeId(siteEdges[0].id);
-    }
-  }, [siteEdges, newConnEdgeId]);
-
-  // Invalidate old test results whenever steps 2-4 change (TC-UI-AD-34)
-  const invalidateTest = () => {
-    if (testResult) setTestResult(null);
-  };
-
-  // Step 2: Create new connection
-  const handleSaveNewConnection = async () => {
-    if (!newConnName.trim()) {
-      setNewConnError('Enter a connection name.');
-      return;
-    }
-    setNewConnSaving(true);
-    setNewConnError(null);
-    try {
-      const configObj: Record<string, unknown> = {
-        host: newConnHost.trim(),
-        port: Number(newConnPort) || 1883,
-        tls: newConnTls,
-        auth_type: newConnAuthType,
-      };
-      if (newConnAuthType === 'userpass') {
-        configObj.username = newConnUsername.trim();
-      }
-
-      const res = await api<{ id: string; name: string }>('/api/v1/connections', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: newConnName.trim(),
-          protocol: newConnProtocol,
-          site_id: targetSite?.id || siteEdges[0]?.site_id,
-          edge_id: newConnEdgeId,
-          config: configObj,
-          secret_input: newConnPassword || undefined,
-        }),
-      });
-
-      await refresh();
-      setNewConnCreatedId(res.id);
-      setSelectedConnectionId(res.id);
-      setIsCreatingNewConn(false);
-      invalidateTest();
-    } catch (err: unknown) {
-      const apiErr = err as ApiError;
-      setNewConnError(apiErr.message || 'Could not save connection');
-    } finally {
-      setNewConnSaving(false);
-    }
-  };
-
-  // Step 4: Real Capture Sample from Edge (10 s)
-  const handleCaptureSample = async () => {
     if (!selectedConnectionId) {
-      alert('Please select a connection first.');
+      setConnDetail(null);
       return;
     }
-    setIsCapturing(true);
-    setCaptureCountdown(10);
-    setCapturedTopics([]);
-    setSelectedCapturedTopic(null);
-
-    const countdownInterval = setInterval(() => {
-      setCaptureCountdown((prev) => (prev > 1 ? prev - 1 : 1));
-    }, 1000);
-
-    try {
-      const captureRes = await api<{ job_id: string; status: string; poll_url: string }>(
-        `/api/v1/connections/${selectedConnectionId}/capture`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            topics: mqttTopicFilter ? [mqttTopicFilter] : ['#'],
-            topic_filter: mqttTopicFilter || '#',
-            duration_seconds: 10,
-            max_messages: 100,
-          }),
+    let cancelled = false;
+    setConnDetailError(null);
+    api<ConnDetail>(`/api/v1/connections/${encodeURIComponent(selectedConnectionId)}`)
+      .then((detail) => {
+        if (cancelled) return;
+        setConnDetail(detail);
+        const cfg = detail.config_json || {};
+        const jobInterval = detail.jobs?.[0]?.interval_ms;
+        const proto = protocolFromApi(detail.protocol);
+        const fallback = proto === 'http' ? 5000 : 1000;
+        if (draftConnectionRef.current === detail.id) {
+          // Keep the values restored from the draft once.
+          draftConnectionRef.current = null;
+          return;
         }
-      );
+        setIntervalMs(Number(jobInterval) || fallback);
+        if (proto === 'modbus') setModbusUnitId(Number(cfg.unit_id ?? 1));
+        if (proto === 'mqtt') setMqttQos(typeof cfg.qos === 'number' ? (cfg.qos as number) : 1);
+      })
+      .catch((error) => {
+        if (!cancelled) setConnDetailError(error instanceof Error ? error.message : 'Could not load the connection.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedConnectionId]);
 
-      const jobId = captureRes.job_id;
-      let terminal = false;
-      let attempts = 0;
-      let finalJob: any = null;
+  const invalidateTest = useCallback(() => {
+    setTestResult(null);
+    setLiveValues({});
+    setAcceptUntested(false);
+  }, []);
 
-      while (!terminal && attempts < 40) {
-        await new Promise((r) => setTimeout(r, 800));
-        attempts++;
+  const settings: AddressSettings = {
+    protocol,
+    mqttQos,
+    timestampMode,
+    timestampPath,
+    opcTimestampNodeId,
+    modbusUnitId,
+  };
+
+  // ---------------------------------------------------------------- Step 3 helpers
+  const connectionSignals = useMemo(() => signals.filter((s) => s.sourceConnectionId === selectedConnectionId), [signals, selectedConnectionId]);
+
+  /** Addresses already used on this connection, rewritten to the target machine code where possible. */
+  const addressSuggestions = useMemo(() => {
+    if (!targetResource) return [] as string[];
+    const out = new Set<string>();
+    const field = protocol === 'mqtt' ? 'topic' : 'path';
+    connectionSignals.forEach((s) => {
+      const value = String((s.addressJson as Record<string, unknown> | undefined)?.[field] || '');
+      if (!value) return;
+      const owner = resources.find((r) => r.id === s.resourceId);
+      if (owner?.code && owner.code !== targetResource.code && value.includes(owner.code)) {
+        out.add(value.split(owner.code).join(targetResource.code));
+      } else if (owner?.id === targetResource.id) {
+        out.add(value);
+      }
+    });
+    if (protocol === 'mqtt') {
+      const cfgTopics = (connDetail?.config_json?.topics as string[] | undefined) || [];
+      cfgTopics.forEach((t) => out.add(t));
+      (discovered || []).filter((t) => t.includes(targetResource.code)).forEach((t) => out.add(t));
+    }
+    return Array.from(out).slice(0, 12);
+  }, [connectionSignals, connDetail, discovered, protocol, resources, targetResource]);
+
+  useEffect(() => {
+    if (currentStep !== 3) return;
+    if (protocol === 'mqtt' && !mqttTopicFilter && addressSuggestions.length) setMqttTopicFilter(addressSuggestions[0]);
+    if (protocol === 'http' && !httpPath && addressSuggestions.length) setHttpPath(addressSuggestions[0]);
+  }, [currentStep, protocol, addressSuggestions, mqttTopicFilter, httpPath]);
+
+  const handleDiscoverTopics = async () => {
+    if (!selectedConnectionId) return;
+    const filter = mqttTopicFilter && !validateTopicFilter(mqttTopicFilter) ? mqttTopicFilter : '#';
+    setDiscovering(true);
+    setDiscoverError(null);
+    const result = await runCapture(selectedConnectionId, { topics: [filter], topic_filter: filter, duration_seconds: 5, max_messages: 200 });
+    setDiscovering(false);
+    if (!result.passed) {
+      setDiscoverError(result.message || 'Capture failed.');
+      return;
+    }
+    const topics = Array.from(new Set(result.captured.map((s) => s.topic).filter(Boolean))).sort();
+    setDiscovered(topics);
+    if (!topics.length) setDiscoverError(`No message on "${filter}" within 5 s.`);
+  };
+
+  const step3Valid = (): string | null => {
+    if (protocol === 'mqtt') return validateTopicFilter(mqttTopicFilter);
+    if (protocol === 'http' && !httpPath.trim().startsWith('/')) return 'Enter the request path, starting with /.';
+    if (isPolling && (!Number.isInteger(intervalMs) || intervalMs < 1000)) return 'Interval must be at least 1000 ms.';
+    if (protocol === 'modbus' && (!Number.isInteger(modbusUnitId) || modbusUnitId < 0 || modbusUnitId > 247)) return 'Unit ID must be 0–247.';
+    return null;
+  };
+
+  // ---------------------------------------------------------------- Step 4: JSON protocols
+  const activeSample = samples[sampleIndex];
+  const selectedPaths = useMemo(() => {
+    const set = new Set<string>();
+    fields.forEach((f) => {
+      if (protocol === 'mqtt' && activeSample && f.topic !== activeSample.topic) return;
+      if (f.jsonpath) set.add(f.jsonpath);
+    });
+    return set;
+  }, [fields, protocol, activeSample]);
+
+  const handleCapture = async () => {
+    if (!selectedConnectionId) return;
+    setCapturing(true);
+    setCaptureError(null);
+    const request =
+      protocol === 'mqtt'
+        ? { topics: [mqttTopicFilter], topic_filter: mqttTopicFilter, duration_seconds: 10, max_messages: 100 }
+        : protocol === 'http'
+          ? { topics: [httpPath], topic_filter: httpPath, duration_seconds: 5, max_messages: 1 }
+          : { duration_seconds: 5, max_messages: 20 };
+    const result = await runCapture(selectedConnectionId, request);
+    setCapturing(false);
+    if (!result.passed) {
+      setCaptureError(result.message || 'Capture failed.');
+      return;
+    }
+    const views: SampleView[] = [];
+    result.captured.forEach((sample) => {
+      let root: JNode | null = null;
+      let reordered = true;
+      if (sample.raw) {
         try {
-          const job = await api<any>(`/api/v1/commissioning/${jobId}`);
-          if (job.status === 'COMPLETED' || job.status === 'PASSED' || job.status === 'FAILED' || job.status === 'CANCELLED') {
-            terminal = true;
-            finalJob = job;
-          }
-        } catch {
-          // continue polling
+          root = parseOrderedJson(sample.raw);
+          reordered = false;
+        } catch (error) {
+          console.warn('Captured payload text is not valid JSON', error);
         }
       }
+      if (!root) root = fromValue(sample.payload);
+      views.push({
+        topic: sample.topic || (protocol === 'http' ? httpPath : protocol === 'mqtt' ? mqttTopicFilter : ''),
+        count: sample.count,
+        root,
+        reordered,
+      });
+    });
+    setSamples(views);
+    setSampleIndex(0);
+    if (!views.length) setCaptureError(protocol === 'mqtt' ? `No message on "${mqttTopicFilter}" within 10 s.` : 'The source returned no payload.');
+  };
 
-      clearInterval(countdownInterval);
-      setCaptureCountdown(0);
-      setIsCapturing(false);
-
-      if (finalJob && (finalJob.status === 'COMPLETED' || finalJob.status === 'PASSED')) {
-        const samples = finalJob.samples_json?.samples || finalJob.samples_json || [];
-        if (Array.isArray(samples) && samples.length > 0) {
-          const parsedTopics: CapturedTopic[] = samples.map((s: any) => ({
-            topic: s.topic,
-            count: s.count || 1,
-            samplePayload: s.payload || {},
-          }));
-          setCapturedTopics(parsedTopics);
-          setSelectedCapturedTopic(parsedTopics[0].topic);
-        } else {
-          setCapturedTopics([]);
-        }
-      } else {
-        const err = finalJob?.diagnostic || finalJob?.error_code || 'Capture timed out or failed';
-        alert(`Capture result: ${err}`);
-      }
-    } catch (err: any) {
-      clearInterval(countdownInterval);
-      setCaptureCountdown(0);
-      setIsCapturing(false);
-      alert(`Capture failed: ${err.message || 'Network error'}`);
+  const handleApplyPaste = () => {
+    setPasteError(null);
+    try {
+      const root = parseOrderedJson(pasteText.trim());
+      const topic = protocol === 'mqtt' ? (/[#+]/.test(mqttTopicFilter) ? '' : mqttTopicFilter) : protocol === 'http' ? httpPath : '';
+      setSamples((prev) => [...prev, { topic, count: 1, root, reordered: false }]);
+      setSampleIndex(samples.length);
+      setPasteOpen(false);
+      setPasteText('');
+    } catch (error) {
+      setPasteError(error instanceof JsonParseError || error instanceof Error ? error.message : 'Invalid JSON.');
     }
   };
 
+  const rowFromLeaf = (path: string, key: string, node: JNode, sample: SampleView): FieldRow => {
+    const inferred = inferDataType(node);
+    const rawKey = keyFromRawName(key);
+    return emptyRow(protocol, {
+      key: rawKey,
+      displayName: rawKey,
+      jsonpath: path,
+      topic: protocol === 'mqtt' ? sample.topic : undefined,
+      path: protocol === 'http' ? httpPath : undefined,
+      dataType: inferred.dataType,
+      nullable: node.kind === 'null' || node.kind === 'string',
+      sample: nodePreview(node),
+      sampleWarning: inferred.warning,
+    });
+  };
 
-  const handleApplyPastedJson = () => {
-    setPastedJsonError(null);
-    try {
-      const parsed = JSON.parse(pastedJsonText);
-      const flattened = flattenJsonPayload(parsed);
-      if (flattened.length === 0) {
-        setPastedJsonError('No fields found in JSON object.');
+  const sameAddress = (row: FieldRow, path: string, sample: SampleView) =>
+    row.jsonpath === path && (protocol !== 'mqtt' || row.topic === sample.topic);
+
+  const handlePickLeaf = (path: string, key: string, node: JNode) => {
+    if (!activeSample) return;
+    invalidateTest();
+    setFields((prev) => {
+      if (prev.some((row) => sameAddress(row, path, activeSample))) return prev.filter((row) => !sameAddress(row, path, activeSample));
+      return [...prev, rowFromLeaf(path, key, node, activeSample)];
+    });
+  };
+
+  const handlePickObject = (leaves: Array<{ path: string; key: string; node: JNode }>) => {
+    if (!activeSample) return;
+    invalidateTest();
+    setFields((prev) => {
+      const next = [...prev];
+      leaves.forEach((leaf) => {
+        if (!next.some((row) => sameAddress(row, leaf.path, activeSample))) next.push(rowFromLeaf(leaf.path, leaf.key, leaf.node, activeSample));
+      });
+      return next;
+    });
+  };
+
+  const siblingTsInfo = useMemo(() => {
+    if (!isJson || !fields.length) return null;
+    const withTs = fields.filter((row) => samples.some((s) => (protocol !== 'mqtt' || s.topic === row.topic) && row.jsonpath && hasSiblingTimestamp(s.root, row.jsonpath)));
+    return `${withTs.length} of ${fields.length} field(s) have a sibling source_timestamp in the captured sample.`;
+  }, [fields, isJson, protocol, samples]);
+
+  // ---------------------------------------------------------------- Step 4: OPC UA / Modbus
+  const handleAddNodeIds = () => {
+    const lines = nodeText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const added: FieldRow[] = [];
+    let tsNode = '';
+    lines.forEach((nodeId) => {
+      const field = nodeIdField(nodeId);
+      if (field === 'source_timestamp') {
+        tsNode = nodeId;
         return;
       }
-      const baseTopic = mqttTopicFilter.replace(/#$/, '').replace(/\/$/, '') || 'uns/data';
-      const newFields: FieldRow[] = flattened.map((f) => {
-        let u = '';
-        const lower = f.variableName.toLowerCase();
-        if (lower.includes('temp')) u = '°C';
-        else if (lower.includes('speed') || lower.includes('rpm')) u = 'rpm';
-        else if (lower.includes('power')) u = 'kW';
-        else if (lower.includes('pressure') || lower.includes('bar')) u = 'bar';
-        else if (lower.includes('current')) u = 'A';
-        else if (lower.includes('voltage') || lower.includes('volt')) u = 'V';
-        else if (lower.includes('energy')) u = 'kWh';
-
-        return {
-          id: `f-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          topic: `${baseTopic}/state`,
-          address: f.jsonPath,
-          name: f.variableName,
-          dataType: f.dataType,
-          unit: u,
-          sample: f.value,
-        };
-      });
-
-      setFields((prev) => {
-        const existing = new Set(prev.map((i) => i.name.toLowerCase()));
-        return [...prev, ...newFields.filter((nf) => !existing.has(nf.name.toLowerCase()))];
-      });
-      setIsPasteModalOpen(false);
-      setPastedJsonText('');
-      invalidateTest();
-    } catch (err: any) {
-      setPastedJsonError(err.message || 'Invalid JSON format.');
-    }
-  };
-  
-  // Helper to add field from captured payload
-  const handleAddFieldFromSample = (key: string, val: unknown, topic: string) => {
-    invalidateTest();
-    // Validate whether field already exists
-    if (fields.some((f) => f.name.toLowerCase() === key.toLowerCase() && f.topic === topic)) {
-      return;
-    }
-
-    let guessedType = 'Number';
-    if (typeof val === 'boolean') guessedType = 'Boolean';
-    else if (typeof val === 'string') guessedType = 'Text';
-    else if (typeof val === 'number') guessedType = Number.isInteger(val) ? 'Integer' : 'Number';
-
-    const newField: FieldRow = {
-      id: `f-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      topic,
-      address: `$.${key}`,
-      name: sanitizeVariableName(key),
-      dataType: guessedType,
-      unit: key === 'power' ? 'kW' : key.includes('temp') ? '°C' : '',
-      sample: val,
-    };
-    setFields((prev) => [...prev, newField]);
-  };
-
-  // Select all numeric from current selected topic (TC-UI-AD-26)
-  const handleSelectAllNumeric = () => {
-    if (!selectedCapturedTopic) return;
-    const topicObj = capturedTopics.find((t) => t.topic === selectedCapturedTopic);
-    if (!topicObj) return;
-
-    for (const [key, val] of Object.entries(topicObj.samplePayload)) {
-      if (typeof val === 'number') {
-        handleAddFieldFromSample(key, val, topicObj.topic);
-      }
-    }
-  };
-
-  // Row validation checker
-  const validateFieldRows = () => {
-    let hasErr = false;
-    const updated = fields.map((f, idx) => {
-      let error: string | undefined;
-      let warning: string | undefined;
-
-      // JSONPath must start with $
-      if (!f.address.startsWith('$')) {
-        error = 'Field paths start with $ (for example $.status).';
-      }
-
-      // Validate variable naming convention
-      const nameErr = validateVariableName(f.name);
-      if (nameErr) {
-        error = nameErr;
-      }
-
-      // Duplicate in this list
-      const dupInList = fields.some(
-        (other, otherIdx) => otherIdx !== idx && other.name.toLowerCase() === f.name.toLowerCase()
-      );
-      if (dupInList) {
-        error = `Another field in this list is named "${f.name}".`;
-      }
-
-      // Already exists on target resource
-      const existingOnRes = signals.some(
-        (s) => s.resourceId === selectedTargetId && (s.key === f.name || s.displayName === f.name)
-      );
-      if (existingOnRes) {
-        error = `${targetResource?.name || 'Resource'} already has a signal named "${f.name}".`;
-      }
-
-      // Type mismatch warning
-      if (typeof f.sample === 'string' && f.dataType === 'Number') {
-        warning = `Sample value "${f.sample}" is text. Choose Text.`;
-      }
-
-      if (error) hasErr = true;
-      return { ...f, error, warning };
+      if (fields.some((row) => row.nodeId === nodeId) || added.some((row) => row.nodeId === nodeId)) return;
+      const key = keyFromRawName(field);
+      added.push(emptyRow('opcua', { key, displayName: key, nodeId, dataType: 'float64' }));
     });
-
-    setFields(updated);
-    return !hasErr;
+    if (tsNode) setOpcTimestampNodeId(tsNode);
+    setFields((prev) => [...prev, ...added]);
+    setNodeText('');
+    invalidateTest();
+    setNodeMessage(
+      `${added.length} node(s) added.${tsNode ? ` ${tsNode} is used as the source timestamp of every field.` : ''}`,
+    );
   };
 
-  // Similar resources detection (TC-UI-AD-27)
-  const similarResources = useMemo(() => {
-    if (!targetResource) return [];
-    return resources.filter(
-      (r) =>
-        r.id !== targetResource.id &&
-        r.type === targetResource.type &&
-        r.parentId === targetResource.parentId
-    );
-  }, [targetResource, resources]);
-
-  // Step 5: Real Commissioning Test on Edge
-  const handleRunTest = async () => {
-    if (!selectedConnectionId) {
-      alert('Please select a connection first.');
+  const browse = async (nodeId: string, label: string, push: boolean) => {
+    if (!selectedConnectionId) return;
+    setBrowsing(true);
+    setBrowseError(null);
+    const result = await runCapture(selectedConnectionId, { browse_node: nodeId, duration_seconds: 5, max_messages: 1 });
+    setBrowsing(false);
+    if (!result.passed) {
+      setBrowseError(result.message || 'Browse failed.');
       return;
     }
-    setIsTesting(true);
+    if (!result.browse.length) {
+      setBrowseError('The collector returned no child nodes. Paste node IDs instead.');
+      setBrowseNodes([]);
+      return;
+    }
+    setBrowseNodes(result.browse);
+    setBrowseStack((prev) => (push ? [...prev, { nodeId, label }] : [{ nodeId, label }]));
+  };
+
+  const handleAddRegisterMap = () => {
+    const parsed = parseRegisterMap(mapText);
+    const added = parsed.rows.map((partial) => emptyRow('modbus', partial));
+    setFields((prev) => [...prev, ...added]);
+    setMapMessage(`${added.length} field(s) added.${parsed.errors.length ? ` ${parsed.errors.join(' ')}` : ''}`);
+    if (added.length) setMapText('');
+    invalidateTest();
+  };
+
+  // ---------------------------------------------------------------- Validation and tests
+  const existingKeys = useCallback(
+    (resourceId: string) => new Set(signals.filter((s) => s.resourceId === resourceId).map((s) => s.key || '')),
+    [signals],
+  );
+
+  const validateCurrentRows = (): boolean => {
+    const result = validateRows(fields, protocol, existingKeys(selectedTargetId));
+    setFields(result.rows);
+    if (result.hasError) setRowsError('Fix the highlighted rows.');
+    else if (!result.rows.length) setRowsError('Add at least one field.');
+    else setRowsError(null);
+    if (protocol === 'opcua' && opcTimestampNodeId.trim() && !/^(ns=\d+;|nsu=[^;]+;)?[isgb]=.+$/.test(opcTimestampNodeId.trim())) {
+      setRowsError('The timestamp node ID is not a valid node ID.');
+      return false;
+    }
+    if (isJson && timestampMode === 'custom' && !timestampPath.trim().startsWith('$')) {
+      setRowsError('The timestamp JSONPath starts with $.');
+      return false;
+    }
+    return !result.hasError && result.rows.length > 0;
+  };
+
+  const handleRunTest = async () => {
+    if (!selectedConnectionId || !validateCurrentRows()) return;
+    setTesting(true);
     setTestResult(null);
-
-    try {
-      const testFields = fields.map((f) => ({
-        key: f.name,
-        name: f.name,
-        dataType: f.dataType,
-        address: {
-          topic: f.topic,
-          jsonpath: (f.address || '').trim().startsWith('$') ? (f.address || '').trim() : `$.${(f.address || '').trim()}`,
-          qos: f.qos !== undefined ? Number(f.qos) : (mqttQos !== '' ? Number(mqttQos) : 0),
-          node_id: f.nodeId || f.address,
-          offset: f.offset,
-          register_area: f.registerArea,
-        },
-      }));
-
-      const testRes = await api<{ job_id: string; status: string }>(
-        `/api/v1/connections/${selectedConnectionId}/tests`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            mode: 'FULL',
-            fields: testFields,
-          }),
-        }
-      );
-
-      const jobId = testRes.job_id;
-      let terminal = false;
-      let attempts = 0;
-      let finalJob: any = null;
-
-      while (!terminal && attempts < 40) {
-        await new Promise((r) => setTimeout(r, 800));
-        attempts++;
-        try {
-          const job = await api<any>(`/api/v1/commissioning/${jobId}`);
-          if (job.status === 'COMPLETED' || job.status === 'PASSED' || job.status === 'FAILED' || job.status === 'CANCELLED') {
-            terminal = true;
-            finalJob = job;
-          }
-        } catch {
-          // continue polling
+    setLiveValues({});
+    const result = await runConnectionTest(selectedConnectionId, {
+      mode: 'FULL',
+      fields: fields.map((row) => ({ key: row.key.trim(), name: row.displayName || row.key, data_type: row.dataType, address: buildAddress(row, settings) })),
+    });
+    setTesting(false);
+    setTestResult(result);
+    const samplesObj = result.samples && typeof result.samples === 'object' && !Array.isArray(result.samples) ? (result.samples as Record<string, unknown>) : {};
+    const responseDoc = samplesObj.response !== undefined ? fromValue(samplesObj.response) : null;
+    const values: Record<string, string> = {};
+    fields.forEach((row) => {
+      const key = row.key.trim();
+      let value: unknown;
+      let found = false;
+      if (key in samplesObj && key !== 'meta') {
+        value = samplesObj[key];
+        found = true;
+      } else if (row.nodeId && row.nodeId in samplesObj) {
+        value = samplesObj[row.nodeId];
+        found = true;
+      } else if (responseDoc && row.jsonpath) {
+        const node = evaluateNode(responseDoc, row.jsonpath);
+        if (node) {
+          value = nodePreview(node);
+          found = true;
         }
       }
-
-      setIsTesting(false);
-      if (finalJob) {
-        const isPassed = finalJob.status === 'COMPLETED' || finalJob.status === 'PASSED';
-        const stagesList = (finalJob.stages_json || []).map((st: any) => ({
-          stage: st.stage,
-          status: st.status,
-          duration_ms: st.duration_ms,
-          detail: st.detail,
-        }));
-        const samplesResult = finalJob.samples_json?.samples || finalJob.samples_json || {};
-
-        setTestResult({
-          passed: isPassed,
-          stages: stagesList,
-          errorMessage: isPassed ? undefined : (finalJob.diagnostic || finalJob.error_code || 'Commissioning test did not pass.'),
-          fieldSamples: typeof samplesResult === 'object' ? samplesResult : {},
-        });
-      } else {
-        setTestResult({
-          passed: false,
-          stages: [{ stage: 'Commissioning', status: 'FAILED', detail: 'Test timed out after 30 seconds.' }],
-          errorMessage: 'Commissioning test timed out.',
-        });
-      }
-    } catch (err: any) {
-      setIsTesting(false);
-      setTestResult({
-        passed: false,
-        stages: [{ stage: 'Connection', status: 'FAILED', detail: err.message || 'Network error' }],
-        errorMessage: err.message || 'Error running commissioning test',
-      });
-    }
+      if (found) values[row.id] = typeof value === 'string' && responseDoc ? value : formatValue(value);
+    });
+    setLiveValues(values);
   };
 
-  // Step 5: Start Collecting (Commit signals)
+  // ---------------------------------------------------------------- Similar machines
+  const similarCandidates = useMemo(() => {
+    if (!targetResource) return [];
+    return resources
+      .filter((r) => r.id !== targetResource.id && r.type === targetResource.type && (r.attributes?.siteId || '') === targetSiteId)
+      .sort((a, b) => (a.code || '').localeCompare(b.code || ''));
+  }, [resources, targetResource, targetSiteId]);
+
+  const rewriteRows = useMemo(
+    () => rewrites.map((rw) => ({ rw, rows: fields.map((row) => applyRewrite(protocol, row, rw)), problems: rewriteProblems(protocol, fields, rw) })),
+    [rewrites, fields, protocol],
+  );
+
+  // ---------------------------------------------------------------- Start collecting
   const handleStartCollecting = async () => {
-    if (!selectedTargetId || fields.length === 0) return;
-    setIsSubmitting(true);
-
+    if (!selectedTargetId || !connDetail || !validateCurrentRows()) return;
+    setSubmitError(null);
+    setOutcomes(null);
+    const targets: Array<{ resourceId: string; name: string; rows: FieldRow[]; unitId: number }> = [
+      { resourceId: selectedTargetId, name: targetResource?.name || targetResource?.code || 'Target', rows: fields, unitId: modbusUnitId },
+      ...rewriteRows.map(({ rw, rows }) => ({ resourceId: rw.resourceId, name: rw.resourceName, rows, unitId: Number(rw.unitId) })),
+    ];
+    // Validate every target before creating anything.
+    for (const { rw, problems } of rewriteRows) {
+      if (problems.length) {
+        setSubmitError(`${rw.resourceName}: ${problems.join(' ')}`);
+        return;
+      }
+    }
+    for (const target of targets.slice(1)) {
+      const check = validateRows(target.rows, protocol, existingKeys(target.resourceId));
+      const bad = check.rows.find((row) => row.error);
+      if (bad) {
+        setSubmitError(`${target.name}: ${bad.key} — ${bad.error}`);
+        return;
+      }
+    }
+    setSubmitting(true);
+    const results: TargetOutcome[] = [];
     try {
-      const conn = connections.find((c) => c.id === selectedConnectionId);
-      if (!conn) throw new Error('Please select a valid connection');
-
-      const protocol: string = (conn.protocol as string) || 'mqtt';
-      const defaultJobMode = protocol === 'mqtt' ? 'SUBSCRIBE' : 'POLL';
-
-      // Ensure we have the acquisition job id for this connection
-      let jobId = '';
-      try {
-        const connDetail = await api<{ id: string; edge_id?: string; jobs?: Array<{ id: string; mode?: string }> }>(`/api/v1/connections/${conn.id}`);
-        if (connDetail?.jobs?.[0]?.id) {
-          jobId = connDetail.jobs[0].id;
-        }
-      } catch {
-        // ignore and fallback
-      }
-
+      let jobId = job?.id || '';
+      const subscribe = protocol === 'mqtt';
       if (!jobId) {
-        const jobRes = await api<{ id: string }>('/api/v1/jobs', {
+        const created = await api<{ id: string }>('/api/v1/jobs', {
           method: 'POST',
-          body: JSON.stringify({
-            connection_id: conn.id,
-            mode: defaultJobMode,
-            interval_ms: Number(pollIntervalMs) || 1000,
-          }),
+          body: JSON.stringify({ connection_id: connDetail.id, mode: subscribe || protocol === 'websocket' ? 'SUBSCRIBE' : 'POLL', interval_ms: subscribe ? 1000 : intervalMs }),
         });
-        jobId = jobRes.id;
-      }
-
-      // Targets list: targetResource + any selected similar resources (TC-UI-AD-28)
-      const targetIdsToCreate = [selectedTargetId, ...selectedSimilarResourceIds];
-
-      for (const tId of targetIdsToCreate) {
-        const resObj = resources.find((r) => r.id === tId);
-
-        const bulkItems = fields.map((f) => {
-          // Replace machine code in topic if similar resource
-          let finalTopic = f.topic;
-          if (targetResource && resObj && targetResource.code !== resObj.code) {
-            finalTopic = finalTopic.replace(targetResource.code, resObj.code);
-          }
-
-          let canonType = 'float64';
-          if (f.dataType === 'Integer') canonType = 'int64';
-          else if (f.dataType === 'Boolean') canonType = 'bool';
-          else if (f.dataType === 'Text') canonType = 'string';
-
-          let jsonPath = (f.address || '').trim();
-          if (jsonPath && !jsonPath.startsWith('$')) {
-            jsonPath = `$.${jsonPath}`;
-          }
-
-          let addressKind = 'mqtt_jsonpath';
-          let addressPayload: Record<string, any> = {};
-
-          if (protocol === 'mqtt') {
-            addressKind = 'mqtt_jsonpath';
-            const chosenQos = f.qos !== undefined ? Number(f.qos) : (mqttQos !== '' ? Number(mqttQos) : 0);
-            addressPayload = {
-              topic: finalTopic,
-              jsonpath: jsonPath || '$',
-              qos: chosenQos,
-            };
-          } else if (protocol === 'opcua') {
-            addressKind = 'opcua_node';
-            addressPayload = {
-              node_id: f.nodeId || f.address || 'i=84',
-            };
-          } else if (protocol === 'modbus' || protocol === 'modbus_tcp') {
-            addressKind = 'modbus_register';
-            addressPayload = {
-              register_area: f.registerArea || 'holding',
-              offset: f.offset !== undefined ? Number(f.offset) : 0,
-              register_count: f.registerCount !== undefined ? Number(f.registerCount) : 1,
-              unit_id: f.unitId !== undefined ? Number(f.unitId) : ((conn.config as any)?.unit_id || 1),
-              word_order: f.wordOrder || 'big',
-              native_type: f.nativeType || 'uint16',
-            };
-          } else if (protocol === 'http') {
-            addressKind = 'http_jsonpath';
-            addressPayload = {
-              path: f.path || (conn.config as any)?.path || '/',
-              method: f.method || (conn.config as any)?.method || 'GET',
-              jsonpath: jsonPath || '$',
-            };
-          }
-
-          return {
-            key: f.name,
-            name: f.name,
-            data_type: canonType,
-            unit: f.unit || undefined,
-            expected_interval_ms: Number(pollIntervalMs) || 10000,
-            source_field: {
-              acquisition_job_id: jobId,
-              address_kind: addressKind,
-              address: addressPayload,
-            },
-          };
-        });
-
-        await api('/api/v1/signals/bulk', {
+        jobId = created.id;
+      } else if (isPolling && job && Number(job.interval_ms) !== intervalMs) {
+        await api('/api/v1/jobs', {
           method: 'POST',
-          body: JSON.stringify({
-            resource_id: tId,
-            items: bulkItems,
-            atomic: true,
-          }),
+          body: JSON.stringify({ connection_id: connDetail.id, mode: job.mode || 'POLL', interval_ms: intervalMs }),
         });
       }
-
-      // Publish config to Connection's assigned Edge
-      const targetEdgeId = (conn as any).edge_id || siteEdges[0]?.id;
-      if (targetEdgeId) {
-        await api('/api/v1/config-releases/publish', {
-          method: 'POST',
-          body: JSON.stringify({ edge_id: targetEdgeId }),
-        });
+      const expected = isPolling ? intervalMs : 1000;
+      for (const target of targets) {
+        const targetSettings: AddressSettings = { ...settings, modbusUnitId: target.unitId };
+        try {
+          await api('/api/v1/signals/bulk', {
+            method: 'POST',
+            body: JSON.stringify({
+              resource_id: target.resourceId,
+              atomic: true,
+              items: target.rows.map((row) => ({
+                key: row.key.trim(),
+                name: (row.displayName || row.key).trim(),
+                data_type: row.dataType,
+                unit: row.unit.trim() || undefined,
+                expected_interval_ms: expected,
+                source_field: {
+                  acquisition_job_id: jobId,
+                  address_kind: addressKindFor(protocol),
+                  address: buildAddress(row, targetSettings),
+                },
+              })),
+            }),
+          });
+          results.push({ resourceId: target.resourceId, name: target.name, ok: true, message: `${target.rows.length} signal(s) created` });
+        } catch (error) {
+          results.push({ resourceId: target.resourceId, name: target.name, ok: false, message: error instanceof Error ? error.message : 'Request failed' });
+        }
       }
-
-      // Clear draft
-      sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+      if (results.some((r) => r.ok) && connDetail.edge_id) {
+        await api('/api/v1/config-releases/publish', { method: 'POST', body: JSON.stringify({ edge_id: connDetail.edge_id }) });
+      }
       await refresh();
-
-      navigate(`/collector/signals?resourceId=${selectedTargetId}`);
-    } catch (err: unknown) {
-      const apiErr = err as ApiError;
-      alert(`Error starting collection: ${apiErr.message}`);
+      setOutcomes(results);
+      if (results.every((r) => r.ok)) {
+        clearDraft();
+        navigate(`/collector/signals?resourceId=${encodeURIComponent(selectedTargetId)}`);
+      }
+    } catch (error) {
+      setOutcomes(results.length ? results : null);
+      setSubmitError(error instanceof ApiError || error instanceof Error ? error.message : 'Could not start collecting.');
     } finally {
-      setIsSubmitting(false);
+      setSubmitting(false);
     }
   };
 
-  // Cancel Handler (TC-UI-AD-40..41)
+  // ---------------------------------------------------------------- Cancel
   const handleCancel = () => {
-    if (newConnCreatedId) {
+    if (newConnCreated) {
       setConfirmCancelOpen(true);
-    } else {
-      sessionStorage.removeItem(DRAFT_STORAGE_KEY);
-      navigate(-1);
+      return;
     }
+    clearDraft();
+    navigate(-1);
   };
 
-  const handleConfirmDiscardNewConn = async (keep: boolean) => {
-    if (!keep && newConnCreatedId) {
+  const handleDiscardNewConn = async (keep: boolean) => {
+    setCancelError(null);
+    if (!keep && newConnCreated) {
       try {
-        await api(`/api/v1/connections/${newConnCreatedId}`, { method: 'DELETE' });
-      } catch {
-        // ignore
+        await api(`/api/v1/connections/${encodeURIComponent(newConnCreated.id)}/pause`, { method: 'POST' });
+        await api(`/api/v1/connections/${encodeURIComponent(newConnCreated.id)}`, { method: 'DELETE' });
+        await refresh();
+      } catch (error) {
+        setCancelError(`The connection could not be archived: ${error instanceof Error ? error.message : 'request failed'}. Archive it from Connections.`);
+        return;
       }
     }
-    sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+    clearDraft();
     setConfirmCancelOpen(false);
     navigate(-1);
   };
 
+  const testPassed = Boolean(testResult?.passed);
+  const canStart = fields.length > 0 && (testPassed || acceptUntested) && !submitting;
+
+  // ---------------------------------------------------------------- Render
+  const stepTitle = ['Choose target resource', 'Select data source', 'Source address', 'Map fields', 'Review & start'][currentStep - 1];
+  const labelCls = 'block text-[11px] font-semibold text-[#657794] uppercase mb-1';
+  const inputCls = 'w-full px-3 py-2 border border-slate-300 rounded text-[12px] focus:outline-none focus:border-blue-500';
+  const requestsPerMinute = protocol === 'http' && intervalMs > 0 ? Math.round((60000 / intervalMs) * (1 + rewrites.length)) : 0;
+  const rateLimit = Number(connDetail?.config_json?.rate_limit_per_min ?? 60) || 60;
+
   return (
-    <div className="max-w-4xl mx-auto space-y-6 pb-12">
-      {/* Top Header & Breadcrumb */}
+    <div className="max-w-6xl mx-auto space-y-6 pb-12">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
         <div>
-          <div className="text-[12px] font-semibold text-blue-600 flex items-center gap-1.5">
+          <div className="text-[12px] font-semibold text-blue-600 flex items-center gap-1.5 flex-wrap">
             <span>Add Data</span>
             {targetPathString && (
               <>
@@ -811,431 +804,328 @@ export const AddDataWizardPage: React.FC = () => {
                 <span className="text-[#111B37] font-mono">{targetPathString}</span>
               </>
             )}
+            {selectedConnection && (
+              <>
+                <ChevronRight className="w-3 h-3 text-slate-400" />
+                <span className="text-[#111B37]">{selectedConnection.name} · {PROTOCOL_LABEL[protocol]}</span>
+              </>
+            )}
           </div>
           <h1 className="text-[20px] font-bold text-[#111B37] mt-0.5">
-            {currentStep === 1 && '1. Choose Target Resource'}
-            {currentStep === 2 && '2. Select Data Source'}
-            {currentStep === 3 && '3. Configure Source Address'}
-            {currentStep === 4 && '4. Map Field Signals'}
-            {currentStep === 5 && '5. Review & Verification'}
+            {currentStep}. {stepTitle}
           </h1>
         </div>
-
         <Button variant="outline" size="sm" onClick={handleCancel}>
           Cancel
         </Button>
       </div>
 
-      {/* Step Indicator Progress Bar */}
-      <div className="grid grid-cols-5 gap-2">
-        {[
-          { num: 1, title: 'Target' },
-          { num: 2, title: 'Source' },
-          { num: 3, title: 'Address' },
-          { num: 4, title: 'Fields' },
-          { num: 5, title: 'Review' },
-        ].map((s) => (
-          <div
-            key={s.num}
-            className={`p-2.5 rounded-lg border text-center transition ${
-              currentStep === s.num
-                ? 'bg-blue-50 border-blue-400 text-blue-700 font-bold'
-                : currentStep > s.num
-                ? 'bg-emerald-50 border-emerald-300 text-emerald-800 font-semibold'
-                : 'bg-white border-slate-200 text-slate-400 font-medium'
-            }`}
-          >
-            <div className="text-[11px] uppercase tracking-wider">Step {s.num}</div>
-            <div className="text-[13px]">{s.title}</div>
-          </div>
-        ))}
-      </div>
+      <ol className="grid grid-cols-5 gap-2" aria-label="Wizard steps">
+        {['Target', 'Source', 'Address', 'Fields', 'Review'].map((title, index) => {
+          const num = index + 1;
+          return (
+            <li
+              key={title}
+              aria-current={currentStep === num ? 'step' : undefined}
+              className={`p-2.5 rounded-lg border text-center transition ${
+                currentStep === num
+                  ? 'bg-blue-50 border-blue-400 text-blue-700 font-bold'
+                  : currentStep > num
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-800 font-semibold'
+                    : 'bg-white border-slate-200 text-slate-400 font-medium'
+              }`}
+            >
+              <div className="text-[11px] uppercase tracking-wider">Step {num}</div>
+              <div className="text-[13px]">{title}</div>
+            </li>
+          );
+        })}
+      </ol>
 
-      {/* STEP 1: TARGET (TC-UI-AD-01..04) - Hierarchical Tree View */}
+      {/* STEP 1 */}
       {currentStep === 1 && (
         <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <div>
-              <h3 className="text-[14px] font-bold text-[#111B37]">Select target resource</h3>
-              <p className="text-[12px] text-[#657794]">
-                Data can be bound to any level in your hierarchy (Machine, Line, Zone, Cell, or Plant)
-              </p>
+              <h3 className="text-[14px] font-bold text-[#111B37]">Select the resource that owns the data</h3>
+              <p className="text-[12px] text-[#657794]">Signals can be bound to any level (machine, line, zone…).</p>
             </div>
-            <div className="flex items-center gap-1.5 self-start sm:self-auto">
-              <button
-                type="button"
-                onClick={expandAllTargets}
-                className="px-2 py-1 text-[11px] font-semibold text-[#134074] hover:bg-[#F1F5F9] rounded-lg transition"
-              >
+            <div className="flex items-center gap-1.5">
+              <button type="button" onClick={() => setExpandedTargetNodes(Object.fromEntries(resources.map((r) => [r.id, true])))} className="px-2 py-1 text-[11px] font-semibold text-[#134074] hover:bg-[#F1F5F9] rounded-lg">
                 Expand all
               </button>
               <span className="text-slate-300">|</span>
-              <button
-                type="button"
-                onClick={collapseAllTargets}
-                className="px-2 py-1 text-[11px] font-semibold text-[#64748B] hover:bg-[#F1F5F9] rounded-lg transition"
-              >
+              <button type="button" onClick={() => setExpandedTargetNodes(Object.fromEntries(resources.map((r) => [r.id, false])))} className="px-2 py-1 text-[11px] font-semibold text-[#64748B] hover:bg-[#F1F5F9] rounded-lg">
                 Collapse all
               </button>
             </div>
           </div>
-
           <div className="relative">
             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
-            <input
-              type="text"
-              placeholder="Search resources by name or code…"
-              value={targetSearch}
-              onChange={(e) => setTargetSearch(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded text-[13px] focus:outline-none focus:border-blue-500"
-            />
+            <input type="text" aria-label="Search resources" placeholder="Search resources by name or code…" value={targetSearch} onChange={(e) => setTargetSearch(e.target.value)} className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded text-[13px] focus:outline-none focus:border-blue-500" />
           </div>
-
-          {/* Hierarchical Tree Container */}
-          <div className="border border-slate-200 rounded-xl max-h-96 overflow-y-auto divide-y divide-slate-100 p-2 bg-[#F8FAFC]">
+          <div role="tree" className="border border-slate-200 rounded-xl max-h-96 overflow-y-auto p-2 bg-[#F8FAFC]">
             {wizardTree.length === 0 ? (
-              <div className="text-center py-8 text-slate-400 text-xs font-medium">No resources found in factory hierarchy.</div>
+              <div className="text-center py-8 text-slate-400 text-xs font-medium">No resources yet. Build the factory model first.</div>
             ) : (
               (() => {
-                const renderTreeNode = (node: WizardTreeNode, depth: number): React.ReactNode => {
+                const renderNode = (node: WizardTreeNode, depth: number): React.ReactNode => {
                   if (!nodeOrDescendantMatches(node, targetSearch)) return null;
                   const hasChildren = node.children.length > 0;
-                  const isExpanded = targetSearch.trim().length > 0 ? true : (expandedTargetNodes[node.resource.id] ?? true);
-                  const isSelected = selectedTargetId === node.resource.id;
-
-                  const getTypeIcon = (type: string) => {
-                    switch (type.toLowerCase()) {
-                      case 'enterprise':
-                        return <Layers className="w-4 h-4 text-blue-600 shrink-0" />;
-                      case 'site':
-                      case 'plant':
-                        return <Network className="w-4 h-4 text-emerald-600 shrink-0" />;
-                      case 'area':
-                        return <FolderTree className="w-4 h-4 text-amber-600 shrink-0" />;
-                      case 'zone':
-                        return <Layers className="w-4 h-4 text-orange-500 shrink-0" />;
-                      case 'line':
-                        return <Cpu className="w-4 h-4 text-indigo-500 shrink-0" />;
-                      case 'machine':
-                        return <Cpu className="w-4 h-4 text-red-500 shrink-0" />;
-                      default:
-                        return <Layers className="w-4 h-4 text-slate-500 shrink-0" />;
-                    }
-                  };
-
+                  const expanded = targetSearch.trim() ? true : expandedTargetNodes[node.resource.id] ?? true;
+                  const selected = selectedTargetId === node.resource.id;
                   return (
                     <React.Fragment key={node.resource.id}>
                       <div
+                        role="treeitem"
+                        aria-selected={selected}
+                        aria-expanded={hasChildren ? expanded : undefined}
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setSelectedTargetId(node.resource.id);
+                            invalidateTest();
+                          }
+                        }}
                         onClick={() => {
                           setSelectedTargetId(node.resource.id);
                           invalidateTest();
                         }}
-                        style={{ paddingLeft: depth * 18 + 8 + 'px' }}
-                        className={'py-2 pr-3 flex items-center justify-between cursor-pointer rounded-lg transition mb-0.5 ' + (
-                          isSelected
-                            ? 'bg-white border-2 border-blue-600 shadow-sm text-blue-900 font-bold'
-                            : 'hover:bg-white text-[#111B37]'
-                        )}
+                        style={{ paddingLeft: depth * 18 + 8 }}
+                        className={`py-2 pr-3 flex items-center justify-between cursor-pointer rounded-lg transition mb-0.5 ${selected ? 'bg-white border-2 border-blue-600 shadow-sm text-blue-900 font-bold' : 'hover:bg-white text-[#111B37]'}`}
                       >
                         <div className="flex items-center gap-2 min-w-0">
                           {hasChildren ? (
                             <button
                               type="button"
-                              onClick={(e) => toggleTargetExpand(node.resource.id, e)}
+                              aria-label={expanded ? 'Collapse' : 'Expand'}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setExpandedTargetNodes((prev) => ({ ...prev, [node.resource.id]: !expanded }));
+                              }}
                               className="p-1 rounded hover:bg-slate-200 text-slate-500"
                             >
-                              {isExpanded ? (
-                                <ChevronDown className="w-3.5 h-3.5" />
-                              ) : (
-                                <ChevronRight className="w-3.5 h-3.5" />
-                              )}
+                              {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
                             </button>
                           ) : (
                             <span className="w-5" />
                           )}
-
-                          {getTypeIcon(node.resource.type)}
-
-                          <span className="text-[13px] font-semibold truncate">
-                            {node.resource.name || node.resource.code}
-                          </span>
-
-                          <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded">
-                            {node.resource.type}
-                          </span>
-
-                          <span className="text-[11px] text-[#657794] font-mono">
-                            {node.resource.code}
-                          </span>
+                          {typeIcon(node.resource.type)}
+                          <span className="text-[13px] font-semibold truncate" title={node.resource.name}>{node.resource.name || node.resource.code}</span>
+                          <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 bg-slate-100 text-slate-600 rounded">{node.resource.type}</span>
+                          <span className="text-[11px] text-[#657794] font-mono">{node.resource.code}</span>
                         </div>
-
-                        {isSelected ? (
-                          <CheckCircle2 className="w-5 h-5 text-blue-600 shrink-0" />
-                        ) : (
-                          <Circle className="w-5 h-5 text-slate-300 shrink-0" />
-                        )}
+                        {selected ? <CheckCircle2 className="w-5 h-5 text-blue-600 shrink-0" /> : <Circle className="w-5 h-5 text-slate-300 shrink-0" />}
                       </div>
-
-                      {hasChildren && isExpanded && (
-                        <div>
-                          {node.children.map((child) => renderTreeNode(child, depth + 1))}
-                        </div>
-                      )}
+                      {hasChildren && expanded && <div role="group">{node.children.map((child) => renderNode(child, depth + 1))}</div>}
                     </React.Fragment>
                   );
                 };
-
-                return wizardTree.map((root) => renderTreeNode(root, 0));
+                return wizardTree.map((root) => renderNode(root, 0));
               })()
             )}
           </div>
-
           <div className="flex justify-end pt-3 border-t border-slate-100">
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={!selectedTargetId}
-              onClick={() => setCurrentStep(2)}
-            >
-              Next: Select Source <ArrowRight className="w-3.5 h-3.5 ml-1" />
+            <Button variant="primary" size="sm" disabled={!selectedTargetId} onClick={() => setCurrentStep(selectedConnectionId ? 3 : 2)}>
+              Next: {selectedConnectionId ? 'Source address' : 'Select source'} <ArrowRight className="w-3.5 h-3.5 ml-1" />
             </Button>
           </div>
         </Card>
       )}
 
-      {/* STEP 2: SOURCE (TC-UI-AD-05..07) */}
+      {/* STEP 2 */}
       {currentStep === 2 && (
         <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
           <div className="flex items-center justify-between">
             <div>
-              <h3 className="text-[14px] font-bold text-[#111B37]">Select data connection</h3>
-              <p className="text-[12px] text-[#657794]">
-                Choose an existing connection for {targetSite?.name || 'this site'} or create a new one
-              </p>
+              <h3 className="text-[14px] font-bold text-[#111B37]">Select the data connection</h3>
+              <p className="text-[12px] text-[#657794]">Connections of the same site as {targetResource?.name || 'the target'}.</p>
             </div>
-            {!isCreatingNewConn && (
-              <Button size="sm" variant="outline" onClick={() => setIsCreatingNewConn(true)}>
-                <Plus className="w-3.5 h-3.5 mr-1" /> New connection
-              </Button>
-            )}
+            <Button size="sm" variant="outline" onClick={() => setIsConnFormOpen(true)}>
+              <Plus className="w-3.5 h-3.5 mr-1" /> New connection
+            </Button>
           </div>
-
-          {/* New Connection Inline Form */}
-          {isCreatingNewConn ? (
-            <div className="p-4 border border-blue-200 bg-blue-50/30 rounded-xl space-y-4">
-              <h4 className="text-[13px] font-bold text-[#111B37]">New Connection</h4>
-
-              {newConnError && (
-                <div className="p-2.5 bg-red-50 border border-red-200 text-red-700 text-[12px] rounded">
-                  {newConnError}
-                </div>
-              )}
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[12px]">
-                <div>
-                  <label className="block text-[11px] font-semibold text-[#657794] uppercase mb-1">
-                    Protocol*
-                  </label>
-                  <select
-                    value={newConnProtocol}
-                    onChange={(e) => setNewConnProtocol(e.target.value as any)}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded bg-white text-slate-800"
-                  >
-                    <option value="mqtt">MQTT Broker</option>
-                    <option value="modbus">Modbus TCP</option>
-                    <option value="opcua">OPC UA</option>
-                    <option value="http">HTTP / REST</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-semibold text-[#657794] uppercase mb-1">
-                    Connection Name*
-                  </label>
-                  <input
-                    type="text"
-                    value={newConnName}
-                    onChange={(e) => setNewConnName(e.target.value)}
-                    placeholder="e.g. mqtt-lab"
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-semibold text-[#657794] uppercase mb-1">
-                    Host / Endpoint*
-                  </label>
-                  <input
-                    type="text"
-                    value={newConnHost}
-                    onChange={(e) => setNewConnHost(e.target.value)}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded font-mono"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-semibold text-[#657794] uppercase mb-1">
-                    Port*
-                  </label>
-                  <input
-                    type="text"
-                    value={newConnPort}
-                    onChange={(e) => setNewConnPort(e.target.value)}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded font-mono"
-                  />
-                </div>
-              </div>
-
-              <div className="flex justify-end gap-2 pt-2 border-t border-blue-100">
-                <Button variant="outline" size="sm" onClick={() => setIsCreatingNewConn(false)}>
-                  Cancel
-                </Button>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={handleSaveNewConnection}
-                  disabled={newConnSaving}
-                >
-                  {newConnSaving ? 'Saving…' : 'Save connection'}
-                </Button>
-              </div>
+          {siteConnections.length === 0 ? (
+            <div className="p-8 text-center text-[#657794] border border-dashed border-slate-300 rounded-lg text-[12px]">
+              No connection exists for this site yet. Click "New connection".
             </div>
           ) : (
-            <div className="space-y-2">
-              {siteConnections.length === 0 ? (
-                <div className="p-8 text-center text-[#657794] border border-dashed border-slate-300 rounded-lg">
-                  No existing connections for this site. Click "+ New connection" above to add one.
-                </div>
-              ) : (
-                <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg">
-                  {siteConnections.map((c) => (
-                    <div
-                      key={c.id}
-                      onClick={() => {
-                        setSelectedConnectionId(c.id);
-                        invalidateTest();
-                      }}
-                      className={`p-3 flex items-center justify-between cursor-pointer transition ${
-                        selectedConnectionId === c.id ? 'bg-blue-50/70 border-l-4 border-blue-600' : 'hover:bg-slate-50'
-                      }`}
-                    >
-                      <div>
-                        <div className="text-[13px] font-semibold text-[#111B37] flex items-center gap-2">
-                          <span>{c.name}</span>
-                          <span className="text-[10px] uppercase font-bold px-1.5 py-0.2 bg-slate-100 text-slate-700 rounded">
-                            {c.protocol}
-                          </span>
-                        </div>
-                        <div className="text-[11px] text-[#657794] font-mono mt-0.5">
-                          {c.endpoint || '192.168.2.108:18883'}
-                        </div>
-                      </div>
-                      <StatusBadge status={c.health || 'ONLINE'} />
+            <div role="radiogroup" aria-label="Connections" className="divide-y divide-slate-100 border border-slate-200 rounded-lg">
+              {siteConnections.map((c) => (
+                <div
+                  key={c.id}
+                  role="radio"
+                  aria-checked={selectedConnectionId === c.id}
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setSelectedConnectionId(c.id);
+                      invalidateTest();
+                    }
+                  }}
+                  onClick={() => {
+                    if (c.id !== selectedConnectionId) {
+                      if (c.protocol !== protocol) {
+                        setFields([]);
+                        setRewrites([]);
+                      }
+                      setSelectedConnectionId(c.id);
+                      setSamples([]);
+                      setDiscovered(null);
+                      invalidateTest();
+                    }
+                  }}
+                  className={`p-3 flex items-center justify-between cursor-pointer transition ${selectedConnectionId === c.id ? 'bg-blue-50/70 border-l-4 border-blue-600' : 'hover:bg-slate-50'}`}
+                >
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-semibold text-[#111B37] flex items-center gap-2">
+                      <span>{c.name}</span>
+                      <span className="text-[10px] font-bold px-1.5 bg-slate-100 text-slate-700 rounded">{PROTOCOL_LABEL[c.protocol]}</span>
                     </div>
+                    <div className="text-[11px] text-[#657794] font-mono mt-0.5 truncate">{c.endpoint || '—'}</div>
+                  </div>
+                  <ConnectionStatusCell conn={c} compact />
+                </div>
+              ))}
+            </div>
+          )}
+          {connDetailError && <p role="alert" className="text-[12px] text-red-600">{connDetailError}</p>}
+          <div className="flex justify-between pt-3 border-t border-slate-100">
+            <Button variant="outline" size="sm" onClick={() => setCurrentStep(1)}>
+              <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back
+            </Button>
+            <Button variant="primary" size="sm" disabled={!selectedConnectionId || !connDetail} onClick={() => setCurrentStep(3)}>
+              Next: Source address <ArrowRight className="w-3.5 h-3.5 ml-1" />
+            </Button>
+          </div>
+        </Card>
+      )}
+
+      {/* STEP 3 */}
+      {currentStep === 3 && (
+        <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
+          <div>
+            <h3 className="text-[14px] font-bold text-[#111B37]">{PROTOCOL_LABEL[protocol]} address for {targetResource?.name || 'the target'}</h3>
+            <p className="text-[12px] text-[#657794]">
+              {protocol === 'mqtt' && 'Topic filter used to capture sample messages. MQTT is push-based: messages are processed as they arrive.'}
+              {protocol === 'http' && 'Request path on the connection base URL. The configured authentication is sent with every request.'}
+              {protocol === 'websocket' && 'The collector keeps one connection to the stream URL; fields are picked from the frames in the next step.'}
+              {protocol === 'opcua' && 'Nodes are read in one batch per cycle. Node IDs are entered or browsed in the next step.'}
+              {protocol === 'modbus' && 'Unit ID of this machine and the poll interval. Registers are defined in the next step.'}
+            </p>
+          </div>
+
+          {protocol === 'mqtt' && (
+            <div className="space-y-3 text-[12px]">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className={labelCls} htmlFor="wiz-topic">Topic filter*</label>
+                  <div className="flex items-center gap-3">
+                    <button type="button" onClick={() => { setMqttTopicFilter('#'); setAddressError(null); }} className="text-blue-600 hover:underline text-[11px] font-semibold">
+                      Use the broker root (#)
+                    </button>
+                    <button type="button" disabled={discovering} onClick={() => void handleDiscoverTopics()} className="text-blue-600 hover:underline text-[11px] font-semibold disabled:opacity-50">
+                      {discovering ? 'Listening 5 s…' : 'Discover topics'}
+                    </button>
+                  </div>
+                </div>
+                <input
+                  id="wiz-topic"
+                  type="text"
+                  value={mqttTopicFilter}
+                  onChange={(e) => {
+                    setMqttTopicFilter(e.target.value.trim());
+                    setAddressError(validateTopicFilter(e.target.value.trim()));
+                    invalidateTest();
+                  }}
+                  placeholder="e.g. plant/line/machine/telemetry or plant/+/telemetry"
+                  className={`${inputCls} font-mono ${addressError ? 'border-red-400' : ''}`}
+                />
+                {addressError && <p className="text-[11px] text-red-600 mt-1">{addressError}</p>}
+              </div>
+              {addressSuggestions.length > 0 && (
+                <div>
+                  <span className={labelCls}>Suggested for {targetResource?.code}</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {addressSuggestions.map((t) => (
+                      <button key={t} type="button" onClick={() => { setMqttTopicFilter(t); setAddressError(null); }} className={`px-2 py-0.5 rounded border font-mono text-[11px] ${mqttTopicFilter === t ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-blue-400'}`}>
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {discoverError && <p className="text-[11px] text-red-600">{discoverError}</p>}
+              {discovered && discovered.length > 0 && (
+                <div>
+                  <span className={labelCls}>Topics seen on the broker ({discovered.length})</span>
+                  <div className="max-h-48 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                    {discovered.map((t) => (
+                      <button key={t} type="button" onClick={() => { setMqttTopicFilter(t); setAddressError(null); }} className={`w-full text-left px-2 py-1 font-mono text-[11px] ${mqttTopicFilter === t ? 'bg-blue-50 font-bold' : 'hover:bg-slate-50'} ${targetResource && t.includes(targetResource.code) ? 'text-blue-800' : 'text-[#111B37]'}`}>
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div className="max-w-xs">
+                <label className={labelCls} htmlFor="wiz-qos">QoS</label>
+                <select id="wiz-qos" value={mqttQos} onChange={(e) => { setMqttQos(Number(e.target.value)); invalidateTest(); }} className={`${inputCls} bg-white`}>
+                  <option value={0}>0 – at most once</option>
+                  <option value={1}>1 – at least once</option>
+                  <option value={2}>2 – exactly once</option>
+                </select>
+              </div>
+            </div>
+          )}
+
+          {protocol === 'http' && (
+            <div className="space-y-3 text-[12px]">
+              <div>
+                <label className={labelCls} htmlFor="wiz-path">Request path*</label>
+                <div className="flex items-center gap-1">
+                  <span className="font-mono text-[11px] text-[#657794] truncate max-w-[260px]">{String(connDetail?.config_json?.base_url || '')}</span>
+                  <input id="wiz-path" value={httpPath} onChange={(e) => { setHttpPath(e.target.value.trim()); invalidateTest(); }} placeholder="/api/v1/…" className={`${inputCls} font-mono`} />
+                </div>
+              </div>
+              {addressSuggestions.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {addressSuggestions.map((p) => (
+                    <button key={p} type="button" onClick={() => setHttpPath(p)} className={`px-2 py-0.5 rounded border font-mono text-[11px] ${httpPath === p ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-blue-400'}`}>
+                      {p}
+                    </button>
                   ))}
                 </div>
               )}
             </div>
           )}
 
-          <div className="flex justify-between pt-3 border-t border-slate-100">
-            <Button variant="outline" size="sm" onClick={() => setCurrentStep(1)}>
-              <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back
-            </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={!selectedConnectionId}
-              onClick={() => setCurrentStep(3)}
-            >
-              Next: Source Address <ArrowRight className="w-3.5 h-3.5 ml-1" />
-            </Button>
-          </div>
-        </Card>
-      )}
+          {protocol === 'modbus' && (
+            <div className="max-w-xs text-[12px]">
+              <label className={labelCls} htmlFor="wiz-unit">Unit ID of this machine*</label>
+              <input id="wiz-unit" type="number" min={0} max={247} value={modbusUnitId} onChange={(e) => { setModbusUnitId(Number(e.target.value)); invalidateTest(); }} className={`${inputCls} font-mono`} />
+              <p className="text-[10px] text-[#657794] mt-1">Written into every field (overrides the connection default {String(connDetail?.config_json?.unit_id ?? '—')}).</p>
+            </div>
+          )}
 
-      {/* STEP 3: ADDRESS (TC-UI-AD-08..15) */}
-      {currentStep === 3 && (
-        <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
-          <div>
-            <h3 className="text-[14px] font-bold text-[#111B37]">Source address parameters</h3>
-            <p className="text-[12px] text-[#657794]">
-              Configure MQTT topic subscriptions and subscription quality parameters
-            </p>
-          </div>
-
-          <div className="space-y-4 text-[12px]">
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="block text-[11px] font-semibold text-[#657794] uppercase">
-                  MQTT Topic Filter*
-                </label>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMqttTopicFilter('#');
-                    setAddressError(null);
-                    invalidateTest();
-                  }}
-                  className="text-blue-600 hover:underline text-[11px] font-semibold"
-                >
-                  Use the broker root (#)
-                </button>
+          {isPolling && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[12px]">
+              <div>
+                <label className={labelCls} htmlFor="wiz-interval">{protocol === 'websocket' ? 'Emit interval (ms)' : 'Poll interval (ms)'}</label>
+                <input id="wiz-interval" type="number" min={1000} step={500} value={intervalMs} onChange={(e) => { setIntervalMs(Number(e.target.value)); invalidateTest(); }} className={`${inputCls} font-mono`} />
+                <p className="text-[10px] text-[#657794] mt-1">Applies to the whole connection (current: {job?.interval_ms ?? '—'} ms).</p>
               </div>
-
-              <input
-                type="text"
-                value={mqttTopicFilter}
-                onChange={(e) => {
-                  const val = e.target.value.replace(/\s+/g, '_');
-                  setMqttTopicFilter(val);
-                  setAddressError(validateTopicFilter(val));
-                  invalidateTest();
-                }}
-                className={`w-full px-3 py-2 border rounded font-mono text-[12px] focus:outline-none focus:border-blue-500 ${
-                  addressError ? 'border-red-400 bg-red-50/20' : 'border-slate-300'
-                }`}
-              />
-              {addressError && (
-                <p className="text-[11px] text-red-600 mt-1">{addressError}</p>
+              {protocol === 'http' && (
+                <div className={`p-2.5 rounded-lg border text-[11px] self-start ${requestsPerMinute > rateLimit ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-slate-50 border-slate-200 text-[#657794]'}`}>
+                  This path is requested {Math.round(60000 / Math.max(intervalMs, 1))} time(s) per minute
+                  {rewrites.length ? `; with ${rewrites.length} similar machine(s) about ${requestsPerMinute}/min in total` : ''}. Connection rate limit: {rateLimit}/min.
+                  {requestsPerMinute > rateLimit && ' Increase the interval or the rate limit, otherwise the collector throttles requests.'}
+                </div>
               )}
             </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-[11px] font-semibold text-[#657794] uppercase mb-1">
-                  QoS (Quality of Service)*
-                </label>
-                <select
-                  value={mqttQos}
-                  onChange={(e) => {
-                    setMqttQos(e.target.value);
-                    invalidateTest();
-                  }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded bg-white text-slate-800"
-                >
-                  <option value="0">0 - At most once</option>
-                  <option value="1">1 - At least once (Default)</option>
-                  <option value="2">2 - Exactly once</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-[11px] font-semibold text-[#657794] uppercase mb-1">
-                  Poll interval (ms)
-                </label>
-                <input
-                  type="number"
-                  value={pollIntervalMs}
-                  onChange={(e) => {
-                    setPollIntervalMs(e.target.value);
-                    invalidateTest();
-                  }}
-                  className="w-full px-3 py-2 border border-slate-300 rounded font-mono"
-                />
-              </div>
-            </div>
-          </div>
+          )}
 
           <div className="flex justify-between pt-3 border-t border-slate-100">
             <Button variant="outline" size="sm" onClick={() => setCurrentStep(2)}>
@@ -1244,577 +1134,458 @@ export const AddDataWizardPage: React.FC = () => {
             <Button
               variant="primary"
               size="sm"
-              disabled={Boolean(addressError) || !mqttTopicFilter.trim()}
+              disabled={!connDetail}
               onClick={() => {
-                const err = validateTopicFilter(mqttTopicFilter);
-                if (err) {
-                  setAddressError(err);
-                  return;
-                }
-                setCurrentStep(4);
+                const error = step3Valid();
+                setAddressError(error);
+                if (!error) setCurrentStep(4);
               }}
             >
-              Next: Map Fields <ArrowRight className="w-3.5 h-3.5 ml-1" />
+              Next: Map fields <ArrowRight className="w-3.5 h-3.5 ml-1" />
             </Button>
           </div>
+          {addressError && protocol !== 'mqtt' && <p className="text-[11px] text-red-600">{addressError}</p>}
         </Card>
       )}
 
-
-      {/* Paste Sample JSON Modal */}
-      {isPasteModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-2xl border border-slate-300 shadow-2xl max-w-lg w-full p-5 space-y-4">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-100">
-              <div className="flex items-center gap-2">
-                <Braces className="w-4 h-4 text-blue-600" />
-                <h3 className="text-sm font-bold text-[#111B37]">Paste Sample JSON Payload</h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setIsPasteModalOpen(false)}
-                className="text-slate-400 hover:text-slate-700"
-              >
-                ✕
-              </button>
-            </div>
-            <p className="text-xs text-[#657794]">
-              Paste any JSON payload. FactoriX will automatically unpack nested objects into flattened variables (e.g. c.d → c_d) and bind JSON paths.
-            </p>
-            <textarea
-              rows={8}
-              value={pastedJsonText}
-              onChange={(e) => setPastedJsonText(e.target.value)}
-              placeholder='{\n  "status": 1,\n  "speed": 1050,\n  "motor": {\n    "temp": 45.2,\n    "vibration": 0.8\n  }\n}'
-              className="w-full p-3 font-mono text-xs border border-slate-300 rounded-xl focus:outline-none focus:border-blue-500"
-            />
-            {pastedJsonError && (
-              <p className="text-xs text-red-600 font-semibold">{pastedJsonError}</p>
-            )}
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
-              <Button variant="outline" size="sm" onClick={() => setIsPasteModalOpen(false)}>
-                Cancel
-              </Button>
-              <Button variant="primary" size="sm" onClick={handleApplyPastedJson} disabled={!pastedJsonText.trim()}>
-                Parse & Auto-Map Fields
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
-  
-      {/* STEP 4: FIELDS (TC-UI-AD-16..28) */}
+      {/* STEP 4 */}
       {currentStep === 4 && (
         <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-              <h3 className="text-[14px] font-bold text-[#111B37]">Map field signals</h3>
-              <p className="text-[12px] text-[#657794]">
-                Capture sample messages from the broker and bind JSON fields to typed signals
-              </p>
+              <h3 className="text-[14px] font-bold text-[#111B37]">Map fields to signals</h3>
+              <p className="text-[12px] text-[#657794]">The signal key is the raw source field name; data models refer to it. Display names are free text.</p>
             </div>
-
             <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setPastedJsonError(null);
-                  setIsPasteModalOpen(true);
-                }}
-              >
-                <Braces className="w-3.5 h-3.5 mr-1" />
-                Paste sample JSON
-              </Button>
-              <Button
-                size="sm"
-                variant={isCapturing ? 'outline' : 'primary'}
-                onClick={handleCaptureSample}
-                disabled={isCapturing}
-              >
-                {isCapturing ? (
-                  <>
-                    <RefreshCw className="w-3.5 h-3.5 mr-1 animate-spin" />
-                    Capturing ({captureCountdown} s)…
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-3.5 h-3.5 mr-1" />
-                    Capture sample (10 s)
-                  </>
-                )}
-              </Button>
+              {isJson && (
+                <>
+                  <Button size="sm" variant="outline" onClick={() => { setPasteError(null); setPasteOpen(true); }}>
+                    <Braces className="w-3.5 h-3.5 mr-1" /> Paste sample JSON
+                  </Button>
+                  <Button size="sm" variant="primary" onClick={() => void handleCapture()} disabled={capturing}>
+                    {capturing ? <RefreshCw className="w-3.5 h-3.5 mr-1 animate-spin" /> : <Play className="w-3.5 h-3.5 mr-1" />}
+                    {capturing ? 'Capturing…' : protocol === 'mqtt' ? 'Capture sample (10 s)' : protocol === 'http' ? 'Fetch sample' : 'Capture frames (5 s)'}
+                  </Button>
+                </>
+              )}
+              {(protocol === 'opcua' || protocol === 'modbus') && (
+                <Button size="sm" variant="outline" onClick={() => void handleRunTest()} disabled={testing || fields.length === 0}>
+                  <Play className={`w-3.5 h-3.5 mr-1 ${testing ? 'animate-spin' : ''}`} /> {testing ? 'Reading…' : 'Test read'}
+                </Button>
+              )}
             </div>
           </div>
 
-          {/* Captured Samples Tree Panel */}
-          {capturedTopics.length > 0 && (
+          {captureError && <p role="alert" className="text-[12px] text-red-600">{captureError}</p>}
+
+          {isJson && samples.length > 0 && (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 p-3 bg-slate-50 border border-slate-200 rounded-xl">
-              {/* Left Column: Topics List */}
               <div className="space-y-1.5">
-                <span className="text-[11px] font-bold uppercase text-[#657794] block mb-1">
-                  Captured Topics
-                </span>
-                {capturedTopics.map((ct) => (
+                <span className="text-[11px] font-bold uppercase text-[#657794] block">{protocol === 'mqtt' ? 'Captured topics' : 'Samples'}</span>
+                {samples.map((s, index) => (
                   <button
-                    key={ct.topic}
+                    key={`${s.topic}-${index}`}
                     type="button"
-                    onClick={() => setSelectedCapturedTopic(ct.topic)}
-                    className={`w-full text-left p-2 rounded text-[11px] font-mono transition flex items-center justify-between ${
-                      selectedCapturedTopic === ct.topic
-                        ? 'bg-blue-600 text-white font-bold'
-                        : 'bg-white hover:bg-slate-200 text-slate-800 border border-slate-200'
-                    }`}
+                    onClick={() => setSampleIndex(index)}
+                    title={s.topic}
+                    className={`w-full text-left p-2 rounded text-[11px] font-mono flex items-center justify-between gap-2 ${sampleIndex === index ? 'bg-blue-600 text-white font-bold' : 'bg-white hover:bg-slate-200 text-slate-800 border border-slate-200'}`}
                   >
-                    <span className="truncate max-w-[170px]">{ct.topic.split('/').pop()}</span>
-                    <span className="text-[10px] opacity-80">{ct.count} msgs</span>
+                    <span className="truncate">{s.topic || '(pasted sample)'}</span>
+                    <span className="text-[10px] opacity-80 shrink-0">{s.count} msg</span>
                   </button>
                 ))}
               </div>
+              <div className="md:col-span-2 space-y-1.5">
+                {activeSample?.reordered && (
+                  <p className="text-[10px] text-amber-700">The collector returned a parsed payload only; fields may not be in source order and whole numbers may hide decimals.</p>
+                )}
+                {protocol === 'mqtt' && activeSample && !activeSample.topic && (
+                  <p className="text-[10px] text-amber-700">Pasted sample: enter the exact topic in each row.</p>
+                )}
+                {activeSample && (
+                  <JsonSampleTree root={activeSample.root} selectedPaths={selectedPaths} onPickLeaf={handlePickLeaf} onPickObject={handlePickObject} />
+                )}
+              </div>
+            </div>
+          )}
 
-              {/* Right Columns: JSON Tree Explorer */}
-              <div className="md:col-span-2 bg-white p-3 border border-slate-200 rounded-lg space-y-2">
-                <div className="flex items-center justify-between pb-1 border-b border-slate-100">
-                  <span className="text-[11px] font-mono text-[#657794] truncate max-w-[260px]">
-                    {selectedCapturedTopic}
-                  </span>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-6 text-[10px]"
-                    onClick={handleSelectAllNumeric}
-                  >
-                    Select all numeric
+          {isJson && (
+            <div className="p-3 border border-slate-200 rounded-lg text-[12px] space-y-2">
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="font-semibold text-[#111B37]" htmlFor="wiz-ts-mode">Source time</label>
+                <select id="wiz-ts-mode" value={timestampMode} onChange={(e) => { setTimestampMode(e.target.value as TimestampMode); invalidateTest(); }} className="px-2 py-1 border border-slate-300 rounded text-[12px] bg-white">
+                  <option value="sibling">Sibling source_timestamp (default)</option>
+                  <option value="custom">Custom JSONPath</option>
+                  <option value="none">None (use read time only)</option>
+                </select>
+                {timestampMode === 'custom' && (
+                  <input aria-label="Timestamp JSONPath" value={timestampPath} onChange={(e) => { setTimestampPath(e.target.value); invalidateTest(); }} placeholder="$.meta.updated_at" className="px-2 py-1 border border-slate-300 rounded text-[12px] font-mono min-w-[240px]" />
+                )}
+              </div>
+              <p className="text-[11px] text-[#657794]">
+                The source time is shown as "Last change"; the read time is always the clock for history.{' '}
+                {timestampMode === 'sibling' && siblingTsInfo}
+              </p>
+            </div>
+          )}
+
+          {protocol === 'opcua' && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className="space-y-2 text-[12px]">
+                <label className={labelCls} htmlFor="wiz-nodes">Node IDs (one per line)</label>
+                <textarea id="wiz-nodes" rows={6} value={nodeText} onChange={(e) => setNodeText(e.target.value)} placeholder={'ns=2;s=Device.Group.field_1\nns=2;s=Device.Group.field_2'} className="w-full p-2 font-mono text-[11px] border border-slate-300 rounded" />
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant="outline" onClick={handleAddNodeIds} disabled={!nodeText.trim()}>
+                    Add nodes
+                  </Button>
+                  {nodeMessage && <span className="text-[11px] text-[#657794]">{nodeMessage}</span>}
+                </div>
+                <div className="pt-2">
+                  <label className={labelCls} htmlFor="wiz-ts-node">Source time</label>
+                  <input id="wiz-ts-node" value={opcTimestampNodeId} onChange={(e) => { setOpcTimestampNodeId(e.target.value.trim()); invalidateTest(); }} placeholder="Empty = DataValue.SourceTimestamp of each node" className={`${inputCls} font-mono`} />
+                  <p className="text-[10px] text-[#657794] mt-1">Optional node holding the group timestamp; read in the same batch.</p>
+                </div>
+              </div>
+              <div className="space-y-2 text-[12px]">
+                <div className="flex items-center justify-between">
+                  <span className={labelCls}>Browse the server</span>
+                  <Button size="sm" variant="outline" disabled={browsing} onClick={() => void browse('i=85', 'Objects', false)}>
+                    {browsing ? 'Browsing…' : 'Browse Objects'}
                   </Button>
                 </div>
-
-                <div className="max-h-52 overflow-y-auto space-y-1 text-[11px]">
-                  {selectedCapturedTopic &&
-                    Object.entries(
-                      capturedTopics.find((t) => t.topic === selectedCapturedTopic)?.samplePayload || {}
-                    ).map(([k, v]) => {
-                      const isAdded = fields.some(
-                        (f) => f.name.toLowerCase() === k.toLowerCase() && f.topic === selectedCapturedTopic
-                      );
-                      const typeLabel = typeof v === 'number' ? (Number.isInteger(v) ? 'Integer' : 'Number') : typeof v === 'boolean' ? 'Boolean' : 'Text';
-
+                {browseStack.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1 text-[11px]">
+                    {browseStack.map((crumb, index) => (
+                      <button key={`${crumb.nodeId}-${index}`} type="button" onClick={() => { setBrowseStack(browseStack.slice(0, index)); void browse(crumb.nodeId, crumb.label, true); }} className="text-blue-600 hover:underline font-mono">
+                        {crumb.label} /
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {browseError && <p className="text-[11px] text-red-600">{browseError}</p>}
+                {browseNodes && browseNodes.length > 0 && (
+                  <div className="max-h-64 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
+                    {browseNodes.map((node) => {
+                      const added = fields.some((row) => row.nodeId === node.node_id);
                       return (
-                        <div
-                          key={k}
-                          onClick={() => handleAddFieldFromSample(k, v, selectedCapturedTopic)}
-                          className={`p-1.5 rounded flex items-center justify-between cursor-pointer transition ${
-                            isAdded ? 'bg-emerald-50 text-emerald-900 font-semibold' : 'hover:bg-slate-50'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-[#111B37]">{k}</span>
-                            <span className="text-[10px] text-[#657794] bg-slate-100 px-1 rounded">
-                              {typeLabel}
-                            </span>
+                        <div key={node.node_id} className="flex items-center justify-between gap-2 px-2 py-1">
+                          <div className="min-w-0">
+                            <div className="text-[11px] font-semibold text-[#111B37] truncate">{node.display_name || node.browse_name}</div>
+                            <div className="text-[10px] font-mono text-[#657794] truncate">{node.node_id} · {node.node_class}</div>
                           </div>
-                          <div className="flex items-center gap-2 font-mono text-[11px]">
-                            <span className="text-slate-600 truncate max-w-[120px]">
-                              {String(v)}
-                            </span>
-                            {isAdded ? (
-                              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                            ) : (
-                              <Plus className="w-3.5 h-3.5 text-blue-600" />
+                          <div className="flex items-center gap-1 shrink-0">
+                            {node.has_children && (
+                              <button type="button" onClick={() => void browse(node.node_id, node.browse_name || node.node_id, true)} className="text-[11px] text-blue-600 hover:underline">
+                                Open
+                              </button>
+                            )}
+                            {node.node_class.toLowerCase().includes('variable') && (
+                              <button
+                                type="button"
+                                disabled={added}
+                                onClick={() => {
+                                  const key = keyFromRawName(nodeIdField(node.node_id) || node.browse_name);
+                                  setFields((prev) => [...prev, emptyRow('opcua', { key, displayName: node.display_name || key, nodeId: node.node_id })]);
+                                  invalidateTest();
+                                }}
+                                className="text-[11px] text-emerald-700 hover:underline disabled:text-slate-400"
+                              >
+                                {added ? 'Added' : 'Add'}
+                              </button>
                             )}
                           </div>
                         </div>
                       );
                     })}
-                </div>
+                  </div>
+                )}
               </div>
             </div>
           )}
 
-          {/* Active Field Rows Table */}
+          {protocol === 'modbus' && (
+            <div className="space-y-2 text-[12px]">
+              <label className={labelCls} htmlFor="wiz-map">Paste a register map (one field per line: name, type, offset[, count][, unit])</label>
+              <textarea
+                id="wiz-map"
+                rows={5}
+                value={mapText}
+                onChange={(e) => setMapText(e.target.value)}
+                placeholder={'field_a, uint16, 100\nfield_b, float32, 102-103, rpm\nlabel, ascii, 104-111\nsource_timestamp, uint64, 112-115'}
+                className="w-full p-2 font-mono text-[11px] border border-slate-300 rounded"
+              />
+              <div className="flex items-center gap-2">
+                <Button size="sm" variant="outline" onClick={handleAddRegisterMap} disabled={!mapText.trim()}>
+                  Add fields from map
+                </Button>
+                {mapMessage && <span className="text-[11px] text-[#657794]">{mapMessage}</span>}
+              </div>
+              <p className="text-[10px] text-[#657794]">
+                Offsets are 0-based PDU addresses (FC03 holding register 0 = 40001). Types: bool, uint16, int16, uint32, int32, uint64, int64, float32, float64, ascii.
+                Mark the uint64 epoch-ms field as "Source ts" to use it as the source time of the other fields of this unit.
+              </p>
+            </div>
+          )}
+
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <span className="text-[12px] font-bold text-[#111B37]">
-                Configured Signals ({fields.length})
-              </span>
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => {
-                    const baseTopic = mqttTopicFilter.replace(/#$/, '').replace(/\/$/, '');
-                    const newField: FieldRow = {
-                      id: `f-${Date.now()}`,
-                      topic: `${baseTopic}/state`,
-                      address: '$.status',
-                      name: fields.some((f) => f.name === 'status') ? `status_${fields.length + 1}` : 'status',
-                      dataType: 'Integer',
-                      unit: '',
-                      sample: 2,
-                    };
-                    setFields((prev) => [...prev, newField]);
-                    invalidateTest();
-                  }}
-                  className="text-[11px] h-7"
-                >
-                  <Plus className="w-3.5 h-3.5 mr-1" /> Add field
-                </Button>
-                {targetResource && similarResources.length > 0 && (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      setSelectedSimilarResourceIds(similarResources.map((r) => r.id));
-                      setShowSimilarModal(true);
-                    }}
-                    className="text-[11px] h-7"
-                  >
-                    Apply to similar resources…
-                  </Button>
-                )}
-              </div>
+              <span className="text-[12px] font-bold text-[#111B37]">Fields ({fields.length})</span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="text-[11px] h-7"
+                onClick={() => {
+                  setFields((prev) => [
+                    ...prev,
+                    emptyRow(protocol, {
+                      topic: protocol === 'mqtt' ? activeSample?.topic || (/[#+]/.test(mqttTopicFilter) ? '' : mqttTopicFilter) : undefined,
+                      path: protocol === 'http' ? httpPath : undefined,
+                      jsonpath: isJson ? '$.' : undefined,
+                    }),
+                  ]);
+                  invalidateTest();
+                }}
+              >
+                <Plus className="w-3.5 h-3.5 mr-1" /> Add field
+              </Button>
             </div>
-
             {fields.length === 0 ? (
               <div className="p-8 text-center text-[#657794] border border-dashed border-slate-300 rounded-lg text-[12px]">
-                Click "Capture sample (10 s)" above or click fields from the JSON tree to add signals.
+                {isJson ? 'Capture a sample and click fields in the tree, or add fields manually.' : protocol === 'opcua' ? 'Paste or browse node IDs.' : 'Paste a register map or add fields manually.'}
               </div>
             ) : (
-              <div className="overflow-x-auto border border-slate-200 rounded-lg">
-                <table className="w-full text-left text-[12px]">
-                  <thead>
-                    <tr className="border-b border-slate-200 bg-slate-50 text-[#657794] font-semibold">
-                      <th className="py-2.5 px-3">Field path</th>
-                      <th className="py-2.5 px-3">Signal name</th>
-                      <th className="py-2.5 px-3">Type</th>
-                      <th className="py-2.5 px-3">Unit</th>
-                      <th className="py-2.5 px-3">Sample</th>
-                      <th className="py-2.5 px-3 text-right w-12"></th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {fields.map((f, idx) => (
-                      <tr key={f.id} className="hover:bg-slate-50">
-                        <td className="py-2.5 px-3">
-                          <input
-                            type="text"
-                            value={f.address}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setFields((prev) =>
-                                prev.map((item, i) => (i === idx ? { ...item, address: val } : item))
-                              );
-                              invalidateTest();
-                            }}
-                            className="w-full px-2 py-1 border border-slate-300 rounded font-mono text-[11px]"
-                          />
-                          {f.error && <p className="text-[10px] text-red-600 mt-0.5">{f.error}</p>}
-                        </td>
-                        <td className="py-2.5 px-3">
-                          <input
-                            type="text"
-                            value={f.name}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setFields((prev) =>
-                                prev.map((item, i) => (i === idx ? { ...item, name: val } : item))
-                              );
-                              invalidateTest();
-                            }}
-                            className="w-full px-2 py-1 border border-slate-300 rounded text-[12px]"
-                          />
-                        </td>
-                        <td className="py-2.5 px-3">
-                          <select
-                            value={f.dataType}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setFields((prev) =>
-                                prev.map((item, i) => (i === idx ? { ...item, dataType: val } : item))
-                              );
-                              invalidateTest();
-                            }}
-                            className="px-2 py-1 border border-slate-300 rounded text-[11px] bg-white"
-                          >
-                            <option value="Number">Number</option>
-                            <option value="Integer">Integer</option>
-                            <option value="Boolean">Boolean</option>
-                            <option value="Text">Text</option>
-                          </select>
-                          {f.warning && (
-                            <p className="text-[10px] text-amber-600 mt-0.5">{f.warning}</p>
-                          )}
-                        </td>
-                        <td className="py-2.5 px-3">
-                          <input
-                            type="text"
-                            value={f.unit}
-                            placeholder="e.g. kW"
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setFields((prev) =>
-                                prev.map((item, i) => (i === idx ? { ...item, unit: val } : item))
-                              );
-                            }}
-                            className="w-16 px-2 py-1 border border-slate-300 rounded text-[11px]"
-                          />
-                        </td>
-                        <td className="py-2.5 px-3 font-mono text-[11px] text-[#111B37]">
-                          {f.sample !== undefined ? String(f.sample) : '—'}
-                        </td>
-                        <td className="py-2.5 px-3 text-right">
-                          <button
-                            onClick={() => {
-                              setFields((prev) => prev.filter((_, i) => i !== idx));
-                              invalidateTest();
-                            }}
-                            className="p-1 text-slate-400 hover:text-red-600"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <FieldTable
+                protocol={protocol}
+                rows={fields}
+                liveValues={liveValues}
+                onChange={(rows) => {
+                  setFields(rows);
+                  invalidateTest();
+                }}
+              />
             )}
-
-            {/* Timestamp field setting (TC-UI-AD-20) */}
-            <div className="pt-2 flex items-center justify-between text-[11px] text-[#657794]">
-              <span>Timestamp field auto-detected: <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-slate-800">{timestampField}</code></span>
-              <button
-                type="button"
-                onClick={() => setTimestampField('$.publish_timestamp')}
-                className="text-blue-600 hover:underline"
-              >
-                Change timestamp path
-              </button>
-            </div>
+            {rowsError && <p role="alert" className="text-[12px] text-red-600">{rowsError}</p>}
           </div>
+
+          {(protocol === 'opcua' || protocol === 'modbus') && (testing || testResult) && (
+            <TestResultPanel running={testing} result={testResult} successLabel="Values read by the Edge collector are shown in the table" />
+          )}
 
           <div className="flex justify-between pt-3 border-t border-slate-100">
             <Button variant="outline" size="sm" onClick={() => setCurrentStep(3)}>
               <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back
             </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={fields.length === 0}
-              onClick={() => {
-                if (!validateFieldRows()) return;
-                setCurrentStep(5);
-              }}
-            >
-              Next: Review & Test <ArrowRight className="w-3.5 h-3.5 ml-1" />
+            <Button variant="primary" size="sm" disabled={fields.length === 0} onClick={() => { if (validateCurrentRows()) setCurrentStep(5); }}>
+              Next: Review <ArrowRight className="w-3.5 h-3.5 ml-1" />
             </Button>
           </div>
         </Card>
       )}
 
-      {/* STEP 5: REVIEW & VERIFY (TC-UI-AD-29..36) */}
+      {pasteOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div role="dialog" aria-modal="true" aria-labelledby="wiz-paste-title" className="bg-white rounded-2xl border border-slate-300 shadow-2xl max-w-lg w-full p-5 space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-100">
+              <h3 id="wiz-paste-title" className="text-sm font-bold text-[#111B37] flex items-center gap-2">
+                <Braces className="w-4 h-4 text-blue-600" /> Paste a sample payload
+              </h3>
+              <button type="button" aria-label="Close" onClick={() => setPasteOpen(false)} className="text-slate-400 hover:text-slate-700">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-[#657794]">Field order and number formatting are kept as pasted. Values are only used to suggest types.</p>
+            <textarea rows={10} value={pasteText} onChange={(e) => setPasteText(e.target.value)} className="w-full p-3 font-mono text-xs border border-slate-300 rounded-xl" aria-label="Sample JSON" />
+            {pasteError && <p className="text-xs text-red-600 font-semibold">{pasteError}</p>}
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <Button variant="outline" size="sm" onClick={() => setPasteOpen(false)}>
+                Cancel
+              </Button>
+              <Button variant="primary" size="sm" onClick={handleApplyPaste} disabled={!pasteText.trim()}>
+                Show fields
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* STEP 5 */}
       {currentStep === 5 && (
         <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
           <div>
-            <h3 className="text-[14px] font-bold text-[#111B37]">Review collection plan</h3>
-            <p className="text-[12px] text-[#657794]">
-              Verify connectivity and data mapping on Edge collector before starting active streaming
-            </p>
+            <h3 className="text-[14px] font-bold text-[#111B37]">Review and start collecting</h3>
+            <p className="text-[12px] text-[#657794]">The Edge collector reads the real source to verify the mapping.</p>
           </div>
 
-          {/* Plan Summary */}
-          <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-2 text-[12px]">
-            <div className="flex justify-between py-1 border-b border-slate-200">
-              <span className="text-[#657794]">Target Resource:</span>
-              <span className="font-semibold text-[#111B37]">{targetPathString}</span>
-            </div>
-            <div className="flex justify-between py-1 border-b border-slate-200">
-              <span className="text-[#657794]">Data Connection:</span>
-              <span className="font-medium text-[#111B37]">
-                {connections.find((c) => c.id === selectedConnectionId)?.name || 'mqtt-lab'}
-              </span>
-            </div>
-            <div className="flex justify-between py-1 border-b border-slate-200">
-              <span className="text-[#657794]">Topic Filter:</span>
-              <span className="font-mono text-[#111B37]">{mqttTopicFilter}</span>
-            </div>
-            <div className="flex justify-between py-1 border-b border-slate-200">
-              <span className="text-[#657794]">Fields count:</span>
-              <span className="font-semibold text-[#111B37]">
-                {fields.length} signal{fields.length > 1 ? 's' : ''}
-                {selectedSimilarResourceIds.length > 0 && ` (+ ${selectedSimilarResourceIds.length * fields.length} replicated)`}
-              </span>
-            </div>
-          </div>
+          <dl className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-[12px] divide-y divide-slate-200">
+            {[
+              ['Target', targetPathString],
+              ['Connection', `${selectedConnection?.name || '—'} (${PROTOCOL_LABEL[protocol]})`],
+              ...(protocol === 'mqtt' ? [['Topic filter', mqttTopicFilter]] : []),
+              ...(protocol === 'http' ? [['Path', httpPath]] : []),
+              ...(protocol === 'modbus' ? [['Unit ID', String(modbusUnitId)]] : []),
+              ...(isPolling ? [[protocol === 'websocket' ? 'Emit interval' : 'Poll interval', `${intervalMs} ms`]] : []),
+              ['Fields', `${fields.length}${rewrites.length ? ` (+ ${rewrites.length * fields.length} on ${rewrites.length} similar machine(s))` : ''}`],
+            ].map(([label, value]) => (
+              <div key={label} className="flex justify-between gap-3 py-1.5">
+                <dt className="text-[#657794]">{label}</dt>
+                <dd className="font-medium text-[#111B37] font-mono text-right break-all">{value}</dd>
+              </div>
+            ))}
+          </dl>
 
-          {/* Test Execution Section */}
-          <div className="space-y-3 pt-2">
+          <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <h4 className="text-[13px] font-bold text-[#111B37]">Live Verification Proof</h4>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={handleRunTest}
-                disabled={isTesting}
-              >
-                <Play className={`w-3.5 h-3.5 mr-1 ${isTesting ? 'animate-spin' : ''}`} />
-                {isTesting ? 'Running test…' : 'Run test'}
+              <h4 className="text-[13px] font-bold text-[#111B37]">Similar machines</h4>
+              <Button size="sm" variant="outline" disabled={!targetResource || similarCandidates.length === 0} onClick={() => setSimilarOpen(true)}>
+                {rewrites.length ? 'Edit machines…' : 'Apply to similar machines…'}
               </Button>
             </div>
-
-            {testResult?.errorMessage && (
-              <div className="p-3 bg-red-50 border border-red-200 text-red-800 text-[12px] rounded-lg flex items-center justify-between">
-                <span>{testResult.errorMessage}</span>
-                <Button size="sm" variant="outline" className="h-7 text-[11px]" onClick={() => setCurrentStep(4)}>
-                  Back to fields
-                </Button>
-              </div>
-            )}
-
-            {testResult?.stages && (
-              <div className="p-3 bg-white border border-slate-200 rounded-lg divide-y divide-slate-100 text-[12px]">
-                {testResult.stages.map((st) => (
-                  <div key={st.stage} className="py-2 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      {st.status === 'PASSED' ? (
-                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                      ) : (
-                        <AlertTriangle className="w-4 h-4 text-red-600" />
-                      )}
-                      <span className="font-medium text-[#111B37]">{st.stage}</span>
-                      {st.detail && <span className="text-[#657794] text-[11px]">({st.detail})</span>}
-                    </div>
-                    {st.duration_ms && (
-                      <span className="text-[#657794] font-mono text-[11px]">{st.duration_ms} ms</span>
-                    )}
-                  </div>
+            {similarCandidates.length === 0 && <p className="text-[11px] text-[#657794]">No other {targetResource?.type} in this site.</p>}
+            {rewrites.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {rewriteRows.map(({ rw, problems }) => (
+                  <span key={rw.resourceId} className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] ${problems.length ? 'border-red-300 bg-red-50 text-red-800' : 'border-slate-200 bg-white'}`}>
+                    {rw.resourceName}
+                    <button type="button" aria-label={`Remove ${rw.resourceName}`} onClick={() => setRewrites((prev) => prev.filter((r) => r.resourceId !== rw.resourceId))} className="text-slate-400 hover:text-red-600">
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
                 ))}
               </div>
             )}
+          </div>
 
-            {/* Field Values Proof Table */}
-            {testResult?.fieldSamples && (
+          <div className="space-y-3 pt-2">
+            <div className="flex items-center justify-between">
+              <h4 className="text-[13px] font-bold text-[#111B37]">Live verification on {targetResource?.name}</h4>
+              <Button size="sm" variant="outline" onClick={() => void handleRunTest()} disabled={testing}>
+                <Play className={`w-3.5 h-3.5 mr-1 ${testing ? 'animate-spin' : ''}`} />
+                {testing ? 'Running test…' : 'Run test'}
+              </Button>
+            </div>
+            <TestResultPanel running={testing} runningLabel="The Edge collector is reading the source…" result={testResult} successLabel="All fields were read from the source" />
+            {testResult && (
               <div className="border border-slate-200 rounded-lg overflow-hidden">
                 <table className="w-full text-left text-[11px]">
                   <thead>
                     <tr className="bg-slate-50 border-b border-slate-200 text-[#657794] font-semibold">
-                      <th className="py-2 px-3">Field</th>
-                      <th className="py-2 px-3">Captured Live Sample</th>
+                      <th className="py-2 px-3">Key</th>
+                      <th className="py-2 px-3">Address</th>
+                      <th className="py-2 px-3">Value read</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-mono">
-                    {Object.entries(testResult.fieldSamples).map(([k, v]) => (
-                      <tr key={k}>
-                        <td className="py-2 px-3 font-semibold text-[#111B37]">{k}</td>
-                        <td className="py-2 px-3 text-emerald-700">{String(v)}</td>
+                    {fields.map((row) => (
+                      <tr key={row.id}>
+                        <td className="py-1.5 px-3 font-semibold text-[#111B37]">{row.key}</td>
+                        <td className="py-1.5 px-3 text-[#657794] break-all">{buildAddressSummary(row, protocol)}</td>
+                        <td className={`py-1.5 px-3 break-all ${liveValues[row.id] !== undefined ? 'text-emerald-700' : 'text-slate-400'}`}>{liveValues[row.id] ?? 'not returned'}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
             )}
+            {testResult && !testPassed && (
+              <label className="flex items-start gap-2 text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg p-2">
+                <input type="checkbox" checked={acceptUntested} onChange={(e) => setAcceptUntested(e.target.checked)} className="mt-0.5" />
+                <span>Start collecting anyway. Signals will show Bad or No data until the source can be read; check the error above first.</span>
+              </label>
+            )}
           </div>
 
-          {/* Action Bar */}
+          {submitError && <p role="alert" className="text-[12px] text-red-600">{submitError}</p>}
+          {outcomes && (
+            <ul className="text-[12px] space-y-1">
+              {outcomes.map((o) => (
+                <li key={o.resourceId} className={o.ok ? 'text-emerald-700' : 'text-red-700'}>
+                  {o.ok ? '✓' : '✗'} {o.name}: {o.message}
+                </li>
+              ))}
+            </ul>
+          )}
+
           <div className="flex justify-between pt-3 border-t border-slate-100">
             <Button variant="outline" size="sm" onClick={() => setCurrentStep(4)}>
               <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back to fields
             </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={!testResult?.passed || isSubmitting}
-              onClick={handleStartCollecting}
-            >
-              {isSubmitting ? 'Starting collection…' : 'Start collecting'}
+            <Button variant="primary" size="sm" disabled={!canStart} onClick={() => void handleStartCollecting()}>
+              {submitting ? 'Starting collection…' : 'Start collecting'}
             </Button>
           </div>
         </Card>
       )}
 
-      {/* Similar Resources Modal (TC-UI-AD-27) */}
-      {showSimilarModal && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
-          <Card className="w-full max-w-md p-5 bg-white border border-slate-300 shadow-xl space-y-4">
-            <div>
-              <h3 className="text-[14px] font-bold text-[#111B37]">Apply to similar resources</h3>
-              <p className="text-[12px] text-[#657794] mt-0.5">
-                Automatically replicate these {fields.length} signal mappings to sibling resources with matching topic segments
-              </p>
-            </div>
-
-            <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg max-h-56 overflow-y-auto">
-              {similarResources.map((sr) => {
-                const isSelected = selectedSimilarResourceIds.includes(sr.id);
-                return (
-                  <div
-                    key={sr.id}
-                    onClick={() => {
-                      setSelectedSimilarResourceIds((prev) =>
-                        prev.includes(sr.id) ? prev.filter((id) => id !== sr.id) : [...prev, sr.id]
-                      );
-                    }}
-                    className="p-2.5 flex items-center justify-between cursor-pointer hover:bg-slate-50 text-[12px]"
-                  >
-                    <div>
-                      <div className="font-semibold text-[#111B37]">{sr.name || sr.code}</div>
-                      <div className="font-mono text-[10px] text-[#657794]">{sr.code}</div>
-                    </div>
-                    {isSelected ? (
-                      <CheckCircle2 className="w-4 h-4 text-blue-600" />
-                    ) : (
-                      <Circle className="w-4 h-4 text-slate-300" />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="p-2.5 bg-blue-50 text-blue-900 rounded text-[11px]">
-              {selectedSimilarResourceIds.length} resources selected × {fields.length} fields ={' '}
-              <span className="font-bold">{selectedSimilarResourceIds.length * fields.length} signals</span>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
-              <Button variant="outline" size="sm" onClick={() => setShowSimilarModal(false)}>
-                Cancel
-              </Button>
-              <Button variant="primary" size="sm" onClick={() => setShowSimilarModal(false)}>
-                Confirm
-              </Button>
-            </div>
-          </Card>
-        </div>
+      {targetResource && (
+        <SimilarResourcesDialog
+          isOpen={similarOpen}
+          protocol={protocol}
+          source={targetResource}
+          candidates={similarCandidates}
+          rows={fields}
+          sourceUnitId={modbusUnitId}
+          initial={rewrites}
+          onCancel={() => setSimilarOpen(false)}
+          onConfirm={(next) => {
+            setRewrites(next);
+            setSimilarOpen(false);
+          }}
+        />
       )}
 
-      {/* Discard New Connection Confirm Dialog (TC-UI-AD-40) */}
+      <ConnectionFormModal
+        isOpen={isConnFormOpen}
+        onClose={() => setIsConnFormOpen(false)}
+        edges={edges}
+        defaultSiteId={targetSiteId || undefined}
+        onSuccess={(saved) => {
+          void refresh();
+          if (saved) {
+            if (saved.protocol !== protocol) {
+              setFields([]);
+              setRewrites([]);
+            }
+            setNewConnCreated(saved);
+            setSelectedConnectionId(saved.id);
+            setSamples([]);
+            setDiscovered(null);
+            invalidateTest();
+          }
+        }}
+      />
+
       {confirmCancelOpen && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
-          <Card className="w-full max-w-sm p-5 bg-white border border-slate-300 shadow-xl space-y-4">
-            <h3 className="text-[14px] font-bold text-[#111B37]">
-              Keep the new connection "{newConnName || 'mqtt-lab'}"?
-            </h3>
-            <p className="text-[12px] text-[#657794]">
-              You created a new connection in Step 2. Do you want to keep it in your connections catalog or delete it?
-            </p>
+          <div role="dialog" aria-modal="true" aria-labelledby="wiz-cancel-title" className="w-full max-w-sm p-5 bg-white border border-slate-300 shadow-xl rounded-xl space-y-4">
+            <h3 id="wiz-cancel-title" className="text-[14px] font-bold text-[#111B37]">Keep the new connection "{newConnCreated?.name}"?</h3>
+            <p className="text-[12px] text-[#657794]">You created it in step 2. Keep it in Connections or archive it.</p>
+            {cancelError && <p role="alert" className="text-[12px] text-red-600">{cancelError}</p>}
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void handleConfirmDiscardNewConn(false)}
-              >
-                Delete connection
+              <Button variant="outline" size="sm" onClick={() => void handleDiscardNewConn(false)}>
+                Archive connection
               </Button>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={() => void handleConfirmDiscardNewConn(true)}
-              >
+              <Button variant="primary" size="sm" onClick={() => void handleDiscardNewConn(true)}>
                 Keep connection
               </Button>
             </div>
-          </Card>
+          </div>
         </div>
       )}
     </div>
   );
 };
+
+function buildAddressSummary(row: FieldRow, protocol: ProtocolType): string {
+  switch (protocol) {
+    case 'mqtt':
+      return `${row.topic} ${row.jsonpath}`;
+    case 'http':
+      return `GET ${row.path} ${row.jsonpath}`;
+    case 'websocket':
+      return row.jsonpath || '';
+    case 'opcua':
+      return row.nodeId || '';
+    default:
+      return `${row.registerArea || 'holding'} ${row.offset} ${row.nativeType}`;
+  }
+}

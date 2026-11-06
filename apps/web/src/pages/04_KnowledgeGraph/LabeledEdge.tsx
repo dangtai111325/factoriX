@@ -9,7 +9,7 @@ import {
 const RELATION_VERB_MAP: Record<string, string> = {
   CONTAINS: 'contains',
   PART_OF: 'part of',
-  HAS_SIGNAL: 'has signal',
+  HAS_SIGNAL: 'has data',
   COLLECTED_VIA: 'collected via',
   RUNS_ON: 'runs on',
   USED_IN: 'used in',
@@ -81,7 +81,7 @@ export const LabeledEdge: React.FC<EdgeProps> = ({
           onMouseLeave={() => setIsHovered(false)}
         >
           <div
-            className={`px-2 py-0.5 rounded-full text-[10px] font-bold tracking-tight select-none shadow-sm transition-all border ${
+            className={`px-2 py-0.5 rounded-full text-[11px] font-semibold select-none shadow-sm transition-all border whitespace-nowrap ${
               isHovered
                 ? 'bg-[#0B2545] text-white border-[#0B2545]'
                 : isDataEdge

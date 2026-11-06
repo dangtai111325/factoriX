@@ -32,6 +32,7 @@ import { SignalSparkline } from './SignalSparkline';
 import { SignalInspector } from './SignalInspector';
 import { SignalEditDialog } from './SignalEditDialog';
 import { api } from '../../api/client';
+import { formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
 
 interface CatalogTreeNodeProps {
   node: { resource: ResourceNode; children: any[] };
@@ -120,7 +121,7 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
               <div className="flex items-center gap-1.5 min-w-0 pr-1">
                 <Activity className={`w-3.5 h-3.5 shrink-0 ${isDataSelected ? 'text-white' : 'text-emerald-600 animate-pulse'}`} />
                 <span className="truncate font-bold text-[11px]">
-                  📊 Data
+                  Data
                 </span>
               </div>
               <span
@@ -155,18 +156,6 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
   );
 };
 
-function timeAgo(isoString: string | null | undefined): string {
-  if (!isoString) return '—';
-  const diffSec = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
-  if (diffSec < 0 || isNaN(diffSec)) return 'just now';
-  if (diffSec < 60) return `${diffSec} s ago`;
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin} min ago`;
-  const diffHour = Math.floor(diffMin / 60);
-  if (diffHour < 24) return `${diffHour} h ago`;
-  return `${Math.floor(diffHour / 24)} d ago`;
-}
-
 function classifyType(typeStr: string | undefined): 'number' | 'integer' | 'boolean' | 'text' {
   const t = (typeStr || '').toLowerCase();
   if (t === 'integer' || t === 'int' || t === 'int64' || t === 'uint16' || t === 'int32') return 'integer';
@@ -189,12 +178,19 @@ export const SignalsCatalogPage: React.FC = () => {
   // Local Filter States
   const [searchTerm, setSearchTerm] = useState('');
   const [typeFilter, setTypeFilter] = useState<'all' | 'number' | 'integer' | 'boolean' | 'text'>('all');
-  const [qualityFilter, setQualityFilter] = useState<'all' | 'good' | 'uncertain' | 'bad' | 'stale' | 'disabled'>('all');
+  const [qualityFilter, setQualityFilter] = useState<'all' | 'good' | 'uncertain' | 'bad' | 'stale' | 'no_data' | 'disabled'>('all');
   const [selectedFilter, setSelectedFilter] = useState<string>('all');
   const [expandedTreeNodes, setExpandedTreeNodes] = useState<Record<string, boolean>>({});
 
   // Inspector & Edit Dialog State
-  const [selectedSignal, setSelectedSignal] = useState<SignalItem | null>(null);
+  const [selectedSignalId, setSelectedSignalIdState] = useState<string | null>(null);
+  // Always derive the inspected signal from the live list so its value keeps updating.
+  const selectedSignal = useMemo(
+    () => (selectedSignalId ? signals.find((s) => s.id === selectedSignalId) || null : null),
+    [selectedSignalId, signals]
+  );
+  const setSelectedSignal = (sig: SignalItem | null) => setSelectedSignalIdState(sig ? sig.id : null);
+  const [deleting, setDeleting] = useState(false);
   const [editTarget, setEditTarget] = useState<SignalItem | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SignalItem | null>(null);
 
@@ -218,11 +214,8 @@ export const SignalsCatalogPage: React.FC = () => {
 
   // Open initial signal inspector from URL (TC-UI-SG-19)
   useEffect(() => {
-    if (initialSignalId) {
-      const match = signals.find((s) => s.id === initialSignalId);
-      if (match) setSelectedSignal(match);
-    }
-  }, [initialSignalId, signals]);
+    if (initialSignalId) setSelectedSignalIdState(initialSignalId);
+  }, [initialSignalId]);
 
   // View toggle helper
   const setViewMode = (mode: 'table' | 'live') => {
@@ -339,12 +332,8 @@ export const SignalsCatalogPage: React.FC = () => {
 
       // 6. Quality Filter
       if (qualityFilter !== 'all') {
-        const q = (s.quality || 'unknown').toLowerCase();
-        if (qualityFilter === 'good' && q !== 'good') return false;
-        if (qualityFilter === 'uncertain' && q !== 'uncertain') return false;
-        if (qualityFilter === 'bad' && q !== 'bad') return false;
-        if (qualityFilter === 'stale' && q !== 'stale') return false;
-        if (qualityFilter === 'disabled' && s.enabled !== false) return false;
+        const q = normalizeQuality(s.quality).toLowerCase();
+        if (q !== qualityFilter) return false;
       }
 
       return true;
@@ -389,16 +378,37 @@ export const SignalsCatalogPage: React.FC = () => {
   };
 
   const handleToggleEnabled = async (sig: SignalItem) => {
-    const nextEnabled = sig.enabled === false ? true : false;
+    const nextEnabled = sig.enabled === false;
     try {
       await api(`/api/v1/signals/${encodeURIComponent(sig.id)}`, {
         method: 'PATCH',
-        body: JSON.stringify({ version: (sig as any).version || 1, enabled: nextEnabled }),
+        body: JSON.stringify({ version: sig.version ?? 1, enabled: nextEnabled }),
       });
       await refresh();
       showToast(`Signal ${sig.key || sig.name} ${nextEnabled ? 'enabled' : 'disabled'}`);
-    } catch {
-      showToast('Failed to update signal');
+    } catch (error) {
+      showToast(`Could not update ${sig.key || sig.name}: ${error instanceof Error ? error.message : 'request failed'}`);
+      await refresh().catch(() => undefined);
+    }
+  };
+
+  const handleDelete = async () => {
+    const sig = deleteTarget;
+    if (!sig) return;
+    setDeleting(true);
+    try {
+      await api(`/api/v1/signals/${encodeURIComponent(sig.id)}`, { method: 'DELETE' });
+      setDeleteTarget(null);
+      if (selectedSignalId === sig.id) setSelectedSignal(null);
+      setTrendSignals((prev) => prev.filter((s) => s.id !== sig.id));
+      setSelectedIds((prev) => prev.filter((id) => id !== sig.id));
+      await refresh();
+      showToast(`Signal ${sig.key || sig.name} deleted`);
+    } catch (error) {
+      setDeleteTarget(null);
+      showToast(`Could not delete ${sig.key || sig.name}: ${error instanceof Error ? error.message : 'request failed'}`);
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -407,30 +417,37 @@ export const SignalsCatalogPage: React.FC = () => {
       selectedIds.length > 0
         ? filteredSignals.filter((s) => selectedIds.includes(s.id))
         : filteredSignals;
-
+    // Quote every cell; neutralise spreadsheet formulas (=, +, -, @, tab, CR) like the Center CSV export.
+    const cell = (value: unknown) => {
+      let text = value === null || value === undefined ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value);
+      if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+      return `"${text.replace(/"/g, '""')}"`;
+    };
     const rows = [
-      ['signal_variable', 'display_name', 'resource', 'value', 'unit', 'quality', 'updated_at'],
+      ['signal_key', 'display_name', 'resource', 'value', 'unit', 'quality', 'last_read', 'last_change'],
       ...listToExport.map((s) => {
         const res = resources.find((r) => r.id === s.resourceId);
         return [
-          `"${(s.key || s.tag || '').replace(/"/g, '""')}"`,
-          `"${(s.displayName || s.name || '').replace(/"/g, '""')}"`,
-          `"${(res?.name || s.resourcePath || '').replace(/"/g, '""')}"`,
-          s.value !== null && s.value !== undefined ? String(s.value) : '',
-          `"${(s.unit || '').replace(/"/g, '""')}"`,
-          s.quality || 'UNKNOWN',
-          s.lastUpdated || '',
-        ];
+          s.key || s.tag || '',
+          s.displayName || s.name || '',
+          res?.name || s.resourcePath || '',
+          s.value,
+          s.unit || '',
+          normalizeQuality(s.quality),
+          s.receivedTime || s.lastUpdated || '',
+          s.sourceTime || '',
+        ].map(cell);
       }),
     ];
-    const csvContent = 'data:text/csv;charset=utf-8,' + rows.map((e) => e.join(',')).join('\n');
-    const encodedUri = encodeURI(csvContent);
+    const blob = new Blob([rows.map((e) => e.join(',')).join('\n')], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
+    link.setAttribute('href', url);
     link.setAttribute('download', `signals_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -440,7 +457,7 @@ export const SignalsCatalogPage: React.FC = () => {
         <div>
           <h1 className="text-[20px] font-bold text-[#111B37]">Signals</h1>
           <p className="text-[13px] text-[#657794]">
-            Unified signal catalog and live real-time observation stream (192 signals active)
+            Signal catalog with live values ({signals.length} signal{signals.length === 1 ? '' : 's'})
           </p>
         </div>
 
@@ -569,7 +586,7 @@ export const SignalsCatalogPage: React.FC = () => {
                 <span className="font-bold">Filtered by:</span>
                 <span className="font-semibold text-blue-900">
                   {selectedFilter.startsWith('data:')
-                    ? `📊 ${resources.find((r) => r.id === selectedFilter.replace('data:', ''))?.name || ''} Telemetry Data`
+                    ? `${resources.find((r) => r.id === selectedFilter.replace('data:', ''))?.name || ''} Telemetry Data`
                     : resources.find((r) => r.id === selectedFilter)?.name || selectedFilter}
                 </span>
                 <span className="text-[#64748B] font-mono">({filteredSignals.length} signals)</span>
@@ -667,7 +684,7 @@ export const SignalsCatalogPage: React.FC = () => {
               {/* Quality Pills */}
               <div className="flex items-center gap-1">
                 <span className="text-[#657794] mr-1 text-[11px] font-semibold uppercase">Quality:</span>
-                {(['all', 'good', 'uncertain', 'bad', 'stale', 'disabled'] as const).map((q) => (
+                {(['all', 'good', 'uncertain', 'bad', 'stale', 'no_data', 'disabled'] as const).map((q) => (
                   <button
                     key={q}
                     onClick={() => setQualityFilter(q)}
@@ -677,7 +694,7 @@ export const SignalsCatalogPage: React.FC = () => {
                         : 'text-[#657794] hover:text-[#111B37]'
                     }`}
                   >
-                    {q}
+                    {q === 'no_data' ? 'no data' : q}
                   </button>
                 ))}
               </div>
@@ -722,14 +739,7 @@ export const SignalsCatalogPage: React.FC = () => {
                 {filteredSignals.map((sig) => {
                   const res = resources.find((r) => r.id === sig.resourceId);
                   const isSelectedForTrend = trendSignals.some((s) => s.id === sig.id);
-                  const formattedVal =
-                    sig.value === null || sig.value === undefined
-                      ? (sig.currentValue ?? '—')
-                      : typeof sig.value === 'number'
-                      ? Number.isInteger(sig.value)
-                        ? String(sig.value)
-                        : sig.value.toFixed(2)
-                      : String(sig.value);
+                  const formattedVal = formatValue(sig.value);
 
                   return (
                     <div
@@ -776,8 +786,12 @@ export const SignalsCatalogPage: React.FC = () => {
 
                       <div className="mt-2.5 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px]">
                         <StatusBadge status={sig.quality || 'NO_DATA'} />
-                        <span className="text-[#657794] font-mono text-[10px]">
-                          {timeAgo(sig.lastUpdated)}
+                        <span
+                          className="text-[#657794] font-mono text-[10px] text-right"
+                          title={`Last read ${formatTimestamp(sig.receivedTime || sig.lastUpdated)} · Last change ${formatTimestamp(sig.sourceTime)}`}
+                        >
+                          read {timeAgo(sig.receivedTime || sig.lastUpdated)}
+                          {sig.sourceTime ? ` · changed ${timeAgo(sig.sourceTime)}` : ''}
                         </span>
                       </div>
                     </div>
@@ -819,21 +833,15 @@ export const SignalsCatalogPage: React.FC = () => {
                         <th className="py-2.5 px-3">Value</th>
                         <th className="py-2.5 px-3">Trend 15 min</th>
                         <th className="py-2.5 px-3">Quality</th>
-                        <th className="py-2.5 px-3 text-right">Updated</th>
+                        <th className="py-2.5 px-3 text-right">Last read</th>
+                        <th className="py-2.5 px-3 text-right">Last change</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {filteredSignals.map((sig) => {
                         const res = resources.find((r) => r.id === sig.resourceId);
                         const isChecked = selectedIds.includes(sig.id);
-                        const formattedVal =
-                          sig.value === null || sig.value === undefined
-                            ? (sig.currentValue ?? '—')
-                            : typeof sig.value === 'number'
-                            ? Number.isInteger(sig.value)
-                              ? String(sig.value)
-                              : sig.value.toFixed(2)
-                            : String(sig.value);
+                        const formattedVal = formatValue(sig.value);
 
                         return (
                           <tr
@@ -876,16 +884,26 @@ export const SignalsCatalogPage: React.FC = () => {
                               {sig.unit && <span className="font-normal text-[#657794] text-[10px] ml-0.5">{sig.unit}</span>}
                             </td>
                             <td className="py-2.5 px-3">
-                              <SignalSparkline signalId={sig.id} quality={sig.quality || 'NO_DATA'} />
+                              {classifyType(sig.data_type || sig.dataType) === 'text' || classifyType(sig.data_type || sig.dataType) === 'boolean' ? (
+                                <span className="text-slate-300 text-[11px]">—</span>
+                              ) : (
+                                <SignalSparkline signalId={sig.id} quality={sig.quality || 'NO_DATA'} />
+                              )}
                             </td>
                             <td className="py-2.5 px-3">
                               <StatusBadge status={sig.quality || 'NO_DATA'} />
                             </td>
                             <td
                               className="py-2.5 px-3 text-right text-[#657794] font-mono text-[11px] whitespace-nowrap"
-                              title={sig.lastUpdated ? new Date(sig.lastUpdated).toLocaleString() : ''}
+                              title={formatTimestamp(sig.receivedTime || sig.lastUpdated)}
                             >
-                              {timeAgo(sig.lastUpdated)}
+                              {timeAgo(sig.receivedTime || sig.lastUpdated)}
+                            </td>
+                            <td
+                              className="py-2.5 px-3 text-right text-[#657794] font-mono text-[11px] whitespace-nowrap"
+                              title={formatTimestamp(sig.sourceTime)}
+                            >
+                              {sig.sourceTime ? timeAgo(sig.sourceTime) : '—'}
                             </td>
                           </tr>
                         );
@@ -903,6 +921,9 @@ export const SignalsCatalogPage: React.FC = () => {
       <SignalInspector
         signal={selectedSignal}
         isOpen={Boolean(selectedSignal)}
+        resourceName={resources.find((r) => r.id === selectedSignal?.resourceId)?.name}
+        connectionName={selectedSignal?.sourceConnectionName || connections.find((c) => c.id === selectedSignal?.sourceConnectionId)?.name}
+        edgeName={selectedSignal?.edgeName}
         onClose={() => setSelectedSignal(null)}
         onEdit={(sig) => setEditTarget(sig)}
         onToggleEnabled={(sig) => void handleToggleEnabled(sig)}
@@ -921,6 +942,17 @@ export const SignalsCatalogPage: React.FC = () => {
           }}
         />
       )}
+
+      <ConfirmDialog
+        isOpen={Boolean(deleteTarget)}
+        title={`Delete signal "${deleteTarget?.key || deleteTarget?.name || ''}"?`}
+        message="Collection stops and the signal is removed from the catalog. Its history stays in storage."
+        confirmText={deleting ? 'Deleting…' : 'Delete signal'}
+        cancelText="Cancel"
+        variant="danger"
+        onConfirm={() => void handleDelete()}
+        onCancel={() => setDeleteTarget(null)}
+      />
 
       {/* Toast Notification */}
       {toastMessage && (

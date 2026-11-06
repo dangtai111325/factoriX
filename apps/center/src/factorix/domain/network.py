@@ -47,10 +47,7 @@ def parse_allowlist(entries: list[str]) -> list[AllowedEndpoint]:
         if not item:
             continue
         if "://" in item:
-            url = urlparse(item)
-            if not url.hostname or not url.port:
-                raise NetworkPolicyError("ALLOWLIST", "Allowlist URL must include host and port.")
-            parsed.append(AllowedEndpoint(url.hostname, url.port, url.scheme))
+            parsed.append(endpoint_from_url(item))
             continue
         if ":" not in item:
             raise NetworkPolicyError("ALLOWLIST", "Allowlist must be in host:port format.")
@@ -82,7 +79,7 @@ def assert_allowed(host: str, port: int, allowlist: list[AllowedEndpoint], *, sc
     permitted = [
         item
         for item in allowlist
-        if item.host.lower() == normalized and (item.port == port or (item.port in {18883, 1883} and port in {18883, 1883})) and (scheme is None or item.scheme in {None, scheme})
+        if item.host.lower() == normalized and item.port == port and (scheme is None or item.scheme in {None, scheme})
     ]
     if not permitted:
         raise NetworkPolicyError("NOT_ALLOWLISTED", "Endpoint is not in edge allowlist.")
@@ -93,22 +90,41 @@ def assert_allowed(host: str, port: int, allowlist: list[AllowedEndpoint], *, sc
             raise NetworkPolicyError("NOT_ALLOWLISTED", "Private network is not permitted.")
 
 
-def assert_url(url: str, allowlist: list[AllowedEndpoint]) -> tuple[str, int]:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https", "opc.tcp", "mqtt", "mqtts", "tcp"}:
+DEFAULT_PORTS: dict[str, int | None] = {
+    "http": 80,
+    "https": 443,
+    "ws": 80,
+    "wss": 443,
+    "opc.tcp": 4840,
+    "mqtt": 1883,
+    "mqtts": 8883,
+    "modbus": 502,
+    "tcp": None,
+}
+
+
+def endpoint_from_url(url: str) -> AllowedEndpoint:
+    """Parse ``scheme://host[:port][/path]`` into an endpoint, using the scheme's default port."""
+    try:
+        parsed = urlparse(url.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise NetworkPolicyError("URL", "URL has an invalid port.") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in DEFAULT_PORTS:
         raise NetworkPolicyError("SCHEME", "URL scheme is not permitted.")
     if parsed.username or parsed.password:
         raise NetworkPolicyError("URL_SECRET", "Do not put secrets in the URL.")
-    host = parsed.hostname
-    port = parsed.port or _default_port(parsed.scheme)
-    if not host or port is None:
+    port = port or DEFAULT_PORTS[scheme]
+    if not parsed.hostname or port is None:
         raise NetworkPolicyError("URL", "URL is missing host or port.")
-    assert_allowed(host, port, allowlist, scheme=parsed.scheme)
-    return host, port
+    return AllowedEndpoint(parsed.hostname, port, scheme)
 
 
-def _default_port(scheme: str) -> int | None:
-    return {"http": 80, "https": 443, "opc.tcp": 4840, "mqtt": 1883, "mqtts": 8883, "tcp": None}[scheme]
+def assert_url(url: str, allowlist: list[AllowedEndpoint]) -> tuple[str, int]:
+    endpoint = endpoint_from_url(url)
+    assert_allowed(endpoint.host, endpoint.port, allowlist, scheme=endpoint.scheme)
+    return endpoint.host, endpoint.port
 
 
 def _resolve(host: str) -> list[str]:

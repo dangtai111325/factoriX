@@ -68,6 +68,9 @@ const mainNav: NavGroup[] = [
   },
 ];
 
+const COMING_SOON_KEY = 'fx.sidebar.comingSoon.v2';
+const COMING_SOON_GROUPS_KEY = 'fx.sidebar.comingSoonSubGroups.v2';
+
 const comingSoonNav: NavGroup[] = [
   {
     id: 'dashboards',
@@ -159,43 +162,44 @@ export const Sidebar: React.FC = () => {
     return { factory: true, collector: true, models: true };
   });
 
-  // Coming soon master section open state (defaults to true so full tree is visible)
+  // "Coming soon" section: collapsed by default so the released modules stay in view. The choice is
+  // remembered per browser (".v2" keys: earlier builds stored "open" for everyone by default).
   const [comingSoonOpen, setComingSoonOpen] = useState<boolean>(() => {
     try {
-      const saved = localStorage.getItem('fx.sidebar.comingSoon');
-      if (saved !== null) return saved === 'true';
+      return localStorage.getItem(COMING_SOON_KEY) === 'true';
     } catch {
-      // fallback
+      return false;
     }
-    return true;
   });
 
-  // Coming soon sub-groups open state
+  // Coming soon sub-groups: collapsed by default as well.
   const [openComingSoonSubGroups, setOpenComingSoonSubGroups] = useState<Record<string, boolean>>(() => {
     try {
-      const saved = localStorage.getItem('fx.sidebar.comingSoonSubGroups');
-      if (saved) return JSON.parse(saved);
-    } catch {}
-    return {
-      dashboards: true,
-      historian: true,
-      alarms: true,
-      analytics: true,
-      reports: true,
-      administration: true,
-    };
+      const saved = localStorage.getItem(COMING_SOON_GROUPS_KEY);
+      if (saved) {
+        const parsed: unknown = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') return parsed as Record<string, boolean>;
+      }
+    } catch {
+      // Unreadable storage: fall back to everything collapsed.
+    }
+    return {};
   });
 
   useEffect(() => {
     try {
       localStorage.setItem('fx.sidebar.groups', JSON.stringify(openGroups));
-    } catch {}
+    } catch {
+      // Storage unavailable (private mode, quota): the state simply is not remembered.
+    }
   }, [openGroups]);
 
   useEffect(() => {
     try {
-      localStorage.setItem('fx.sidebar.comingSoon', String(comingSoonOpen));
-    } catch {}
+      localStorage.setItem(COMING_SOON_KEY, String(comingSoonOpen));
+    } catch {
+      // Storage unavailable: not remembered.
+    }
   }, [comingSoonOpen]);
 
   useEffect(() => {
@@ -207,13 +211,22 @@ export const Sidebar: React.FC = () => {
     );
     if (isAnyComingSoon) {
       setComingSoonOpen(true);
+      // Reveal the active sub-module as well.
+      const activeGroup = comingSoonNav.find(
+        (item) => Boolean(item.children?.some((c) => location.pathname === c.path)),
+      );
+      if (activeGroup) {
+        setOpenComingSoonSubGroups((prev) => (prev[activeGroup.id] ? prev : { ...prev, [activeGroup.id]: true }));
+      }
     }
   }, [location.pathname]);
 
   useEffect(() => {
     try {
-      localStorage.setItem('fx.sidebar.comingSoonSubGroups', JSON.stringify(openComingSoonSubGroups));
-    } catch {}
+      localStorage.setItem(COMING_SOON_GROUPS_KEY, JSON.stringify(openComingSoonSubGroups));
+    } catch {
+      // Storage unavailable: not remembered.
+    }
   }, [openComingSoonSubGroups]);
 
   const toggleGroup = (id: string) => {
@@ -262,15 +275,15 @@ export const Sidebar: React.FC = () => {
 
   return (
     <>
-      <aside className="fx-sidebar select-none flex flex-col justify-between">
+      <aside className="fx-sidebar select-none flex flex-col" aria-label="Main navigation">
         {/* Brand Header: Logo only in red/white tone per user request */}
-        <div>
-          <div className="h-[62px] px-5 flex items-center border-b border-[#E3EAF3]">
+        <div className="flex-1 min-h-0 flex flex-col">
+          <div className="h-[62px] px-5 flex items-center border-b border-[#E3EAF3] shrink-0">
             <img src={factorixLogo} alt="FactoriX" className="h-8 w-auto object-contain" />
           </div>
 
-          {/* Navigation Links */}
-          <div className="px-3 py-4 space-y-1 overflow-y-auto max-h-[calc(100vh-170px)]">
+          {/* Navigation Links: scroll inside, never under the footer */}
+          <nav className="px-3 py-4 space-y-1 overflow-y-auto flex-1 min-h-0">
             {mainNav.map((group) => {
               const Icon = group.icon;
               const active = isGroupActive(group);
@@ -301,6 +314,7 @@ export const Sidebar: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => toggleGroup(group.id)}
+                    aria-expanded={isOpen}
                     className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-[14px] font-medium transition-colors ${
                       active
                         ? 'text-[#EF1B24] font-semibold bg-[#FEF2F2]/60'
@@ -379,7 +393,7 @@ export const Sidebar: React.FC = () => {
                 <div className="ml-2 pl-2 border-l border-[#E2E8F0] space-y-1 py-1">
                   {comingSoonNav.map((item) => {
                     const Icon = item.icon;
-                    const isSubOpen = openComingSoonSubGroups[item.id] ?? true;
+                    const isSubOpen = openComingSoonSubGroups[item.id] ?? false;
                     const hasChildren = item.children && item.children.length > 0;
                     const itemActive =
                       location.pathname === item.path ||
@@ -411,7 +425,9 @@ export const Sidebar: React.FC = () => {
                               type="button"
                               onClick={(e) => toggleComingSoonSubGroup(item.id, e)}
                               className="p-1 text-[#94A3B8] hover:text-[#EF1B24] transition-colors rounded flex-shrink-0 mr-0.5"
-                              title="Toggle submodules"
+                              title={isSubOpen ? `Hide ${item.label} modules` : `Show ${item.label} modules`}
+                              aria-label={isSubOpen ? `Hide ${item.label} modules` : `Show ${item.label} modules`}
+                              aria-expanded={isSubOpen}
                             >
                               <ChevronDown
                                 className={`w-3.5 h-3.5 transition-transform duration-200 ${
@@ -453,11 +469,11 @@ export const Sidebar: React.FC = () => {
                 </div>
               )}
             </div>
-          </div>
+          </nav>
         </div>
 
         {/* Footer Actions */}
-        <div className="p-3 border-t border-[#E3EAF3] bg-[#F9FAFD]/80">
+        <div className="p-3 border-t border-[#E3EAF3] bg-[#F9FAFD] shrink-0">
           <button
             type="button"
             onClick={() => setRevertModalOpen(true)}

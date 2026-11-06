@@ -31,7 +31,16 @@ export interface ResourceNode {
   updatedAt?: string;
 }
 
-export type ProtocolType = 'modbus' | 'opcua' | 'mqtt' | 'http';
+export type ProtocolType = 'modbus' | 'opcua' | 'mqtt' | 'http' | 'websocket';
+
+/** Stored protocol keys used by the Center API (`connections.protocol`). */
+export type StoredProtocol = 'modbus_tcp' | 'opcua' | 'mqtt' | 'http' | 'websocket';
+
+/** Display state of a connection, derived from lifecycle status + server `effective_health`. */
+export type ConnectionDisplayState = 'connected' | 'idle' | 'degraded' | 'paused' | 'unknown';
+
+/** Effective signal status as computed by the Center (`latest_signal_state` evaluation). */
+export type SignalQuality = 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE' | 'NO_DATA' | 'DISABLED';
 
 export type DemoScenario = 'healthy' | 'degraded_modbus' | 'timeout_opcua' | 'auth_fail_mqtt' | 'offline';
 
@@ -60,7 +69,17 @@ export interface ConnectionItem {
   name: string;
   protocol: ProtocolType;
   endpoint: string;
-  status: 'connected' | 'disconnected' | 'warning' | 'testing' | string;
+  /** Display state (see ConnectionDisplayState). */
+  status: ConnectionDisplayState | string;
+  /** Raw lifecycle status from the API: ACTIVE | PAUSED | DRAFT | ARCHIVED. */
+  lifecycleStatus?: string;
+  /** Server-computed effective health (HEALTHY | DEGRADED | IDLE | PAUSED | UNKNOWN …); falls back to `health`. */
+  effectiveHealth?: string;
+  version?: number;
+  messagesPerMin?: number;
+  secretConfigured?: boolean;
+  edgeName?: string;
+  lastSuccessAt?: string;
   plantId?: string;
   siteId?: string;
   site_id?: string;
@@ -116,8 +135,19 @@ export interface SignalItem {
   unit?: string;
   currentValue?: number | string | boolean | null;
   value?: number | string | boolean | null;
-  quality: 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE' | 'UNKNOWN' | string;
+  /** Effective status code (SignalQuality), always upper case. */
+  quality: SignalQuality | string;
+  reasonCode?: string;
+  /** Last read = acquisition time on the edge (`received_time`). Same as `receivedTime`. */
   lastUpdated: string;
+  receivedTime?: string;
+  /** Last change = source-reported group timestamp (`source_time`), metadata only. */
+  sourceTime?: string;
+  version?: number;
+  addressKind?: string;
+  addressJson?: Record<string, unknown>;
+  edgeName?: string;
+  connectionProtocol?: string;
   sampleIntervalMs: number;
   bindingType?: SignalBindingType;
   bindingAddress?: string;

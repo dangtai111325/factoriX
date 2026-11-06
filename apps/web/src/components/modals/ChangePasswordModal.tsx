@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { X, Lock, CheckCircle, AlertCircle } from 'lucide-react';
-import { api } from '../../api/client';
+import { ApiError, api } from '../../api/client';
+import { useDialogA11y } from './useDialogA11y';
 
 interface ChangePasswordModalProps {
   isOpen: boolean;
@@ -19,6 +20,22 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [generalError, setGeneralError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useDialogA11y(isOpen, dialogRef, () => {
+    if (!isSubmitting) onClose();
+  });
+
+  // Never keep passwords in memory between two openings of the dialog.
+  useEffect(() => {
+    if (!isOpen) return;
+    setCurrentPassword('');
+    setNewPassword('');
+    setConfirmPassword('');
+    setFieldErrors({});
+    setGeneralError(null);
+    setIsSubmitting(false);
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -60,10 +77,10 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
       if (onSuccessToast) {
         onSuccessToast('Password changed');
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       setIsSubmitting(false);
-      const msg = err?.response?.data?.message || err?.message || 'Failed to change password.';
-      if (msg.includes('current password') || err?.response?.data?.code === 'INVALID_CREDENTIALS') {
+      const msg = err instanceof Error && err.message ? err.message : 'The password could not be changed.';
+      if (err instanceof ApiError && err.code === 'INVALID_CREDENTIALS') {
         setFieldErrors({ currentPassword: 'The current password is incorrect.' });
       } else {
         setGeneralError(msg);
@@ -74,7 +91,9 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
       <div
-        className="w-full max-w-md bg-white rounded-xl shadow-2xl border border-[#D4DFEC] overflow-hidden"
+        ref={dialogRef}
+        tabIndex={-1}
+        className="w-full max-w-md bg-white rounded-xl shadow-2xl border border-[#D4DFEC] overflow-hidden outline-none"
         role="dialog"
         aria-modal="true"
         aria-labelledby="change-password-title"

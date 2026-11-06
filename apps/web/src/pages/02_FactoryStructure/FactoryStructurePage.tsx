@@ -1,1036 +1,1247 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import {
-  Plus,
-  ChevronsDown,
-  ChevronsUp,
-  Search,
-  Building2,
-  Factory,
-  Boxes,
-  Cpu,
-  ChevronRight,
-  ChevronDown,
-  Activity,
-  ArrowRightLeft,
-  Copy,
-  Edit2,
-  Archive,
-  Layers,
-  Share2,
-  UploadCloud,
-} from 'lucide-react';
-import { Button } from '../../components/common/Button';
-import { Card } from '../../components/common/Card';
-import { Badge } from '../../components/common/Badge';
-import { useApp } from '../../store/AppContext';
-import { useNavigate, useSearchParams } from 'react-router-dom';
-import { ResourceNode } from '../../types';
-import { AddResourceModal } from '../../components/modals/AddResourceModal';
-import { EditResourceModal } from '../../components/modals/EditResourceModal';
-import { MoveResourceModal } from '../../components/modals/MoveResourceModal';
-import { ImportTopicsModal } from '../../components/modals/ImportTopicsModal';
-import { translateApiError } from '../../utils/apiErrors';
-import {
-  allowedChildTypes,
-  ancestorPath,
-  buildResourceTree,
-  childrenOf,
-  filterResourcesWithAncestors,
-  hasChildren,
-  HierarchyTreeNode,
-} from '../../utils/resourceHierarchy';
-
-function titleCaseType(type: string): string {
-  return type.charAt(0).toUpperCase() + type.slice(1);
-}
-
-function getIconForType(type: string) {
-  switch (type.toLowerCase()) {
-    case 'enterprise':
-    case 'site':
-      return <Building2 className="w-4 h-4 text-[#2A82E7]" />;
-    case 'plant':
-      return <Factory className="w-4 h-4 text-[#8858EA]" />;
-    case 'line':
-    case 'zone':
-    case 'workshop':
-      return <Boxes className="w-4 h-4 text-[#FFAA23]" />;
-    default:
-      return <Cpu className="w-4 h-4 text-[#EF1B24]" />;
-  }
-}
-
-function statusPresentation(status?: string, signalsCount?: number, liveGoodCount?: number): {
-  label: string;
-  variant: 'good' | 'warning' | 'error' | 'neutral';
-} {
-  const total = signalsCount ?? 0;
-  if (total > 0) {
-    if ((liveGoodCount ?? 0) > 0) {
-      return { label: `ONLINE · ${liveGoodCount}/${total} SIGNALS`, variant: 'good' };
-    }
-    return { label: `OFFLINE · ${total} SIGNALS`, variant: 'error' };
-  }
-  const s = (status || '').toLowerCase();
-  if (s === 'offline') return { label: 'OFFLINE', variant: 'error' };
-  if (s === 'warning') return { label: 'WARNING', variant: 'warning' };
-  return { label: 'ACTIVE', variant: 'neutral' };
-}
-
-/** Fill missing childrenCount / signalsCount from the live graph. */
-function enrichResourceCounts(
-  resources: ResourceNode[],
-  signals: Array<{ resourceId: string }>,
-): ResourceNode[] {
-  const childCounts = new Map<string, number>();
-  const signalCounts = new Map<string, number>();
-
-  for (const resource of resources) {
-    if (!resource.parentId) continue;
-    childCounts.set(resource.parentId, (childCounts.get(resource.parentId) || 0) + 1);
-  }
-  for (const signal of signals) {
-    if (!signal.resourceId) continue;
-    signalCounts.set(signal.resourceId, (signalCounts.get(signal.resourceId) || 0) + 1);
-  }
-
-  return resources.map((resource) => ({
-    ...resource,
-    childrenCount: resource.childrenCount ?? childCounts.get(resource.id) ?? 0,
-    signalsCount: resource.signalsCount ?? signalCounts.get(resource.id) ?? 0,
-  }));
-}
-
-interface TreeRowProps {
-  node: HierarchyTreeNode;
-  depth: number;
-  selectedId: string;
-  expandedNodes: Record<string, boolean>;
-  onToggle: (id: string) => void;
-  onSelect: (id: string) => void;
-  onSelectData?: (id: string) => void;
-  onKeyNavigate: (event: React.KeyboardEvent, node: HierarchyTreeNode) => void;
-}
-
-const TreeRow: React.FC<TreeRowProps> = ({
-  node,
-  depth,
-  selectedId,
-  expandedNodes,
-  onToggle,
-  onSelect,
-  onSelectData,
-  onKeyNavigate,
-}) => {
-  const { resource, children } = node;
-  const isSelected = resource.id === selectedId;
-  const signalCount = resource.signalsCount ?? 0;
-  const hasDirectData = signalCount > 0;
-  const hasKids = children.length > 0 || hasDirectData;
-  const isExpanded = expandedNodes[resource.id] ?? true;
-
-  return (
-    <>
-      <div
-        role="treeitem"
-        aria-label={`${resource.name}, ${signalCount} bound signals`}
-        aria-expanded={hasKids ? isExpanded : undefined}
-        aria-selected={isSelected}
-        tabIndex={isSelected ? 0 : -1}
-        style={{ paddingLeft: `${depth * 14 + 8}px` }}
-        className={`flex items-center justify-between py-1.5 px-2 rounded-lg cursor-pointer text-[13px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[#EF1B24]/40 ${
-          isSelected
-            ? 'bg-[#FFF0F1] text-[#EF1B24] font-bold border-l-2 border-[#EF1B24]'
-            : 'text-[#334568] hover:bg-[#F1F5FA]'
-        }`}
-        onClick={() => onSelect(resource.id)}
-        onKeyDown={(event) => onKeyNavigate(event, node)}
-      >
-        <div className="flex items-center gap-2 truncate min-w-0">
-          {hasKids ? (
-            <button
-              type="button"
-              tabIndex={-1}
-              aria-label={isExpanded ? 'Collapse' : 'Expand'}
-              onClick={(e) => {
-                e.stopPropagation();
-                onToggle(resource.id);
-              }}
-              className="p-0.5 text-[#94A3B8] hover:text-[#111B37] flex-shrink-0"
-            >
-              {isExpanded ? (
-                <ChevronDown className="w-3.5 h-3.5" />
-              ) : (
-                <ChevronRight className="w-3.5 h-3.5" />
-              )}
-            </button>
-          ) : (
-            <span className="w-4 flex-shrink-0" />
-          )}
-          {getIconForType(resource.type)}
-          <span className="truncate">{resource.name}</span>
-        </div>
-        <span className="text-[11px] font-mono text-[#94A3B8] ml-2 flex-shrink-0" aria-hidden="true">
-          {signalCount}
-        </span>
-      </div>
-      {isExpanded && (
-        <div role="group">
-          {/* Distinct Data Nav Child */}
-          {hasDirectData && (
-            <div
-              style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}
-              className="flex items-center justify-between py-1 px-2 rounded-lg cursor-pointer text-[12px] transition-colors text-emerald-700 hover:bg-emerald-50/70"
-              onClick={(e) => {
-                e.stopPropagation();
-                onSelect(resource.id);
-                if (onSelectData) onSelectData(resource.id);
-              }}
-            >
-              <div className="flex items-center gap-2 truncate min-w-0">
-                <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse shrink-0" />
-                <span className="truncate font-bold">
-                  📊 Data
-                </span>
-              </div>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded font-extrabold bg-emerald-100 text-emerald-800">
-                {signalCount}
-              </span>
-            </div>
-          )}
-          {children.map((child) => (
-            <TreeRow
-              key={child.resource.id}
-              node={child}
-              depth={depth + 1}
-              selectedId={selectedId}
-              expandedNodes={expandedNodes}
-              onToggle={onToggle}
-              onSelect={onSelect}
-              onSelectData={onSelectData}
-              onKeyNavigate={onKeyNavigate}
-            />
-          ))}
-        </div>
-      )}
-    </>
-  );
-};
-
-export const FactoryStructurePage: React.FC = () => {
-  const {
-    resources: rawResources,
-    signals,
-    activities,
-    selectedResourceId,
-    setSelectedResourceId,
-    addResource,
-    moveResource,
-    archiveResource,
-    refresh,
-  } = useApp();
-  const [searchParams] = useSearchParams();
-  const [searchTerm, setSearchTerm] = useState('');
-  const [moveToast, setMoveToast] = useState<{
-    message: string;
-    undoParentId?: string;
-    linkTo?: string;
-  } | null>(null);
-  const [pageError, setPageError] = useState<string | null>(null);
-  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
-  const [expandedInitialized, setExpandedInitialized] = useState(false);
-
-  const [isAddModalOpen, setIsAddModalOpen] = useState(searchParams.get('modal') === 'add');
-  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
-  const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
-  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
-  const [rightPanelTab, setRightPanelTab] = useState<'children' | 'telemetry'>('children');
-
-  const handleExpandAll = () => {
-    const next: Record<string, boolean> = {};
-    for (const r of resources) {
-      next[r.id] = true;
-    }
-    setExpandedNodes(next);
-  };
-
-  const handleCollapseAll = () => {
-    const next: Record<string, boolean> = {};
-    for (const r of resources) {
-      next[r.id] = false;
-    }
-    setExpandedNodes(next);
-  };
-
-  const navigate = useNavigate();
-
-  const resources = useMemo(
-    () => enrichResourceCounts(rawResources, signals),
-    [rawResources, signals],
-  );
-
-  const visibleResources = useMemo(
-    () => filterResourcesWithAncestors(resources, searchTerm),
-    [resources, searchTerm],
-  );
-
-  const tree = useMemo(() => buildResourceTree(visibleResources), [visibleResources]);
-
-  const flatVisibleOrder = useMemo(() => {
-    const order: HierarchyTreeNode[] = [];
-    const walk = (nodes: HierarchyTreeNode[]) => {
-      for (const node of nodes) {
-        order.push(node);
-        const expanded = expandedNodes[node.resource.id] ?? true;
-        if (expanded && node.children.length) walk(node.children);
-      }
-    };
-    walk(tree);
-    return order;
-  }, [tree, expandedNodes]);
-
-  // Default-expand all parents whenever resources update
-  useEffect(() => {
-    if (!resources.length) return;
-    setExpandedNodes((prev) => {
-      let changed = false;
-      const next = { ...prev };
-      for (const r of resources) {
-        if (hasChildren(resources, r.id) && next[r.id] !== false) {
-          if (!next[r.id]) {
-            next[r.id] = true;
-            changed = true;
-          }
-        }
-      }
-      return changed ? next : prev;
-    });
-  }, [resources]);
-
-  // Expand path to deep-linked resource
-  useEffect(() => {
-    const resourceId = searchParams.get('resourceId');
-    if (resourceId && resources.some((item) => item.id === resourceId)) {
-      setSelectedResourceId(resourceId);
-    }
-  }, [resources, searchParams, setSelectedResourceId]);
-
-  // Keep ancestors of the selected node expanded so it stays visible
-  useEffect(() => {
-    const focusId = selectedResourceId || resources[0]?.id;
-    if (!focusId) return;
-    const path = ancestorPath(resources, focusId);
-    if (path.length < 2) return;
-    setExpandedNodes((prev) => {
-      let changed = false;
-      const next = { ...prev };
-      for (const id of path.slice(0, -1)) {
-        if (next[id] !== true) {
-          next[id] = true;
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-  }, [selectedResourceId, resources]);
-
-  // While filtering, keep ancestors expanded
-  useEffect(() => {
-    if (!searchTerm.trim()) return;
-    setExpandedNodes((prev) => {
-      const next = { ...prev };
-      for (const r of visibleResources) {
-        if (hasChildren(visibleResources, r.id)) next[r.id] = true;
-      }
-      return next;
-    });
-  }, [searchTerm, visibleResources]);
-
-  const toggleExpand = useCallback((id: string) => {
-    setExpandedNodes((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
-  }, []);
-
-  const selectedResource =
-    resources.find((r) => r.id === selectedResourceId) || resources[0];
-  const selectedDirectSignals = signals.filter((s) => s.resourceId === selectedResource?.id);
-  const selectedLiveGood = selectedDirectSignals.filter((s) => (s.quality || '').toLowerCase() === 'good').length;
-  const selectedStatus = statusPresentation(selectedResource?.status, selectedDirectSignals.length, selectedLiveGood);
-
-  const childResources = selectedResource
-    ? childrenOf(resources, selectedResource.id)
-    : [];
-
-  const canArchive = selectedResource
-    ? !hasChildren(resources, selectedResource.id)
-    : false;
-
-  const canonicalPath = (() => {
-    if (!selectedResource) return '';
-    const names: string[] = [];
-    const seen = new Set<string>();
-    let current: ResourceNode | undefined = selectedResource;
-    while (current && !seen.has(current.id)) {
-      seen.add(current.id);
-      names.unshift(current.name);
-      current = resources.find((item) => item.id === current?.parentId);
-    }
-    return names.join(' / ');
-  })();
-
-  const declaredAttributes = Object.entries(selectedResource?.attributes || {}).filter(
-    ([key]) => key !== 'siteId' && key !== 'version',
-  );
-
-  const allowedTypesForSelected = selectedResource
-    ? allowedChildTypes(selectedResource.type)
-    : ['enterprise'];
-
-  const handleCreateResource = async (data: {
-    name: string;
-    code: string;
-    type: string;
-    parent_id?: string | null;
-    description: string;
-    properties: Record<string, string>;
-  }) => {
-    setPageError(null);
-    try {
-      const result = await addResource({
-        name: data.name,
-        code: data.code,
-        parentId: data.parent_id || selectedResource?.id || undefined,
-        type: (data.type.toLowerCase() || 'enterprise') as ResourceNode['type'],
-        description: data.description,
-        attributes: data.properties,
-      });
-    } catch (caught) {
-      throw new Error(translateApiError(caught));
-    }
-  };
-
-  const handleMoveResource = async (targetParentId: string) => {
-    if (!selectedResource) return { success: false, error: 'No resource selected.' };
-    const oldParentId = selectedResource.parentId;
-    const res = await moveResource(selectedResource.id, targetParentId);
-    if (!res.success) {
-      return { success: false, error: translateApiError(res.error || 'Move failed') };
-    }
-    setExpandedNodes((prev) => ({ ...prev, [targetParentId]: true }));
-    setMoveToast({
-      message: `Successfully moved "${selectedResource.name}"`,
-      undoParentId: oldParentId,
-    });
-    setTimeout(() => setMoveToast(null), 5000);
-    setPageError(null);
-    return { success: true };
-  };
-
-  const handleUndoMove = () => {
-    if (moveToast?.undoParentId && selectedResource) {
-      void moveResource(selectedResource.id, moveToast.undoParentId);
-      setMoveToast(null);
-    }
-  };
-
-  const handleArchive = async () => {
-    if (!selectedResource) return;
-    if (!canArchive) {
-      setPageError('Archive child resources first.');
-      return;
-    }
-    setPageError(null);
-    const res = await archiveResource(selectedResource.id);
-    if (!res.success) {
-      setPageError(translateApiError(res.error || 'Archive failed'));
-    }
-  };
-
-  const handleTreeKeyNavigate = useCallback(
-    (event: React.KeyboardEvent, node: HierarchyTreeNode) => {
-      const { resource, children } = node;
-      const expanded = expandedNodes[resource.id] ?? true;
-      const index = flatVisibleOrder.findIndex((n) => n.resource.id === resource.id);
-
-      if (event.key === 'ArrowRight') {
-        event.preventDefault();
-        if (children.length && !expanded) {
-          toggleExpand(resource.id);
-        } else if (children.length && expanded) {
-          setSelectedResourceId(children[0].resource.id);
-        }
-        return;
-      }
-      if (event.key === 'ArrowLeft') {
-        event.preventDefault();
-        if (children.length && expanded) {
-          toggleExpand(resource.id);
-        } else if (resource.parentId) {
-          setSelectedResourceId(resource.parentId);
-        }
-        return;
-      }
-      if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        const next = flatVisibleOrder[index + 1];
-        if (next) setSelectedResourceId(next.resource.id);
-        return;
-      }
-      if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        const prev = flatVisibleOrder[index - 1];
-        if (prev) setSelectedResourceId(prev.resource.id);
-        return;
-      }
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        setSelectedResourceId(resource.id);
-      }
-    },
-    [expandedNodes, flatVisibleOrder, setSelectedResourceId, toggleExpand],
-  );
-
-  if (!selectedResource) {
-    return (
-      <div className="space-y-4">
-        <h1 className="fx-page-title">Hierarchy Structure</h1>
-        <p className="fx-page-subtitle">
-          The model is empty. Create an enterprise, then a site, plant, line and machine. Each step
-          is checked by the server.
-        </p>
-        {pageError && (
-          <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-            {pageError}
-          </p>
-        )}
-        <Button
-          variant="primary"
-          icon={<Plus className="w-4 h-4" />}
-          onClick={() => setIsAddModalOpen(true)}
-        >
-          Create enterprise
-        </Button>
-        <AddResourceModal
-          isOpen={isAddModalOpen}
-          onClose={() => setIsAddModalOpen(false)}
-          parentPath="(root)"
-          parentName="Root"
-          recommendedTypes={['enterprise']}
-          onAddResource={handleCreateResource}
-        />
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4 animate-in fade-in duration-200">
-      {/* Region 1 & 2: Heading & Actions Toolbar */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="fx-page-title">Hierarchy Structure</h1>
-          <p className="fx-page-subtitle">
-            Enterprise asset topology, functional locations, and resource hierarchy.
-          </p>
-        </div>
-        <div className="flex items-center gap-2.5">
-          <div className="relative w-56">
-            <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#94A3B8]" />
-            <input
-              type="text"
-              placeholder="Filter hierarchy..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="fx-input !pl-9 h-9 text-[13px]"
-            />
-          </div>
-          <Button
-            variant="secondary"
-            icon={<UploadCloud className="w-4 h-4" />}
-            onClick={() => setIsImportModalOpen(true)}
-          >
-            Import Topics
-          </Button>
-          <Button
-            variant="primary"
-            icon={<Plus className="w-4 h-4" />}
-            onClick={() => setIsAddModalOpen(true)}
-          >
-            Add Resource
-          </Button>
-          <Button
-            variant="secondary"
-            icon={<ArrowRightLeft className="w-4 h-4" />}
-            onClick={() => setIsMoveModalOpen(true)}
-          >
-            Move
-          </Button>
-          <Button
-            variant="secondary"
-            icon={<Edit2 className="w-4 h-4" />}
-            onClick={() => setIsEditModalOpen(true)}
-            disabled={!selectedResource}
-            title={selectedResource ? `Edit ${selectedResource.name}` : 'Select a resource to edit'}
-          >
-            Edit
-          </Button>
-          <Button
-            variant="secondary"
-            icon={<Archive className="w-4 h-4" />}
-            onClick={() => void handleArchive()}
-            disabled={!canArchive}
-            title={
-              canArchive
-                ? 'Archive this resource'
-                : 'Archive child resources first before archiving this node'
-            }
-          >
-            Archive
-          </Button>
-        </div>
-      </div>
-
-      {pageError && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-          {pageError}
-        </div>
-      )}
-
-      {/* 3-Column Layout: Hierarchy Tree, Child Units, and Detail Inspector */}
-      <div className="grid grid-cols-12 gap-3.5">
-        {/* Region 3: Asset Hierarchy Tree */}
-        <div className="col-span-12 lg:col-span-3">
-          <Card className="h-[calc(100vh-210px)] min-h-[620px] flex flex-col p-0">
-            <div className="px-3 py-2.5 border-b border-[#E3EAF3] flex items-center justify-between bg-[#F9FAFD]">
-              <span className="text-[12px] font-bold text-[#111B37] uppercase tracking-wider">
-                Hierarchy Tree
-              </span>
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={handleExpandAll}
-                  title="Expand All"
-                  className="px-1.5 py-0.5 rounded text-[11px] font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200/80 transition-colors flex items-center gap-0.5"
-                >
-                  <ChevronsDown className="w-3.5 h-3.5" />
-                  <span>Expand</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleCollapseAll}
-                  title="Collapse All"
-                  className="px-1.5 py-0.5 rounded text-[11px] font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200/80 transition-colors flex items-center gap-0.5"
-                >
-                  <ChevronsUp className="w-3.5 h-3.5" />
-                  <span>Collapse</span>
-                </button>
-                <span className="text-[11px] font-semibold text-[#657794] ml-1">
-                  {visibleResources.length}
-                </span>
-              </div>
-            </div>
-            <div className="p-3 overflow-y-auto flex-1 min-h-0" role="tree" aria-label="Factory hierarchy">
-              {tree.length === 0 ? (
-                <div className="text-center py-8 text-[#94A3B8] text-[13px]">No matching resources.</div>
-              ) : (
-                tree.map((node) => (
-                  <TreeRow
-                    key={node.resource.id}
-                    node={node}
-                    depth={0}
-                    selectedId={selectedResource.id}
-                    expandedNodes={expandedNodes}
-                    onToggle={toggleExpand}
-                    onSelect={setSelectedResourceId}
-                    onSelectData={(id) => {
-                      setSelectedResourceId(id);
-                      setRightPanelTab('telemetry');
-                    }}
-                    onKeyNavigate={handleTreeKeyNavigate}
-                  />
-                ))
-              )}
-            </div>
-          </Card>
-        </div>
-
-        {/* Region 4: Child Units & Real-time Telemetry Synchronization */}
-        <div className="col-span-12 lg:col-span-4">
-          <Card className="h-[calc(100vh-210px)] min-h-[620px] flex flex-col p-0">
-            {/* Header Tabs: Sub-units vs Telemetry Data */}
-            <div className="px-3 py-2.5 border-b border-[#E3EAF3] flex items-center justify-between bg-[#F9FAFD]">
-              {(() => {
-                const unitSignals = signals.filter((s) => s.resourceId === selectedResource.id);
-                return (
-                  <div className="flex items-center gap-1 bg-slate-200/70 p-0.5 rounded-lg">
-                    {childResources.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => setRightPanelTab('children')}
-                        className={`px-2.5 py-1 text-xs font-bold rounded-md transition ${
-                          rightPanelTab === 'children'
-                            ? 'bg-white text-[#0B2545] shadow-xs'
-                            : 'text-[#64748B] hover:text-[#0B2545]'
-                        }`}
-                      >
-                        Sub-units ({childResources.length})
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => setRightPanelTab('telemetry')}
-                      className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-bold rounded-md transition ${
-                        rightPanelTab === 'telemetry' || childResources.length === 0
-                          ? 'bg-emerald-700 text-white shadow-xs'
-                          : 'text-emerald-800 hover:bg-emerald-50'
-                      }`}
-                    >
-                      <Activity className="w-3.5 h-3.5" />
-                      <span>📊 Telemetry Data ({unitSignals.length})</span>
-                    </button>
-                  </div>
-                );
-              })()}
-
-              <div className="flex items-center gap-1">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  icon={<Plus className="w-3.5 h-3.5" />}
-                  onClick={() => navigate(`/collector/add-data?resourceId=${encodeURIComponent(selectedResource.id)}`)}
-                >
-                  Add Data
-                </Button>
-                {allowedTypesForSelected.length > 0 && (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    icon={<Plus className="w-3.5 h-3.5" />}
-                    onClick={() => setIsAddModalOpen(true)}
-                  >
-                    Add Child
-                  </Button>
-                )}
-              </div>
-            </div>
-
-            <div className="p-3 overflow-y-auto flex-1 min-h-0 space-y-2.5">
-              {(() => {
-                const unitSignals = signals.filter((s) => s.resourceId === selectedResource.id);
-                const isTelemetryView = rightPanelTab === 'telemetry' || childResources.length === 0;
-
-                if (isTelemetryView) {
-                  if (unitSignals.length === 0) {
-                    return (
-                      <div className="text-center py-12 space-y-2">
-                        <div className="text-[#94A3B8] text-[13px] font-medium">
-                          No direct telemetry signals bound under {selectedResource.name}.
-                        </div>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => navigate(`/collector/add-data?resourceId=${encodeURIComponent(selectedResource.id)}`)}
-                        >
-                          Bind Data / Signals
-                        </Button>
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <div className="space-y-2">
-                      <div className="text-[11px] font-bold uppercase tracking-wider text-[#657794] px-1 flex items-center justify-between">
-                        <span className="flex items-center gap-1.5">
-                          <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
-                          <span>{selectedResource.name} Telemetry Tags ({unitSignals.length})</span>
-                        </span>
-                        <span className="font-mono text-emerald-600">● Live Stream</span>
-                      </div>
-                      <div className="grid grid-cols-1 gap-2">
-                        {unitSignals.map((sig) => {
-                          const isGood = sig.quality === 'GOOD';
-                          const val = sig.value !== null && sig.value !== undefined ? sig.value : (sig.currentValue ?? '—');
-                          return (
-                            <div
-                              key={sig.id}
-                              className="p-2.5 rounded-xl border border-[#E3EAF3] bg-white hover:border-emerald-500 transition-all shadow-sm"
-                            >
-                              <div className="flex items-center justify-between mb-1">
-                                <div className="text-xs font-bold font-mono text-[#0B2545] truncate">
-                                  {sig.key || sig.tag || sig.name}
-                                </div>
-                                <span
-                                  className={`text-[9px] font-bold px-1.5 py-0.5 rounded font-mono uppercase ${
-                                    isGood ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-500'
-                                  }`}
-                                >
-                                  {sig.quality || 'NO_DATA'}
-                                </span>
-                              </div>
-                              <div className="flex items-baseline justify-between mt-1">
-                                <div className="text-lg font-black font-mono text-[#0B2545]">
-                                  {String(val)}
-                                  {sig.unit && <span className="text-xs font-normal text-[#657794] ml-1">{sig.unit}</span>}
-                                </div>
-                                <div className="text-[10px] font-mono text-[#94A3B8] truncate max-w-[130px]">
-                                  {sig.tag}
-                                </div>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                }
-
-                return childResources.map((child) => {
-                  const childStatus = statusPresentation(child.status);
-                  const childSignals = signals.filter((s) => s.resourceId === child.id);
-                  const statusSig = childSignals.find((s) => s.tag === 'status');
-                  return (
-                    <div
-                      key={child.id}
-                      onClick={() => setSelectedResourceId(child.id)}
-                      className="p-3 rounded-xl border border-[#E3EAF3] hover:border-[#134074] cursor-pointer bg-white transition-all shadow-sm space-y-2 group"
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2 min-w-0">
-                          {getIconForType(child.type)}
-                          <span className="text-[13px] font-bold text-[#111B37] group-hover:text-[#134074] truncate transition-colors">
-                            {child.name}
-                          </span>
-                        </div>
-                        {statusSig && statusSig.currentValue !== '—' && (statusSig.quality || '').toLowerCase() === 'good' ? (
-                          <Badge variant="good">
-                            {Number(statusSig.currentValue) === 2 ? 'RUNNING' : Number(statusSig.currentValue) === 0 ? 'IDLE' : 'ONLINE'}
-                          </Badge>
-                        ) : childSignals.length > 0 ? (
-                          <Badge variant={childStatus.variant}>{childStatus.label}</Badge>
-                        ) : null}
-                      </div>
-                      <div className="flex items-center justify-between text-xs text-[#657794]">
-                        <span className="font-mono text-[11px] uppercase bg-slate-100 px-1.5 py-0.2 rounded">
-                          {child.type}
-                        </span>
-                        <span className="font-mono font-semibold text-emerald-700">
-                          {childSignals.length} telemetry tags
-                        </span>
-                      </div>
-                    </div>
-                  );
-                });
-              })()}
-            </div>
-          </Card>
-        </div>
-
-        {/* Right Inspector: Details, Specification, Topology, Activity */}
-        <div className="col-span-12 lg:col-span-5 space-y-3.5 h-[calc(100vh-210px)] min-h-[620px] overflow-y-auto pr-1">
-          <Card className="p-4">
-            <div className="flex items-start justify-between">
-              <div>
-                <div className="flex items-center gap-2.5">
-                  <h2 className="text-[18px] font-extrabold text-[#111B37]">
-                    {selectedResource.name}
-                  </h2>
-                  {(selectedResource.signalsCount ?? 0) > 0 ? (
-                    <Badge variant={selectedStatus.variant}>
-                      <span
-                        className={`w-1.5 h-1.5 rounded-full mr-1 inline-block ${
-                          selectedStatus.variant === 'good'
-                            ? 'bg-emerald-500 animate-pulse'
-                            : 'bg-red-500'
-                        }`}
-                      />
-                      {selectedStatus.label}
-                    </Badge>
-                  ) : (
-                    <Badge variant="good">ACTIVE</Badge>
-                  )}
-                </div>
-                <div className="text-[12px] font-mono text-[#657794] mt-1">
-                  ID:{' '}
-                  <span className="text-[#111B37] font-semibold">
-                    {selectedResource.code || 'RES-01'}
-                  </span>{' '}
-                  · Type:{' '}
-                  <span className="uppercase text-[#2A82E7] font-bold">{selectedResource.type}</span>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  icon={<Edit2 className="w-3.5 h-3.5" />}
-                  onClick={() => setIsEditModalOpen(true)}
-                >
-                  Edit
-                </Button>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  icon={<ArrowRightLeft className="w-3.5 h-3.5" />}
-                  onClick={() => setIsMoveModalOpen(true)}
-                >
-                  Move
-                </Button>
-                <Button
-                  size="sm"
-                  variant="primary"
-                  icon={<Activity className="w-3.5 h-3.5" />}
-                  onClick={() =>
-                    navigate(`/collector/add-data?resourceId=${selectedResource.id}`)
-                  }
-                >
-                  Add Signals
-                </Button>
-              </div>
-            </div>
-          </Card>
-
-          <div className="grid grid-cols-2 gap-3.5">
-            <Card title="Specification & Attributes" className="h-[240px]">
-              <div className="space-y-2 text-[12px]">
-                {declaredAttributes.length > 0 ? (
-                  declaredAttributes.map(([k, v]) => (
-                    <div key={k} className="flex justify-between py-1 border-b border-[#F1F5FA]">
-                      <span className="text-[#657794]">{k}</span>
-                      <span className="font-semibold text-[#111B37]">{String(v)}</span>
-                    </div>
-                  ))
-                ) : (
-                  <p className="py-6 text-center text-[12px] text-[#94A3B8]">
-                    No attributes declared for this resource.
-                  </p>
-                )}
-              </div>
-            </Card>
-
-            <Card title="Topology Context" className="h-[240px]">
-              <div className="space-y-3 text-[12px]">
-                <div>
-                  <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">
-                    Canonical Path
-                  </span>
-                  <p className="font-mono text-[#111B37] font-medium text-[12px] mt-0.5">
-                    {canonicalPath}
-                  </p>
-                </div>
-                <div className="pt-2 border-t border-[#E3EAF3]">
-                  <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">
-                    Bound Telemetry
-                  </span>
-                  <div className="flex items-baseline gap-2 mt-1">
-                    <span className="text-[20px] font-extrabold text-[#111B37]">
-                      {selectedResource.signalsCount ?? 0}
-                    </span>
-                    <span className="text-[#657794]">active collector tags</span>
-                  </div>
-                </div>
-                <div className="pt-2 flex gap-2">
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    className="w-full text-[11px]"
-                    icon={<Share2 className="w-3 h-3" />}
-                    onClick={() => navigate(`/factory/graph?resourceId=${selectedResource.id}`)}
-                  >
-                    View in Graph
-                  </Button>
-                </div>
-              </div>
-            </Card>
-          </div>
-
-          <Card title="Asset Change & Synchronization Log">
-            <div className="overflow-x-auto">
-              <table className="fx-table">
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Action</th>
-                    <th>Operator</th>
-                    <th>Note</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {activities.slice(0, 8).map((act) => (
-                    <tr key={act.id}>
-                      <td className="font-mono text-[11px] text-[#94A3B8]">{act.timestamp}</td>
-                      <td className="font-semibold text-[#111B37] text-[12px]">{act.eventType}</td>
-                      <td className="text-[#657794] text-[12px]">{act.source}</td>
-                      <td className="text-[#334568] text-[12px]">{act.message}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </Card>
-        </div>
-      </div>
-
-      <AddResourceModal
-        isOpen={isAddModalOpen}
-        onClose={() => setIsAddModalOpen(false)}
-        parentId={selectedResource?.id || null}
-        parentName={selectedResource?.name}
-        parentPath={
-          selectedResource ? `${selectedResource.code} · ${selectedResource.name}` : '(root)'
-        }
-        recommendedTypes={allowedTypesForSelected}
-        onAddResource={handleCreateResource}
-      />
-
-      <ImportTopicsModal
-        isOpen={isImportModalOpen}
-        onClose={() => setIsImportModalOpen(false)}
-        onSuccess={() => window.location.reload()}
-      />
-
-      <EditResourceModal
-        isOpen={isEditModalOpen}
-        onClose={() => setIsEditModalOpen(false)}
-        resource={selectedResource}
-        onSuccess={async () => {
-          await refresh();
-          setMoveToast({ message: `Resource "${selectedResource?.name}" updated` });
-          setTimeout(() => setMoveToast(null), 5000);
-        }}
-      />
-
-      <MoveResourceModal
-        isOpen={isMoveModalOpen}
-        onClose={() => setIsMoveModalOpen(false)}
-        selectedResource={selectedResource}
-        allResources={resources}
-        onMoveResource={handleMoveResource}
-      />
-
-      {moveToast && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-900 text-white shadow-2xl border border-slate-700 animate-in slide-in-from-bottom-4 duration-200">
-          <span className="text-xs font-semibold">{moveToast.message}</span>
-          {moveToast.linkTo && (
-            <button
-              type="button"
-              onClick={() => {
-                setMoveToast(null);
-                navigate(moveToast.linkTo!);
-              }}
-              className="text-xs font-bold text-sky-300 hover:text-sky-200 underline ml-2"
-            >
-              Open Edges
-            </button>
-          )}
-          {moveToast.undoParentId && (
-            <button
-              type="button"
-              onClick={handleUndoMove}
-              className="text-xs font-bold text-amber-400 hover:text-amber-300 underline ml-2"
-            >
-              Undo
-            </button>
-          )}
-        </div>
-      )}
-    </div>
-  );
-};
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Plus,
+  ChevronsDown,
+  ChevronsUp,
+  Search,
+  ChevronRight,
+  ChevronDown,
+  Activity,
+  ArrowRightLeft,
+  Edit2,
+  Archive,
+  ArchiveRestore,
+  Share2,
+  UploadCloud,
+  MoreHorizontal,
+  RefreshCw,
+  X,
+} from 'lucide-react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Button } from '../../components/common/Button';
+import { Card } from '../../components/common/Card';
+import { Badge, BadgeVariant } from '../../components/common/Badge';
+import { MenuButton } from '../../components/common/MenuButton';
+import { ResourceTypeIcon, resourceTypeLabel } from '../../components/common/ResourceTypeIcon';
+import { useApp } from '../../store/AppContext';
+import { useAuth } from '../../features/auth';
+import { ApiError, api } from '../../api/client';
+import { ResourceNode, SignalItem } from '../../types';
+import { AddResourceModal, NewResourceInput } from '../../components/modals/AddResourceModal';
+import { EditResourceModal } from '../../components/modals/EditResourceModal';
+import { MoveResourceModal } from '../../components/modals/MoveResourceModal';
+import { ImportTopicsModal } from '../../components/modals/ImportTopicsModal';
+import { ArchiveResourceModal } from '../../components/modals/ArchiveResourceModal';
+import { translateApiError } from '../../utils/apiErrors';
+import { AuditRow, describeAudit } from '../../utils/auditText';
+import { formatTimestamp, formatValue, normalizeQuality, QUALITY_LABEL, timeAgo } from '../../lib/format';
+import {
+  allowedChildTypes,
+  ancestorPath,
+  buildResourceTree,
+  childrenOf,
+  filterResourcesWithAncestors,
+  hasChildren,
+  HierarchyTreeNode,
+} from '../../utils/resourceHierarchy';
+
+/** Summary of the data bound directly to a resource, from the live signal qualities. */
+function dataStatus(signals: SignalItem[]): { label: string; variant: BadgeVariant } {
+  const total = signals.length;
+  if (total === 0) return { label: 'No data bound', variant: 'neutral' };
+  const good = signals.filter((s) => normalizeQuality(s.quality) === 'GOOD').length;
+  const reporting = signals.filter((s) => Boolean(s.lastUpdated)).length;
+  const noun = total === 1 ? 'signal' : 'signals';
+  if (good === total) return { label: `Receiving data · ${total} ${noun}`, variant: 'good' };
+  if (good > 0) return { label: `${good} of ${total} ${noun} good`, variant: 'warning' };
+  if (reporting === 0) return { label: `Waiting for data · ${total} ${noun}`, variant: 'neutral' };
+  return { label: `No good data · ${total} ${noun}`, variant: 'error' };
+}
+
+/** Fill missing childrenCount / signalsCount from the loaded lists. */
+function enrichResourceCounts(resources: ResourceNode[], signals: Array<{ resourceId: string }>): ResourceNode[] {
+  const childCounts = new Map<string, number>();
+  const signalCounts = new Map<string, number>();
+  for (const resource of resources) {
+    if (!resource.parentId) continue;
+    childCounts.set(resource.parentId, (childCounts.get(resource.parentId) || 0) + 1);
+  }
+  for (const signal of signals) {
+    if (!signal.resourceId) continue;
+    signalCounts.set(signal.resourceId, (signalCounts.get(signal.resourceId) || 0) + 1);
+  }
+  return resources.map((resource) => ({
+    ...resource,
+    childrenCount: resource.childrenCount ?? childCounts.get(resource.id) ?? 0,
+    signalsCount: resource.signalsCount ?? signalCounts.get(resource.id) ?? 0,
+  }));
+}
+
+function text(value: unknown): string {
+  return value == null ? '' : String(value);
+}
+
+async function fetchArchivedResources(): Promise<ResourceNode[]> {
+  const result: ResourceNode[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < 10; page += 1) {
+    const query: string = `/api/v1/resources?view=all&include_archived=true&limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+    const res: { items?: Array<Record<string, unknown>>; next_cursor?: string | null } = await api(query);
+    for (const row of res.items || []) {
+      if (!row.archived_at) continue;
+      result.push({
+        id: text(row.id),
+        name: text(row.name),
+        code: text(row.code),
+        type: text(row.type_key) as ResourceNode['type'],
+        status: 'offline',
+        parentId: row.parent_id ? text(row.parent_id) : undefined,
+        attributes: { siteId: text(row.site_id), version: text(row.version || 1), archivedAt: text(row.archived_at) },
+      });
+    }
+    cursor = res.next_cursor || null;
+    if (!cursor) break;
+  }
+  return result;
+}
+
+interface ResourceDetail {
+  description?: string | null;
+  properties_json?: Record<string, unknown> | null;
+}
+
+interface ToastState {
+  id: number;
+  message: string;
+  tone: 'info' | 'error';
+  action?: { label: string; run: () => void };
+}
+
+interface TreeRowProps {
+  node: HierarchyTreeNode;
+  depth: number;
+  selectedId: string;
+  archivedIds: Set<string>;
+  restoringId: string | null;
+  expandedNodes: Record<string, boolean>;
+  onToggle: (id: string) => void;
+  onSelect: (id: string) => void;
+  onSelectData: (id: string) => void;
+  onRestore: (resource: ResourceNode) => void;
+  onKeyNavigate: (event: React.KeyboardEvent, node: HierarchyTreeNode) => void;
+}
+
+const TreeRow: React.FC<TreeRowProps> = ({
+  node,
+  depth,
+  selectedId,
+  archivedIds,
+  restoringId,
+  expandedNodes,
+  onToggle,
+  onSelect,
+  onSelectData,
+  onRestore,
+  onKeyNavigate,
+}) => {
+  const { resource, children } = node;
+  const archived = archivedIds.has(resource.id);
+  const isSelected = !archived && resource.id === selectedId;
+  const signalCount = archived ? 0 : resource.signalsCount ?? 0;
+  const hasDirectData = signalCount > 0;
+  const hasKids = children.length > 0 || hasDirectData;
+  const isExpanded = expandedNodes[resource.id] ?? true;
+  const typeLabel = resourceTypeLabel(resource.type);
+
+  return (
+    <>
+      <div
+        role="treeitem"
+        aria-label={
+          archived
+            ? `${resource.name}, ${typeLabel}, archived`
+            : `${resource.name}, ${typeLabel}${signalCount ? `, ${signalCount} signals` : ''}`
+        }
+        aria-expanded={hasKids ? isExpanded : undefined}
+        aria-selected={isSelected}
+        aria-disabled={archived || undefined}
+        tabIndex={isSelected ? 0 : -1}
+        title={archived ? `${resource.name} (archived)` : resource.name}
+        style={{ paddingLeft: `${depth * 14 + 8}px` }}
+        className={`group flex items-center justify-between py-1.5 pr-2 rounded-lg text-[13px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[#EF1B24]/40 ${
+          archived
+            ? 'text-[#94A3B8] cursor-default'
+            : isSelected
+              ? 'bg-[#FFF0F1] text-[#C8151D] font-semibold cursor-pointer'
+              : 'text-[#334568] hover:bg-[#F1F5FA] cursor-pointer'
+        }`}
+        onClick={() => {
+          if (!archived) onSelect(resource.id);
+        }}
+        onKeyDown={(event) => {
+          if (!archived) onKeyNavigate(event, node);
+        }}
+      >
+        <div className="flex items-center gap-1.5 min-w-0">
+          {hasKids ? (
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-label={isExpanded ? `Collapse ${resource.name}` : `Expand ${resource.name}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggle(resource.id);
+              }}
+              className="p-0.5 text-[#94A3B8] hover:text-[#111B37] flex-shrink-0"
+            >
+              {isExpanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+            </button>
+          ) : (
+            <span className="w-[18px] flex-shrink-0" />
+          )}
+          <span className={isSelected ? 'text-current' : 'text-[#7A8AA3]'}>
+            <ResourceTypeIcon type={resource.type} />
+          </span>
+          <span className={`truncate ${archived ? 'line-through decoration-[#CBD5E1]' : ''}`}>{resource.name}</span>
+        </div>
+        {archived ? (
+          <span className="flex items-center gap-1.5 ml-2 flex-shrink-0">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-[#94A3B8]">Archived</span>
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onRestore(resource);
+              }}
+              disabled={restoringId === resource.id}
+              aria-label={`Restore ${resource.name}`}
+              title={`Restore ${resource.name}`}
+              className="p-1 rounded-md text-[#475569] hover:text-[#111B37] hover:bg-[#E2E8F0] disabled:opacity-50"
+            >
+              <ArchiveRestore className="w-3.5 h-3.5" />
+            </button>
+          </span>
+        ) : signalCount > 0 ? (
+          <span
+            className="text-[11px] font-mono text-[#94A3B8] ml-2 flex-shrink-0"
+            title={`${signalCount} ${signalCount === 1 ? 'signal' : 'signals'}`}
+            aria-hidden="true"
+          >
+            {signalCount}
+          </span>
+        ) : null}
+      </div>
+      {isExpanded && (
+        <div role="group">
+          {hasDirectData && (
+            <div
+              style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}
+              className="flex items-center justify-between py-1 pr-2 rounded-lg cursor-pointer text-[12px] transition-colors text-emerald-700 hover:bg-emerald-50/70"
+              title={`Signals of ${resource.name}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectData(resource.id);
+              }}
+            >
+              <div className="flex items-center gap-2 truncate min-w-0 pl-[22px]">
+                <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse shrink-0" />
+                <span className="truncate font-semibold">Data</span>
+              </div>
+              <span className="text-[10px] font-mono px-1.5 rounded font-bold bg-emerald-100 text-emerald-800">
+                {signalCount}
+              </span>
+            </div>
+          )}
+          {children.map((child) => (
+            <TreeRow
+              key={child.resource.id}
+              node={child}
+              depth={depth + 1}
+              selectedId={selectedId}
+              archivedIds={archivedIds}
+              restoringId={restoringId}
+              expandedNodes={expandedNodes}
+              onToggle={onToggle}
+              onSelect={onSelect}
+              onSelectData={onSelectData}
+              onRestore={onRestore}
+              onKeyNavigate={onKeyNavigate}
+            />
+          ))}
+        </div>
+      )}
+    </>
+  );
+};
+
+export const FactoryStructurePage: React.FC = () => {
+  const {
+    resources: rawResources,
+    signals,
+    connections,
+    selectedResourceId,
+    setSelectedResourceId,
+    addResource,
+    moveResource,
+    refresh,
+  } = useApp();
+  const { state: authState } = useAuth();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
+  const [searchTerm, setSearchTerm] = useState('');
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
+  const [rightPanelTab, setRightPanelTab] = useState<'children' | 'telemetry'>('children');
+
+  const [isAddModalOpen, setIsAddModalOpen] = useState(searchParams.get('modal') === 'add');
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [archiveTarget, setArchiveTarget] = useState<ResourceNode | null>(null);
+
+  const [showArchived, setShowArchived] = useState(false);
+  const [archivedResources, setArchivedResources] = useState<ResourceNode[]>([]);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
+
+  const [toast, setToast] = useState<ToastState | null>(null);
+  const toastTimer = useRef<number | null>(null);
+
+  const [auditRows, setAuditRows] = useState<AuditRow[]>([]);
+  const [auditState, setAuditState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [detail, setDetail] = useState<ResourceDetail | null>(null);
+  const [historyTick, setHistoryTick] = useState(0);
+
+  const resources = useMemo(() => enrichResourceCounts(rawResources, signals), [rawResources, signals]);
+
+  const showToast = useCallback((next: Omit<ToastState, 'id'>) => {
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    const id = Date.now();
+    setToast({ ...next, id });
+    toastTimer.current = window.setTimeout(() => setToast((current) => (current?.id === id ? null : current)), 8000);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    },
+    [],
+  );
+
+  const reloadArchived = useCallback(async () => {
+    try {
+      setArchivedResources(await fetchArchivedResources());
+    } catch (caught) {
+      setPageError(`Archived resources could not be loaded: ${translateApiError(caught)}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (showArchived) void reloadArchived();
+  }, [showArchived, reloadArchived]);
+
+  const safeRefresh = useCallback(async () => {
+    try {
+      await refresh();
+    } catch (caught) {
+      setPageError(`The model could not be reloaded: ${translateApiError(caught)}`);
+    }
+  }, [refresh]);
+
+  // Archived resources the active model no longer lists (a restore makes them active again).
+  const visibleArchived = useMemo(() => {
+    if (!showArchived) return [];
+    const activeIds = new Set(resources.map((item) => item.id));
+    return archivedResources.filter((item) => !activeIds.has(item.id));
+  }, [showArchived, archivedResources, resources]);
+  const archivedIds = useMemo(() => new Set(visibleArchived.map((item) => item.id)), [visibleArchived]);
+
+  const treeSource = useMemo(() => [...resources, ...visibleArchived], [resources, visibleArchived]);
+  const visibleResources = useMemo(() => filterResourcesWithAncestors(treeSource, searchTerm), [treeSource, searchTerm]);
+  const tree = useMemo(() => buildResourceTree(visibleResources), [visibleResources]);
+
+  const flatVisibleOrder = useMemo(() => {
+    const order: HierarchyTreeNode[] = [];
+    const walk = (nodes: HierarchyTreeNode[]) => {
+      for (const node of nodes) {
+        if (!archivedIds.has(node.resource.id)) order.push(node);
+        const expanded = expandedNodes[node.resource.id] ?? true;
+        if (expanded && node.children.length) walk(node.children);
+      }
+    };
+    walk(tree);
+    return order;
+  }, [tree, expandedNodes, archivedIds]);
+
+  // Apply a deep link (?resourceId=) once per link, not on every data refresh.
+  const appliedDeepLink = useRef<string | null>(null);
+  useEffect(() => {
+    const resourceId = searchParams.get('resourceId');
+    if (!resourceId || appliedDeepLink.current === resourceId) return;
+    if (resources.some((item) => item.id === resourceId)) {
+      appliedDeepLink.current = resourceId;
+      setSelectedResourceId(resourceId);
+    }
+  }, [resources, searchParams, setSelectedResourceId]);
+
+  const selectedResource = resources.find((r) => r.id === selectedResourceId) || resources[0];
+  const selectedId = selectedResource?.id || '';
+
+  // Keep ancestors of the selected node expanded so it stays visible.
+  useEffect(() => {
+    if (!selectedId) return;
+    const path = ancestorPath(resources, selectedId);
+    if (path.length < 2) return;
+    setExpandedNodes((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const id of path.slice(0, -1)) {
+        if (next[id] !== true) {
+          next[id] = true;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [selectedId, resources]);
+
+  // While filtering, keep ancestors expanded.
+  useEffect(() => {
+    if (!searchTerm.trim()) return;
+    setExpandedNodes((prev) => {
+      const next = { ...prev };
+      for (const r of visibleResources) {
+        if (hasChildren(visibleResources, r.id)) next[r.id] = true;
+      }
+      return next;
+    });
+  }, [searchTerm, visibleResources]);
+
+  const toggleExpand = useCallback((id: string) => {
+    setExpandedNodes((prev) => ({ ...prev, [id]: !(prev[id] ?? true) }));
+  }, []);
+
+  const setAllExpanded = (value: boolean) => {
+    const next: Record<string, boolean> = {};
+    for (const r of treeSource) next[r.id] = value;
+    setExpandedNodes(next);
+  };
+
+  const childResources = useMemo(
+    () => (selectedResource ? childrenOf(resources, selectedResource.id) : []),
+    [resources, selectedResource],
+  );
+  const selectedSignals = useMemo(
+    () => signals.filter((s) => s.resourceId === selectedId),
+    [signals, selectedId],
+  );
+  const selectedStatus = dataStatus(selectedSignals);
+
+  // Default tab per selected resource: its children when it has any, otherwise its signals.
+  // Evaluated when the selection changes only, so a data refresh never switches the user's tab.
+  const hasChildResourcesRef = useRef(false);
+  hasChildResourcesRef.current = childResources.length > 0;
+  const requestedTabRef = useRef<'children' | 'telemetry' | null>(null);
+  useEffect(() => {
+    const requested = requestedTabRef.current;
+    requestedTabRef.current = null;
+    setRightPanelTab(requested || (hasChildResourcesRef.current ? 'children' : 'telemetry'));
+  }, [selectedId]);
+
+  // "Add resource" adds under the selection; for leaf types (e.g. a machine) it adds a sibling under
+  // the nearest ancestor that can hold children.
+  const defaultAddParentId = useMemo(() => {
+    if (!selectedResource) return null;
+    const byId = new Map(resources.map((item) => [item.id, item]));
+    let cursor: ResourceNode | undefined = selectedResource;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor.id)) {
+      seen.add(cursor.id);
+      if (allowedChildTypes(cursor.type).length > 0) return cursor.id;
+      cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
+    }
+    return selectedResource.id;
+  }, [resources, selectedResource]);
+  const defaultAddParentName = resources.find((item) => item.id === defaultAddParentId)?.name || '';
+
+  const breadcrumb = useMemo(() => {
+    if (!selectedResource) return [] as ResourceNode[];
+    const byId = new Map(resources.map((item) => [item.id, item]));
+    return ancestorPath(resources, selectedResource.id)
+      .map((id) => byId.get(id))
+      .filter(Boolean) as ResourceNode[];
+  }, [resources, selectedResource]);
+
+  // Change log and details of the selected resource. Reloaded when the resource changes
+  // (version bump), when its signal count changes, or after an action on this page.
+  const selectedVersion = selectedResource?.attributes?.version || '';
+  const selectedSignalCount = selectedSignals.length;
+  useEffect(() => {
+    if (!selectedId) {
+      setAuditRows([]);
+      setDetail(null);
+      return;
+    }
+    let active = true;
+    setAuditState('loading');
+    Promise.all([
+      api<{ items?: AuditRow[] }>(`/api/v1/audit-events?entity_id=${encodeURIComponent(selectedId)}&limit=25`),
+      api<ResourceDetail>(`/api/v1/resources/${encodeURIComponent(selectedId)}`),
+    ])
+      .then(([page, row]) => {
+        if (!active) return;
+        setAuditRows(page.items || []);
+        setDetail(row);
+        setAuditState('idle');
+      })
+      .catch((caught) => {
+        if (!active) return;
+        console.warn('Resource history could not be loaded', caught);
+        setAuditState('error');
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedId, selectedVersion, selectedSignalCount, historyTick]);
+
+  const nameLookup = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const item of [...resources, ...archivedResources]) names.set(item.id, item.name);
+    for (const item of connections) names.set(item.id, item.name);
+    if (selectedId) names.set(selectedId, 'this resource');
+    return names;
+  }, [resources, archivedResources, connections, selectedId]);
+
+  const currentActorId = authState.status === 'authenticated' ? authState.user.admin_id : undefined;
+  const historyItems = useMemo(
+    () =>
+      auditRows.map((row) => ({
+        row,
+        text: describeAudit(row, { names: nameLookup, currentActorId, currentActorName: 'You' }),
+      })),
+    [auditRows, nameLookup, currentActorId],
+  );
+
+  const declaredProperties = Object.entries(detail?.properties_json || {}).filter(([key]) => !key.startsWith('_'));
+
+  // ---- actions ----
+
+  const handleCreateResource = async (input: NewResourceInput) => {
+    setPageError(null);
+    await addResource({
+      name: input.name,
+      code: input.code,
+      parentId: input.parent_id || undefined,
+      type: input.type.toLowerCase() as ResourceNode['type'],
+      description: input.description,
+    });
+    if (input.parent_id) setExpandedNodes((prev) => ({ ...prev, [input.parent_id as string]: true }));
+    showToast({ message: `Added "${input.name}"`, tone: 'info' });
+  };
+
+  const handleMoveResource = async (targetParentId: string) => {
+    if (!selectedResource) return { success: false, error: 'No resource selected.' };
+    const moved = selectedResource;
+    const oldParentId = moved.parentId;
+    const res = await moveResource(moved.id, targetParentId);
+    if (!res.success) return { success: false, error: translateApiError(res.error || 'Move failed') };
+    setExpandedNodes((prev) => ({ ...prev, [targetParentId]: true }));
+    setPageError(null);
+    const newParent = resources.find((item) => item.id === targetParentId);
+    showToast({
+      message: `Moved "${moved.name}"${newParent ? ` under ${newParent.name}` : ''}`,
+      tone: 'info',
+      action: oldParentId
+        ? {
+            label: 'Undo',
+            run: () => {
+              void moveResource(moved.id, oldParentId).then((undo) => {
+                if (undo.success) {
+                  showToast({ message: `Moved "${moved.name}" back`, tone: 'info' });
+                } else {
+                  showToast({ message: `Undo failed: ${translateApiError(undo.error || 'Move failed')}`, tone: 'error' });
+                }
+              });
+            },
+          }
+        : undefined,
+    });
+    return { success: true };
+  };
+
+  const restoreResource = useCallback(
+    async (target: ResourceNode) => {
+      setRestoringId(target.id);
+      try {
+        await api(`/api/v1/resources/${encodeURIComponent(target.id)}/restore`, { method: 'POST' });
+        await safeRefresh();
+        if (showArchived) await reloadArchived();
+        setSelectedResourceId(target.id);
+        setHistoryTick((value) => value + 1);
+        showToast({ message: `Restored "${target.name}"`, tone: 'info' });
+      } catch (caught) {
+        let message = translateApiError(caught);
+        if (caught instanceof ApiError && caught.code === 'ARCHIVED_PARENT') {
+          const parent = archivedResources.find((item) => item.id === target.parentId);
+          message = parent
+            ? `Restore "${parent.name}" first; "${target.name}" is inside it.`
+            : `The parent of "${target.name}" is archived. Restore the parent first.`;
+        }
+        showToast({ message: `Could not restore "${target.name}". ${message}`, tone: 'error' });
+      } finally {
+        setRestoringId(null);
+      }
+    },
+    [archivedResources, reloadArchived, safeRefresh, setSelectedResourceId, showArchived, showToast],
+  );
+
+  const confirmArchive = async (): Promise<{ success: boolean; error?: string }> => {
+    const target = archiveTarget;
+    if (!target) return { success: false, error: 'No resource selected.' };
+    let affected = 0;
+    try {
+      const res = await api<{ affected_signals?: number }>(
+        `/api/v1/resources/${encodeURIComponent(target.id)}/archive`,
+        { method: 'POST' },
+      );
+      affected = Number(res?.affected_signals || 0);
+    } catch (caught) {
+      return { success: false, error: translateApiError(caught) };
+    }
+    await safeRefresh();
+    if (showArchived) await reloadArchived();
+    // Keep the user in context: select the parent of the archived resource.
+    setSelectedResourceId(target.parentId || '');
+    setPageError(null);
+    showToast({
+      message: `Archived "${target.name}"${affected ? ` · ${affected} ${affected === 1 ? 'signal' : 'signals'} stopped` : ''}`,
+      tone: 'info',
+      action: { label: 'Undo', run: () => void restoreResource(target) },
+    });
+    return { success: true };
+  };
+
+  const handleTreeKeyNavigate = useCallback(
+    (event: React.KeyboardEvent, node: HierarchyTreeNode) => {
+      const { resource, children } = node;
+      const expanded = expandedNodes[resource.id] ?? true;
+      const index = flatVisibleOrder.findIndex((n) => n.resource.id === resource.id);
+      const focusRow = (id: string) => {
+        setSelectedResourceId(id);
+        window.requestAnimationFrame(() => {
+          document.querySelector<HTMLElement>('[role="treeitem"][aria-selected="true"]')?.focus();
+        });
+      };
+
+      if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        if (children.length && !expanded) toggleExpand(resource.id);
+        else if (children.length && expanded) focusRow(children[0].resource.id);
+        return;
+      }
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        if (children.length && expanded) toggleExpand(resource.id);
+        else if (resource.parentId) focusRow(resource.parentId);
+        return;
+      }
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        const next = flatVisibleOrder[index + 1];
+        if (next) focusRow(next.resource.id);
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        const prev = flatVisibleOrder[index - 1];
+        if (prev) focusRow(prev.resource.id);
+        return;
+      }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        setSelectedResourceId(resource.id);
+      }
+    },
+    [expandedNodes, flatVisibleOrder, setSelectedResourceId, toggleExpand],
+  );
+
+  const goToAddData = () => {
+    if (selectedResource) navigate(`/collector/add-data?resourceId=${encodeURIComponent(selectedResource.id)}`);
+  };
+
+  const toastView = toast && (
+    <div
+      role={toast.tone === 'error' ? 'alert' : 'status'}
+      aria-live={toast.tone === 'error' ? 'assertive' : 'polite'}
+      className={`fixed bottom-6 right-6 z-50 max-w-md flex items-center gap-3 pl-4 pr-2 py-2.5 rounded-xl text-white shadow-2xl border animate-in slide-in-from-bottom-4 duration-200 ${
+        toast.tone === 'error' ? 'bg-[#7F1D1D] border-[#991B1B]' : 'bg-slate-900 border-slate-700'
+      }`}
+    >
+      <span className="text-xs font-semibold leading-snug">{toast.message}</span>
+      {toast.action && (
+        <button
+          type="button"
+          onClick={() => {
+            const action = toast.action;
+            setToast(null);
+            action?.run();
+          }}
+          className="text-xs font-bold text-amber-300 hover:text-amber-200 px-2 py-1 rounded-md hover:bg-white/10 shrink-0"
+        >
+          {toast.action.label}
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => setToast(null)}
+        aria-label="Dismiss notification"
+        className="p-1 rounded-md text-white/60 hover:text-white hover:bg-white/10 shrink-0"
+      >
+        <X className="w-3.5 h-3.5" />
+      </button>
+    </div>
+  );
+
+  if (!selectedResource) {
+    return (
+      <div className="space-y-4">
+        <div>
+          <h1 className="fx-page-title">Hierarchy Structure</h1>
+          <p className="fx-page-subtitle">
+            The factory model is empty. Start with an enterprise, then add its sites, areas, lines and machines.
+          </p>
+        </div>
+        {pageError && (
+          <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            {pageError}
+          </p>
+        )}
+        <div className="flex items-center gap-2.5">
+          <Button variant="primary" icon={<Plus className="w-4 h-4" />} onClick={() => setIsAddModalOpen(true)}>
+            Add enterprise
+          </Button>
+          <Button variant="secondary" icon={<UploadCloud className="w-4 h-4" />} onClick={() => setIsImportModalOpen(true)}>
+            Import from MQTT topics
+          </Button>
+        </div>
+        <AddResourceModal
+          isOpen={isAddModalOpen}
+          onClose={() => setIsAddModalOpen(false)}
+          resources={resources}
+          defaultParentId={null}
+          onAddResource={handleCreateResource}
+        />
+        <ImportTopicsModal
+          isOpen={isImportModalOpen}
+          onClose={() => setIsImportModalOpen(false)}
+          onSuccess={async (count) => {
+            await safeRefresh();
+            showToast({ message: `Imported ${count} ${count === 1 ? 'resource' : 'resources'}`, tone: 'info' });
+          }}
+        />
+        {toastView}
+      </div>
+    );
+  }
+
+  const unitSignals = selectedSignals;
+  const isTelemetryView = rightPanelTab === 'telemetry';
+  const lastUpdate = unitSignals.reduce<string>(
+    (latest, s) => (s.lastUpdated && (!latest || s.lastUpdated > latest) ? s.lastUpdated : latest),
+    '',
+  );
+
+  return (
+    <div className="space-y-4 animate-in fade-in duration-200">
+      {/* Heading and page toolbar */}
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+        <div className="min-w-0">
+          <h1 className="fx-page-title">Hierarchy Structure</h1>
+          <p className="fx-page-subtitle">Sites, areas, lines and machines of the factory, and the data bound to them.</p>
+        </div>
+        <div className="flex items-center gap-2 flex-nowrap">
+          <div className="relative w-56">
+            <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#94A3B8]" aria-hidden="true" />
+            <input
+              type="search"
+              aria-label="Filter the hierarchy by name or code"
+              placeholder="Filter by name or code"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="fx-input !pl-9 h-9 text-[13px]"
+            />
+          </div>
+          <Button
+            variant="primary"
+            icon={<Plus className="w-4 h-4" />}
+            onClick={() => setIsAddModalOpen(true)}
+            className="whitespace-nowrap"
+            title={defaultAddParentName ? `Add a resource under ${defaultAddParentName}` : 'Add a resource'}
+          >
+            Add resource
+          </Button>
+          <MenuButton
+            label="More"
+            ariaLabel="More hierarchy actions"
+            icon={<MoreHorizontal className="w-4 h-4" />}
+            items={[
+              {
+                key: 'import',
+                label: 'Import from MQTT topics…',
+                icon: <UploadCloud className="w-4 h-4" />,
+                onSelect: () => setIsImportModalOpen(true),
+              },
+              {
+                key: 'refresh',
+                label: 'Reload model',
+                icon: <RefreshCw className="w-4 h-4" />,
+                onSelect: () => {
+                  void safeRefresh();
+                  if (showArchived) void reloadArchived();
+                  setHistoryTick((value) => value + 1);
+                },
+              },
+            ]}
+          />
+        </div>
+      </div>
+
+      {pageError && (
+        <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 flex items-start justify-between gap-3">
+          <span>{pageError}</span>
+          <button type="button" onClick={() => setPageError(null)} aria-label="Dismiss error" className="text-red-500 hover:text-red-700">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-12 gap-3.5">
+        {/* Hierarchy tree */}
+        <div className="col-span-12 lg:col-span-3">
+          <Card className="h-[calc(100vh-210px)] min-h-[620px] flex flex-col p-0">
+            <div className="px-3 py-2 border-b border-[#E3EAF3] flex items-center justify-between gap-2 bg-[#F9FAFD]">
+              <span className="text-[12px] font-bold text-[#111B37] uppercase tracking-wider">Hierarchy</span>
+              <div className="flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={() => setAllExpanded(true)}
+                  title="Expand all"
+                  aria-label="Expand all"
+                  className="p-1 rounded text-slate-500 hover:text-slate-900 hover:bg-slate-200/80 transition-colors"
+                >
+                  <ChevronsDown className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAllExpanded(false)}
+                  title="Collapse all"
+                  aria-label="Collapse all"
+                  className="p-1 rounded text-slate-500 hover:text-slate-900 hover:bg-slate-200/80 transition-colors"
+                >
+                  <ChevronsUp className="w-3.5 h-3.5" />
+                </button>
+                <span className="text-[11px] font-semibold text-[#657794] ml-1 tabular-nums" title="Resources shown">
+                  {visibleResources.filter((item) => !archivedIds.has(item.id)).length}
+                </span>
+              </div>
+            </div>
+            <div className="p-2 overflow-y-auto flex-1 min-h-0" role="tree" aria-label="Factory hierarchy">
+              {tree.length === 0 ? (
+                <div className="text-center py-8 text-[#94A3B8] text-[13px]">No resource matches “{searchTerm}”.</div>
+              ) : (
+                tree.map((node) => (
+                  <TreeRow
+                    key={node.resource.id}
+                    node={node}
+                    depth={0}
+                    selectedId={selectedId}
+                    archivedIds={archivedIds}
+                    restoringId={restoringId}
+                    expandedNodes={expandedNodes}
+                    onToggle={toggleExpand}
+                    onSelect={setSelectedResourceId}
+                    onSelectData={(id) => {
+                      if (id === selectedId) {
+                        setRightPanelTab('telemetry');
+                      } else {
+                        requestedTabRef.current = 'telemetry';
+                        setSelectedResourceId(id);
+                      }
+                    }}
+                    onRestore={(resource) => void restoreResource(resource)}
+                    onKeyNavigate={handleTreeKeyNavigate}
+                  />
+                ))
+              )}
+            </div>
+            <div className="px-3 py-2 border-t border-[#E3EAF3] bg-[#F9FAFD] flex items-center justify-between">
+              <label className="flex items-center gap-2 text-[12px] text-[#475569] cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={showArchived}
+                  onChange={(event) => setShowArchived(event.target.checked)}
+                  className="rounded border-slate-300 text-[#EF1B24] focus:ring-[#EF1B24]/30"
+                />
+                Show archived
+              </label>
+              {showArchived && (
+                <span className="text-[11px] text-[#94A3B8]">
+                  {archivedIds.size === 0 ? 'None archived' : `${archivedIds.size} archived`}
+                </span>
+              )}
+            </div>
+          </Card>
+        </div>
+
+        {/* Contents of the selected resource: sub-units or signals */}
+        <div className="col-span-12 lg:col-span-4">
+          <Card className="h-[calc(100vh-210px)] min-h-[620px] flex flex-col p-0">
+            <div className="px-3 py-2 border-b border-[#E3EAF3] flex items-center justify-between gap-2 bg-[#F9FAFD]">
+              <div className="flex items-center gap-1 bg-slate-200/70 p-0.5 rounded-lg" role="tablist" aria-label="Contents">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={!isTelemetryView}
+                  onClick={() => setRightPanelTab('children')}
+                  className={`px-2.5 py-1 text-xs font-bold rounded-md transition ${
+                    !isTelemetryView ? 'bg-white text-[#0B2545] shadow-xs' : 'text-[#64748B] hover:text-[#0B2545]'
+                  }`}
+                >
+                  Sub-units ({childResources.length})
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={isTelemetryView}
+                  onClick={() => setRightPanelTab('telemetry')}
+                  className={`px-2.5 py-1 text-xs font-bold rounded-md transition ${
+                    isTelemetryView ? 'bg-white text-[#0B2545] shadow-xs' : 'text-[#64748B] hover:text-[#0B2545]'
+                  }`}
+                >
+                  Signals ({unitSignals.length})
+                </button>
+              </div>
+              {isTelemetryView && unitSignals.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => navigate(`/collector/signals?resourceId=${encodeURIComponent(selectedResource.id)}`)}
+                  className="text-[12px] font-semibold text-[#2A82E7] hover:underline whitespace-nowrap"
+                >
+                  Open in Signals
+                </button>
+              )}
+            </div>
+
+            <div className="p-3 overflow-y-auto flex-1 min-h-0 space-y-2">
+              {isTelemetryView ? (
+                unitSignals.length === 0 ? (
+                  <div className="text-center py-12 px-4 space-y-1.5">
+                    <p className="text-[13px] font-semibold text-[#334568]">No signals bound to {selectedResource.name}</p>
+                    <p className="text-[12px] text-[#94A3B8]">Use Add data to connect a source and bind its fields.</p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="text-[11px] text-[#657794] px-1 flex items-center justify-between">
+                      <span>{selectedStatus.label}</span>
+                      <span title={lastUpdate ? formatTimestamp(lastUpdate) : undefined}>
+                        {lastUpdate ? `Updated ${timeAgo(lastUpdate)}` : 'No value received yet'}
+                      </span>
+                    </div>
+                    {unitSignals.map((sig) => {
+                      const quality = normalizeQuality(sig.quality);
+                      const label = sig.displayName || sig.key || sig.name;
+                      return (
+                        <button
+                          key={sig.id}
+                          type="button"
+                          onClick={() => navigate(`/collector/signals?signalId=${encodeURIComponent(sig.id)}`)}
+                          className="w-full text-left p-2.5 rounded-xl border border-[#E3EAF3] bg-white hover:border-[#94A3B8] transition-colors"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-semibold text-[#0B2545] truncate" title={label}>
+                              {label}
+                            </span>
+                            <span
+                              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded shrink-0 ${
+                                quality === 'GOOD'
+                                  ? 'bg-emerald-50 text-emerald-700'
+                                  : quality === 'UNCERTAIN'
+                                    ? 'bg-amber-50 text-amber-700'
+                                    : quality === 'NO_DATA' || quality === 'DISABLED'
+                                      ? 'bg-slate-100 text-slate-500'
+                                      : 'bg-red-50 text-red-700'
+                              }`}
+                            >
+                              {QUALITY_LABEL[quality]}
+                            </span>
+                          </div>
+                          <div className="flex items-baseline justify-between gap-2 mt-1">
+                            <span className="text-base font-bold font-mono text-[#0B2545] truncate" title={formatValue(sig.value)}>
+                              {formatValue(sig.value)}
+                              {sig.unit && <span className="text-xs font-normal text-[#657794] ml-1">{sig.unit}</span>}
+                            </span>
+                            <span className="text-[10px] text-[#94A3B8] shrink-0" title={sig.lastUpdated ? formatTimestamp(sig.lastUpdated) : undefined}>
+                              {sig.lastUpdated ? timeAgo(sig.lastUpdated) : '—'}
+                            </span>
+                          </div>
+                          {sig.key && sig.key !== label && (
+                            <div className="text-[10px] font-mono text-[#94A3B8] truncate mt-0.5">{sig.key}</div>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </>
+                )
+              ) : childResources.length === 0 ? (
+                <div className="text-center py-12 px-4 space-y-1.5">
+                  <p className="text-[13px] font-semibold text-[#334568]">Nothing under {selectedResource.name} yet</p>
+                  <p className="text-[12px] text-[#94A3B8]">Use Add resource to add an area, line or machine here.</p>
+                </div>
+              ) : (
+                childResources.map((child) => {
+                  const childSignals = signals.filter((s) => s.resourceId === child.id);
+                  const childStatus = dataStatus(childSignals);
+                  const grandChildren = resources.filter((item) => item.parentId === child.id).length;
+                  return (
+                    <button
+                      key={child.id}
+                      type="button"
+                      onClick={() => setSelectedResourceId(child.id)}
+                      className="w-full text-left p-3 rounded-xl border border-[#E3EAF3] hover:border-[#94A3B8] bg-white transition-colors space-y-1.5"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-[#7A8AA3]">
+                          <ResourceTypeIcon type={child.type} />
+                        </span>
+                        <span className="text-[13px] font-semibold text-[#111B37] truncate" title={child.name}>
+                          {child.name}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 text-[11px] text-[#657794]">
+                        <span>
+                          {resourceTypeLabel(child.type)}
+                          {grandChildren > 0 ? ` · ${grandChildren} ${grandChildren === 1 ? 'sub-unit' : 'sub-units'}` : ''}
+                        </span>
+                        <Badge variant={childStatus.variant} dot={childSignals.length > 0}>
+                          {childStatus.label}
+                        </Badge>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </Card>
+        </div>
+
+        {/* Inspector */}
+        <div className="col-span-12 lg:col-span-5 space-y-3.5 h-[calc(100vh-210px)] min-h-[620px] overflow-y-auto pr-1">
+          <section className="fx-card p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-[#7A8AA3]">
+                    <ResourceTypeIcon type={selectedResource.type} size={18} />
+                  </span>
+                  <h2 className="text-[18px] font-extrabold text-[#111B37] break-words min-w-0">{selectedResource.name}</h2>
+                </div>
+                <div className="text-[12px] text-[#657794] mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span>{resourceTypeLabel(selectedResource.type)}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    Code <span className="font-mono text-[#111B37] font-semibold">{selectedResource.code}</span>
+                  </span>
+                  <Badge variant={selectedStatus.variant} dot={selectedSignals.length > 0}>
+                    {selectedStatus.label}
+                  </Badge>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <Button size="sm" variant="primary" icon={<Plus className="w-3.5 h-3.5" />} onClick={goToAddData}>
+                  Add data
+                </Button>
+                <Button size="sm" variant="secondary" icon={<Edit2 className="w-3.5 h-3.5" />} onClick={() => setIsEditModalOpen(true)}>
+                  Edit
+                </Button>
+                <MenuButton
+                  size="sm"
+                  label="More"
+                  ariaLabel={`More actions for ${selectedResource.name}`}
+                  icon={<MoreHorizontal className="w-3.5 h-3.5" />}
+                  items={[
+                    {
+                      key: 'move',
+                      label: 'Move…',
+                      icon: <ArrowRightLeft className="w-4 h-4" />,
+                      onSelect: () => setIsMoveModalOpen(true),
+                    },
+                    {
+                      key: 'archive',
+                      label: 'Archive…',
+                      icon: <Archive className="w-4 h-4" />,
+                      danger: true,
+                      onSelect: () => setArchiveTarget(selectedResource),
+                    },
+                  ]}
+                />
+              </div>
+            </div>
+          </section>
+
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-3.5">
+            <Card title="Details" className="min-h-[220px]">
+              <div className="space-y-3 text-[12px]">
+                <div>
+                  <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">Description</span>
+                  <p className="text-[#111B37] mt-0.5 whitespace-pre-wrap break-words">
+                    {detail?.description ? detail.description : <span className="text-[#94A3B8]">No description</span>}
+                  </p>
+                </div>
+                <div className="pt-2 border-t border-[#E3EAF3]">
+                  <span className="text-[#94A3B8] block text-[11px] uppercase font-bold mb-1">Properties</span>
+                  {declaredProperties.length > 0 ? (
+                    declaredProperties.map(([k, v]) => (
+                      <div key={k} className="flex justify-between gap-3 py-1 border-b border-[#F1F5FA] last:border-0">
+                        <span className="text-[#657794] break-all">{k}</span>
+                        <span className="font-semibold text-[#111B37] text-right break-all">
+                          {typeof v === 'string' ? v : JSON.stringify(v)}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-[#94A3B8]">No properties. Add them with Edit.</p>
+                  )}
+                </div>
+              </div>
+            </Card>
+
+            <Card title="Location" className="min-h-[220px]">
+              <div className="space-y-3 text-[12px]">
+                <div>
+                  <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">Path</span>
+                  <nav aria-label="Path" className="mt-1 flex flex-wrap items-center gap-1 text-[#111B37]">
+                    {breadcrumb.map((item, idx) => (
+                      <React.Fragment key={item.id}>
+                        {idx > 0 && <ChevronRight className="w-3 h-3 text-[#CBD5E1]" aria-hidden="true" />}
+                        {item.id === selectedResource.id ? (
+                          <span className="font-semibold break-words">{item.name}</span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setSelectedResourceId(item.id)}
+                            className="hover:underline text-[#334568] break-words text-left"
+                          >
+                            {item.name}
+                          </button>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </nav>
+                </div>
+                <div className="pt-2 border-t border-[#E3EAF3] grid grid-cols-2 gap-2">
+                  <div>
+                    <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">Sub-units</span>
+                    <span className="text-[18px] font-extrabold text-[#111B37] tabular-nums">{childResources.length}</span>
+                  </div>
+                  <div>
+                    <span className="text-[#94A3B8] block text-[11px] uppercase font-bold">Signals</span>
+                    <span className="text-[18px] font-extrabold text-[#111B37] tabular-nums">{selectedSignals.length}</span>
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="w-full"
+                  icon={<Share2 className="w-3.5 h-3.5" />}
+                  onClick={() => navigate(`/factory/graph?resourceId=${encodeURIComponent(selectedResource.id)}`)}
+                >
+                  View in Knowledge Graph
+                </Button>
+              </div>
+            </Card>
+          </div>
+
+          <Card title="Change history" subtitle={`Changes made to ${selectedResource.name}`}>
+            {auditState === 'error' ? (
+              <p className="text-[12px] text-[#94A3B8] py-2">
+                The change history could not be loaded.{' '}
+                <button type="button" className="text-[#2A82E7] hover:underline" onClick={() => setHistoryTick((v) => v + 1)}>
+                  Try again
+                </button>
+              </p>
+            ) : historyItems.length === 0 ? (
+              <p className="text-[12px] text-[#94A3B8] py-2">{auditState === 'loading' ? 'Loading…' : 'No changes recorded yet.'}</p>
+            ) : (
+              <ol className="divide-y divide-[#F1F5FA]">
+                {historyItems.map(({ row, text: entry }) => (
+                  <li key={row.id} className="py-2 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-[12px] text-[#111B37]">
+                        <span className="font-semibold">{entry.actor}</span> {entry.action}
+                      </p>
+                      {entry.detail && <p className="text-[11px] text-[#657794] mt-0.5 break-words">{entry.detail}</p>}
+                    </div>
+                    <time
+                      dateTime={row.occurred_at}
+                      title={formatTimestamp(row.occurred_at)}
+                      className="text-[11px] text-[#94A3B8] whitespace-nowrap shrink-0"
+                    >
+                      {timeAgo(row.occurred_at)}
+                    </time>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </Card>
+        </div>
+      </div>
+
+      <AddResourceModal
+        isOpen={isAddModalOpen}
+        onClose={() => setIsAddModalOpen(false)}
+        resources={resources}
+        defaultParentId={defaultAddParentId}
+        onAddResource={handleCreateResource}
+      />
+
+      <ImportTopicsModal
+        isOpen={isImportModalOpen}
+        onClose={() => setIsImportModalOpen(false)}
+        onSuccess={async (count) => {
+          await safeRefresh();
+          showToast({ message: `Imported ${count} ${count === 1 ? 'resource' : 'resources'}`, tone: 'info' });
+        }}
+      />
+
+      <EditResourceModal
+        isOpen={isEditModalOpen}
+        onClose={() => setIsEditModalOpen(false)}
+        resource={selectedResource}
+        onSuccess={async (updated) => {
+          await safeRefresh();
+          setHistoryTick((value) => value + 1);
+          showToast({ message: `Saved "${updated.name}"`, tone: 'info' });
+        }}
+      />
+
+      <MoveResourceModal
+        isOpen={isMoveModalOpen}
+        onClose={() => setIsMoveModalOpen(false)}
+        selectedResource={selectedResource}
+        allResources={resources}
+        onMoveResource={handleMoveResource}
+      />
+
+      <ArchiveResourceModal
+        isOpen={Boolean(archiveTarget)}
+        resource={archiveTarget}
+        childCount={archiveTarget ? resources.filter((item) => item.parentId === archiveTarget.id).length : 0}
+        signalCount={archiveTarget ? signals.filter((s) => s.resourceId === archiveTarget.id).length : 0}
+        onClose={() => setArchiveTarget(null)}
+        onConfirm={confirmArchive}
+      />
+
+      {toastView}
+    </div>
+  );
+};

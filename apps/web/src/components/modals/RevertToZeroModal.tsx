@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, X } from 'lucide-react';
 import { useApp } from '../../store/AppContext';
+import { useDialogA11y } from './useDialogA11y';
 
 interface RevertToZeroModalProps {
   isOpen: boolean;
@@ -12,6 +13,18 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
   const [inputVal, setInputVal] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useDialogA11y(isOpen, dialogRef, () => {
+    if (!isSubmitting) onClose();
+  });
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setInputVal('');
+    setError(null);
+    setIsSubmitting(false);
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -32,7 +45,9 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
       <div
-        className="w-full max-w-md bg-white rounded-xl shadow-2xl border border-[#FAC6C9] overflow-hidden"
+        ref={dialogRef}
+        tabIndex={-1}
+        className="w-full max-w-md bg-white rounded-xl shadow-2xl border border-[#FAC6C9] overflow-hidden outline-none"
         role="dialog"
         aria-modal="true"
         aria-labelledby="revert-modal-title"

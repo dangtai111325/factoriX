@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factorix.modules.common import as_uuid, execute, fetch_one, jsonb, utcnow
+from factorix.domain.health import (
+    ConnectionUpdate,
+    apply_connection_report,
+    edge_config_state,
+    effective_connection_health,
+    effective_edge_health,
+)
+from factorix.modules.common import as_uuid, audit, execute, fetch_all, fetch_one, iso_ms, jsonb, queue_stream_event, utcnow
 from factorix.modules.telemetry import ingest_observations
 from factorix.platform.errors import AppError
 from factorix.platform.security import decrypt_secret, hash_token, new_token
@@ -60,11 +68,42 @@ async def edge_principal(session: AsyncSession, credential: str | None) -> dict[
     return row
 
 
+_EDGE_REPORTED_HEALTH = {"HEALTHY", "DEGRADED", "ACTIVE", "CONFIG_PENDING"}
+
+
+def edge_health_payload(row: dict[str, Any], now: datetime) -> dict[str, Any]:
+    effective = effective_edge_health(row, now)
+    return {
+        "type": "health",
+        "entity": "edge",
+        "id": str(row["id"]),
+        "health": effective,
+        "effective_health": effective,
+        "config_state": edge_config_state(row),
+        "last_error": None,
+        "last_success_at": iso_ms(row.get("last_heartbeat")),
+    }
+
+
 async def heartbeat(session: AsyncSession, edge: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
-    health = str(body.get("health") or "HEALTHY")
-    if health not in {"HEALTHY", "DEGRADED", "OFFLINE", "ACTIVE", "CONFIG_PENDING"}:
+    """Record edge liveness and apply the per-connection states the edge reports."""
+    now = utcnow()
+    edge_id = as_uuid(edge["id"])
+    tenant_id = as_uuid(edge["tenant_id"])
+    previous = await fetch_one(
+        session,
+        "SELECT id, enrollment_status, health, last_heartbeat, desired_revision, active_revision FROM edge_nodes WHERE id = :id FOR UPDATE",
+        {"id": edge_id},
+    )
+    assert previous is not None
+    health = str(body.get("health") or "HEALTHY").upper()
+    if health not in _EDGE_REPORTED_HEALTH:
         health = "DEGRADED"
     queues = body.get("queues")
+    try:
+        pending = max(int(body.get("outbox_pending") or 0), 0)
+    except (TypeError, ValueError):
+        pending = 0
     await execute(
         session,
         """
@@ -74,17 +113,143 @@ async def heartbeat(session: AsyncSession, edge: dict[str, Any], body: dict[str,
         WHERE id = :id
         """,
         {
-            "now": utcnow(),
+            "now": now,
             "health": health,
             "version": str(body.get("software_version") or "")[:40],
-            "pending": int(body.get("outbox_pending") or 0),
+            "pending": pending,
             "queues": jsonb(queues if isinstance(queues, dict) else {}),
-            "id": as_uuid(edge["id"]),
+            "id": edge_id,
         },
     )
-    fresh = await fetch_one(session, "SELECT desired_revision, active_revision, health, queues_json FROM edge_nodes WHERE id = :id", {"id": as_uuid(edge["id"])})
+    fresh = await fetch_one(
+        session,
+        "SELECT id, enrollment_status, health, last_heartbeat, desired_revision, active_revision, queues_json FROM edge_nodes WHERE id = :id",
+        {"id": edge_id},
+    )
     assert fresh is not None
-    return fresh
+    before = effective_edge_health(previous, now)
+    after = effective_edge_health(fresh, now)
+    if before != after:
+        if before == "OFFLINE":
+            await audit(
+                session,
+                tenant_id=tenant_id,
+                event_type="EDGE_ONLINE",
+                actor_id=None,
+                entity_type="edge",
+                entity_id=edge_id,
+                before={"health": before},
+                after={"health": after},
+                correlation_id="heartbeat",
+            )
+        queue_stream_event(session, "health", tenant_id, edge_health_payload(fresh, now))
+    reports = body.get("connections")
+    if isinstance(reports, dict) and reports:
+        await _apply_connection_reports(session, tenant_id, edge_id, reports, now)
+    return {
+        "desired_revision": fresh["desired_revision"],
+        "active_revision": fresh["active_revision"],
+        "health": fresh["health"],
+        "effective_health": after,
+        "queues_json": fresh.get("queues_json"),
+    }
+
+
+async def _apply_connection_reports(
+    session: AsyncSession,
+    tenant_id: UUID,
+    edge_id: UUID,
+    reports: dict[str, Any],
+    now: datetime,
+) -> None:
+    by_id: dict[UUID, dict[str, Any]] = {}
+    for key, report in list(reports.items())[:500]:
+        if not isinstance(report, dict):
+            continue
+        try:
+            by_id[UUID(str(key))] = report
+        except ValueError:
+            continue
+    if not by_id:
+        return
+    rows = await fetch_all(
+        session,
+        """
+        SELECT id, status, health, last_error, last_success_at
+        FROM connections
+        WHERE tenant_id = :tenant_id AND edge_id = :edge_id AND id = ANY(:ids)
+        FOR UPDATE
+        """,
+        {"tenant_id": tenant_id, "edge_id": edge_id, "ids": list(by_id)},
+    )
+    if not rows:
+        return
+    counts = await fetch_all(
+        session,
+        """
+        SELECT j.connection_id, count(DISTINCT b.signal_id) AS active_bindings
+        FROM acquisition_jobs j
+        JOIN source_fields f ON f.acquisition_job_id = j.id
+        JOIN signal_bindings b ON b.source_field_id = f.id
+        JOIN signal_definitions s ON s.id = b.signal_id
+        WHERE j.connection_id = ANY(:ids) AND b.enabled = TRUE AND b.valid_to IS NULL AND s.status = 'ACTIVE'
+        GROUP BY j.connection_id
+        """,
+        {"ids": [as_uuid(row["id"]) for row in rows]},
+    )
+    bindings = {str(row["connection_id"]): int(row["active_bindings"] or 0) for row in counts}
+    for row in rows:
+        conn_id = as_uuid(row["id"])
+        update = apply_connection_report(row, by_id[conn_id], now)
+        if update is None:
+            continue
+        await execute(
+            session,
+            "UPDATE connections SET health = :health, last_error = :last_error, last_success_at = :last_success_at WHERE id = :id",
+            {"health": update.health, "last_error": update.last_error, "last_success_at": update.last_success_at, "id": conn_id},
+        )
+        payload = _connection_payload(conn_id, update, bindings.get(str(conn_id), 0))
+        if update.health == row["health"]:
+            if update.last_error != row.get("last_error"):
+                queue_stream_event(session, "health", tenant_id, payload)
+            continue
+        if update.health == "DEGRADED":
+            await audit(
+                session,
+                tenant_id=tenant_id,
+                event_type="CONNECTION_DEGRADED",
+                actor_id=None,
+                entity_type="connection",
+                entity_id=conn_id,
+                before={"health": row["health"]},
+                after={"health": "DEGRADED", "last_error": update.last_error, "source": "edge"},
+                correlation_id="heartbeat",
+            )
+        elif row["health"] == "DEGRADED":
+            await audit(
+                session,
+                tenant_id=tenant_id,
+                event_type="CONNECTION_RECOVERED",
+                actor_id=None,
+                entity_type="connection",
+                entity_id=conn_id,
+                before={"health": "DEGRADED"},
+                after={"health": update.health},
+                correlation_id="heartbeat",
+            )
+        queue_stream_event(session, "health", tenant_id, payload)
+
+
+def _connection_payload(conn_id: UUID, update: ConnectionUpdate, active_bindings: int) -> dict[str, Any]:
+    return {
+        "type": "health",
+        "entity": "connection",
+        "id": str(conn_id),
+        "health": update.health,
+        "effective_health": effective_connection_health(status="ACTIVE", health=update.health, active_bindings=active_bindings, edge_health="ONLINE"),
+        "last_error": update.last_error,
+        "last_success_at": iso_ms(update.last_success_at),
+    }
 
 
 async def desired_config(session: AsyncSession, edge: dict[str, Any]) -> dict[str, Any]:
@@ -178,23 +343,36 @@ async def pull_commands(session: AsyncSession, edge: dict[str, Any]) -> dict[str
         return {"job": None}
     await execute(session, "UPDATE commissioning_jobs SET status = 'RUNNING', started_at = :now WHERE id = :id", {"now": utcnow(), "id": as_uuid(jobs["id"])})
     meta = (jobs.get("samples_json") or {}).get("meta", {})
+    override = meta.get("config_override")
     job_payload = {
         "id": str(jobs["id"]),
         "connection_id": str(jobs["connection_id"]),
         "stages_json": jobs["stages_json"],
         "protocol": jobs["protocol"],
-        "config_json": jobs["config_json"],
+        # A test of unsaved edits carries the validated draft config; otherwise the stored one.
+        "config_json": override if isinstance(override, dict) and override else jobs["config_json"],
         "endpoint_redacted": jobs["endpoint_redacted"],
         "secret_ref": str(jobs["secret_ref"]) if jobs.get("secret_ref") else None,
         "command_type": meta.get("command_type") or "COMMISSION",
         "mode": meta.get("mode") or "FULL",
         "fields": meta.get("fields") or [],
         "topic_filter": meta.get("topic_filter"),
+        "topics": meta.get("topics") or [],
+        # HTTP capture fetches one path; the wizard sends it as the capture filter.
+        "path": meta.get("path") or (meta.get("topic_filter") if jobs["protocol"] == "http" else None),
         "seconds": meta.get("seconds"),
         "max_messages": meta.get("max_messages"),
         "browse_node": meta.get("browse_node"),
     }
     return {"job": job_payload}
+
+
+def _command_result(body: dict[str, Any]) -> dict[str, Any]:
+    samples = body.get("samples")
+    result: dict[str, Any] = dict(samples) if isinstance(samples, dict) else {"samples": samples or []}
+    if body.get("browse") is not None:
+        result["browse"] = body.get("browse")
+    return result
 
 
 async def finish_command(session: AsyncSession, edge: dict[str, Any], job_id: UUID, body: dict[str, Any]) -> dict[str, Any]:
@@ -224,7 +402,8 @@ async def finish_command(session: AsyncSession, edge: dict[str, Any], job_id: UU
         {
             "status": status,
             "stages": jsonb(body.get("stages") or []),
-            "samples": jsonb(body.get("samples") or {}),
+            # Keep every result part the edge reports (samples, browse tree, raw payload text).
+            "samples": jsonb(_command_result(body)),
             "now": utcnow(),
             "error_code": body.get("error_code"),
             "diagnostic": str(body.get("diagnostic") or "")[:1000],

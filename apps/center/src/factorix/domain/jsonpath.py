@@ -1,6 +1,7 @@
 """Restricted JSONPath evaluator with explicit cardinality policies.
 
-Supports dotted names, quoted keys, indexes and a single wildcard in an array.
+Supports dotted names, bracket-quoted keys (``$.machines["M-01"]`` or
+``$['a.b']``, with backslash escapes), indexes and a single wildcard in an array.
 """
 
 from __future__ import annotations
@@ -23,6 +24,26 @@ class PathToken:
     kind: Literal["key", "index", "wildcard"]
     key: str | None = None
     index: int | None = None
+
+
+def _read_quoted(expression: str, i: int) -> tuple[str, int]:
+    """Read a quoted key starting at ``expression[i]`` (the quote). Returns (key, index after quote)."""
+    quote = expression[i]
+    i += 1
+    chars: list[str] = []
+    while i < len(expression):
+        ch = expression[i]
+        if ch == "\\":
+            if i + 1 >= len(expression):
+                break
+            chars.append(expression[i + 1])
+            i += 2
+            continue
+        if ch == quote:
+            return "".join(chars), i + 1
+        chars.append(ch)
+        i += 1
+    raise MappingError("INVALID_PATH", "Quoted key is not closed.")
 
 
 def compile_path(expression: str) -> list[PathToken]:
@@ -49,16 +70,24 @@ def compile_path(expression: str) -> list[PathToken]:
             tokens.append(PathToken("key", key=name))
             continue
         if ch == "[":
+            j = i + 1
+            while j < len(expression) and expression[j] == " ":
+                j += 1
+            if j < len(expression) and expression[j] in {"'", '"'}:
+                key, j = _read_quoted(expression, j)
+                while j < len(expression) and expression[j] == " ":
+                    j += 1
+                if j >= len(expression) or expression[j] != "]":
+                    raise MappingError("INVALID_PATH", "Missing closing ].")
+                tokens.append(PathToken("key", key=key))
+                i = j + 1
+                continue
             end = expression.find("]", i)
             if end < 0:
                 raise MappingError("INVALID_PATH", "Missing closing ].")
             inner = expression[i + 1 : end].strip()
             if inner == "*":
                 tokens.append(PathToken("wildcard"))
-            elif (inner.startswith("'") and inner.endswith("'")) or (
-                inner.startswith('"') and inner.endswith('"')
-            ):
-                tokens.append(PathToken("key", key=inner[1:-1]))
             elif inner.isdigit() or (inner.startswith("-") and inner[1:].isdigit()):
                 tokens.append(PathToken("index", index=int(inner)))
             else:
@@ -72,12 +101,21 @@ def compile_path(expression: str) -> list[PathToken]:
 
 
 def evaluate(expression: str, document: Any) -> list[Any]:
+    return [value for value, _parent in evaluate_nodes(expression, document)]
+
+
+def evaluate_nodes(expression: str, document: Any) -> list[tuple[Any, Any]]:
+    """Evaluate a path and return ``(value, parent)`` pairs.
+
+    ``parent`` is the container that holds the matched value (``None`` for the root
+    document itself). Used to read a sibling key such as ``source_timestamp``.
+    """
     tokens = compile_path(expression)
-    current: list[Any] = [document]
+    current: list[tuple[Any, Any]] = [(document, None)]
     for token in tokens:
-        nxt: list[Any] = []
-        for node in current:
-            nxt.extend(_step(node, token))
+        nxt: list[tuple[Any, Any]] = []
+        for node, _parent in current:
+            nxt.extend((value, node) for value in _step(node, token))
         current = nxt
     return current
 

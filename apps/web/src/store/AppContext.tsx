@@ -1,7 +1,8 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
-import { ApiError, api } from '../api/client'
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { api } from '../api/client'
 import {
   ActivityEvent,
+  ConnectionDisplayState,
   ConnectionItem,
   DiagnosticItem,
   EdgeItem,
@@ -14,6 +15,17 @@ import {
   TestExecutionState,
   TestStepResult,
 } from '../types'
+import {
+  HealthMsg,
+  LatestMsg,
+  getPushedSignalIds,
+  onPushCoverageChange,
+  subscribeHealth,
+  subscribeSignals,
+  useStreamStatus,
+} from '../lib/liveStream'
+import { CommissionResult, runConnectionTest } from '../lib/commissioning'
+import { normalizeQuality } from '../lib/format'
 
 const EMPTY_PLANT: PlantScope = {
   id: '',
@@ -23,6 +35,17 @@ const EMPTY_PLANT: PlantScope = {
   status: 'maintenance',
   assetsCount: 0,
 }
+
+/** Server cap for one `/observations/latest` request. */
+const LATEST_CHUNK = 200
+/** Metadata (lists) refresh period while the push stream is open / closed. */
+const META_REFRESH_OPEN_MS = 30000
+const META_REFRESH_CLOSED_MS = 10000
+/** Latest-value polling period for signals that are not pushed. */
+const POLL_STREAM_DOWN_MS = 1500
+const POLL_PARTIAL_MS = 2000
+/** Coalescing window for applying live updates to React state. */
+const LIVE_FLUSH_MS = 200
 
 export interface AcquisitionField {
   name: string
@@ -94,7 +117,8 @@ interface AppContextType {
   moveResource: (resourceId: string, newParentId: string) => Promise<{ success: boolean; error?: string }>
   archiveResource: (resourceId: string) => Promise<{ success: boolean; error?: string }>
   updateLayoutNode: (id: string, updates: Partial<LayoutMachineNode>) => void
-  testConnection: (id: string) => Promise<{ success: boolean; latency: number }>
+  /** Real connectivity test (REACH + AUTH) run by the Edge collector. */
+  testConnection: (id: string) => Promise<{ success: boolean; latency: number; result: CommissionResult }>
   runDeterministicConnectionTest: (id: string, scenario?: string) => Promise<{ overallStatus: TestExecutionState; latency: number; steps: TestStepResult[] }>
   prepareAcquisition: (draft: AcquisitionDraft) => Promise<PreparedConnection>
   commissionAcquisition: (connectionId: string) => Promise<{ passed: boolean; stages: Array<{ name: string; status: string; latency?: number }>; errorCode?: string }>
@@ -118,7 +142,7 @@ function text(value: unknown): string {
 function codeFrom(name: string): string {
   const raw = name
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[̀-ͯ]/g, '')
     .replace(/[^A-Za-z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 64)
@@ -126,10 +150,12 @@ function codeFrom(name: string): string {
   return /^[A-Za-z0-9]/.test(raw) ? raw : `R-${raw}`.slice(0, 64)
 }
 
-function protocolOf(value: string): ProtocolType {
-  if (value.includes('modbus')) return 'modbus'
-  if (value.includes('opc')) return 'opcua'
-  if (value.includes('mqtt')) return 'mqtt'
+export function protocolOf(value: string): ProtocolType {
+  const v = value.toLowerCase()
+  if (v.includes('modbus')) return 'modbus'
+  if (v.includes('opc')) return 'opcua'
+  if (v.includes('mqtt')) return 'mqtt'
+  if (v.includes('websocket') || v === 'ws' || v === 'wss') return 'websocket'
   return 'http'
 }
 
@@ -175,11 +201,139 @@ function scopeToPlant(all: ResourceNode[], plantId: string): ResourceNode[] {
   return all.filter((item) => keep.has(item.id))
 }
 
+/** Derive the connection display state from lifecycle status and the server-computed effective health. */
+export function connectionDisplayState(input: {
+  lifecycleStatus?: string
+  effectiveHealth?: string
+  health?: string
+  signalsCount?: number
+}): ConnectionDisplayState {
+  const lifecycle = text(input.lifecycleStatus).toUpperCase()
+  if (lifecycle === 'PAUSED') return 'paused'
+  const eff = text(input.effectiveHealth || input.health).toUpperCase()
+  if (eff === 'PAUSED') return 'paused'
+  if (eff === 'IDLE' || (input.signalsCount ?? 0) === 0) return 'idle'
+  if (eff === 'HEALTHY' || eff === 'ONLINE' || eff === 'UP' || eff === 'RATE_LIMITED') return 'connected'
+  if (eff === 'DEGRADED' || eff === 'OFFLINE' || eff === 'DOWN' || eff === 'AUTH_FAILED' || eff === 'ERROR') return 'degraded'
+  return 'unknown'
+}
+
+function addressSummary(kind: string, address: Record<string, unknown> | undefined): string {
+  if (!address) return ''
+  if (kind.startsWith('modbus') || address.offset !== undefined) {
+    const unit = address.unit_id !== undefined ? `unit ${text(address.unit_id)} · ` : ''
+    return `${unit}${text(address.register_area || 'holding')} ${text(address.offset)} (${text(address.native_type || 'uint16')})`
+  }
+  if (address.node_id) return text(address.node_id)
+  const parts = [address.topic, address.path, address.jsonpath].map(text).filter(Boolean)
+  return parts.join(' · ')
+}
+
+function mapConnection(row: Record<string, unknown>): ConnectionItem {
+  const signalsCount = Number(row.signal_count ?? 0) || 0
+  const lifecycleStatus = text(row.status).toUpperCase()
+  const health = text(row.health).toUpperCase()
+  const effectiveHealth = text(row.effective_health || row.health).toUpperCase()
+  const config = (row.config_json as Record<string, unknown>) || (row.config as Record<string, unknown>) || {}
+  return {
+    id: text(row.id),
+    name: text(row.name),
+    protocol: protocolOf(text(row.protocol)),
+    endpoint: text(row.endpoint_redacted),
+    status: connectionDisplayState({ lifecycleStatus, effectiveHealth, health, signalsCount }),
+    lifecycleStatus,
+    health,
+    effectiveHealth,
+    version: Number(row.version || 1),
+    lastError: text(row.last_error),
+    plantId: text(row.site_id),
+    siteId: text(row.site_id),
+    edgeId: text(row.edge_id),
+    edgeName: text(row.edge_name) || undefined,
+    latencyMs: 0,
+    lastConnected: text(row.last_success_at),
+    lastSuccessAt: text(row.last_success_at),
+    signalsCount,
+    messagesPerMin: Number(row.messages_per_min ?? 0) || 0,
+    throughputPerSec: (Number(row.messages_per_min ?? 0) || 0) / 60,
+    errorRate: 0,
+    secretConfigured: Boolean(row.secret_configured),
+    config,
+  }
+}
+
+interface LiveState {
+  value: unknown
+  quality: string
+  reasonCode: string
+  receivedTime: string
+  sourceTime: string
+}
+
+function timeOf(iso: string): number {
+  if (!iso) return 0
+  const ts = Date.parse(iso)
+  return Number.isNaN(ts) ? 0 : ts
+}
+
+function liveFromRow(row: Record<string, unknown>): LiveState {
+  const value = row.value !== undefined ? row.value : (row.value_json as { v?: unknown } | undefined)?.v
+  return {
+    value: value === undefined ? null : value,
+    quality: normalizeQuality(row.effective_status ?? row.quality),
+    reasonCode: text(row.reason_code),
+    receivedTime: text(row.received_time || row.event_time),
+    sourceTime: text(row.source_time),
+  }
+}
+
+interface SignalMeta extends SignalItem {
+  enabled: boolean
+}
+
+function mapSignal(row: Record<string, unknown>, connectionName: Map<string, string>): SignalMeta {
+  const dataType = text(row.data_type)
+  const addressJson = (row.address_json as Record<string, unknown>) || undefined
+  const addressKind = text(row.address_kind)
+  const connectionId = text(row.connection_id)
+  const summary = addressSummary(addressKind, addressJson)
+  return {
+    id: text(row.id),
+    key: text(row.key),
+    name: text(row.key),
+    displayName: text(row.display_name || row.key),
+    tag: text(row.key),
+    data_type: dataType,
+    connectionId,
+    sourceConnectionId: connectionId,
+    sourceConnectionName: text(row.connection_name) || connectionName.get(connectionId) || '',
+    connectionProtocol: text(row.connection_protocol),
+    edgeName: text(row.edge_name) || undefined,
+    resourceId: text(row.resource_id),
+    resourcePath: text(row.resource_name || row.resource_code),
+    dataType: dataType === 'boolean' || dataType === 'bool' ? 'boolean' : signalType(dataType),
+    unit: text(row.unit),
+    enabled: row.enabled !== false,
+    version: Number(row.version || 1),
+    addressKind,
+    addressJson,
+    bindingAddress: summary || undefined,
+    topic: text(addressJson?.topic || addressJson?.path || addressJson?.node_id) || undefined,
+    address: addressJson?.jsonpath ? text(addressJson.jsonpath) : summary || undefined,
+    expectedIntervalMs: row.expected_interval_ms != null ? Number(row.expected_interval_ms) : undefined,
+    sampleIntervalMs: Number(row.expected_interval_ms || 1000),
+    currentValue: '—',
+    value: null,
+    quality: 'NO_DATA',
+    lastUpdated: '',
+  }
+}
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [allResources, setAllResources] = useState<ResourceNode[]>([])
   const [connections, setConnections] = useState<ConnectionItem[]>([])
   const [edges, setEdges] = useState<EdgeItem[]>([])
-  const [signals, setSignals] = useState<SignalItem[]>([])
+  const [signalMeta, setSignalMeta] = useState<SignalMeta[]>([])
   const [layoutNodes, setLayoutNodes] = useState<LayoutMachineNode[]>([])
   const [outputGroups, setOutputGroups] = useState<OutputGroup[]>([])
   const [activities, setActivities] = useState<ActivityEvent[]>([])
@@ -193,7 +347,75 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [collectorLabel, setCollectorLabel] = useState('Collector: not enrolled')
-  const [layoutMeta, setLayoutMeta] = useState<{ id: string; version: number } | null>(null)
+  const streamStatus = useStreamStatus()
+
+  // Live values live outside the metadata so a metadata refresh never wipes them.
+  const liveRef = useRef<Map<string, LiveState>>(new Map())
+  const [liveTick, setLiveTick] = useState(0)
+  // Re-evaluates client-side staleness between server reconciliations.
+  const [clockTick, setClockTick] = useState(0)
+  const flushTimer = useRef<number | null>(null)
+  const signalIdsRef = useRef<string[]>([])
+
+  const scheduleLiveFlush = useCallback(() => {
+    if (flushTimer.current !== null) return
+    flushTimer.current = window.setTimeout(() => {
+      flushTimer.current = null
+      setLiveTick((tick) => tick + 1)
+    }, LIVE_FLUSH_MS)
+  }, [])
+
+  useEffect(() => () => {
+    if (flushTimer.current !== null) window.clearTimeout(flushTimer.current)
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockTick((tick) => tick + 1), 5000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  /** Merge one live state; older samples (by received_time) never overwrite newer ones. */
+  const applyLive = useCallback((signalId: string, next: LiveState): boolean => {
+    const current = liveRef.current.get(signalId)
+    if (current) {
+      const curTs = timeOf(current.receivedTime)
+      const nextTs = timeOf(next.receivedTime)
+      if (curTs && nextTs && nextTs < curTs) return false
+      if (
+        curTs === nextTs &&
+        current.value === next.value &&
+        current.quality === next.quality &&
+        current.sourceTime === next.sourceTime &&
+        current.reasonCode === next.reasonCode
+      ) {
+        return false
+      }
+    }
+    liveRef.current.set(signalId, next)
+    return true
+  }, [])
+
+  const fetchLatest = useCallback(async (ids: string[]) => {
+    const unique = Array.from(new Set(ids.filter(Boolean)))
+    if (!unique.length) return
+    const chunks: string[][] = []
+    for (let i = 0; i < unique.length; i += LATEST_CHUNK) chunks.push(unique.slice(i, i + LATEST_CHUNK))
+    const pages = await Promise.all(
+      chunks.map((chunk) =>
+        api<{ items: Array<Record<string, unknown>> }>(`/api/v1/observations/latest?signal_ids=${chunk.join(',')}`).catch((error) => {
+          console.warn('Latest values request failed', error)
+          return { items: [] as Array<Record<string, unknown>> }
+        }),
+      ),
+    )
+    let changed = false
+    for (const page of pages) {
+      for (const row of page.items || []) {
+        if (applyLive(text(row.signal_id), liveFromRow(row))) changed = true
+      }
+    }
+    if (changed) scheduleLiveFlush()
+  }, [applyLive, scheduleLiveFlush])
 
   const resources = useMemo(
     () => scopeToPlant(allResources, currentPlant.id),
@@ -207,13 +429,55 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!siteId) return connections
     return connections.filter((item) => !item.plantId || item.plantId === siteId)
   }, [allResources, connections, currentPlant.id])
-  const scopedSignals = signals.filter((item) => !currentPlant.id || resourceIds.has(item.resourceId))
+
+  const signals = useMemo<SignalItem[]>(() => {
+    void liveTick
+    void clockTick
+    const now = Date.now()
+    return signalMeta.map((meta) => {
+      const live = liveRef.current.get(meta.id)
+      if (!meta.enabled) {
+        return {
+          ...meta,
+          quality: 'DISABLED',
+          value: live?.value === undefined ? null : (live.value as SignalItem['value']),
+          currentValue: live?.value == null ? '—' : (live.value as SignalItem['currentValue']),
+          lastUpdated: live?.receivedTime || '',
+          receivedTime: live?.receivedTime || '',
+          sourceTime: live?.sourceTime || '',
+        }
+      }
+      if (!live) return meta
+      const value = live.value as SignalItem['value']
+      // Same rule as the Center (max(2 x interval, 12 s) since received_time), so a source that stopped
+      // pushing is shown Stale before the next server reconciliation.
+      const staleAfter = Math.max(2 * (meta.expectedIntervalMs || 1000), 12000)
+      const receivedTs = timeOf(live.receivedTime)
+      const quality = live.quality === 'GOOD' && receivedTs && now - receivedTs > staleAfter ? 'STALE' : live.quality
+      return {
+        ...meta,
+        value: value == null ? null : value,
+        currentValue: value == null ? '—' : value,
+        quality,
+        reasonCode: live.reasonCode || undefined,
+        qualityReason: live.reasonCode || undefined,
+        lastUpdated: live.receivedTime,
+        receivedTime: live.receivedTime,
+        sourceTime: live.sourceTime,
+      }
+    })
+  }, [signalMeta, liveTick, clockTick])
+
+  const scopedSignals = useMemo(
+    () => signals.filter((item) => !currentPlant.id || resourceIds.has(item.resourceId)),
+    [signals, currentPlant.id, resourceIds],
+  )
 
   const refresh = useCallback(async () => {
     const [resourcePage, connectionPage, signalPage, groupPage, auditPage, edgePage] = await Promise.all([
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/resources?view=all&limit=200'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/connections'),
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/signals?limit=500'),
+      api<{ items: Array<Record<string, unknown>> }>('/api/v1/signals?limit=1000'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/output-groups'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/audit-events?limit=50'),
       api<{ items: Array<Record<string, unknown>> }>('/api/v1/edges'),
@@ -243,79 +507,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCurrentPlant((current) => nextPlants.find((item) => item.id === current.id) || nextPlants[0] || EMPTY_PLANT)
     setAllResources(mappedResources)
 
-    const latestIds = (signalPage.items || []).map((row) => text(row.id)).filter(Boolean)
-    let latest = new Map<string, Record<string, unknown>>()
-    if (latestIds.length) {
-      const page = await api<{ items: Array<Record<string, unknown>> }>(
-        `/api/v1/observations/latest?signal_ids=${latestIds.slice(0, 200).join(',')}`,
-      )
-      latest = new Map((page.items || []).map((row) => [text(row.signal_id), row]))
+    const connectionRows = connectionPage.items || []
+    const connectionName = new Map(connectionRows.map((row) => [text(row.id), text(row.name)]))
+    setConnections(connectionRows.map(mapConnection))
+
+    const metas = (signalPage.items || []).map((row) => mapSignal(row, connectionName))
+    const ids = metas.map((item) => item.id).filter(Boolean)
+    signalIdsRef.current = ids
+    // Forget live values of signals that no longer exist; keep everything else untouched.
+    const keep = new Set(ids)
+    for (const id of Array.from(liveRef.current.keys())) {
+      if (!keep.has(id)) liveRef.current.delete(id)
     }
-    const connectionName = new Map((connectionPage.items || []).map((row) => [text(row.id), text(row.name)]))
-    const signalCountsByConn = new Map<string, number>()
-    for (const s of (signalPage.items || [])) {
-      const cid = text(s.connection_id)
-      if (cid) {
-        signalCountsByConn.set(cid, (signalCountsByConn.get(cid) || 0) + 1)
-      }
-    }
-    setConnections(
-      (connectionPage.items || []).map((row) => {
-        const health = text(row.health).toUpperCase()
-        const rawStatus = text(row.status).toUpperCase()
-        const isOnline =
-          (health === 'HEALTHY' || health === 'ONLINE') &&
-          (rawStatus === 'ACTIVE' || rawStatus === 'CONNECTED') &&
-          !row.last_error
-        const status = isOnline ? 'connected' : 'disconnected'
-        return {
-          id: text(row.id),
-          name: text(row.name),
-          protocol: protocolOf(text(row.protocol)),
-          endpoint: text(row.endpoint_redacted),
-          status,
-          health: isOnline ? 'HEALTHY' : 'DEGRADED',
-          lastError: text(row.last_error),
-          plantId: text(row.site_id),
-          latencyMs: 0,
-          lastConnected: text(row.last_success_at),
-          signalsCount: signalCountsByConn.get(text(row.id)) || 0,
-          throughputPerSec: 0,
-          errorRate: 0,
-          config: (row.config as Record<string, unknown>) || {},
-        }
-      }),
-    )
-    setSignals(
-      (signalPage.items || []).map((row) => {
-        const state = latest.get(text(row.id))
-        const rawVal = state?.value !== undefined ? state.value : (state?.value_json as { v?: unknown } | undefined)?.v;
-        const value = rawVal;
-        const dataType = text(row.data_type)
-        return {
-          id: text(row.id),
-          key: text(row.key),
-          name: text(row.key),
-          displayName: text(row.display_name || row.key),
-          tag: text(row.key),
-          connectionId: text(row.connection_id),
-          sourceConnectionId: text(row.connection_id),
-          sourceConnectionName: connectionName.get(text(row.connection_id)) || 'Collector',
-          resourceId: text(row.resource_id),
-          resourcePath: text(row.resource_name || row.resource_code),
-          dataType: dataType === 'boolean' || dataType === 'bool' ? 'boolean' : signalType(dataType),
-          unit: text(row.unit),
-          currentValue: value == null ? '—' : (value as string | number | boolean),
-          value: value == null ? null : (value as string | number | boolean),
-          quality: (() => {
-            const effStatus = text(state?.effective_status || state?.quality || 'BAD').toUpperCase();
-            return (effStatus === 'GOOD' ? 'Good' : effStatus === 'UNCERTAIN' ? 'Uncertain' : 'Bad') as SignalItem['quality'];
-          })(),
-          lastUpdated: text(state?.event_time),
-          sampleIntervalMs: Number(row.expected_interval_ms || 1000),
-        }
-      }),
-    )
+    setSignalMeta(metas)
+    // Reconcile latest values for ALL signals (chunked), merged by received_time.
+    await fetchLatest(ids)
+
     setLayoutNodes([])
     setOutputGroups(
       (groupPage.items || []).map((row) => ({
@@ -345,6 +552,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       id: text(row.id),
       name: text(row.name),
       siteId: text(row.site_id),
+      site_id: text(row.site_id),
       enrollmentStatus: text(row.enrollment_status),
       health: text(row.health),
       desiredRevision: Number(row.desired_revision || 0),
@@ -365,100 +573,141 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setCollectorLabel('Collector: not enrolled')
     }
     setDiagnostics(
-      (connectionPage.items || [])
-        .filter((row) => text(row.health) === 'DEGRADED' || text(row.last_error))
+      connectionRows
+        .filter((row) => text(row.effective_health || row.health).toUpperCase() === 'DEGRADED' || text(row.last_error))
         .map((row) => ({
           id: text(row.id),
           connectionId: text(row.id),
           connectionName: text(row.name),
           protocol: protocolOf(text(row.protocol)),
-          status: text(row.health) === 'DEGRADED' ? 'degraded' : 'critical',
+          status: text(row.effective_health || row.health).toUpperCase() === 'DEGRADED' ? 'degraded' : 'critical',
           uptimeSeconds: 0,
-          messagesReceived: 0,
+          messagesReceived: Number(row.messages_per_min ?? 0) || 0,
           messagesDropped: 0,
           lastError: text(row.last_error),
         })),
     )
-  }, [])
+  }, [fetchLatest])
 
+  // Initial load.
   useEffect(() => {
-    void refresh().catch(() => undefined)
+    void refresh().catch((error) => console.warn('Initial refresh failed', error))
   }, [refresh])
 
+  // Metadata refresh: 30 s while push is available, 10 s otherwise. Never wipes live values.
   useEffect(() => {
     if (!isStreaming) return
+    const period = streamStatus === 'open' ? META_REFRESH_OPEN_MS : META_REFRESH_CLOSED_MS
     const timer = window.setInterval(() => {
-      void refresh().catch(() => undefined)
-    }, 8000)
+      void refresh().catch((error) => console.warn('Metadata refresh failed', error))
+    }, period)
     return () => window.clearInterval(timer)
-  }, [isStreaming, refresh])
+  }, [isStreaming, refresh, streamStatus])
 
-  // Fast 1.2s live telemetry polling for real-time 1 Hz stream
+  // Push: subscribe to latest values of every known signal.
+  const signalIdsKey = useMemo(() => signalMeta.map((item) => item.id).sort().join(','), [signalMeta])
   useEffect(() => {
-    if (!isStreaming || signals.length === 0) return
-    let active = true
+    if (!isStreaming || !signalIdsKey) return
+    const ids = signalIdsKey.split(',')
+    const onLatest = (msg: LatestMsg) => {
+      const id = text(msg.signal_id)
+      const current = liveRef.current.get(id)
+      const next: LiveState = {
+        value: msg.value === undefined ? null : msg.value,
+        quality: normalizeQuality(msg.effective_status ?? msg.quality),
+        reasonCode: text(msg.reason_code),
+        // Older servers do not send received_time: treat the push as "now" so it is not discarded.
+        receivedTime: text(msg.received_time) || new Date().toISOString(),
+        sourceTime: msg.source_time !== undefined ? text(msg.source_time) : current?.sourceTime || '',
+      }
+      if (applyLive(id, next)) scheduleLiveFlush()
+    }
+    return subscribeSignals(ids, onLatest)
+  }, [applyLive, isStreaming, scheduleLiveFlush, signalIdsKey])
 
-    const pollLiveObservations = async () => {
-      try {
-        const ids = signals.map((s) => s.id).filter(Boolean)
-        if (!ids.length) return
-
-        const chunkSize = 195
-        const chunks = []
-        for (let i = 0; i < ids.length; i += chunkSize) {
-          chunks.push(ids.slice(i, i + chunkSize))
-        }
-
-        const allResults = []
-        for (const chunk of chunks) {
-          const res = await api<{ items: Array<Record<string, unknown>> }>('/api/v1/observations/latest?signal_ids=' + chunk.join(','))
-          if (res.items) {
-            allResults.push(...res.items)
-          }
-        }
-
-        if (!active || allResults.length === 0) return
-        const obsMap = new Map(allResults.map((r) => [text(r.signal_id), r]))
-
-        setSignals((prev) => {
-          let changed = false
-          const next = prev.map((sig) => {
-            const obs = obsMap.get(sig.id)
-            if (!obs) return sig
-            const rawVal =
-              obs.value !== undefined
-                ? obs.value
-                : (obs.value_json as { v?: unknown } | undefined)?.v
-            const effStatus = text(obs.effective_status || obs.quality || 'BAD').toUpperCase()
-            const isGood = effStatus === 'GOOD'
-            const q = (isGood ? 'Good' : effStatus === 'UNCERTAIN' ? 'Uncertain' : 'Bad') as SignalItem['quality']
-            const t = text(obs.event_time)
-
-            if (sig.value === rawVal && sig.quality === q && sig.lastUpdated === t) {
-              return sig
+  // Push: connection / edge health.
+  useEffect(() => {
+    const onHealth = (msg: HealthMsg) => {
+      const id = text(msg.id)
+      if (msg.entity === 'connection') {
+        setConnections((prev) =>
+          prev.map((conn) => {
+            if (conn.id !== id) return conn
+            const health = msg.health != null ? text(msg.health).toUpperCase() : conn.health
+            const effectiveHealth = msg.effective_health != null ? text(msg.effective_health).toUpperCase() : health
+            const next: ConnectionItem = {
+              ...conn,
+              health,
+              effectiveHealth,
+              lastError: msg.last_error !== undefined ? text(msg.last_error) : conn.lastError,
+              lastSuccessAt: msg.last_success_at !== undefined ? text(msg.last_success_at) : conn.lastSuccessAt,
+              lastConnected: msg.last_success_at !== undefined ? text(msg.last_success_at) : conn.lastConnected,
             }
-            changed = true
-            return {
-              ...sig,
-              value: rawVal == null ? null : (rawVal as string | number | boolean),
-              currentValue: rawVal == null ? '—' : (rawVal as string | number | boolean),
-              quality: q,
-              lastUpdated: t,
-            }
-          })
-          return changed ? next : prev
-        })
-      } catch {
-        // silent fallback
+            next.status = connectionDisplayState(next)
+            return next
+          }),
+        )
+      } else if (msg.entity === 'edge') {
+        setEdges((prev) =>
+          prev.map((edge) =>
+            edge.id === id
+              ? {
+                  ...edge,
+                  health: text(msg.effective_health || msg.health) || edge.health,
+                  lastHeartbeat: msg.last_success_at ? text(msg.last_success_at) : edge.lastHeartbeat,
+                }
+              : edge,
+          ),
+        )
       }
     }
+    return subscribeHealth(onHealth)
+  }, [])
 
-    const interval = window.setInterval(pollLiveObservations, 1200)
+  // Polling fallback: self-scheduled, one request wave in flight at a time.
+  // Stream down -> poll every signal; stream up -> poll only ids the server does not push.
+  useEffect(() => {
+    if (!isStreaming) return
+    let active = true
+    let timer: number | null = null
+    let inFlight = false
+    const schedule = (delay: number) => {
+      if (!active) return
+      if (timer !== null) window.clearTimeout(timer)
+      timer = window.setTimeout(tick, delay)
+    }
+    const tick = async () => {
+      timer = null
+      if (!active) return
+      if (inFlight) {
+        schedule(POLL_PARTIAL_MS)
+        return
+      }
+      const ids = signalIdsRef.current
+      const pushed = getPushedSignalIds()
+      const pending = ids.filter((id) => !pushed.has(id))
+      if (!pending.length) {
+        schedule(POLL_PARTIAL_MS)
+        return
+      }
+      inFlight = true
+      try {
+        await fetchLatest(pending)
+      } finally {
+        inFlight = false
+      }
+      schedule(pushed.size ? POLL_PARTIAL_MS : POLL_STREAM_DOWN_MS)
+    }
+    schedule(POLL_STREAM_DOWN_MS)
+    const offCoverage = onPushCoverageChange(() => {
+      if (!inFlight && timer === null) schedule(0)
+    })
     return () => {
       active = false
-      window.clearInterval(interval)
+      offCoverage()
+      if (timer !== null) window.clearTimeout(timer)
     }
-  }, [isStreaming, signals.length])
+  }, [fetchLatest, isStreaming])
 
   const revertToZero = async (confirm: string) => {
     await api('/api/v1/admin/revert-to-zero', {
@@ -468,7 +717,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setAllResources([])
     setConnections([])
     setEdges([])
-    setSignals([])
+    setSignalMeta([])
+    liveRef.current.clear()
     setLayoutNodes([])
     setOutputGroups([])
     setActivities([])
@@ -563,7 +813,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     if (draft.protocol === 'opcua') {
       const endpoint = draft.host.startsWith('opc.tcp://') ? draft.host : `opc.tcp://${draft.host}:${port}`
-      return { endpoint, security_mode: 'None', anonymous: true, interval_ms }
+      return { endpoint, security_mode: 'None', security_policy: 'None', anonymous: true, interval_ms }
     }
     if (draft.protocol === 'mqtt') {
       const topic = draft.extra.trim()
@@ -592,8 +842,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }
 
   const ensureEdge = async (siteId: string) => {
-    const edges = await api<{ items: Array<Record<string, unknown>> }>('/api/v1/edges')
-    const existing = (edges.items || []).find((item) => text(item.site_id) === siteId)
+    const edgeRows = await api<{ items: Array<Record<string, unknown>> }>('/api/v1/edges')
+    const existing = (edgeRows.items || []).find((item) => text(item.site_id) === siteId)
     if (existing) return text(existing.id)
     const created = await api<{ id: string }>('/api/v1/edges', {
       method: 'POST',
@@ -627,74 +877,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }
 
   const commissionAcquisition = async (connectionId: string) => {
-    let queued: { job_id?: string; error_code?: string; message?: string; status?: string }
-    try {
-      queued = await api(`/api/v1/connections/${connectionId}/tests`, { method: 'POST' })
-    } catch (error) {
-      if (error instanceof ApiError && (error.code === 'EDGE_NOT_ENROLLED' || /not enrolled/i.test(error.message))) {
-        return {
-          passed: false,
-          errorCode: 'EDGE_NOT_ENROLLED',
-          stages: [{ name: 'EDGE_ENROLLMENT', status: 'FAILED', latency: undefined }],
-        }
-      }
-      throw error
+    const result = await runConnectionTest(connectionId, { mode: 'FULL' })
+    return {
+      passed: result.passed,
+      errorCode: result.errorCode,
+      stages: result.stages.map((stage) => ({
+        name: stage.stage,
+        status: stage.status,
+        latency: stage.duration_ms ?? undefined,
+      })),
     }
-    if (text(queued.error_code) === 'EDGE_NOT_ENROLLED') {
-      return {
-        passed: false,
-        errorCode: 'EDGE_NOT_ENROLLED',
-        stages: [{ name: 'EDGE_ENROLLMENT', status: 'FAILED', latency: undefined }],
-      }
-    }
-    const jobId = text(queued.job_id)
-    if (!jobId) throw new Error('Commission job was not created.')
-    let last: {
-      status?: string
-      error_code?: string
-      stages_json?: Array<{ stage: string; status: string; duration_ms?: number }>
-    } = {}
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      last = await api(`/api/v1/commissioning/${jobId}`)
-      const status = text(last.status)
-      const code = text(last.error_code)
-      if (code === 'EDGE_NOT_ENROLLED') {
-        return {
-          passed: false,
-          errorCode: 'EDGE_NOT_ENROLLED',
-          stages: [{ name: 'EDGE_ENROLLMENT', status: 'FAILED', latency: undefined }],
-        }
-      }
-      if (['PASSED', 'FAILED', 'COMPLETED', 'ERROR'].includes(status)) break
-      await new Promise((resolve) => window.setTimeout(resolve, 1000))
-    }
-    const finalStatus = text(last.status)
-    if (!['PASSED', 'FAILED', 'COMPLETED', 'ERROR'].includes(finalStatus)) {
-      return {
-        passed: false,
-        stages: [
-          ...(last.stages_json || []).map((stage) => ({
-            name: stage.stage,
-            status: stage.status,
-            latency: stage.duration_ms,
-          })),
-          {
-            name: 'TIMEOUT',
-            status: 'FAILED',
-            latency: undefined,
-          },
-        ],
-      }
-    }
-    const stages = (last.stages_json || []).map((stage) => ({
-      name: stage.stage,
-      status: stage.status,
-      latency: stage.duration_ms,
-    }))
-    const failed = stages.some((stage) => stage.status === 'FAILED')
-    const network = stages.find((stage) => stage.name === 'NETWORK')
-    const passed = !failed && (network?.status === 'PASSED' || network?.status === 'COMPLETED' || finalStatus === 'PASSED' || finalStatus === 'COMPLETED')
-    return { passed, stages }
   }
 
   const activateAcquisition = async (prepared: PreparedConnection, draft: AcquisitionDraft) => {
@@ -745,8 +937,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }
 
   const testConnection = async (id: string) => {
-    const result = await commissionAcquisition(id)
-    return { success: result.passed, latency: result.stages.find((stage) => stage.latency)?.latency || 0 }
+    const result = await runConnectionTest(id, { mode: 'CONNECTIVITY' })
+    const latency = result.stages.reduce((sum, stage) => sum + (Number(stage.duration_ms) || 0), 0)
+    return { success: result.passed, latency, result }
   }
 
   const deleteConnection = async (connectionId: string) => {
@@ -810,8 +1003,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     updateLayoutNode,
     testConnection,
     runDeterministicConnectionTest: async (id, _scenario) => {
-      const result = await testConnection(id)
-      return { overallStatus: result.success ? 'PASS' : 'FAIL', latency: result.latency, steps: [] }
+      const outcome = await testConnection(id)
+      return { overallStatus: outcome.success ? 'PASS' : 'FAIL', latency: outcome.latency, steps: [] }
     },
     prepareAcquisition,
     commissionAcquisition,

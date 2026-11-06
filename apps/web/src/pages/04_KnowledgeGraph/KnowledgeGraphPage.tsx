@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow,
   MiniMap,
@@ -9,15 +9,18 @@ import {
   MarkerType,
   Node,
   Edge,
+  ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import {
-  Activity,
-  RotateCcw,
-  X,
-} from 'lucide-react';
+import { Activity, Cable, ChevronRight, Crosshair, ListTree, Loader2, RotateCcw, X } from 'lucide-react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useApp } from '../../store/AppContext';
+import { api } from '../../api/client';
 import { ResourceNode, SignalItem } from '../../types';
+import { resourceTypeLabel } from '../../components/common/ResourceTypeIcon';
+import { formatValue, normalizeQuality, QUALITY_LABEL } from '../../lib/format';
+import { translateApiError } from '../../utils/apiErrors';
+import { ancestorPath, descendantIds } from '../../utils/resourceHierarchy';
 import { layoutGraph } from './graphLayout';
 import { LabeledEdge } from './LabeledEdge';
 import {
@@ -42,244 +45,489 @@ const edgeTypes = {
   labeled: LabeledEdge,
 };
 
+/** Relations between resources that the structure view does not already draw. */
+const CROSS_RELATIONS = new Set(['FEEDS', 'CONNECTED_TO', 'INSTALLED_AT', 'MONITORED_BY', 'PART_OF']);
+
+interface NeighborNode {
+  id: string;
+  kind?: string;
+  label?: string;
+  name?: string;
+  protocol?: string;
+  health?: string;
+  status?: string;
+  archived_at?: string | null;
+}
+
+interface NeighborEdge {
+  from: string;
+  to: string;
+  relation_code: string;
+}
+
+interface Expansion {
+  nodes: Node[];
+  edges: Edge[];
+  connections: number;
+  models: number;
+}
+
+type SelectedEntity =
+  | { kind: 'resource'; id: string }
+  | { kind: 'telemetryGroup'; resourceId: string }
+  | { kind: 'connection'; id: string; name: string; protocol: string; health: string }
+  | { kind: 'model'; id: string; name: string; status: string };
+
+function protocolLabel(value: string): string {
+  const key = value.toLowerCase();
+  if (key.includes('modbus')) return 'Modbus TCP';
+  if (key.includes('opc')) return 'OPC UA';
+  if (key.includes('mqtt')) return 'MQTT';
+  if (key.includes('websocket') || key === 'ws') return 'WebSocket';
+  if (key.includes('http')) return 'HTTP';
+  return value.toUpperCase();
+}
+
+function labeledEdge(id: string, source: string, target: string, relation: string, sourceLabel: string, targetLabel: string, color: string): Edge {
+  return {
+    id,
+    source,
+    target,
+    type: 'labeled',
+    markerEnd: { type: MarkerType.ArrowClosed, color },
+    data: { relation_code: relation, sourceLabel, targetLabel },
+  };
+}
+
+/** Convert a /graph/neighbors response into extra nodes/edges hung off the structure graph. */
+function buildExpansion(
+  payload: { nodes?: NeighborNode[]; edges?: NeighborEdge[] },
+  resourceNames: Map<string, string>,
+): Expansion {
+  const nodesById = new Map((payload.nodes || []).map((node) => [String(node.id), node]));
+  const signalOwner = new Map<string, string>();
+  for (const edge of payload.edges || []) {
+    if (edge.relation_code === 'HAS_SIGNAL') signalOwner.set(String(edge.to), String(edge.from));
+  }
+  const nodes = new Map<string, Node>();
+  const edges = new Map<string, Edge>();
+  let connections = 0;
+  let models = 0;
+
+  for (const edge of payload.edges || []) {
+    const from = String(edge.from);
+    const to = String(edge.to);
+    if (edge.relation_code === 'COLLECTED_VIA' || edge.relation_code === 'USED_IN') {
+      const owner = signalOwner.get(from);
+      const target = nodesById.get(to);
+      if (!owner || !target || !resourceNames.has(owner)) continue;
+      const isConnection = edge.relation_code === 'COLLECTED_VIA';
+      const nodeId = `${isConnection ? 'conn' : 'model'}-${to}`;
+      const name = String(target.label || target.name || (isConnection ? 'Connection' : 'Data model'));
+      if (!nodes.has(nodeId)) {
+        if (isConnection) connections += 1;
+        else models += 1;
+        nodes.set(nodeId, {
+          id: nodeId,
+          type: isConnection ? 'connection' : 'model',
+          position: { x: 0, y: 0 },
+          data: isConnection
+            ? {
+                kind: 'connection',
+                id: to,
+                label: name,
+                protocol: String(target.protocol || ''),
+                protocolLabel: protocolLabel(String(target.protocol || '')),
+                health: String(target.health || ''),
+              }
+            : { kind: 'model', id: to, label: name, status: String(target.status || '') },
+        });
+      }
+      const groupId = `telemetry-${owner}`;
+      const edgeId = `${groupId}->${nodeId}-${edge.relation_code}`;
+      if (!edges.has(edgeId)) {
+        edges.set(
+          edgeId,
+          labeledEdge(
+            edgeId,
+            groupId,
+            nodeId,
+            edge.relation_code,
+            `${resourceNames.get(owner)} data`,
+            name,
+            isConnection ? '#2563EB' : '#7C3AED',
+          ),
+        );
+      }
+      continue;
+    }
+    if (CROSS_RELATIONS.has(edge.relation_code) && resourceNames.has(from) && resourceNames.has(to)) {
+      const edgeId = `${from}->${to}-${edge.relation_code}`;
+      edges.set(
+        edgeId,
+        labeledEdge(edgeId, from, to, edge.relation_code, resourceNames.get(from) || '', resourceNames.get(to) || '', '#64748B'),
+      );
+    }
+  }
+  return { nodes: Array.from(nodes.values()), edges: Array.from(edges.values()), connections, models };
+}
+
 export const KnowledgeGraphPage: React.FC = () => {
-  const { scopedResources, resources, signals } = useApp();
+  const { resources, signals, setSelectedResourceId } = useApp();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const focusParam = searchParams.get('resourceId') || '';
+
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-  const [selectedEntity, setSelectedEntity] = useState<Record<string, unknown> | null>(null);
+  const [selected, setSelected] = useState<SelectedEntity | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [layoutTrigger, setLayoutTrigger] = useState(0);
-  const isInitialLayoutDoneRef = useRef(false);
+  const [expansions, setExpansions] = useState<Record<string, Expansion>>({});
+  const [expanding, setExpanding] = useState<string | null>(null);
+  const [expandError, setExpandError] = useState<string | null>(null);
+  const nodesRef = useRef<Node[]>([]);
+  nodesRef.current = nodes;
+  const appliedLayoutTrigger = useRef(0);
+  const flowRef = useRef<ReactFlowInstance | null>(null);
 
-  const resourceList = useMemo(() => {
-    return scopedResources.length > 0 ? scopedResources : resources;
-  }, [scopedResources, resources]);
+  const resourceById = useMemo(() => new Map(resources.map((item) => [item.id, item])), [resources]);
+  const focus = focusParam ? resourceById.get(focusParam) : undefined;
 
-  // Topology fingerprint: changes ONLY when resources or signal-to-resource mappings change.
-  // Crucially: live telemetry value updates do NOT alter this key, eliminating graph flickering.
+  // Resources in view: the whole model, or the focused resource with its ancestors and descendants.
+  const viewResources = useMemo(() => {
+    if (!focus) return resources;
+    const keep = descendantIds(resources, focus.id);
+    ancestorPath(resources, focus.id).forEach((id) => keep.add(id));
+    return resources.filter((item) => keep.has(item.id));
+  }, [resources, focus]);
+
+  const viewIds = useMemo(() => new Set(viewResources.map((item) => item.id)), [viewResources]);
+  const viewSignals = useMemo(() => signals.filter((s) => viewIds.has(s.resourceId)), [signals, viewIds]);
+
+  const signalsByResource = useMemo(() => {
+    const map = new Map<string, SignalItem[]>();
+    for (const s of viewSignals) {
+      const list = map.get(s.resourceId) || [];
+      list.push(s);
+      map.set(s.resourceId, list);
+    }
+    return map;
+  }, [viewSignals]);
+
+  const goodSignals = useMemo(() => viewSignals.filter((s) => normalizeQuality(s.quality) === 'GOOD').length, [viewSignals]);
+
+  const resourceNames = useMemo(() => new Map(viewResources.map((item) => [item.id, item.name])), [viewResources]);
+  const visibleExpansions = useMemo(
+    () => Object.entries(expansions).filter(([resourceId]) => viewIds.has(resourceId)),
+    [expansions, viewIds],
+  );
+
+  // Topology fingerprint: changes only when the structure, signal ownership or expansions change.
+  // Live value updates do not alter it, so the canvas does not re-layout on every sample.
   const topologyFingerprint = useMemo(() => {
-    const rPart = resourceList
+    const rPart = viewResources
       .map((r) => `${r.id}:${r.parentId}:${r.name}:${r.code}:${r.type}`)
       .sort()
       .join(';');
-    const sPart = signals
-      .map((s) => `${s.id}:${s.resourceId || ''}`)
+    const sPart = viewSignals
+      .map((s) => `${s.id}:${s.resourceId}`)
       .sort()
       .join(';');
-    return `${rPart}###${sPart}`;
-  }, [resourceList, signals.map((s) => `${s.id}:${s.resourceId || ''}`).join(';')]);
+    const ePart = visibleExpansions
+      .map(([id, exp]) => `${id}:${exp.nodes.map((n) => n.id).join(',')}:${exp.edges.length}`)
+      .sort()
+      .join(';');
+    return `${focus?.id || ''}#${rPart}#${sPart}#${ePart}`;
+  }, [viewResources, viewSignals, visibleExpansions, focus]);
 
-  // Build full factory topology DAG (§9.6 TC-UI-KG-01..09)
   useEffect(() => {
     let active = true;
-
     void (async () => {
       try {
-        if (resourceList.length === 0) return;
-
-        const resMap = new Map<string, ResourceNode>();
-        resourceList.forEach((r) => resMap.set(r.id, r));
-
-        // 1. Structure Nodes
-        const rawNodes: Node[] = resourceList.map((r) => ({
+        if (viewResources.length === 0) {
+          setNodes([]);
+          setEdges([]);
+          return;
+        }
+        const rawNodes: Node[] = viewResources.map((r) => ({
           id: r.id,
           type: 'resource',
-          data: {
-            ...r,
-            label: r.name,
-            name: r.name,
-            code: r.code,
-            type: r.type,
-            type_key: r.type,
-            onClick: () => {
-              setSelectedEntity({
-                kind: 'resource',
-                ...r,
-              });
-            },
-          },
           position: { x: 0, y: 0 },
+          data: { label: r.name, name: r.name, code: r.code, type: r.type, type_key: r.type, isCenter: r.id === focus?.id },
         }));
-
-        // 2. Structure CONTAINS Edges
         const rawEdges: Edge[] = [];
-        resourceList.forEach((r) => {
-          if (r.parentId && resMap.has(r.parentId)) {
-            const parent = resMap.get(r.parentId)!;
-            rawEdges.push({
-              id: `${r.parentId}->${r.id}-CONTAINS`,
-              source: r.parentId,
-              target: r.id,
-              type: 'labeled',
-              markerEnd: { type: MarkerType.ArrowClosed, color: '#134074' },
-              data: {
-                relation_code: 'CONTAINS',
-                sourceLabel: parent.name,
-                targetLabel: r.name,
-              },
-            });
+        for (const r of viewResources) {
+          const parent = r.parentId ? resourceById.get(r.parentId) : undefined;
+          if (parent && viewIds.has(parent.id)) {
+            rawEdges.push(labeledEdge(`${parent.id}->${r.id}-CONTAINS`, parent.id, r.id, 'CONTAINS', parent.name, r.name, '#134074'));
           }
-        });
-
-        // 3. Telemetry Nodes and HAS_SIGNAL Edges
-        const signalsByRes = new Map<string, SignalItem[]>();
-        signals.forEach((s) => {
-          if (s.resourceId) {
-            if (!signalsByRes.has(s.resourceId)) signalsByRes.set(s.resourceId, []);
-            signalsByRes.get(s.resourceId)!.push(s);
-          }
-        });
-
-        signalsByRes.forEach((sigList, resId) => {
-          const res = resMap.get(resId);
-          const resName = res ? res.name : 'Asset';
-          const teleNodeId = `telemetry-${resId}`;
-
+        }
+        signalsByResource.forEach((list, resId) => {
+          const res = resourceById.get(resId);
+          const groupId = `telemetry-${resId}`;
           rawNodes.push({
-            id: teleNodeId,
+            id: groupId,
             type: 'telemetryGroup',
+            position: { x: 0, y: 0 },
             data: {
-              id: teleNodeId,
               kind: 'telemetryGroup',
               resourceId: resId,
-              label: `Data (${sigList.length})`,
-              signalCount: sigList.length,
-              resourceName: resName,
-              onClick: () => {
-                setSelectedEntity({
-                  kind: 'telemetryGroup',
-                  id: teleNodeId,
-                  resourceId: resId,
-                  name: `${resName} Data`,
-                  resourceName: resName,
-                });
-              },
-            },
-            position: { x: 0, y: 0 },
-          });
-
-          rawEdges.push({
-            id: `${resId}->${teleNodeId}-HAS_SIGNAL`,
-            source: resId,
-            target: teleNodeId,
-            type: 'labeled',
-            markerEnd: { type: MarkerType.ArrowClosed, color: '#10B981' },
-            data: {
-              relation_code: 'HAS_SIGNAL',
-              sourceLabel: resName,
-              targetLabel: 'Data',
+              resourceName: res?.name || '',
+              signalCount: list.length,
+              goodCount: list.filter((s) => normalizeQuality(s.quality) === 'GOOD').length,
             },
           });
+          rawEdges.push(labeledEdge(`${resId}->${groupId}-HAS_SIGNAL`, resId, groupId, 'HAS_SIGNAL', res?.name || '', 'Data', '#10B981'));
         });
+        const nodeIds = new Set(rawNodes.map((n) => n.id));
+        for (const [, exp] of visibleExpansions) {
+          for (const node of exp.nodes) {
+            if (!nodeIds.has(node.id)) {
+              nodeIds.add(node.id);
+              rawNodes.push(node);
+            }
+          }
+        }
+        const edgeIds = new Set(rawEdges.map((e) => e.id));
+        for (const [, exp] of visibleExpansions) {
+          for (const edge of exp.edges) {
+            if (!edgeIds.has(edge.id) && nodeIds.has(edge.source) && nodeIds.has(edge.target)) {
+              edgeIds.add(edge.id);
+              rawEdges.push(edge);
+            }
+          }
+        }
 
-        // Check if user has already positioned or dragged existing nodes
-        if (isInitialLayoutDoneRef.current && layoutTrigger === 0 && nodes.length > 0) {
-          const currentPositions = new Map<string, { x: number; y: number }>();
-          nodes.forEach((n) => currentPositions.set(n.id, n.position));
-
-          const allNodesExist = rawNodes.every((n) => currentPositions.has(n.id));
-          if (allNodesExist) {
-            setNodes(
-              rawNodes.map((n) => ({
-                ...n,
-                position: currentPositions.get(n.id) || n.position,
-              }))
-            );
+        // Keep the user's arrangement unless new nodes appeared or Reset layout was pressed.
+        const resetRequested = appliedLayoutTrigger.current !== layoutTrigger;
+        const current = nodesRef.current;
+        if (!resetRequested && current.length > 0) {
+          const positions = new Map(current.map((n) => [n.id, n.position]));
+          if (rawNodes.every((n) => positions.has(n.id))) {
+            setNodes(rawNodes.map((n) => ({ ...n, position: positions.get(n.id) || n.position })));
             setEdges(rawEdges);
             return;
           }
         }
 
-        // Layout DAG with ELK (horizontal Right flow)
         setIsLoading(true);
         const layouted = await layoutGraph(rawNodes, rawEdges, 'RIGHT');
         if (!active) return;
+        appliedLayoutTrigger.current = layoutTrigger;
         setNodes(layouted.nodes);
         setEdges(layouted.edges);
-        isInitialLayoutDoneRef.current = true;
+        // Frame the new arrangement once React Flow has measured the nodes.
+        window.setTimeout(() => {
+          if (active) void flowRef.current?.fitView({ padding: 0.15, duration: 300 });
+        }, 60);
       } catch (err) {
-        console.error('Failed to layout factory graph', err);
+        console.error('Failed to lay out the knowledge graph', err);
       } finally {
         if (active) setIsLoading(false);
       }
     })();
-
     return () => {
       active = false;
     };
+    // The fingerprint captures every structural input; values are patched by the effect below.
   }, [topologyFingerprint, layoutTrigger]);
 
+  // Live quality counts on data nodes, without re-layout.
+  const qualityFingerprint = useMemo(
+    () => viewSignals.map((s) => `${s.id}:${normalizeQuality(s.quality)}`).join(';'),
+    [viewSignals],
+  );
+  useEffect(() => {
+    setNodes((prev) =>
+      prev.map((node) => {
+        if (node.type !== 'telemetryGroup') return node;
+        const list = signalsByResource.get(String(node.data?.resourceId || '')) || [];
+        const goodCount = list.filter((s) => normalizeQuality(s.quality) === 'GOOD').length;
+        if (node.data?.goodCount === goodCount && node.data?.signalCount === list.length) return node;
+        return { ...node, data: { ...node.data, goodCount, signalCount: list.length } };
+      }),
+    );
+  }, [qualityFingerprint, signalsByResource, setNodes]);
+
   const handleNodeClick = (_: React.MouseEvent, node: Node) => {
-    setSelectedEntity(node.data as Record<string, unknown>);
+    const data = (node.data || {}) as Record<string, unknown>;
+    if (node.type === 'resource') setSelected({ kind: 'resource', id: node.id });
+    else if (node.type === 'telemetryGroup') setSelected({ kind: 'telemetryGroup', resourceId: String(data.resourceId || '') });
+    else if (node.type === 'connection')
+      setSelected({
+        kind: 'connection',
+        id: String(data.id || ''),
+        name: String(data.label || ''),
+        protocol: String(data.protocolLabel || ''),
+        health: String(data.health || ''),
+      });
+    else if (node.type === 'model')
+      setSelected({ kind: 'model', id: String(data.id || ''), name: String(data.label || ''), status: String(data.status || '') });
   };
 
-  const handleResetLayout = () => {
-    setLayoutTrigger((prev) => prev + 1);
+  const expand = useCallback(
+    async (resourceId: string) => {
+      setExpanding(resourceId);
+      setExpandError(null);
+      try {
+        const payload = await api<{ nodes?: NeighborNode[]; edges?: NeighborEdge[] }>(
+          `/api/v1/graph/neighbors?resource_id=${encodeURIComponent(resourceId)}&depth=2&include_data=true`,
+        );
+        const live = (payload.nodes || []).filter((node) => !node.archived_at);
+        const exp = buildExpansion({ nodes: live, edges: payload.edges }, resourceNames);
+        setExpansions((prev) => ({ ...prev, [resourceId]: exp }));
+      } catch (caught) {
+        setExpandError(translateApiError(caught));
+      } finally {
+        setExpanding(null);
+      }
+    },
+    [resourceNames],
+  );
+
+  const collapse = (resourceId: string) => {
+    setExpansions((prev) => {
+      const next = { ...prev };
+      delete next[resourceId];
+      return next;
+    });
   };
 
-  // Live signals for the selected entity in the drawer (updates in real time without touching canvas)
-  const drawerSignals = useMemo(() => {
-    if (!selectedEntity) return [];
-    const targetId = (selectedEntity.resourceId as string) || (selectedEntity.id as string);
-    return signals.filter((s) => s.resourceId === targetId);
-  }, [selectedEntity, signals]);
+  const focusOn = (resourceId: string | null) => {
+    const next = new URLSearchParams(searchParams);
+    if (resourceId) next.set('resourceId', resourceId);
+    else next.delete('resourceId');
+    setSearchParams(next, { replace: true });
+    setLayoutTrigger((value) => value + 1);
+  };
 
-  const resourceCount = resourceList.length;
+  const openInHierarchy = (resourceId: string) => {
+    setSelectedResourceId(resourceId);
+    navigate(`/factory/structure?resourceId=${encodeURIComponent(resourceId)}`);
+  };
 
-  if (resourceCount === 0) {
+  // ---- header content (all real data) ----
+  const focusPath = focus
+    ? ancestorPath(resources, focus.id)
+        .map((id) => resourceById.get(id))
+        .filter(Boolean) as ResourceNode[]
+    : [];
+  const roots = resources.filter((item) => !item.parentId || !resourceById.has(item.parentId));
+  const groupCount = signalsByResource.size;
+  const signalTotal = viewSignals.length;
+
+  if (resources.length === 0) {
     return (
       <div className="space-y-3">
-        <h1 className="text-xl font-bold text-[#0B2545]">Knowledge Graph</h1>
-        <p className="text-xs text-[#64748B]">
-          The graph is populated from the factory model. Create an enterprise and its children in Factory Structure first.
+        <h1 className="fx-page-title">Knowledge Graph</h1>
+        <p className="fx-page-subtitle">
+          The graph is drawn from the factory model. Add an enterprise and its sites, lines and machines in Hierarchy
+          Structure first.
         </p>
+        <button
+          type="button"
+          onClick={() => navigate('/factory/structure')}
+          className="inline-flex items-center gap-1.5 h-9 px-4 rounded-lg bg-[#EF1B24] text-white text-[13px] font-semibold hover:bg-[#D9141D]"
+        >
+          <ListTree className="w-4 h-4" aria-hidden="true" />
+          Open Hierarchy Structure
+        </button>
       </div>
     );
   }
 
+  const drawerResource =
+    selected?.kind === 'resource'
+      ? resourceById.get(selected.id)
+      : selected?.kind === 'telemetryGroup'
+        ? resourceById.get(selected.resourceId)
+        : undefined;
+  const drawerSignals = drawerResource ? signals.filter((s) => s.resourceId === drawerResource.id) : [];
+  const drawerExpansion = drawerResource ? expansions[drawerResource.id] : undefined;
+
   return (
-    <div className="space-y-4 animate-in fade-in duration-200 select-none pb-8">
-      {/* Top Header - Knowledge Graph */}
-      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2 mb-1 text-xs text-[#64748B]">
-            <span className="font-bold uppercase text-[#134074]">Plant Topology</span>
-            <span>·</span>
-            <span className="font-mono">TIPA · DongNai · Factory 1 · ASSY</span>
-          </div>
-          <h1 className="text-xl md:text-2xl font-black text-[#0B2545] tracking-tight">
-            Knowledge Graph: TIPA Enterprise
-          </h1>
-          <p className="text-xs text-[#64748B] mt-0.5">
-            Full enterprise asset topology and telemetry graph (16 structure nodes · 12 live data groups · 192 streaming signals).
+    <div className="space-y-4 animate-in fade-in duration-200 pb-8">
+      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
+        <div className="min-w-0">
+          <nav aria-label="Graph scope" className="flex flex-wrap items-center gap-1 mb-1 text-xs text-[#64748B]">
+            {focus ? (
+              <>
+                <button type="button" onClick={() => focusOn(null)} className="hover:underline">
+                  Whole model
+                </button>
+                {focusPath.map((item) => (
+                  <React.Fragment key={item.id}>
+                    <ChevronRight className="w-3 h-3 text-[#CBD5E1]" aria-hidden="true" />
+                    {item.id === focus.id ? (
+                      <span className="font-semibold text-[#334568]">{item.name}</span>
+                    ) : (
+                      <button type="button" onClick={() => focusOn(item.id)} className="hover:underline">
+                        {item.name}
+                      </button>
+                    )}
+                  </React.Fragment>
+                ))}
+              </>
+            ) : (
+              <span>{roots.length === 1 ? roots[0].name : `${roots.length} top-level resources`}</span>
+            )}
+          </nav>
+          <h1 className="fx-page-title">{focus ? `Knowledge Graph: ${focus.name}` : 'Knowledge Graph'}</h1>
+          <p className="fx-page-subtitle">
+            {viewResources.length} {viewResources.length === 1 ? 'resource' : 'resources'} · {groupCount}{' '}
+            {groupCount === 1 ? 'resource with data' : 'resources with data'} · {signalTotal}{' '}
+            {signalTotal === 1 ? 'signal' : 'signals'}
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 font-bold">
-            <Activity className="w-4 h-4 text-emerald-600 animate-pulse" />
-            <span>192 Signals Active (1 Hz)</span>
+        <div className="flex items-center gap-2 flex-wrap">
+          <div
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-semibold ${
+              signalTotal === 0
+                ? 'bg-slate-50 border-slate-200 text-slate-600'
+                : goodSignals === signalTotal
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-amber-50 border-amber-200 text-amber-800'
+            }`}
+          >
+            <Activity className="w-4 h-4" aria-hidden="true" />
+            <span>{signalTotal === 0 ? 'No signals bound yet' : `${goodSignals} of ${signalTotal} signals good`}</span>
           </div>
+          {focus && (
+            <button
+              type="button"
+              onClick={() => focusOn(null)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-semibold text-[#0B2545]"
+            >
+              Show whole model
+            </button>
+          )}
           <button
             type="button"
-            onClick={handleResetLayout}
-            title="Reset layout to auto-aligned hierarchical graph"
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-bold text-[#0B2545] shadow-sm transition active:scale-95"
+            onClick={() => setLayoutTrigger((prev) => prev + 1)}
+            title="Arrange the graph automatically again"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-semibold text-[#0B2545]"
           >
-            <RotateCcw className="w-3.5 h-3.5" />
-            <span>Reset Layout</span>
+            <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>Reset layout</span>
           </button>
         </div>
       </div>
 
-      {/* Main Canvas Viewport with Drawer */}
+      {focusParam && !focus && (
+        <p role="status" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          The requested resource is not in the model (it may have been archived). Showing the whole model.
+        </p>
+      )}
+
       <div className="relative h-[720px] rounded-2xl border border-[#CBD5E1] bg-[#F8FAFC] shadow-sm overflow-hidden flex">
         <div className="flex-1 h-full relative">
           {isLoading && (
             <div className="absolute inset-0 bg-white/70 backdrop-blur-xs flex items-center justify-center z-10">
-              <div className="flex items-center gap-2 text-xs font-bold text-[#0B2545]">
-                <Activity className="w-4 h-4 animate-spin text-[#134074]" />
-                <span>Computing hierarchical DAG layout…</span>
+              <div className="flex items-center gap-2 text-xs font-semibold text-[#0B2545]">
+                <Loader2 className="w-4 h-4 animate-spin text-[#134074]" aria-hidden="true" />
+                <span>Arranging the graph…</span>
               </div>
             </div>
           )}
@@ -292,7 +540,11 @@ export const KnowledgeGraphPage: React.FC = () => {
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onNodeClick={handleNodeClick}
-            nodesDraggable={true}
+            onPaneClick={() => setSelected(null)}
+            onInit={(instance) => {
+              flowRef.current = instance;
+            }}
+            nodesDraggable
             fitView
             minZoom={0.15}
             maxZoom={2.5}
@@ -304,190 +556,238 @@ export const KnowledgeGraphPage: React.FC = () => {
               nodeColor={(node) => {
                 if (node.type === 'telemetryGroup') return '#10B981';
                 if (node.type === 'connection') return '#3B82F6';
-                if (node.type === 'edgeNode') return '#0B2545';
+                if (node.type === 'model') return '#7C3AED';
                 return '#64748B';
               }}
               className="!border !border-[#E2E8F0] !rounded-xl !overflow-hidden !shadow-sm"
             />
           </ReactFlow>
 
-          {/* Legend Banner */}
-          <div className="absolute bottom-3 left-3 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-xl border border-[#E2E8F0] shadow-sm flex items-center gap-3 text-[11px] font-semibold text-[#475569] pointer-events-none">
-            <div className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded bg-[#0B2545]" />
-              <span>Asset Structure (CONTAINS)</span>
-            </div>
-            <div className="flex items-center gap-1.5">
+          <div className="absolute bottom-3 left-14 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-xl border border-[#E2E8F0] shadow-sm flex flex-wrap items-center gap-3 text-[11px] font-medium text-[#475569] pointer-events-none">
+            <span className="flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded bg-[#64748B]" />
+              Resource (contains)
+            </span>
+            <span className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded bg-[#10B981]" />
-              <span>Data Group (HAS_SIGNAL)</span>
-            </div>
+              Data (has data)
+            </span>
+            {visibleExpansions.some(([, exp]) => exp.connections + exp.models > 0) && (
+              <>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded bg-[#3B82F6]" />
+                  Connection (collected via)
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded bg-[#7C3AED]" />
+                  Data model (used in)
+                </span>
+              </>
+            )}
           </div>
         </div>
 
-        {/* Right Details Panel for Clicked Node (§9.6 TC-UI-KG-09) */}
-        {selectedEntity && (
-          <div className="w-80 md:w-96 bg-white border-l border-[#E2E8F0] h-full flex flex-col p-4 shadow-xl z-20 animate-in slide-in-from-right duration-200 overflow-y-auto">
-            <div className="flex items-center justify-between pb-3 border-b border-[#E2E8F0]">
-              <div>
-                <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-[#F1F5F9] text-[#475569] font-bold">
-                  {String(selectedEntity.kind || selectedEntity.type || 'Entity')}
+        {selected && (
+          <aside
+            aria-label="Details"
+            className="w-80 md:w-96 bg-white border-l border-[#E2E8F0] h-full flex flex-col p-4 shadow-xl z-20 animate-in slide-in-from-right duration-200 overflow-y-auto"
+          >
+            <div className="flex items-start justify-between gap-2 pb-3 border-b border-[#E2E8F0]">
+              <div className="min-w-0">
+                <span className="text-[10px] uppercase px-2 py-0.5 rounded bg-[#F1F5F9] text-[#475569] font-semibold">
+                  {selected.kind === 'resource' && drawerResource
+                    ? resourceTypeLabel(drawerResource.type)
+                    : selected.kind === 'telemetryGroup'
+                      ? 'Data'
+                      : selected.kind === 'connection'
+                        ? 'Connection'
+                        : 'Data model'}
                 </span>
-                <h3 className="text-sm font-bold text-[#0B2545] mt-1 truncate">
-                  {String(selectedEntity.label || selectedEntity.name || selectedEntity.key || 'Node details')}
-                </h3>
+                <h2 className="text-sm font-bold text-[#0B2545] mt-1 break-words">
+                  {selected.kind === 'connection' || selected.kind === 'model'
+                    ? selected.name
+                    : selected.kind === 'telemetryGroup'
+                      ? `${drawerResource?.name || ''} data`
+                      : drawerResource?.name}
+                </h2>
               </div>
               <button
                 type="button"
-                onClick={() => setSelectedEntity(null)}
+                onClick={() => setSelected(null)}
+                aria-label="Close details"
                 className="p-1 rounded-md text-[#64748B] hover:text-[#0B2545] hover:bg-[#E2E8F0] transition-colors"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Telemetry Group Drawer Detail */}
-            {String(selectedEntity.kind || selectedEntity.type) === 'telemetryGroup' && (
-              <div className="space-y-3 mt-3">
-                <div className="p-3 rounded-2xl bg-gradient-to-br from-emerald-500/10 to-teal-500/10 border border-emerald-300">
+            {selected.kind === 'connection' && (
+              <div className="mt-3 space-y-3 text-xs">
+                <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] space-y-2">
                   <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-800">
-                      Live Observation Stream
-                    </span>
-                    <span className="text-[10px] font-mono font-bold bg-emerald-600 text-white px-2 py-0.5 rounded-full">
-                      {drawerSignals.length} TAGS ACTIVE
-                    </span>
+                    <span className="text-[#64748B]">Protocol</span>
+                    <span className="font-semibold text-[#0B2545]">{selected.protocol || '—'}</span>
                   </div>
-                  <p className="text-[11px] text-emerald-700 mt-1">
-                    Real-time streaming telemetry from active data connections
-                  </p>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#64748B]">Health</span>
+                    <span className="font-semibold text-[#0B2545] capitalize">{selected.health.toLowerCase() || '—'}</span>
+                  </div>
                 </div>
-
-                <div className="space-y-2 max-h-[560px] overflow-y-auto pr-1">
-                  {drawerSignals.length === 0 ? (
-                    <div className="text-center py-6 text-xs text-slate-400">No signals assigned to this unit.</div>
-                  ) : (
-                    drawerSignals.map((sig, idx) => {
-                      const val =
-                        sig.value !== undefined && sig.value !== null
-                          ? typeof sig.value === 'object'
-                            ? (sig.value as any)?.v ?? JSON.stringify(sig.value)
-                            : sig.value
-                          : sig.currentValue !== undefined && sig.currentValue !== null
-                          ? sig.currentValue
-                          : '—';
-                      const isGood = (sig.quality || '').toLowerCase() === 'good';
-                      return (
-                        <div
-                          key={sig.id || idx}
-                          className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#CBD5E1] hover:border-emerald-400 transition"
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="font-mono text-xs font-bold text-[#0B2545]">
-                              {sig.key || sig.tag || sig.name}
-                            </span>
-                            <span
-                              className={`text-[9px] font-bold px-1.5 py-0.2 rounded ${
-                                isGood ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
-                              }`}
-                            >
-                              {sig.quality || 'NO_DATA'}
-                            </span>
-                          </div>
-                          <div className="mt-1 flex items-baseline justify-between">
-                            <span className="text-base font-black font-mono text-[#0B2545]">
-                              {String(val)}
-                            </span>
-                            <span className="text-[10px] text-slate-500 font-mono">
-                              {sig.unit || ''}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
+                <button
+                  type="button"
+                  onClick={() => navigate('/collector/connections')}
+                  className="w-full h-8 rounded-lg border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-semibold text-[#0B2545]"
+                >
+                  Open Connections
+                </button>
               </div>
             )}
 
-            {/* Resource Drawer Detail */}
-            {String(selectedEntity.kind || selectedEntity.type) === 'resource' && (
-              <div className="mt-4 space-y-3 text-xs">
-                <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[#64748B]">Resource Type</span>
-                    <span className="font-bold uppercase font-mono text-[#134074]">
-                      {String(selectedEntity.type || '')}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-[#64748B]">Resource Code</span>
-                    <span className="font-mono font-semibold text-[#0B2545]">
-                      {String(selectedEntity.code || '')}
-                    </span>
-                  </div>
-                  {Boolean(selectedEntity.parentId) && (
-                    <div className="flex items-center justify-between">
-                      <span className="text-[#64748B]">Parent Unit</span>
+            {selected.kind === 'model' && (
+              <div className="mt-3 space-y-3 text-xs">
+                <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] flex items-center justify-between">
+                  <span className="text-[#64748B]">Status</span>
+                  <span className="font-semibold text-[#0B2545] capitalize">{selected.status.toLowerCase() || '—'}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => navigate('/models')}
+                  className="w-full h-8 rounded-lg border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-semibold text-[#0B2545]"
+                >
+                  Open Model Catalog
+                </button>
+              </div>
+            )}
+
+            {drawerResource && (selected.kind === 'resource' || selected.kind === 'telemetryGroup') && (
+              <div className="mt-3 space-y-3 text-xs">
+                {selected.kind === 'resource' && (
+                  <div className="p-3 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] space-y-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-[#64748B]">Code</span>
+                      <span className="font-mono font-semibold text-[#0B2545] break-all text-right">{drawerResource.code}</span>
+                    </div>
+                    {drawerResource.parentId && resourceById.get(drawerResource.parentId) && (
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-[#64748B]">Parent</span>
+                        <span className="font-semibold text-[#0B2545] text-right break-words">
+                          {resourceById.get(drawerResource.parentId)?.name}
+                        </span>
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-[#64748B]">Sub-units</span>
                       <span className="font-semibold text-[#0B2545]">
-                        {resources.find((r) => r.id === selectedEntity.parentId)?.name ||
-                          String(selectedEntity.parentId)}
+                        {resources.filter((item) => item.parentId === drawerResource.id).length}
                       </span>
                     </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => openInHierarchy(drawerResource.id)}
+                    className="h-8 rounded-lg border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-semibold text-[#0B2545] inline-flex items-center justify-center gap-1.5"
+                  >
+                    <ListTree className="w-3.5 h-3.5" aria-hidden="true" />
+                    Open in hierarchy
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => focusOn(drawerResource.id)}
+                    disabled={focus?.id === drawerResource.id}
+                    className="h-8 rounded-lg border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-semibold text-[#0B2545] inline-flex items-center justify-center gap-1.5 disabled:opacity-50"
+                  >
+                    <Crosshair className="w-3.5 h-3.5" aria-hidden="true" />
+                    Focus here
+                  </button>
+                </div>
+
+                <div className="p-3 rounded-xl border border-[#E2E8F0] space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-[#0B2545]">Connections and data models</span>
+                    {drawerExpansion ? (
+                      <button type="button" onClick={() => collapse(drawerResource.id)} className="text-[#2A82E7] hover:underline">
+                        Hide
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => void expand(drawerResource.id)}
+                        disabled={expanding === drawerResource.id}
+                        className="inline-flex items-center gap-1 text-[#2A82E7] hover:underline disabled:opacity-60"
+                      >
+                        {expanding === drawerResource.id ? (
+                          <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
+                        ) : (
+                          <Cable className="w-3 h-3" aria-hidden="true" />
+                        )}
+                        Show in graph
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-[#64748B]">
+                    {drawerExpansion
+                      ? `${drawerExpansion.connections} ${drawerExpansion.connections === 1 ? 'connection' : 'connections'} and ${drawerExpansion.models} ${drawerExpansion.models === 1 ? 'data model' : 'data models'} linked to this resource and the resources around it.`
+                      : 'Adds the connections that collect this data and the data models that use it.'}
+                  </p>
+                  {expandError && expanding === null && !drawerExpansion && (
+                    <p role="alert" className="text-[11px] text-red-600">
+                      {expandError}
+                    </p>
                   )}
                 </div>
 
-                {/* Direct Signals under this resource */}
-                {drawerSignals.length > 0 && (
-                  <div className="space-y-2 mt-4">
-                    <div className="flex items-center justify-between text-[11px] font-bold uppercase tracking-wider text-[#64748B]">
-                      <span>Direct Signals ({drawerSignals.length})</span>
-                      <span className="text-emerald-600 font-mono">● Live Stream</span>
-                    </div>
+                <div className="space-y-2">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[#64748B]">
+                    Signals ({drawerSignals.length})
+                  </div>
+                  {drawerSignals.length === 0 ? (
+                    <p className="text-[#94A3B8]">No signals are bound to this resource.</p>
+                  ) : (
                     <div className="space-y-1.5 max-h-[380px] overflow-y-auto pr-1">
                       {drawerSignals.map((sig) => {
-                        const val =
-                          sig.value !== undefined && sig.value !== null
-                            ? typeof sig.value === 'object'
-                              ? (sig.value as any)?.v ?? JSON.stringify(sig.value)
-                              : sig.value
-                            : sig.currentValue !== undefined && sig.currentValue !== null
-                            ? sig.currentValue
-                            : '—';
-                        const isGood = (sig.quality || '').toLowerCase() === 'good';
+                        const quality = normalizeQuality(sig.quality);
+                        const label = sig.displayName || sig.key || sig.name;
                         return (
-                          <div
-                            key={sig.id}
-                            className="p-2 rounded-lg bg-[#F8FAFC] border border-slate-200 flex items-center justify-between"
-                          >
-                            <div>
-                              <div className="font-mono font-bold text-xs text-[#0B2545]">
-                                {sig.key || sig.tag}
+                          <div key={sig.id} className="p-2 rounded-lg bg-[#F8FAFC] border border-slate-200 flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="font-semibold text-xs text-[#0B2545] truncate" title={label}>
+                                {label}
                               </div>
-                              <div className="text-[10px] text-slate-500 font-mono">
-                                {sig.dataType || 'number'}
-                              </div>
+                              {sig.key && sig.key !== label && (
+                                <div className="text-[10px] text-slate-500 font-mono truncate">{sig.key}</div>
+                              )}
                             </div>
-                            <div className="text-right">
-                              <div className="font-mono font-black text-xs text-[#0B2545]">
-                                {String(val)}
+                            <div className="text-right shrink-0">
+                              <div className="font-mono font-bold text-xs text-[#0B2545]">
+                                {formatValue(sig.value)}
+                                {sig.unit ? <span className="font-sans font-normal text-[10px] text-slate-500 ml-1">{sig.unit}</span> : null}
                               </div>
                               <div
-                                className={`text-[9px] font-bold ${
-                                  isGood ? 'text-emerald-600' : 'text-red-600'
+                                className={`text-[10px] font-semibold ${
+                                  quality === 'GOOD'
+                                    ? 'text-emerald-600'
+                                    : quality === 'UNCERTAIN'
+                                      ? 'text-amber-600'
+                                      : quality === 'NO_DATA' || quality === 'DISABLED'
+                                        ? 'text-slate-500'
+                                        : 'text-red-600'
                                 }`}
                               >
-                                {sig.quality || 'NO_DATA'}
+                                {QUALITY_LABEL[quality]}
                               </div>
                             </div>
                           </div>
                         );
                       })}
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             )}
-          </div>
+          </aside>
         )}
       </div>
     </div>

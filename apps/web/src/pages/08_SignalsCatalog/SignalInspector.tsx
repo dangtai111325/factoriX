@@ -16,6 +16,7 @@ import {
 import { SignalItem } from '../../types';
 import { Button } from '../../components/common/Button';
 import { StatusBadge } from '../../components/common/StatusBadge';
+import { QUALITY_LABEL, formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
 
 interface SignalInspectorProps {
   signal: SignalItem | null;
@@ -27,18 +28,6 @@ interface SignalInspectorProps {
   resourceName?: string;
   connectionName?: string;
   edgeName?: string;
-}
-
-function timeAgo(isoString: string | null | undefined): string {
-  if (!isoString) return '—';
-  const diffSec = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
-  if (diffSec < 0 || isNaN(diffSec)) return 'just now';
-  if (diffSec < 60) return `${diffSec} s ago`;
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin} min ago`;
-  const diffHour = Math.floor(diffMin / 60);
-  if (diffHour < 24) return `${diffHour} h ago`;
-  return `${Math.floor(diffHour / 24)} d ago`;
 }
 
 export const SignalInspector: React.FC<SignalInspectorProps> = ({
@@ -55,21 +44,20 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
   if (!isOpen || !signal) return null;
 
   const isEnabled = signal.enabled !== false;
-  const quality = !isEnabled ? 'DISABLED' : (signal.quality || 'NO_DATA').toUpperCase();
-
-  const formattedVal =
-    signal.value === null || signal.value === undefined
-      ? '—'
-      : typeof signal.value === 'number'
-      ? Number.isInteger(signal.value)
-        ? String(signal.value)
-        : signal.value.toFixed(2)
-      : String(signal.value);
-
-  const staleSec = signal.expectedIntervalMs ? Math.round(signal.expectedIntervalMs / 1000) : 10;
+  const quality = !isEnabled ? 'DISABLED' : normalizeQuality(signal.quality);
+  const formattedVal = formatValue(signal.value);
+  // Center rule: stale after max(2 x expected interval, 12 s) without a new read.
+  const staleSec = Math.round(Math.max(2 * (signal.expectedIntervalMs || 1000), 12000) / 1000);
+  const lastRead = signal.receivedTime || signal.lastUpdated;
 
   return (
-    <div className="fixed inset-y-0 right-0 w-full sm:w-96 bg-white border-l border-slate-200 shadow-xl z-40 flex flex-col justify-between">
+    <aside
+      role="dialog"
+      aria-modal="false"
+      aria-label={`Signal ${signal.key || signal.name}`}
+      style={{ top: 'var(--fx-topbar-height)' }}
+      className="fixed bottom-0 right-0 w-full sm:w-96 bg-white border-l border-slate-200 shadow-xl z-20 flex flex-col justify-between"
+    >
       {/* Top Header */}
       <div>
         <div className="p-4 border-b border-slate-100 flex items-center justify-between">
@@ -98,8 +86,11 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
                   <span className="text-[14px] font-normal text-[#657794]">{signal.unit}</span>
                 )}
               </div>
-              <div className="text-[11px] text-[#657794] mt-0.5" title={signal.lastUpdated ? new Date(signal.lastUpdated).toLocaleString() : ''}>
-                Updated {timeAgo(signal.lastUpdated)}
+              <div className="text-[11px] text-[#657794] mt-0.5" title={formatTimestamp(lastRead)}>
+                Last read {timeAgo(lastRead)}
+              </div>
+              <div className="text-[11px] text-[#657794]" title={formatTimestamp(signal.sourceTime)}>
+                Last change {signal.sourceTime ? timeAgo(signal.sourceTime) : '—'}
               </div>
             </div>
             <StatusBadge status={quality} />
@@ -107,17 +98,21 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
 
           {/* Quality Reason */}
           <div className="text-[11px] text-[#657794] bg-white p-2.5 rounded border border-slate-200">
-            <span className="font-semibold text-slate-700">Quality reason: </span>
-            {signal.qualityReason ||
-              (quality === 'GOOD'
-                ? 'Valid payload format and within expected interval'
-                : quality === 'STALE'
-                ? `No update received within ${staleSec} s`
-                : quality === 'BAD'
-                ? 'Field missing in payload or type mismatch'
-                : quality === 'DISABLED'
-                ? 'Signal collection paused by user'
-                : 'Awaiting initial sample')}
+            <span className="font-semibold text-slate-700">Quality: </span>
+            <span className="font-semibold text-slate-700">{QUALITY_LABEL[quality]}</span>
+            {signal.reasonCode ? <span className="font-mono"> · {signal.reasonCode}</span> : null}
+            {' — '}
+            {quality === 'GOOD'
+              ? 'Value read successfully within the expected interval.'
+              : quality === 'STALE'
+              ? `No new read within ${staleSec} s.`
+              : quality === 'UNCERTAIN'
+              ? 'The source or the collector flagged this value as uncertain.'
+              : quality === 'BAD'
+              ? 'The last read failed or could not be decoded.'
+              : quality === 'DISABLED'
+              ? 'Collection is disabled for this signal.'
+              : 'No sample received yet.'}
           </div>
         </div>
 
@@ -141,21 +136,17 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
               <span className="text-[#657794]">Connection:</span>
-              <span className="font-medium text-[#111B37]">{connectionName || 'mqtt-lab'}</span>
+              <span className="font-medium text-[#111B37]">{connectionName || '—'}</span>
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-[#657794]">Topic / Address:</span>
-              <span className="font-mono text-[#111B37] text-[11px] truncate max-w-[200px]" title={signal.topic || signal.address}>
-                {signal.topic || signal.address || '—'}
+              <span className="text-[#657794]">Address:</span>
+              <span className="font-mono text-[#111B37] text-[11px] break-all text-right max-w-[220px]" title={signal.bindingAddress}>
+                {signal.bindingAddress || '—'}
               </span>
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-[#657794]">Field path:</span>
-              <span className="font-mono text-[#111B37] text-[11px]">{signal.address || `$.${signal.key}`}</span>
-            </div>
-            <div className="flex justify-between py-1 border-b border-slate-100">
               <span className="text-[#657794]">Edge collector:</span>
-              <span className="font-medium text-[#111B37]">{edgeName || 'Edge DongNai'}</span>
+              <span className="font-medium text-[#111B37]">{edgeName || '—'}</span>
             </div>
           </div>
 
@@ -166,7 +157,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
               <span className="text-[#657794]">Data type:</span>
-              <span className="font-semibold text-[#111B37] capitalize">{signal.dataType || signal.type || 'Float32'}</span>
+              <span className="font-semibold text-[#111B37] capitalize">{signal.data_type || signal.dataType || '—'}</span>
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
               <span className="text-[#657794]">Unit:</span>
@@ -214,6 +205,6 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
           </Button>
         </div>
       </div>
-    </div>
+    </aside>
   );
 };

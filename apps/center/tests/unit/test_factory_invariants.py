@@ -153,6 +153,7 @@ async def test_restore_resource_restores_only_previously_enabled_bindings() -> N
 
     with patch("factorix.modules.resources._resource", AsyncMock(return_value=mock_archived_resource)), \
          patch("factorix.modules.resources.fetch_one", AsyncMock(return_value=None)), \
+         patch("factorix.modules.resources.fetch_all", AsyncMock(return_value=[{"id": sig_enabled, "key_taken": False}, {"id": sig_disabled, "key_taken": False}])), \
          patch("factorix.modules.resources.execute", AsyncMock()) as mock_exec, \
          patch("factorix.modules.resources.audit", AsyncMock()), \
          patch("factorix.modules.resources.get_resource", AsyncMock(return_value={"id": str(resource_id), "status": "ACTIVE"})), \

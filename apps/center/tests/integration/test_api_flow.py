@@ -274,7 +274,8 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
             json={
                 "observations": [
                     {**payload, "event_uid": "edge-01:temp:1", "event_time": newer, "received_time": newer, "value": 1, "origin": "REPLAYED"},
-                    {**payload, "event_uid": "edge-01:temp:0", "event_time": older, "received_time": newer, "value": 10, "origin": "REPLAYED"},
+                    # Latest is ordered by acquisition time (received_time): an older acquisition never wins.
+                    {**payload, "event_uid": "edge-01:temp:0", "event_time": older, "received_time": older, "value": 10, "origin": "REPLAYED"},
                 ]
             },
         )
@@ -310,13 +311,22 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
                 "resource_id": machine.json()["id"],
                 "key": "state",
                 "display_name": "State",
-                "members": [{"signal_id": signal_id, "alias": "temperature"}],
+                "members": [
+                    {"kind": "system", "alias": "source_timestamp", "field": "source_timestamp"},
+                    {"kind": "system", "alias": "publish_timestamp", "field": "publish_timestamp"},
+                    {"kind": "signal", "signal_id": signal_id, "alias": "temperature"},
+                ],
             },
         )
         assert group.status_code == 201, group.text
         preview = await client.get(f"/api/v1/output-groups/{group.json()['id']}/preview")
         assert preview.status_code == 200, preview.text
-        assert preview.json()["values"]["temperature"]["value"] == 0
+        assert preview.json()["values"]["temperature"] == 0
+        assert preview.json()["body"].startswith('{"source_timestamp":')
+        published = await client.post(f"/api/v1/output-groups/{group.json()['id']}/publish", headers=headers, json={"version": 1})
+        assert published.status_code == 200, published.text
+        latest_body = await client.get(f"/api/v1/output-groups/{group.json()['id']}/latest")
+        assert latest_body.status_code == 200 and '"temperature":0' in latest_body.json()["body"]
         dashboard = await client.post("/api/v1/dashboards", headers=headers, json={"name": "Chuyen lap rap", "site_id": site_id})
         assert dashboard.status_code == 201, dashboard.text
         drafted = await client.patch(

@@ -116,25 +116,82 @@ def _assert_depth(value: Any, depth: int) -> None:
             _assert_depth(item, depth + 1)
 
 
-def ordering_key(event_time: datetime, received_time: datetime, event_uid: str) -> tuple[datetime, datetime, str]:
-    return (ensure_utc(event_time), ensure_utc(received_time), event_uid)
+SOURCE_TIME_FUTURE = "SOURCE_TIME_FUTURE"
+EDGE_CLOCK_FUTURE = "EDGE_CLOCK_FUTURE"
+
+
+@dataclass(frozen=True, slots=True)
+class TimeDecision:
+    """Result of the time model for one incoming sample.
+
+    event_time is always the acquisition time (received_time). source_time is metadata only.
+    """
+
+    event_time: datetime
+    received_time: datetime
+    source_time: datetime | None
+    quality: str
+    reason: str | None
+
+
+def resolve_times(
+    *,
+    received_time: datetime | None,
+    source_time: datetime | None,
+    quality: str,
+    now: datetime | None = None,
+) -> TimeDecision:
+    """Apply the FactoriX time model.
+
+    - event_time = received_time (acquisition time on the edge), always.
+    - source_time (the source's last-change time) is kept as metadata. An old source_time never
+      downgrades quality. A source_time more than FUTURE_SKEW ahead of received_time marks a GOOD
+      sample UNCERTAIN with reason SOURCE_TIME_FUTURE; the sample is still accepted.
+    - A received_time more than FUTURE_SKEW ahead of the Center clock is impossible for a real
+      acquisition. It is clamped to the Center clock (UNCERTAIN, EDGE_CLOCK_FUTURE) so that one
+      bad edge clock cannot freeze the latest value ordering.
+    """
+    current = ensure_utc(now or datetime.now(timezone.utc))
+    received = ensure_utc(received_time) if received_time is not None else current
+    source = ensure_utc(source_time) if source_time is not None else None
+    upper = str(quality or "GOOD").upper()
+    reason: str | None = None
+    if received > current + FUTURE_SKEW:
+        received = current
+        reason = EDGE_CLOCK_FUTURE
+        if upper == "GOOD":
+            upper = "UNCERTAIN"
+    if source is not None and source > received + FUTURE_SKEW:
+        if upper == "GOOD":
+            upper = "UNCERTAIN"
+        reason = reason or SOURCE_TIME_FUTURE
+    return TimeDecision(event_time=received, received_time=received, source_time=source, quality=upper, reason=reason)
+
+
+def ordering_key(received_time: datetime, observation_id: str) -> tuple[datetime, str]:
+    """Latest-state ordering: acquisition time first, observation id as the tie breaker."""
+    return (ensure_utc(received_time), str(observation_id))
 
 
 def should_replace_latest(
     *,
-    current_event_time: datetime | None,
     current_received_time: datetime | None,
     current_uid: str | None,
-    incoming_event_time: datetime,
     incoming_received_time: datetime,
     incoming_uid: str,
+    current_event_time: datetime | None = None,
+    incoming_event_time: datetime | None = None,
 ) -> bool:
-    """Newer source/event time wins. Replayed older samples must not regress latest."""
-    if current_event_time is None or current_received_time is None or current_uid is None:
+    """Newer acquisition (received_time, observation id) wins; replayed older samples never regress latest.
+
+    event_time arguments are accepted for compatibility and ignored: event_time equals received_time
+    by contract, and the source clock never takes part in the ordering. Mirrors the SQL guard in
+    ``telemetry._upsert_latest``.
+    """
+    del current_event_time, incoming_event_time
+    if current_received_time is None or current_uid is None:
         return True
-    incoming = ordering_key(incoming_event_time, incoming_received_time, incoming_uid)
-    current = ordering_key(current_event_time, current_received_time, current_uid)
-    return incoming > current
+    return ordering_key(incoming_received_time, incoming_uid) > ordering_key(current_received_time, current_uid)
 
 
 def classify_clock(
@@ -143,7 +200,10 @@ def classify_clock(
     *,
     now: datetime | None = None,
 ) -> Quality | None:
-    """Return UNCERTAIN when the source timestamp is too far in the future; None means accept as-is."""
+    """Return UNCERTAIN when a timestamp is too far ahead of the Center clock; None means accept as-is.
+
+    Ingest uses ``resolve_times``; this helper remains for callers that only need the check.
+    """
     now = now or datetime.now(timezone.utc)
     if ensure_utc(event_time) > ensure_utc(now) + FUTURE_SKEW:
         return Quality.UNCERTAIN

@@ -75,6 +75,7 @@ def evaluate_signal_state(
     last_good_time: datetime | None = None,
     raw_reason_code: str | None = None,
     acquisition_mode: str = "POLL",
+    null_allowed: bool = False,
 ) -> SignalEvaluationResult:
     """Canonical single-source-of-truth evaluator for effective signal status across FactoriX."""
     eval_now = now or datetime.now(timezone.utc)
@@ -131,8 +132,9 @@ def evaluate_signal_state(
         if elapsed_ms > stale_after_ms:
             is_stale = True
 
-    # 3. Explicit BAD from source or null value on scalar measurement
-    if raw_value is None and norm_quality == "GOOD":
+    # 3. Explicit BAD from source or null value on scalar measurement.
+    # A field declared nullable (address.nullable) reports a successful read of null as GOOD.
+    if raw_value is None and norm_quality == "GOOD" and not null_allowed:
         return SignalEvaluationResult(
             source_quality=str(SourceQuality.BAD),
             freshness=str(Freshness.STALE if is_stale else Freshness.FRESH),

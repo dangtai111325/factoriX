@@ -25,6 +25,24 @@ def iso(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def iso_ms(value: datetime | str | None) -> str | None:
+    """Contract timestamp text: ``YYYY-MM-DDTHH:mm:ss.SSSZ`` (UTC, exactly 3 fraction digits)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    moment = value.astimezone(timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
 def dump(row: Any) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -53,6 +71,38 @@ async def fetch_all(session: AsyncSession, sql: str, params: dict[str, Any]) -> 
 
 async def execute(session: AsyncSession, sql: str, params: dict[str, Any]) -> None:
     await session.execute(text(sql), params)
+
+
+async def execute_rowcount(session: AsyncSession, sql: str, params: dict[str, Any]) -> int:
+    """Execute a DML statement and return the number of affected rows (for optimistic locking)."""
+    result = await session.execute(text(sql), params)
+    return int(result.rowcount or 0)
+
+
+def queue_stream_event(
+    session: AsyncSession,
+    kind: str,
+    tenant_id: Any,
+    payload: dict[str, Any],
+    *,
+    signal_id: Any = None,
+    group_id: Any = None,
+) -> None:
+    """Queue a push event for the ``/stream`` hub; it leaves the process only after commit.
+
+    Routing (see ``factorix.transport.hub``): ``latest`` goes to sockets subscribed to
+    ``signal_id``; ``health`` goes to every socket of the tenant; any other kind carrying a
+    ``group_id`` (``model_body``, ``model_event``) goes to sockets subscribed to that group via
+    ``{"op": "subscribe_models"}``. ``payload`` is sent to the browser as-is.
+    """
+    from factorix.platform.after_commit import queue
+
+    event: dict[str, Any] = {"kind": kind, "tenant_id": str(tenant_id), "payload": payload}
+    if signal_id is not None:
+        event["signal_id"] = str(signal_id)
+    if group_id is not None:
+        event["group_id"] = str(group_id)
+    queue(session, event)
 
 
 def jsonb(value: Any) -> str:
