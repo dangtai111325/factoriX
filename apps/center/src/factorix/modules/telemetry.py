@@ -616,8 +616,10 @@ async def storage_overview(session: AsyncSession, tenant_id: UUID) -> dict[str, 
     quality = await fetch_all(
         session,
         """
-        SELECT quality, count(*) AS count FROM latest_signal_state
-        WHERE tenant_id = :tenant_id GROUP BY quality
+        SELECT l.quality, count(*) AS count FROM latest_signal_state l
+        JOIN signal_definitions s ON s.id = l.signal_id
+        WHERE l.tenant_id = :tenant_id AND s.status = 'ACTIVE'
+        GROUP BY l.quality
         """,
         {"tenant_id": tenant_id},
     )
