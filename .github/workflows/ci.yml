@@ -17,6 +17,10 @@ jobs:
           python -m pip install -r infrastructure/docker/requirements.txt
           python -m pip install pytest pytest-asyncio
       - name: Run unit & safety tests
+        env:
+          FACTORIX_DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/factorix_test
+          FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+          FACTORIX_ENVIRONMENT: test
         run: |
           python -m pytest apps/center/tests/unit apps/edge/tests tests/safety -q
 
