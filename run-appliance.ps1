@@ -6,15 +6,12 @@ if (-not (Test-Path .env)) {
   Write-Error "Missing .env next to this script. Copy your appliance env file first."
 }
 
-Write-Host "Backing up current factorix image tag if exists..."
-docker tag factorix factorix:backup 2>$null | Out-Null
-
 Write-Host "Building factorix image..."
 docker build -t factorix .
 
 Write-Host "Replacing container factorix-appliance..."
 docker rm -f factorix-appliance 2>$null | Out-Null
-docker run -d --name factorix-appliance --env-file .env -p 8080:8080 -v factorix-data:/data factorix
+docker run -d --name factorix-appliance --restart unless-stopped --env-file .env -p 8080:8080 -v factorix-data:/data factorix
 
 # Docker Desktop sometimes leaves the container in "created"; force start.
 Start-Sleep -Seconds 2
