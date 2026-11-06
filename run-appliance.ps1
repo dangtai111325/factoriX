@@ -8,6 +8,9 @@ if (-not (Test-Path .env)) {
 
 Write-Host "Building factorix image..."
 docker build -t factorix .
+if ($LASTEXITCODE -ne 0) {
+  Write-Error "Image build failed; the running appliance was left unchanged."
+}
 
 Write-Host "Replacing container factorix-appliance..."
 docker rm -f factorix-appliance 2>$null | Out-Null
