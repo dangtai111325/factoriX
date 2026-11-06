@@ -48,6 +48,10 @@ MAX_CAPTURE_BYTES = 65536
 
 
 class Stages:
+    """Stage results. Statuses: PASSED, FAILED, NOT_APPLICABLE, NOT_TESTED and SKIPPED (the stage
+    could not be verified with the given input, e.g. HTTP authentication without a data path;
+    the detail says why). Only FAILED fails a test."""
+
     def __init__(self, names: list[str]) -> None:
         self.items = [{"stage": name, "status": "NOT_TESTED", "duration_ms": 0, "detail": ""} for name in names]
         self.by_name = {item["stage"]: item for item in self.items}
@@ -56,6 +60,12 @@ class Stages:
     def set(self, name: str, status: str, detail: str = "") -> None:
         item = self.by_name.get(name)
         now = time.monotonic()
+        if item is None and status == "FAILED":
+            # A failure in a stage the requested mode does not list (e.g. READ in a CONNECTIVITY
+            # test) is still shown, so the overall result never contradicts the stage list.
+            item = {"stage": name, "status": "NOT_TESTED", "duration_ms": 0, "detail": ""}
+            self.items.append(item)
+            self.by_name[name] = item
         if item is not None:
             item["status"] = status
             item["detail"] = detail[:240]
@@ -67,6 +77,30 @@ class Stages:
             if item["status"] == "NOT_TESTED":
                 self.set(item["stage"], "FAILED", detail)
                 return
+
+    @property
+    def failed(self) -> dict[str, Any] | None:
+        return next((item for item in self.items if item["status"] == "FAILED"), None)
+
+
+def overall_status(passed: bool, stages: Stages, diagnostic: str) -> tuple[bool, str]:
+    """The overall result is derived from the stages (R2-CN-03).
+
+    PASSED needs the probe to succeed and no FAILED stage. A probe that failed without marking a
+    stage marks the first stage it did not reach, so the stage list always shows the cause.
+    Returns ``(passed, diagnostic)``.
+    """
+    failed = stages.failed
+    if passed and failed is None:
+        return True, ""
+    if failed is None:
+        stages.fail_next(diagnostic or "The test stopped before this stage.")
+        failed = stages.failed
+        if failed is None:
+            logger.error("Commissioning probe failed without a failing stage: %s", diagnostic)
+            stages.items.append({"stage": "RESULT", "status": "FAILED", "duration_ms": 0, "detail": (diagnostic or "Test failed.")[:240]})
+            failed = stages.items[-1]
+    return False, diagnostic or str(failed.get("detail") or "") or "Test failed."
 
 
 def _key(item: dict[str, Any]) -> str:
@@ -160,10 +194,9 @@ class Commissioner:
             error_code = error.code
             diagnostic = str(error)
             stages.fail_next(diagnostic)
-        if not passed and not diagnostic:
-            failed = next((item for item in stages.items if item["status"] == "FAILED"), None)
+        passed, diagnostic = overall_status(passed, stages, diagnostic)
+        if not passed:
             error_code = error_code or "FAILED"
-            diagnostic = (failed or {}).get("detail") or "Commissioning did not prove live data collection."
         await self._report(
             job_id,
             {
@@ -368,7 +401,13 @@ class Commissioner:
             await connector.close()
 
     async def _probe_http(self, job: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]], stages: Stages, mode: str, allow: list[AllowedEndpoint]) -> tuple[bool, dict[str, Any]]:
+        """REACH and AUTH use a real data path: the first field's path, else the connection's
+        ``path``, else the test's ``test_path``. Without any path the host is only reached and
+        AUTH is SKIPPED ("Not verified"), never PASSED: a public root URL proves nothing about
+        the credential (R2-CN-01). A 401/403 always fails AUTH.
+        """
         base_url = str(config.get("base_url") or config.get("url") or "")
+        auth = str(config.get("auth") or "none").lower()
         try:
             connector = HttpPullConnector(
                 base_url,
@@ -385,8 +424,12 @@ class Commissioner:
         for item in fields:
             paths.setdefault(str(field_address(item).get("path") or config.get("path") or "/"), []).append(item)
         if not paths:
-            paths[str(config.get("path") or "/")] = []
+            probe = str(config.get("path") or job.get("test_path") or "").strip()
+            if probe:
+                paths[probe] = []
         try:
+            if not paths:
+                return await self._http_reach_only(connector, base_url, headers, auth, stages, mode)
             samples: list[Sample] = []
             documents: dict[str, Any] = {}
             for index, (path, path_fields) in enumerate(list(paths.items())[:6]):
@@ -394,21 +437,27 @@ class Commissioner:
                     documents[path] = await connector.get_json(path, headers, max_wait_s=8.0)
                 except ConnectorError as exc:
                     if index == 0:
-                        if exc.code == "AUTH":
-                            stages.set("REACH", "PASSED", f"Reached {base_url}")
-                            stages.set("AUTH", "FAILED", str(exc))
-                        elif exc.code in {"NETWORK", "TIMEOUT", "REDIRECT"}:
+                        if exc.code in {"NETWORK", "TIMEOUT", "REDIRECT", "RATE_LIMITED"}:
                             stages.set("REACH", "FAILED", str(exc))
+                            return False, {}
+                        stages.set("REACH", "PASSED", f"Reached {base_url}")
+                        if exc.code == "AUTH":
+                            stages.set("AUTH", "FAILED", f"The source rejected the credential on GET {path}: {exc} Check the {auth_label(auth)}.")
+                            return False, {}
+                        if auth == "none":
+                            stages.set("AUTH", "NOT_APPLICABLE", "No authentication configured")
                         else:
-                            stages.set("REACH", "PASSED", f"Reached {base_url}")
-                            stages.set("AUTH", "PASSED", "")
-                            stages.set("READ", "FAILED", str(exc))
+                            stages.set("AUTH", "SKIPPED", f"Not verified: GET {path} did not answer with data ({exc})")
+                        stages.set("READ", "FAILED", f"GET {path}: {exc}")
                         return False, {}
                     samples.extend(Sample(_key(f), None, "BAD", None, exc.code) for f in path_fields)
                     continue
                 if index == 0:
                     stages.set("REACH", "PASSED", f"Reached {base_url}")
-                    stages.set("AUTH", "PASSED", "No authentication" if str(config.get("auth") or "none") == "none" else f"Accepted {config.get('auth')}")
+                    if auth == "none":
+                        stages.set("AUTH", "NOT_APPLICABLE", "No authentication configured")
+                    else:
+                        stages.set("AUTH", "PASSED", f"Accepted {auth_label(auth)} on GET {path}")
                     if mode == "CONNECTIVITY":
                         return True, {}
                 samples.extend(project_json(path_fields, documents[path], now_iso()))
@@ -416,10 +465,35 @@ class Commissioner:
             stages.set("SAMPLE", "PASSED" if documents else "FAILED", "JSON body received" if documents else "No JSON body")
             if not fields:
                 stages.set("MAP", "NOT_APPLICABLE", "No fields to map")
-                return True, {"response": _json_safe(next(iter(documents.values()), None))}
+                return bool(documents), {"response": _json_safe(next(iter(documents.values()), None))}
             return _map_stage(stages, fields, samples)
         finally:
             await connector.close()
+
+    async def _http_reach_only(
+        self, connector: HttpPullConnector, base_url: str, headers: dict[str, str], auth: str, stages: Stages, mode: str
+    ) -> tuple[bool, dict[str, Any]]:
+        """No data path: prove the host answers; authentication stays unverified."""
+        try:
+            await connector.get_json("", headers, max_wait_s=8.0)
+        except ConnectorError as exc:
+            if exc.code in {"NETWORK", "TIMEOUT", "REDIRECT", "RATE_LIMITED"}:
+                stages.set("REACH", "FAILED", str(exc))
+                return False, {}
+            if exc.code == "AUTH":
+                stages.set("REACH", "PASSED", f"Reached {base_url}")
+                stages.set("AUTH", "FAILED", f"The source rejected the credential at {base_url}: {exc} Check the {auth_label(auth)}.")
+                return False, {}
+        stages.set("REACH", "PASSED", f"Reached {base_url}")
+        if auth == "none":
+            stages.set("AUTH", "NOT_APPLICABLE", "No authentication configured")
+        else:
+            stages.set("AUTH", "SKIPPED", "Not verified — add a data path")
+        if mode != "CONNECTIVITY":
+            stages.set("READ", "NOT_APPLICABLE", "No data path to read. Add a field or a test path.")
+            stages.set("SAMPLE", "NOT_APPLICABLE", "No data path to read")
+            stages.set("MAP", "NOT_APPLICABLE", "No fields to map")
+        return True, {}
 
     async def _ws_connector(self, job: dict[str, Any], config: dict[str, Any], allow: list[AllowedEndpoint]) -> WebSocketConnector:
         headers = await http_headers(config, job.get("secret_ref"), self.secret)
@@ -536,6 +610,10 @@ class Commissioner:
             channel = urlparse(connector.url).path or "/"
             return group_samples([(channel, frame.document, frame.received_time, frame.raw) for frame in frames]), []
         raise ConnectorError("PROTOCOL", "Capture is not supported for this protocol.")
+
+
+def auth_label(auth: str) -> str:
+    return {"api_key": "API key", "bearer": "bearer token", "basic": "user name and password"}.get(auth, "credential")
 
 
 def group_samples(messages: list[tuple[Any, ...]]) -> list[dict[str, Any]]:

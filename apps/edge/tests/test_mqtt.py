@@ -121,3 +121,23 @@ def test_missing_skip_vs_bad() -> None:
     assert skip == {}
     _, bad = map_mqtt_messages([_field("b", "uns/m1/status", "$.status", missing="BAD")], CONFIG, messages)
     assert bad["b"].quality == "BAD" and bad["b"].reason == "FIELD_MISSING"
+
+
+def test_latest_only_throttle_is_per_field_not_per_job() -> None:
+    """R2-SG-01: a second machine's message is not held back by the first machine's emit slot."""
+    from factorix_edge.jobs import FieldThrottle
+    from factorix_edge.mapping import Sample
+
+    def sample(fid: str, value: int) -> Sample:
+        return Sample(fid, value, "GOOD", None, None, "2026-11-06T08:00:00.000Z")
+
+    throttle = FieldThrottle(1.0)
+    throttle.offer({"m1.temp": sample("m1.temp", 1)})
+    assert [s.value for s in throttle.due(0.0)] == [1]
+    throttle.offer({"m2.temp": sample("m2.temp", 2)})  # other machine, 0.3 s later
+    assert [s.field_id for s in throttle.due(0.3)] == ["m2.temp"]
+    throttle.offer({"m1.temp": sample("m1.temp", 3)})  # same field again within its interval: held
+    assert throttle.due(0.5) == [] and throttle.wait(0.5) == pytest.approx(0.5)
+    throttle.offer({"m1.temp": sample("m1.temp", 4)})  # newest wins while held
+    assert [s.value for s in throttle.due(1.0)] == [4]
+    assert throttle.wait(1.0) is None

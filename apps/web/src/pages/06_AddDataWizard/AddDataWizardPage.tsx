@@ -24,11 +24,14 @@ import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { validateTopicFilter } from '../../utils/mqttTopic';
 import { api, ApiError } from '../../api/client';
-import { BrowseNode, CommissionResult, runCapture, runConnectionTest } from '../../lib/commissioning';
+import { BrowseNode, COLLECTOR_STARTING_MESSAGE, CommissionResult, runCapture, runConnectionTest, useCollectorStarting } from '../../lib/commissioning';
 import { formatValue } from '../../lib/format';
 import { ConnectionFormModal, SavedConnection } from '../05_Connections/ConnectionFormModal';
+import { ModalPortal } from '../../components/modals/ModalPortal';
+import { PROTOCOL_LABEL } from '../../lib/protocols';
 import { ConnectionStatusCell } from '../05_Connections/connectionStatus';
 import { TestResultPanel } from '../05_Connections/TestResultPanel';
+import { DEFAULT_HTTP_RATE_LIMIT, httpPathsOfConnection, rateBudget } from '../05_Connections/httpRate';
 import { FieldTable } from './FieldTable';
 import { JsonSampleTree } from './JsonSampleTree';
 import { SimilarResourcesDialog } from './SimilarResourcesDialog';
@@ -55,6 +58,8 @@ import {
   nodeIdField,
   parseRegisterMap,
   rewriteProblems,
+  rewriteText,
+  targetAddress,
   validateRows,
 } from './wizardModel';
 
@@ -123,13 +128,6 @@ interface TargetOutcome {
   message: string;
 }
 
-const PROTOCOL_LABEL: Record<ProtocolType, string> = {
-  mqtt: 'MQTT',
-  modbus: 'Modbus TCP',
-  opcua: 'OPC UA',
-  http: 'HTTP / REST',
-  websocket: 'WebSocket',
-};
 
 const POLLING: ProtocolType[] = ['modbus', 'opcua', 'http', 'websocket'];
 const JSON_PROTOCOLS: ProtocolType[] = ['mqtt', 'http', 'websocket'];
@@ -242,6 +240,12 @@ export const AddDataWizardPage: React.FC = () => {
 
   /** Connection whose interval / unit id come from the restored draft instead of the server. */
   const draftConnectionRef = useRef<string | null>(null);
+  /** QoS chosen by the user in this wizard; otherwise it follows the connection's default QoS. */
+  const qosTouchedRef = useRef(false);
+  const [connectionQos, setConnectionQos] = useState<number | null>(null);
+  const collectorStarting = useCollectorStarting();
+  /** Value read from the OPC UA source-time node by the last test (R2-AD-05). */
+  const [sourceTimeValue, setSourceTimeValue] = useState<string | null>(null);
 
   // Restore draft, then apply deep-link parameters.
   useEffect(() => {
@@ -345,6 +349,15 @@ export const AddDataWizardPage: React.FC = () => {
         const jobInterval = detail.jobs?.[0]?.interval_ms;
         const proto = protocolFromApi(detail.protocol);
         const fallback = proto === 'http' ? 5000 : 1000;
+        // R2-AD-04: the field QoS defaults to the connection's QoS unless the user picked another one.
+        const cfgQos = Number(cfg.qos);
+        const defaultQos = cfgQos === 0 || cfgQos === 1 || cfgQos === 2 ? cfgQos : 1;
+        if (proto === 'mqtt') {
+          setConnectionQos(defaultQos);
+          if (!qosTouchedRef.current) setMqttQos(defaultQos);
+        } else {
+          setConnectionQos(null);
+        }
         if (draftConnectionRef.current === detail.id) {
           // Keep the values restored from the draft once.
           draftConnectionRef.current = null;
@@ -352,7 +365,6 @@ export const AddDataWizardPage: React.FC = () => {
         }
         setIntervalMs(Number(jobInterval) || fallback);
         if (proto === 'modbus') setModbusUnitId(Number(cfg.unit_id ?? 1));
-        if (proto === 'mqtt') setMqttQos(typeof cfg.qos === 'number' ? (cfg.qos as number) : 1);
       })
       .catch((error) => {
         if (!cancelled) setConnDetailError(error instanceof Error ? error.message : 'Could not load the connection.');
@@ -365,17 +377,14 @@ export const AddDataWizardPage: React.FC = () => {
   const invalidateTest = useCallback(() => {
     setTestResult(null);
     setLiveValues({});
+    setSourceTimeValue(null);
     setAcceptUntested(false);
   }, []);
 
-  const settings: AddressSettings = {
-    protocol,
-    mqttQos,
-    timestampMode,
-    timestampPath,
-    opcTimestampNodeId,
-    modbusUnitId,
-  };
+  const settings: AddressSettings = useMemo(
+    () => ({ protocol, mqttQos, timestampMode, timestampPath, opcTimestampNodeId, modbusUnitId }),
+    [protocol, mqttQos, timestampMode, timestampPath, opcTimestampNodeId, modbusUnitId],
+  );
 
   // ---------------------------------------------------------------- Step 3 helpers
   const connectionSignals = useMemo(() => signals.filter((s) => s.sourceConnectionId === selectedConnectionId), [signals, selectedConnectionId]);
@@ -625,10 +634,14 @@ export const AddDataWizardPage: React.FC = () => {
     setTesting(true);
     setTestResult(null);
     setLiveValues({});
-    const result = await runConnectionTest(selectedConnectionId, {
-      mode: 'FULL',
-      fields: fields.map((row) => ({ key: row.key.trim(), name: row.displayName || row.key, data_type: row.dataType, address: buildAddress(row, settings) })),
-    });
+    setSourceTimeValue(null);
+    // OPC UA: also read the source-time node so the operator sees the group timestamp it returns.
+    const tsNode = protocol === 'opcua' ? opcTimestampNodeId.trim() : '';
+    const usedKeys = new Set(fields.map((row) => row.key.trim()));
+    const tsKey = tsNode ? ['source_timestamp', 'source_time_node', '_source_time_node'].find((k) => !usedKeys.has(k)) || '' : '';
+    const testFields = fields.map((row) => ({ key: row.key.trim(), name: row.displayName || row.key, data_type: row.dataType, address: buildAddress(row, settings) }));
+    if (tsKey) testFields.push({ key: tsKey, name: 'Source time', data_type: 'string', address: { node_id: tsNode, nullable: true } });
+    const result = await runConnectionTest(selectedConnectionId, { mode: 'FULL', fields: testFields });
     setTesting(false);
     setTestResult(result);
     const samplesObj = result.samples && typeof result.samples === 'object' && !Array.isArray(result.samples) ? (result.samples as Record<string, unknown>) : {};
@@ -654,6 +667,10 @@ export const AddDataWizardPage: React.FC = () => {
       if (found) values[row.id] = typeof value === 'string' && responseDoc ? value : formatValue(value);
     });
     setLiveValues(values);
+    if (tsKey) {
+      const raw = tsKey in samplesObj ? samplesObj[tsKey] : tsNode in samplesObj ? samplesObj[tsNode] : undefined;
+      setSourceTimeValue(raw === undefined || raw === null ? 'not returned' : formatValue(raw));
+    }
   };
 
   // ---------------------------------------------------------------- Similar machines
@@ -665,8 +682,15 @@ export const AddDataWizardPage: React.FC = () => {
   }, [resources, targetResource, targetSiteId]);
 
   const rewriteRows = useMemo(
-    () => rewrites.map((rw) => ({ rw, rows: fields.map((row) => applyRewrite(protocol, row, rw)), problems: rewriteProblems(protocol, fields, rw) })),
-    [rewrites, fields, protocol],
+    () =>
+      rewrites.map((rw) => ({
+        rw,
+        rows: fields.map((row) => applyRewrite(protocol, row, rw)),
+        // Full address_json per source row: every address string (incl. source time node / path) rewritten.
+        addresses: fields.map((row) => targetAddress(row, settings, rw)),
+        problems: rewriteProblems(protocol, fields, rw, { settings, sourceCode: targetResource?.code || '' }),
+      })),
+    [rewrites, fields, protocol, settings, targetResource?.code],
   );
 
   // ---------------------------------------------------------------- Start collecting
@@ -674,9 +698,14 @@ export const AddDataWizardPage: React.FC = () => {
     if (!selectedTargetId || !connDetail || !validateCurrentRows()) return;
     setSubmitError(null);
     setOutcomes(null);
-    const targets: Array<{ resourceId: string; name: string; rows: FieldRow[]; unitId: number }> = [
-      { resourceId: selectedTargetId, name: targetResource?.name || targetResource?.code || 'Target', rows: fields, unitId: modbusUnitId },
-      ...rewriteRows.map(({ rw, rows }) => ({ resourceId: rw.resourceId, name: rw.resourceName, rows, unitId: Number(rw.unitId) })),
+    const targets: Array<{ resourceId: string; name: string; rows: FieldRow[]; addresses: Array<Record<string, unknown>> }> = [
+      {
+        resourceId: selectedTargetId,
+        name: targetResource?.name || targetResource?.code || 'Target',
+        rows: fields,
+        addresses: fields.map((row) => buildAddress(row, settings)),
+      },
+      ...rewriteRows.map(({ rw, rows, addresses }) => ({ resourceId: rw.resourceId, name: rw.resourceName, rows, addresses })),
     ];
     // Validate every target before creating anything.
     for (const { rw, problems } of rewriteRows) {
@@ -712,14 +741,13 @@ export const AddDataWizardPage: React.FC = () => {
       }
       const expected = isPolling ? intervalMs : 1000;
       for (const target of targets) {
-        const targetSettings: AddressSettings = { ...settings, modbusUnitId: target.unitId };
         try {
           await api('/api/v1/signals/bulk', {
             method: 'POST',
             body: JSON.stringify({
               resource_id: target.resourceId,
               atomic: true,
-              items: target.rows.map((row) => ({
+              items: target.rows.map((row, index) => ({
                 key: row.key.trim(),
                 name: (row.displayName || row.key).trim(),
                 data_type: row.dataType,
@@ -728,7 +756,7 @@ export const AddDataWizardPage: React.FC = () => {
                 source_field: {
                   acquisition_job_id: jobId,
                   address_kind: addressKindFor(protocol),
-                  address: buildAddress(row, targetSettings),
+                  address: target.addresses[index],
                 },
               })),
             }),
@@ -782,6 +810,21 @@ export const AddDataWizardPage: React.FC = () => {
     navigate(-1);
   };
 
+  // R2-AD-01: entering Review runs the live test automatically (Modbus / OPC keep the result of their
+  // "Test read" in step 4 unless the fields changed since).
+  const autoTestedRef = useRef(false);
+  useEffect(() => {
+    if (currentStep !== 5) {
+      autoTestedRef.current = false;
+      return;
+    }
+    if (autoTestedRef.current || testing || testResult || !fields.length || !connDetail) return;
+    autoTestedRef.current = true;
+    void handleRunTest();
+    // handleRunTest reads the current state; re-running it on every field edit is not wanted.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStep, connDetail]);
+
   const testPassed = Boolean(testResult?.passed);
   const canStart = fields.length > 0 && (testPassed || acceptUntested) && !submitting;
 
@@ -789,8 +832,20 @@ export const AddDataWizardPage: React.FC = () => {
   const stepTitle = ['Choose target resource', 'Select data source', 'Source address', 'Map fields', 'Review & start'][currentStep - 1];
   const labelCls = 'block text-[11px] font-semibold text-[#657794] uppercase mb-1';
   const inputCls = 'w-full px-3 py-2 border border-slate-300 rounded text-[12px] focus:outline-none focus:border-blue-500';
-  const requestsPerMinute = protocol === 'http' && intervalMs > 0 ? Math.round((60000 / intervalMs) * (1 + rewrites.length)) : 0;
-  const rateLimit = Number(connDetail?.config_json?.rate_limit_per_min ?? 60) || 60;
+  // R2-CN-04: the rate limit covers the whole connection: every distinct path already bound on it plus
+  // the paths this wizard adds (target + similar machines), each requested once per interval.
+  const rateLimit = Number(connDetail?.config_json?.rate_limit_per_min ?? DEFAULT_HTTP_RATE_LIMIT) || DEFAULT_HTTP_RATE_LIMIT;
+  const httpBudget = (() => {
+    if (protocol !== 'http' || !selectedConnectionId || intervalMs <= 0) return null;
+    const paths = httpPathsOfConnection(signals, selectedConnectionId);
+    const existing = paths.size;
+    const newPath = httpPath.trim();
+    if (newPath) {
+      paths.add(newPath);
+      rewrites.forEach((rw) => paths.add(rewriteText(newPath, 'http', rw)));
+    }
+    return { ...rateBudget(paths.size, intervalMs, rateLimit), existing };
+  })();
 
   return (
     <div className="max-w-6xl mx-auto space-y-6 pb-12">
@@ -864,7 +919,7 @@ export const AddDataWizardPage: React.FC = () => {
             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
             <input type="text" aria-label="Search resources" placeholder="Search resources by name or code…" value={targetSearch} onChange={(e) => setTargetSearch(e.target.value)} className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded text-[13px] focus:outline-none focus:border-blue-500" />
           </div>
-          <div role="tree" className="border border-slate-200 rounded-xl max-h-96 overflow-y-auto p-2 bg-[#F8FAFC]">
+          <div role="tree" aria-label="Target resource" className="border border-slate-200 rounded-xl max-h-96 overflow-y-auto p-2 bg-[#F8FAFC]">
             {wizardTree.length === 0 ? (
               <div className="text-center py-8 text-slate-400 text-xs font-medium">No resources yet. Build the factory model first.</div>
             ) : (
@@ -878,6 +933,8 @@ export const AddDataWizardPage: React.FC = () => {
                     <React.Fragment key={node.resource.id}>
                       <div
                         role="treeitem"
+                        aria-label={`${node.resource.name || node.resource.code} (${node.resource.type}${node.resource.code ? `, ${node.resource.code}` : ''})`}
+                        aria-level={depth + 1}
                         aria-selected={selected}
                         aria-expanded={hasChildren ? expanded : undefined}
                         tabIndex={0}
@@ -1072,11 +1129,16 @@ export const AddDataWizardPage: React.FC = () => {
               )}
               <div className="max-w-xs">
                 <label className={labelCls} htmlFor="wiz-qos">QoS</label>
-                <select id="wiz-qos" value={mqttQos} onChange={(e) => { setMqttQos(Number(e.target.value)); invalidateTest(); }} className={`${inputCls} bg-white`}>
+                <select id="wiz-qos" value={mqttQos} onChange={(e) => { qosTouchedRef.current = true; setMqttQos(Number(e.target.value)); invalidateTest(); }} className={`${inputCls} bg-white`}>
                   <option value={0}>0 – at most once</option>
                   <option value={1}>1 – at least once</option>
                   <option value={2}>2 – exactly once</option>
                 </select>
+                {connectionQos !== null && (
+                  <p className="text-[10px] text-[#657794] mt-1">
+                    {mqttQos === connectionQos ? `Default QoS of the connection (${connectionQos}).` : `The connection default is ${connectionQos}; these fields use ${mqttQos}.`}
+                  </p>
+                )}
               </div>
             </div>
           )}
@@ -1117,13 +1179,7 @@ export const AddDataWizardPage: React.FC = () => {
                 <input id="wiz-interval" type="number" min={1000} step={500} value={intervalMs} onChange={(e) => { setIntervalMs(Number(e.target.value)); invalidateTest(); }} className={`${inputCls} font-mono`} />
                 <p className="text-[10px] text-[#657794] mt-1">Applies to the whole connection (current: {job?.interval_ms ?? '—'} ms).</p>
               </div>
-              {protocol === 'http' && (
-                <div className={`p-2.5 rounded-lg border text-[11px] self-start ${requestsPerMinute > rateLimit ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-slate-50 border-slate-200 text-[#657794]'}`}>
-                  This path is requested {Math.round(60000 / Math.max(intervalMs, 1))} time(s) per minute
-                  {rewrites.length ? `; with ${rewrites.length} similar machine(s) about ${requestsPerMinute}/min in total` : ''}. Connection rate limit: {rateLimit}/min.
-                  {requestsPerMinute > rateLimit && ' Increase the interval or the rate limit, otherwise the collector throttles requests.'}
-                </div>
-              )}
+              {httpBudget && <HttpBudgetNote budget={httpBudget} />}
             </div>
           )}
 
@@ -1176,6 +1232,9 @@ export const AddDataWizardPage: React.FC = () => {
             </div>
           </div>
 
+          {collectorStarting && (capturing || browsing || testing) && (
+            <p role="status" className="text-[12px] text-[#134074] bg-[#EEF5FF] border border-[#D2E3FA] rounded-lg px-3 py-2">{COLLECTOR_STARTING_MESSAGE}</p>
+          )}
           {captureError && <p role="alert" className="text-[12px] text-red-600">{captureError}</p>}
 
           {isJson && samples.length > 0 && (
@@ -1263,6 +1322,40 @@ export const AddDataWizardPage: React.FC = () => {
                   </div>
                 )}
                 {browseError && <p className="text-[11px] text-red-600">{browseError}</p>}
+                {browseNodes && browseNodes.some((node) => node.node_class.toLowerCase().includes('variable')) && (() => {
+                  const variables = browseNodes.filter((node) => node.node_class.toLowerCase().includes('variable'));
+                  const pending = variables.filter((node) => !fields.some((row) => row.nodeId === node.node_id) && node.node_id !== opcTimestampNodeId);
+                  return (
+                    <div className="flex items-center justify-between gap-2 text-[11px]">
+                      <span className="text-[#657794]">{variables.length} variable(s) in {browseStack[browseStack.length - 1]?.label || 'this folder'}</span>
+                      <button
+                        type="button"
+                        disabled={pending.length === 0}
+                        onClick={() => {
+                          const added: FieldRow[] = [];
+                          let tsNode = '';
+                          pending.forEach((node) => {
+                            const field = nodeIdField(node.node_id) || node.browse_name;
+                            // A variable named source_timestamp is the group timestamp, not a signal.
+                            if (field === 'source_timestamp' && !opcTimestampNodeId.trim()) {
+                              tsNode = node.node_id;
+                              return;
+                            }
+                            const key = keyFromRawName(field);
+                            added.push(emptyRow('opcua', { key, displayName: node.display_name || key, nodeId: node.node_id }));
+                          });
+                          if (tsNode) setOpcTimestampNodeId(tsNode);
+                          setFields((prev) => [...prev, ...added]);
+                          setNodeMessage(`${added.length} node(s) added.${tsNode ? ` ${tsNode} is used as the source time of every field.` : ''}`);
+                          invalidateTest();
+                        }}
+                        className="font-semibold text-emerald-700 hover:underline disabled:text-slate-400 disabled:no-underline"
+                      >
+                        {pending.length === 0 ? 'All added' : `Add all variables (${pending.length})`}
+                      </button>
+                    </div>
+                  );
+                })()}
                 {browseNodes && browseNodes.length > 0 && (
                   <div className="max-h-64 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100">
                     {browseNodes.map((node) => {
@@ -1370,6 +1463,12 @@ export const AddDataWizardPage: React.FC = () => {
           {(protocol === 'opcua' || protocol === 'modbus') && (testing || testResult) && (
             <TestResultPanel running={testing} result={testResult} successLabel="Values read by the Edge collector are shown in the table" />
           )}
+          {protocol === 'opcua' && sourceTimeValue !== null && (
+            <p className="text-[12px] text-[#334568]">
+              Source time node <span className="font-mono text-[11px]">{opcTimestampNodeId}</span>:{' '}
+              <span className={`font-mono text-[11px] ${sourceTimeValue === 'not returned' ? 'text-slate-400' : 'text-emerald-700 font-semibold'}`}>{sourceTimeValue}</span>
+            </p>
+          )}
 
           <div className="flex justify-between pt-3 border-t border-slate-100">
             <Button variant="outline" size="sm" onClick={() => setCurrentStep(3)}>
@@ -1383,6 +1482,7 @@ export const AddDataWizardPage: React.FC = () => {
       )}
 
       {pasteOpen && (
+        <ModalPortal>
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div role="dialog" aria-modal="true" aria-labelledby="wiz-paste-title" className="bg-white rounded-2xl border border-slate-300 shadow-2xl max-w-lg w-full p-5 space-y-4">
             <div className="flex items-center justify-between pb-2 border-b border-slate-100">
@@ -1406,6 +1506,7 @@ export const AddDataWizardPage: React.FC = () => {
             </div>
           </div>
         </div>
+        </ModalPortal>
       )}
 
       {/* STEP 5 */}
@@ -1441,6 +1542,7 @@ export const AddDataWizardPage: React.FC = () => {
               </Button>
             </div>
             {similarCandidates.length === 0 && <p className="text-[11px] text-[#657794]">No other {targetResource?.type} in this site.</p>}
+            {httpBudget && (httpBudget.over || rewrites.length > 0) && <HttpBudgetNote budget={httpBudget} />}
             {rewrites.length > 0 && (
               <div className="flex flex-wrap gap-1.5">
                 {rewriteRows.map(({ rw, problems }) => (
@@ -1509,9 +1611,26 @@ export const AddDataWizardPage: React.FC = () => {
             <Button variant="outline" size="sm" onClick={() => setCurrentStep(4)}>
               <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back to fields
             </Button>
-            <Button variant="primary" size="sm" disabled={!canStart} onClick={() => void handleStartCollecting()}>
-              {submitting ? 'Starting collection…' : 'Start collecting'}
-            </Button>
+            <div className="flex items-center gap-3">
+              {!canStart && !submitting && (
+                <span id="wiz-start-hint" className="text-[11px] text-[#657794] text-right">
+                  {testing
+                    ? 'Waiting for the test result…'
+                    : !testResult
+                      ? 'Run the test first.'
+                      : 'The test failed: fix the fields, or tick "Start collecting anyway".'}
+                </span>
+              )}
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={!canStart}
+                aria-describedby={!canStart && !submitting ? 'wiz-start-hint' : undefined}
+                onClick={() => void handleStartCollecting()}
+              >
+                {submitting ? 'Starting collection…' : 'Start collecting'}
+              </Button>
+            </div>
           </div>
         </Card>
       )}
@@ -1523,6 +1642,7 @@ export const AddDataWizardPage: React.FC = () => {
           source={targetResource}
           candidates={similarCandidates}
           rows={fields}
+          settings={settings}
           sourceUnitId={modbusUnitId}
           initial={rewrites}
           onCancel={() => setSimilarOpen(false)}
@@ -1555,6 +1675,7 @@ export const AddDataWizardPage: React.FC = () => {
       />
 
       {confirmCancelOpen && (
+        <ModalPortal>
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
           <div role="dialog" aria-modal="true" aria-labelledby="wiz-cancel-title" className="w-full max-w-sm p-5 bg-white border border-slate-300 shadow-xl rounded-xl space-y-4">
             <h3 id="wiz-cancel-title" className="text-[14px] font-bold text-[#111B37]">Keep the new connection "{newConnCreated?.name}"?</h3>
@@ -1570,10 +1691,26 @@ export const AddDataWizardPage: React.FC = () => {
             </div>
           </div>
         </div>
+        </ModalPortal>
       )}
     </div>
   );
 };
+
+/** Request budget of the whole HTTP connection after this wizard (R2-CN-04). */
+const HttpBudgetNote: React.FC<{ budget: ReturnType<typeof rateBudget> & { existing: number } }> = ({ budget }) => (
+  <div
+    role={budget.over ? 'alert' : undefined}
+    className={`p-2.5 rounded-lg border text-[11px] self-start ${budget.over ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-slate-50 border-slate-200 text-[#657794]'}`}
+  >
+    {budget.existing > 0 && (
+      <span className="block font-semibold mb-0.5">
+        Connection total: {budget.existing} path(s) already bound + {Math.max(budget.paths - budget.existing, 0)} added by this wizard.
+      </span>
+    )}
+    {budget.message}
+  </div>
+);
 
 function buildAddressSummary(row: FieldRow, protocol: ProtocolType): string {
   switch (protocol) {

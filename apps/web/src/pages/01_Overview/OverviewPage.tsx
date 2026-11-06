@@ -14,6 +14,7 @@ import { useNavigate } from 'react-router-dom';
 import { useApp } from '../../store/AppContext';
 import { useAuth } from '../../features/auth';
 import { Button } from '../../components/common/Button';
+import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { DonutChart } from '../../components/charts/DonutChart';
 import { StatusBadge } from '../../components/common/StatusBadge';
 import { refreshCollectorHealth, useCollectorHealth } from '../../components/shell/collectorHealth';
@@ -61,7 +62,7 @@ interface ChecklistStep {
 
 export const OverviewPage: React.FC = () => {
   const navigate = useNavigate();
-  const { resources, connections, signals, outputGroups, currentPlant, refresh } = useApp();
+  const { resources, connections, signals, outputGroups, currentPlant, refresh, loadState } = useApp();
   const { state: authState } = useAuth();
   const collector = useCollectorHealth();
 
@@ -228,6 +229,22 @@ export const OverviewPage: React.FC = () => {
       .filter((row) => row.entity_type === 'resource' && row.entity_id && !names.has(String(row.entity_id)))
       .map((row) => String(row.entity_id))
       .filter((id) => !requestedNames.current.has(id));
+    // Template names for "created N data models from template X" (model templates are not in AppContext).
+    const needsTemplates = recentActivities.some(
+      ({ row }) => row.entity_type === 'model_template' && row.entity_id && !names.has(String(row.entity_id)),
+    );
+    if (needsTemplates && !requestedNames.current.has('model-templates')) {
+      requestedNames.current.add('model-templates');
+      api<{ items?: Array<{ id: string; display_name?: string; key?: string }> }>('/api/v1/model-templates')
+        .then((page) => {
+          const found: Record<string, string> = {};
+          (page.items || []).forEach((item) => {
+            if (item.id) found[String(item.id)] = item.display_name || item.key || '';
+          });
+          if (Object.keys(found).length) setExtraNames((prev) => ({ ...prev, ...found }));
+        })
+        .catch((error) => console.warn('Template names could not be loaded', error));
+    }
     if (missing.length === 0) return;
     missing.forEach((id) => requestedNames.current.add(id));
     void Promise.allSettled(
@@ -281,7 +298,13 @@ export const OverviewPage: React.FC = () => {
         </div>
       </div>
 
-      {!checklistDismissed && !allStepsComplete && (
+      {loadState !== 'ready' && (
+        <section className="fx-card border border-[#CBD5E1]">
+          <LoadStateNotice subject="the overview" />
+        </section>
+      )}
+
+      {loadState === 'ready' && !checklistDismissed && !allStepsComplete && (
         <section className="fx-card border border-[#CBD5E1] bg-gradient-to-r from-blue-50/50 to-indigo-50/30 p-5">
           <div className="flex items-start justify-between gap-4">
             <div>
@@ -350,6 +373,8 @@ export const OverviewPage: React.FC = () => {
         </section>
       )}
 
+      {loadState === 'ready' && (
+        <>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <button type="button" onClick={() => navigate('/factory/structure')} className={kpiClass}>
           <div className="flex items-center justify-between text-[#657794]">
@@ -612,6 +637,8 @@ export const OverviewPage: React.FC = () => {
           )}
         </section>
       </div>
+        </>
+      )}
     </div>
   );
 };

@@ -27,6 +27,8 @@ import { ConfirmDialog } from '../../components/common/ConfirmDialog';
 import { api, ApiError } from '../../api/client';
 import { CommissionResult, runConnectionTest } from '../../lib/commissioning';
 import { timeAgo } from '../../lib/format';
+import { PROTOCOL_LABEL } from '../../lib/protocols';
+import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 
 type KpiFilter = 'all' | 'connected' | 'idle' | 'degraded' | 'paused';
 
@@ -45,16 +47,9 @@ export const getProtocolIcon = (proto: ProtocolType) => {
   }
 };
 
-const PROTOCOL_LABEL: Record<ProtocolType, string> = {
-  mqtt: 'MQTT',
-  modbus: 'Modbus TCP',
-  opcua: 'OPC UA',
-  http: 'HTTP',
-  websocket: 'WebSocket',
-};
 
 export const ConnectionsPage: React.FC = () => {
-  const { connections, signals, scopedResources, edges, refresh } = useApp();
+  const { connections, signals, scopedResources, edges, refresh, loadState } = useApp();
 
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -268,7 +263,9 @@ export const ConnectionsPage: React.FC = () => {
       )}
 
       <div className="bg-white rounded-2xl border border-[#E2E8F0] shadow-sm overflow-visible">
-        {filteredConnections.length === 0 ? (
+        {loadState !== 'ready' ? (
+          <LoadStateNotice subject="the connections" />
+        ) : filteredConnections.length === 0 ? (
           <div className="p-12 text-center space-y-3">
             <div className="w-12 h-12 rounded-full bg-[#F1F5F9] flex items-center justify-center mx-auto text-[#64748B]">
               <Network className="w-6 h-6" />

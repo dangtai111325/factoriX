@@ -7,6 +7,7 @@ import { CommissionResult } from '../../lib/commissioning';
 import { formatTimestamp, formatValue, timeAgo } from '../../lib/format';
 import { ConnectionStatusCell } from './connectionStatus';
 import { TestResultPanel } from './TestResultPanel';
+import { PROTOCOL_LABEL } from '../../lib/protocols';
 
 interface ConnectionDetailDrawerProps {
   connection: ConnectionItem;
@@ -62,12 +63,12 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
       aria-modal="false"
       aria-labelledby={titleId}
       style={{ top: 'var(--fx-topbar-height)' }}
-      className="fixed bottom-0 right-0 w-full sm:w-[520px] bg-white border-l border-[#E2E8F0] shadow-2xl z-20 flex flex-col animate-in slide-in-from-right duration-200"
+      className="fixed bottom-0 right-0 w-full sm:w-[520px] max-w-full box-border overflow-x-hidden bg-white border-l border-[#E2E8F0] shadow-2xl z-20 flex flex-col animate-in slide-in-from-right duration-200"
     >
       <div className="p-4 border-b border-[#E2E8F0] bg-[#F8FAFC] flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-[#EFF6FF] text-[#134074] font-bold">{connection.protocol}</span>
+            <span className="text-[10px] px-2 py-0.5 rounded bg-[#EFF6FF] text-[#134074] font-bold whitespace-nowrap">{PROTOCOL_LABEL[connection.protocol]}</span>
             <span className="text-[11px] font-mono text-[#64748B] truncate" title={connection.endpoint}>{connection.endpoint}</span>
           </div>
           <h2 id={titleId} className="text-lg font-bold text-[#0B2545] truncate">{connection.name}</h2>
@@ -77,7 +78,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
         </button>
       </div>
 
-      <div className="p-3 border-b border-[#E2E8F0] bg-[#F1F5F9] grid grid-cols-2 sm:grid-cols-4 gap-2">
+      <div role="toolbar" aria-label="Connection actions" className="px-4 py-3 border-b border-[#E2E8F0] bg-[#F1F5F9] flex flex-wrap gap-2 [&>button]:flex-1 [&>button]:min-w-[96px] [&>button]:whitespace-nowrap">
         <button type="button" disabled={testing} onClick={() => onTest(connection.id)} className="py-1.5 px-2 rounded-lg bg-white border border-[#CBD5E1] hover:border-[#134074] text-xs font-semibold text-[#134074] flex items-center justify-center gap-1.5 shadow-sm disabled:opacity-50">
           <Activity className="w-3.5 h-3.5" />
           <span>{testing ? 'Testing…' : 'Test'}</span>

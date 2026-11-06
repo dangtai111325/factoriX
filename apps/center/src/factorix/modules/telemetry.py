@@ -278,14 +278,24 @@ async def ingest_observations(
     edge_id: UUID,
     items: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """Validate, authorise and store one edge batch.
+
+    Accepted samples are written with one statement per table for the whole batch (dedup keys,
+    observations, newest-per-signal latest upsert). Per-row statements cost about 5 round trips
+    and several milliseconds of Python per sample, which capped ingest at ~135 samples/s while a
+    6-machine site produces ~320/s (R2-SG-01): the edge backlog grew without bound and every
+    latest value arrived 2-5 s late. If the batch statement fails, the batch is stored row by row
+    so one bad sample is quarantined alone (same isolation as before).
+    """
     if len(items) > 1000:
         raise AppError(422, "BATCH", "Observation batch exceeds 1000 records.")
     now = utcnow()
-    results: list[dict[str, str]] = []
+    results: list[dict[str, str] | None] = []
     context = await _batch_context(session, tenant_id, edge_id, items)
     checked_partitions: set[str] = set()
     live_connections: set[UUID] = set()
     touched: set[UUID] = set()
+    accepted: list[tuple[int, Observation, dict[str, Any]]] = []
     for item in items:
         event_uid = str(item.get("event_uid", ""))[:256]
         try:
@@ -335,6 +345,248 @@ async def ingest_observations(
         if month_key not in checked_partitions:
             await create_partitions_for(session, observation.event_time)
             checked_partitions.add(month_key)
+        accepted.append((len(results), observation, owned))
+        results.append(None)
+
+    if accepted:
+        events_mark = len(session.info.get("fx_events", []))
+        try:
+            async with session.begin_nested():
+                outcome = await _store_batch(session, tenant_id, edge_id, accepted, context, now)
+        except (SQLAlchemyError, ValueError, TypeError) as exc:
+            _truncate_events(session, events_mark)
+            logger.warning("Batch store of %d observations failed; storing them one by one.", len(accepted), exc_info=exc)
+            outcome = await _store_rows(session, tenant_id, edge_id, accepted, context, now)
+        uid_at = {index: observation.event_uid for index, observation, _owned in accepted}
+        for index, status in outcome.statuses.items():
+            results[index] = {"event_uid": uid_at[index], "status": status}
+        live_connections |= outcome.live_connections
+        touched |= outcome.touched
+
+    if live_connections:
+        await _mark_connections_live(session, tenant_id, edge_id, live_connections, now)
+    if touched:
+        await _notify_models(session, tenant_id, touched)
+    return {"results": [row for row in results if row is not None]}
+
+
+class _StoreOutcome:
+    def __init__(self) -> None:
+        self.statuses: dict[int, str] = {}
+        self.live_connections: set[UUID] = set()
+        self.touched: set[UUID] = set()
+
+    def committed(self, index: int, observation: Observation, owned: dict[str, Any]) -> None:
+        self.statuses[index] = "committed"
+        if observation.quality in {Quality.GOOD, Quality.UNCERTAIN}:
+            self.live_connections.add(as_uuid(owned["connection_id"]))
+
+
+def newest_per_signal(rows: list[tuple[UUID, Observation, dict[str, Any]]]) -> dict[UUID, tuple[UUID, Observation, dict[str, Any]]]:
+    """The row that may replace latest for each signal: highest (received_time, observation_id).
+
+    Same ordering as the latest upsert (and ``domain.observation.should_replace_latest``); one row
+    per signal is required because ON CONFLICT DO UPDATE cannot touch a row twice in a statement.
+    """
+    newest: dict[UUID, tuple[UUID, Observation, dict[str, Any]]] = {}
+    for row in rows:
+        observation_id, observation, _owned = row
+        current = newest.get(observation.signal_id)
+        if current is None or (observation.received_time, str(observation_id)) > (current[1].received_time, str(current[0])):
+            newest[observation.signal_id] = row
+    return newest
+
+
+_BULK_DEDUP = """
+INSERT INTO ingest_dedup (tenant_id, edge_id, event_uid, first_seen_at)
+SELECT CAST(:tenant_id AS uuid), CAST(:edge_id AS uuid), u.event_uid, CAST(:now AS timestamptz)
+FROM unnest(CAST(:uids AS text[])) AS u(event_uid)
+ON CONFLICT DO NOTHING
+RETURNING event_uid
+"""
+
+_BULK_OBSERVATIONS = """
+INSERT INTO observations (
+    id, tenant_id, site_id, resource_id, signal_id, edge_id, connection_id, event_uid,
+    event_time, received_time, source_time, value_type, value_json, unit, quality, origin,
+    config_revision, provenance_json
+)
+SELECT t.id, CAST(:tenant_id AS uuid), t.site_id, t.resource_id, t.signal_id, CAST(:edge_id AS uuid),
+       t.connection_id, t.event_uid, t.event_time, t.received_time, t.source_time, t.value_type,
+       CAST(t.value_json AS jsonb), t.unit, t.quality, t.origin, t.config_revision, CAST(t.provenance AS jsonb)
+FROM unnest(
+    CAST(:ids AS uuid[]), CAST(:site_ids AS uuid[]), CAST(:resource_ids AS uuid[]), CAST(:signal_ids AS uuid[]),
+    CAST(:connection_ids AS uuid[]), CAST(:event_uids AS text[]), CAST(:event_times AS timestamptz[]),
+    CAST(:received_times AS timestamptz[]), CAST(:source_times AS timestamptz[]), CAST(:value_types AS text[]),
+    CAST(:value_jsons AS text[]), CAST(:units AS text[]), CAST(:qualities AS text[]), CAST(:origins AS text[]),
+    CAST(:revisions AS bigint[]), CAST(:provenances AS text[])
+) AS t(id, site_id, resource_id, signal_id, connection_id, event_uid, event_time, received_time, source_time,
+       value_type, value_json, unit, quality, origin, config_revision, provenance)
+"""
+
+_BULK_LATEST = """
+INSERT INTO latest_signal_state (
+    tenant_id, signal_id, resource_id, observation_id, value_type, value_json, unit, quality,
+    event_time, received_time, source_time, config_revision, origin, last_good_value_json,
+    last_good_event_time, updated_at
+)
+SELECT CAST(:tenant_id AS uuid), t.signal_id, t.resource_id, t.observation_id, t.value_type, CAST(t.value_json AS jsonb),
+       t.unit, t.quality, t.event_time, t.received_time, t.source_time, t.config_revision, t.origin,
+       CAST(t.good AS jsonb), t.good_time, CAST(:now AS timestamptz)
+FROM unnest(
+    CAST(:signal_ids AS uuid[]), CAST(:resource_ids AS uuid[]), CAST(:observation_ids AS uuid[]), CAST(:value_types AS text[]),
+    CAST(:value_jsons AS text[]), CAST(:units AS text[]), CAST(:qualities AS text[]), CAST(:event_times AS timestamptz[]),
+    CAST(:received_times AS timestamptz[]), CAST(:source_times AS timestamptz[]), CAST(:revisions AS bigint[]),
+    CAST(:origins AS text[]), CAST(:goods AS text[]), CAST(:good_times AS timestamptz[])
+) AS t(signal_id, resource_id, observation_id, value_type, value_json, unit, quality, event_time, received_time,
+       source_time, config_revision, origin, good, good_time)
+ON CONFLICT (tenant_id, signal_id) DO UPDATE SET
+    resource_id = EXCLUDED.resource_id,
+    observation_id = EXCLUDED.observation_id,
+    value_type = EXCLUDED.value_type,
+    value_json = EXCLUDED.value_json,
+    unit = EXCLUDED.unit,
+    quality = EXCLUDED.quality,
+    event_time = EXCLUDED.event_time,
+    received_time = EXCLUDED.received_time,
+    source_time = EXCLUDED.source_time,
+    config_revision = EXCLUDED.config_revision,
+    origin = EXCLUDED.origin,
+    last_good_value_json = CASE
+        WHEN EXCLUDED.quality = 'GOOD' AND EXCLUDED.value_json->>'v' IS NOT NULL THEN EXCLUDED.value_json
+        ELSE latest_signal_state.last_good_value_json
+    END,
+    last_good_event_time = CASE
+        WHEN EXCLUDED.quality = 'GOOD' AND EXCLUDED.value_json->>'v' IS NOT NULL THEN EXCLUDED.event_time
+        ELSE latest_signal_state.last_good_event_time
+    END,
+    updated_at = EXCLUDED.updated_at
+WHERE (EXCLUDED.received_time, EXCLUDED.observation_id)
+    > (latest_signal_state.received_time, latest_signal_state.observation_id)
+RETURNING signal_id
+"""
+
+
+async def _store_batch(
+    session: AsyncSession,
+    tenant_id: UUID,
+    edge_id: UUID,
+    accepted: list[tuple[int, Observation, dict[str, Any]]],
+    context: _BatchContext,
+    now: datetime,
+) -> _StoreOutcome:
+    """Store every accepted sample of the batch with one statement per table."""
+    outcome = _StoreOutcome()
+    first_of_uid: dict[str, int] = {}
+    for index, observation, _owned in accepted:
+        first_of_uid.setdefault(observation.event_uid, index)
+    inserted_rows = await fetch_all(
+        session,
+        _BULK_DEDUP,
+        {"tenant_id": tenant_id, "edge_id": edge_id, "now": now, "uids": list(first_of_uid)},
+    )
+    fresh = {str(row["event_uid"]) for row in inserted_rows}
+    new_rows: list[tuple[UUID, Observation, dict[str, Any]]] = []
+    for index, observation, owned in accepted:
+        if observation.event_uid in fresh and first_of_uid[observation.event_uid] == index:
+            new_rows.append((uuid4(), observation, owned))
+            outcome.committed(index, observation, owned)
+        else:
+            outcome.statuses[index] = "duplicate"
+    if not new_rows:
+        return outcome
+
+    await execute(
+        session,
+        _BULK_OBSERVATIONS,
+        {
+            "tenant_id": tenant_id,
+            "edge_id": edge_id,
+            "ids": [oid for oid, _o, _w in new_rows],
+            "site_ids": [as_uuid(w["site_id"]) if w.get("site_id") else None for _oid, _o, w in new_rows],
+            "resource_ids": [as_uuid(w["resource_id"]) for _oid, _o, w in new_rows],
+            "signal_ids": [o.signal_id for _oid, o, _w in new_rows],
+            "connection_ids": [as_uuid(w["connection_id"]) for _oid, _o, w in new_rows],
+            "event_uids": [o.event_uid for _oid, o, _w in new_rows],
+            "event_times": [o.event_time for _oid, o, _w in new_rows],
+            "received_times": [o.received_time for _oid, o, _w in new_rows],
+            "source_times": [o.source_time for _oid, o, _w in new_rows],
+            "value_types": [o.data_type for _oid, o, _w in new_rows],
+            "value_jsons": [_value_json(o.value) for _oid, o, _w in new_rows],
+            "units": [o.unit for _oid, o, _w in new_rows],
+            "qualities": [o.quality.value for _oid, o, _w in new_rows],
+            "origins": [o.origin.value for _oid, o, _w in new_rows],
+            "revisions": [int(o.config_revision) for _oid, o, _w in new_rows],
+            "provenances": [jsonb(o.provenance or {}) for _oid, o, _w in new_rows],
+        },
+    )
+
+    candidates = list(newest_per_signal(new_rows).values())
+    goods = [(o.quality.value == "GOOD" and o.value is not None) for _oid, o, _w in candidates]
+    replaced_rows = await fetch_all(
+        session,
+        _BULK_LATEST,
+        {
+            "tenant_id": tenant_id,
+            "now": now,
+            "signal_ids": [o.signal_id for _oid, o, _w in candidates],
+            "resource_ids": [as_uuid(w["resource_id"]) for _oid, _o, w in candidates],
+            "observation_ids": [oid for oid, _o, _w in candidates],
+            "value_types": [o.data_type for _oid, o, _w in candidates],
+            "value_jsons": [_value_json(o.value) for _oid, o, _w in candidates],
+            "units": [o.unit for _oid, o, _w in candidates],
+            "qualities": [o.quality.value for _oid, o, _w in candidates],
+            "event_times": [o.event_time for _oid, o, _w in candidates],
+            "received_times": [o.received_time for _oid, o, _w in candidates],
+            "source_times": [o.source_time for _oid, o, _w in candidates],
+            "revisions": [int(o.config_revision) for _oid, o, _w in candidates],
+            "origins": [o.origin.value for _oid, o, _w in candidates],
+            "goods": [_value_json(o.value) if good else None for (_oid, o, _w), good in zip(candidates, goods)],
+            "good_times": [o.event_time if good else None for (_oid, o, _w), good in zip(candidates, goods)],
+        },
+    )
+    replaced = {as_uuid(row["signal_id"]) for row in replaced_rows}
+    for _oid, observation, owned in candidates:
+        if observation.signal_id not in replaced:
+            continue
+        outcome.touched.add(observation.signal_id)
+        reason = (observation.provenance or {}).get("reason")
+        queue_stream_event(
+            session,
+            "latest",
+            tenant_id,
+            latest_stream_payload(
+                signal_id=observation.signal_id,
+                value=observation.value,
+                quality=observation.quality.value,
+                reason=str(reason) if reason else None,
+                received_time=observation.received_time,
+                source_time=observation.source_time,
+                expected_interval_ms=owned.get("expected_interval_ms"),
+                null_allowed=bool(owned.get("nullable")),
+                now=now,
+            ),
+            signal_id=observation.signal_id,
+        )
+    for _oid, observation, _owned in new_rows:
+        if observation.signal_id in context.formula_inputs:
+            outputs: set[UUID] = set()
+            await _run_formulas(session, tenant_id, observation.signal_id, observation.event_time, observation.received_time, depth=0, outputs=outputs)
+            outcome.touched |= outputs
+    return outcome
+
+
+async def _store_rows(
+    session: AsyncSession,
+    tenant_id: UUID,
+    edge_id: UUID,
+    accepted: list[tuple[int, Observation, dict[str, Any]]],
+    context: _BatchContext,
+    now: datetime,
+) -> _StoreOutcome:
+    """Row-by-row fallback: each sample in its own savepoint, a failing one is quarantined alone."""
+    outcome = _StoreOutcome()
+    for index, observation, owned in accepted:
         events_mark = len(session.info.get("fx_events", []))
         try:
             async with session.begin_nested():
@@ -348,22 +600,16 @@ async def ingest_observations(
                 exc_info=exc,
             )
             await _quarantine(session, tenant_id, edge_id, observation.event_uid, f"STORE_FAILED: {type(exc).__name__}")
-            results.append({"event_uid": observation.event_uid, "status": "quarantined"})
+            outcome.statuses[index] = "quarantined"
             continue
-        results.append({"event_uid": observation.event_uid, "status": status})
         if status != "committed":
+            outcome.statuses[index] = status
             continue
-        if observation.quality in {Quality.GOOD, Quality.UNCERTAIN}:
-            live_connections.add(as_uuid(owned["connection_id"]))
+        outcome.committed(index, observation, owned)
         if replaced:
-            touched.add(observation.signal_id)
-        touched |= formula_outputs
-
-    if live_connections:
-        await _mark_connections_live(session, tenant_id, edge_id, live_connections, now)
-    if touched:
-        await _notify_models(session, tenant_id, touched)
-    return {"results": results}
+            outcome.touched.add(observation.signal_id)
+        outcome.touched |= formula_outputs
+    return outcome
 
 
 async def _store_observation(

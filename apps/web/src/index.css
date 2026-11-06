@@ -55,6 +55,17 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/*
+ * Modal overlays (rendered under <body> by ModalPortal): the page behind a modal dialog does not
+ * scroll, so the overlay always covers the whole viewport. The gutter is kept to avoid a layout jump.
+ */
+html {
+  scrollbar-gutter: stable;
+}
+html:has([aria-modal='true']) {
+  overflow: hidden;
+}
+
 /* Custom Scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
@@ -267,4 +278,22 @@ body {
 
 .fx-input::placeholder {
   color: var(--fx-placeholder);
+}
+
+/*
+ * R2-DM-03: a disabled primary action must look disabled app-wide, including hand-styled buttons that
+ * do not use <Button>. Red / navy filled buttons turn neutral gray instead of a faded red that still
+ * reads as clickable.
+ */
+button:disabled[class*='bg-[#EF1B24]'],
+button:disabled[class*='bg-[#0B2545]'],
+button:disabled[class*='bg-[#134074]'],
+button:disabled[class*='bg-red-6'],
+button:disabled[class*='bg-blue-6'] {
+  background-color: #e3eaf3 !important;
+  border-color: #e3eaf3 !important;
+  color: #94a3b8 !important;
+  box-shadow: none !important;
+  opacity: 1 !important;
+  cursor: not-allowed;
 }

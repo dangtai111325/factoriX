@@ -1,10 +1,72 @@
 /**
  * Client for the Center commissioning API (real tests run by the Edge collector):
- *   POST /api/v1/connections/{id}/tests    {mode: "CONNECTIVITY" | "FULL", fields: [...]}
+ *   POST /api/v1/connections/{id}/tests    {mode: "CONNECTIVITY" | "FULL", fields: [...], config?, test_path?}
  *   POST /api/v1/connections/{id}/capture  {topics, topic_filter, duration_seconds, max_messages, browse_node}
  *   GET  /api/v1/commissioning/{job_id}    {status, error_code, diagnostic, stages_json, samples_json}
  */
+import { useSyncExternalStore } from 'react'
 import { ApiError, api } from '../api/client'
+
+// ---------------------------------------------------------------------------------------------
+// Collector start-up (R2-CN-02): right after installation the built-in collector needs a few seconds
+// to enroll. A test requested meanwhile is answered 409 EDGE_NOT_ENROLLED, or its job stays PENDING
+// because no collector picked it up yet. That is not an error: the request is retried / polled until
+// the collector is up, and the UI shows "Collector is starting…" while waiting.
+// ---------------------------------------------------------------------------------------------
+
+/** How long a test waits for a starting collector before giving up. */
+const COLLECTOR_START_WAIT_MS = 120000
+/** A job still fully PENDING after this long means no collector has picked it up yet. */
+const PENDING_IS_WAITING_MS = 8000
+
+let waitingCount = 0
+const waitingListeners = new Set<() => void>()
+
+function setWaiting(delta: 1 | -1): void {
+  waitingCount = Math.max(0, waitingCount + delta)
+  waitingListeners.forEach((listener) => listener())
+}
+
+/** True while at least one test or capture is waiting for the collector to start. */
+export function useCollectorStarting(): boolean {
+  return useSyncExternalStore(
+    (listener) => {
+      waitingListeners.add(listener)
+      return () => {
+        waitingListeners.delete(listener)
+      }
+    },
+    () => waitingCount > 0,
+  )
+}
+
+export const COLLECTOR_STARTING_MESSAGE = 'Collector is starting… the test will run automatically.'
+
+function isCollectorStarting(error: unknown): boolean {
+  return error instanceof ApiError && error.code === 'EDGE_NOT_ENROLLED'
+}
+
+/** POST a test / capture request, retrying while the collector is still enrolling. */
+async function queueJob(path: string, body: unknown): Promise<{ job_id?: string }> {
+  const deadline = Date.now() + COLLECTOR_START_WAIT_MS
+  let waiting = false
+  try {
+    for (;;) {
+      try {
+        return await api<{ job_id?: string }>(path, { method: 'POST', body: JSON.stringify(body) })
+      } catch (error) {
+        if (!isCollectorStarting(error) || Date.now() > deadline) throw error
+        if (!waiting) {
+          waiting = true
+          setWaiting(1)
+        }
+        await sleep(3000)
+      }
+    }
+  } finally {
+    if (waiting) setWaiting(-1)
+  }
+}
 
 export interface CommissionStage {
   stage: string
@@ -49,8 +111,30 @@ function errorResult(code: string, message: string, stage = 'REQUEST'): Commissi
   }
 }
 
+function notPickedUp(row: JobRow): boolean {
+  const status = String(row.status || '').toUpperCase()
+  if (status && status !== 'PENDING' && status !== 'QUEUED') return false
+  const stages = Array.isArray(row.stages_json) ? row.stages_json : []
+  return stages.every((stage) => String(stage.status || '').toUpperCase() === 'PENDING')
+}
+
 async function pollJob(jobId: string, timeoutMs: number): Promise<CommissionResult> {
-  const deadline = Date.now() + timeoutMs
+  const started = Date.now()
+  let waiting = false
+  try {
+    return await pollJobInner(jobId, timeoutMs, started, (next) => {
+      if (next === waiting) return
+      waiting = next
+      setWaiting(next ? 1 : -1)
+    })
+  } finally {
+    if (waiting) setWaiting(-1)
+  }
+}
+
+async function pollJobInner(jobId: string, timeoutMs: number, started: number, markWaiting: (waiting: boolean) => void): Promise<CommissionResult> {
+  let deadline = started + timeoutMs
+  let waiting = false
   let last: JobRow = {}
   let lastError: unknown = null
   while (Date.now() < deadline) {
@@ -61,6 +145,19 @@ async function pollJob(jobId: string, timeoutMs: number): Promise<CommissionResu
     } catch (error) {
       lastError = error
       continue
+    }
+    // Still queued with no stage started: the collector is starting. Keep polling (longer) instead of failing.
+    if (notPickedUp(last) && Date.now() - started > PENDING_IS_WAITING_MS) {
+      if (!waiting) {
+        waiting = true
+        markWaiting(true)
+        deadline = Math.max(deadline, started + COLLECTOR_START_WAIT_MS)
+      }
+    } else if (waiting) {
+      waiting = false
+      markWaiting(false)
+      // The collector picked the job up: give the test its normal time from now.
+      deadline = Math.max(deadline, Date.now() + timeoutMs)
     }
     const status = String(last.status || '').toUpperCase()
     if (TERMINAL.has(status)) {
@@ -86,7 +183,9 @@ async function pollJob(jobId: string, timeoutMs: number): Promise<CommissionResu
     passed: false,
     stages,
     errorCode: 'TIMEOUT',
-    message: 'The collector did not finish the test in time. Check that the Edge collector is online.',
+    message: notPickedUp(last)
+      ? 'The collector did not start within 2 minutes. Check that the Edge collector is running and enrolled.'
+      : 'The collector did not finish the test in time. Check that the Edge collector is online.',
     samples: last.samples_json ?? null,
   }
 }
@@ -94,7 +193,12 @@ async function pollJob(jobId: string, timeoutMs: number): Promise<CommissionResu
 function describeRequestError(error: unknown): CommissionResult {
   if (error instanceof ApiError) {
     if (error.code === 'EDGE_NOT_ENROLLED') {
-      return errorResult('EDGE_NOT_ENROLLED', error.message || 'No enrolled collector for this site.', 'EDGE_ENROLLMENT')
+      // Only reached after waiting COLLECTOR_START_WAIT_MS for the collector to enroll.
+      return errorResult(
+        'EDGE_NOT_ENROLLED',
+        'The collector of this site is still not enrolled after 2 minutes. Check the Edge collector, then test again.',
+        'EDGE_ENROLLMENT',
+      )
     }
     return errorResult(error.code || `HTTP_${error.status}`, error.message || 'The request failed.')
   }
@@ -116,25 +220,52 @@ export async function runConnectionTest(
     fields?: TestFieldInput[]
     /** Unsaved connection config to test instead of the stored one (the stored config is not changed). */
     config?: Record<string, unknown>
+    /** HTTP only: relative data path used by the AUTH stage to prove the credentials (`test_path`). */
+    testPath?: string
     timeoutMs?: number
   },
 ): Promise<CommissionResult> {
-  let queued: { job_id?: string }
+  return runJob(
+    `/api/v1/connections/${encodeURIComponent(connectionId)}/tests`,
+    {
+      mode: options.mode,
+      // Both `address` and `address_json` carry the same object so every Edge version can read it.
+      fields: (options.fields || []).map((field) => ({ ...field, address_json: field.address })),
+      ...(options.config ? { config: options.config } : {}),
+      ...(options.testPath && options.testPath.trim() ? { test_path: options.testPath.trim() } : {}),
+    },
+    options.timeoutMs ?? 45000,
+    'test',
+  )
+}
+
+/**
+ * Queue a job and wait for its result. While the collector is still starting (409 EDGE_NOT_ENROLLED,
+ * or the Center reaped the queued job with EDGE_NOT_STARTED because nobody picked it up), the job is
+ * queued again automatically until COLLECTOR_START_WAIT_MS has elapsed.
+ */
+async function runJob(path: string, body: unknown, timeoutMs: number, noun: 'test' | 'capture'): Promise<CommissionResult> {
+  const deadline = Date.now() + COLLECTOR_START_WAIT_MS
+  let waiting = false
   try {
-    queued = await api<{ job_id?: string }>(`/api/v1/connections/${encodeURIComponent(connectionId)}/tests`, {
-      method: 'POST',
-      body: JSON.stringify({
-        mode: options.mode,
-        // Both `address` and `address_json` carry the same object so every Edge version can read it.
-        fields: (options.fields || []).map((field) => ({ ...field, address_json: field.address })),
-        ...(options.config ? { config: options.config } : {}),
-      }),
-    })
-  } catch (error) {
-    return describeRequestError(error)
+    for (;;) {
+      let queued: { job_id?: string }
+      try {
+        queued = await queueJob(path, body)
+      } catch (error) {
+        return describeRequestError(error)
+      }
+      if (!queued.job_id) return errorResult('NO_JOB', `The Center did not create a ${noun} job.`)
+      const result = await pollJob(queued.job_id, timeoutMs)
+      if (result.errorCode !== 'EDGE_NOT_STARTED' || Date.now() > deadline) return result
+      if (!waiting) {
+        waiting = true
+        setWaiting(1)
+      }
+    }
+  } finally {
+    if (waiting) setWaiting(-1)
   }
-  if (!queued.job_id) return errorResult('NO_JOB', 'The Center did not create a test job.')
-  return pollJob(queued.job_id, options.timeoutMs ?? 45000)
 }
 
 export interface CaptureRequest {
@@ -204,17 +335,7 @@ function extractCapture(samplesJson: unknown): { samples: CapturedSample[]; brow
 
 /** Ask the Edge to capture live payloads (MQTT/HTTP/WebSocket) or browse an OPC UA node. Never throws. */
 export async function runCapture(connectionId: string, request: CaptureRequest, timeoutMs = 45000): Promise<CaptureResult> {
-  let queued: { job_id?: string }
-  try {
-    queued = await api<{ job_id?: string }>(`/api/v1/connections/${encodeURIComponent(connectionId)}/capture`, {
-      method: 'POST',
-      body: JSON.stringify(request),
-    })
-  } catch (error) {
-    return { ...describeRequestError(error), captured: [], browse: [] }
-  }
-  if (!queued.job_id) return { ...errorResult('NO_JOB', 'The Center did not create a capture job.'), captured: [], browse: [] }
-  const result = await pollJob(queued.job_id, timeoutMs)
+  const result = await runJob(`/api/v1/connections/${encodeURIComponent(connectionId)}/capture`, request, timeoutMs, 'capture')
   const { samples, browse } = result.passed ? extractCapture(result.samples) : { samples: [], browse: [] }
   return { ...result, captured: samples, browse }
 }

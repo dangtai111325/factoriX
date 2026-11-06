@@ -27,14 +27,15 @@ export const Button: React.FC<ButtonProps> = ({
   };
 
   const variantClasses = {
+    // Disabled primary buttons turn neutral gray: a faded red still reads as clickable (R2-DM-03).
     primary:
-      'bg-[#EF1B24] text-white hover:bg-[#D9141D] active:bg-[#C7111A] border border-[#EF1B24] shadow-sm',
+      'bg-[#EF1B24] text-white hover:bg-[#D9141D] active:bg-[#C7111A] border border-[#EF1B24] shadow-sm disabled:opacity-100 disabled:bg-[#E3EAF3] disabled:border-[#E3EAF3] disabled:text-[#94A3B8] disabled:shadow-none disabled:hover:bg-[#E3EAF3] disabled:active:bg-[#E3EAF3]',
     secondary:
       'bg-white text-[#334568] hover:bg-[#F9FAFD] hover:text-[#111B37] border border-[#D4DFEC]',
     outline:
-      'bg-white text-[#334568] hover:bg-[#F9FAFD] hover:text-[#111B37] border border-[#D4DFEC]',
+      'bg-white text-[#334568] hover:bg-[#F9FAFD] hover:text-[#111B37] border border-[#D4DFEC] disabled:hover:bg-white disabled:hover:text-[#334568]',
     danger:
-      'bg-white text-[#F2343B] hover:bg-[#FFF0F1] border border-[#FAC6C9]',
+      'bg-white text-[#F2343B] hover:bg-[#FFF0F1] border border-[#FAC6C9] disabled:hover:bg-white',
     ghost:
       'bg-transparent text-[#657794] hover:bg-[#F1F5FA] hover:text-[#111B37]',
     icon:

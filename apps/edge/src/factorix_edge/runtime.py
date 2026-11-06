@@ -6,8 +6,11 @@
 * commands — every 2 s; each test or capture runs in its own task.
 * jobs     — one task per acquisition job (see ``jobs.py``).
 * flusher  — wakes when samples are written; micro-batches (≤100 ms or 500 rows),
-             sends the newest row of each signal first, then history, within a time budget.
-* maintenance — every 60 s; prunes delivered rows and enforces the pending cap.
+             sends the newest row of each signal first, then at most one history slice
+             (``HISTORY_SLICE_S``), so a backlog never delays live values by more than one
+             history batch.
+* maintenance — every 60 s; prunes delivered rows in bounded chunks (yielding to the loop
+             between chunks) and enforces the pending cap.
 
 A Center answer 401 means the credential was revoked: ``run()`` stops and raises
 ``CredentialRevoked`` so the entry point can re-enroll.
@@ -49,6 +52,11 @@ SOFTWARE_VERSION = os.environ.get("FACTORIX_EDGE_VERSION", "r2")
 BATCH_ROWS = 500
 LINGER_S = 0.1
 FLUSH_BUDGET_S = 1.0
+# Per flusher cycle, history (older rows of a backlog) may use this much time after the latest
+# lane. The latest lane is sent at the start of every cycle, so live values wait for at most one
+# history batch instead of a full second of history (R2-SG-01).
+HISTORY_SLICE_S = 0.25
+PRUNE_CHUNK = 2000
 ACKED_RETENTION = timedelta(minutes=10)
 
 
@@ -525,24 +533,28 @@ class EdgeRuntime:
     # ------------------------------------------------------------------ flush
 
     async def flush_once(self, budget_s: float = FLUSH_BUDGET_S) -> tuple[int, bool]:
-        """Send pending rows: newest per signal first, then oldest history. Returns (acked, failed)."""
-        deadline = time.monotonic() + budget_s
+        """Send pending rows: newest per signal first, then oldest history. Returns (acked, failed).
+
+        History gets ``budget_s`` after the latest lane and always at least one batch, so a
+        backlog keeps draining however long the latest lane took.
+        """
         acked = 0
         rows = self.outbox.latest_pending(BATCH_ROWS)
         if rows:
-            count, ok = await self._send(rows, deadline)
+            count, ok = await self._send(rows, time.monotonic() + max(budget_s, FLUSH_BUDGET_S))
             acked += count
             if not ok:
                 return acked, True
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + budget_s
+        while True:
             rows = self.outbox.pending(BATCH_ROWS)
             if not rows:
                 break
-            count, ok = await self._send(rows, deadline)
+            count, ok = await self._send(rows, max(deadline, time.monotonic() + FLUSH_BUDGET_S))
             acked += count
             if not ok:
                 return acked, True
-            if len(rows) < BATCH_ROWS:
+            if len(rows) < BATCH_ROWS or time.monotonic() >= deadline:
                 break
         return acked, False
 
@@ -689,7 +701,7 @@ class EdgeRuntime:
             while self._unflushed < BATCH_ROWS and time.monotonic() < linger_end:
                 await asyncio.sleep(0.02)
             self._unflushed = 0
-            _acked, failed = await self.flush_once()
+            _acked, failed = await self.flush_once(budget_s=HISTORY_SLICE_S)
             if failed:
                 backoff = min(30.0, max(1.0, backoff * 2))
                 continue
@@ -702,7 +714,13 @@ class EdgeRuntime:
         while True:
             await asyncio.sleep(60)
             cutoff = iso_ms(datetime.now(timezone.utc) - ACKED_RETENTION)
-            removed = self.outbox.prune(cutoff)
+            removed = 0
+            while True:
+                chunk = self.outbox.prune(cutoff, chunk=PRUNE_CHUNK, max_chunks=1)
+                removed += chunk
+                if chunk < PRUNE_CHUNK:
+                    break
+                await asyncio.sleep(0)  # let acquisition, heartbeat and flushing run between chunks
             dropped = self.outbox.enforce_cap(self.max_pending)
             if dropped:
                 logger.error("Outbox above %d pending rows: %d oldest rows dropped", self.max_pending, dropped)

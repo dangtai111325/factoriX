@@ -34,6 +34,8 @@ export interface ModelListItem {
   version: number;
   member_count: number;
   updated_at?: string | null;
+  /** Present in list rows from the server (republish_ms null = emit on change only). */
+  emit_policy?: EmitPolicy;
 }
 
 /** Member as sent to / received from the backend. */
@@ -201,6 +203,7 @@ export function normListItem(raw: Raw): ModelListItem {
     version: Number(raw.version ?? 1),
     member_count: Number(raw.member_count ?? (Array.isArray(raw.members) ? raw.members.length : 0)),
     updated_at: optStr(raw.updated_at),
+    emit_policy: raw.emit_policy !== undefined || raw.emit_policy_json !== undefined ? normEmitPolicy(raw.emit_policy ?? raw.emit_policy_json) : undefined,
   };
 }
 

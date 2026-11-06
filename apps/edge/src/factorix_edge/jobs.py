@@ -425,6 +425,37 @@ def map_mqtt_messages(fields: list[dict[str, Any]], config: dict[str, Any], mess
     return events, latest
 
 
+class FieldThrottle:
+    """LATEST_ONLY delivery: the newest sample per field, released at most once per interval *per field*.
+
+    The interval caps the rate of each signal. It is not a shared job clock: one MQTT job usually
+    carries several machines whose messages arrive at different phases, and a job-wide emit slot
+    held each later machine back for up to one interval (~0.5 s on average, R2-SG-01).
+    """
+
+    def __init__(self, interval_s: float) -> None:
+        self.interval_s = max(0.0, interval_s)
+        self.pending: dict[str, Sample] = {}
+        self.last: dict[str, float] = {}
+
+    def offer(self, samples: dict[str, Sample]) -> None:
+        self.pending.update(samples)
+
+    def due(self, now: float) -> list[Sample]:
+        ready = [sample for fid, sample in self.pending.items() if self.last.get(fid, float("-inf")) + self.interval_s <= now]
+        for sample in ready:
+            self.last[sample.field_id] = now
+            del self.pending[sample.field_id]
+        return ready
+
+    def wait(self, now: float) -> float | None:
+        """Seconds until the next held sample may be released; None when nothing is held."""
+        if not self.pending:
+            return None
+        due_at = min(self.last.get(fid, float("-inf")) + self.interval_s for fid in self.pending)
+        return max(0.0, due_at - now)
+
+
 # --------------------------------------------------------------------------- runner
 
 
@@ -574,28 +605,26 @@ class JobRunner:
             raise ConnectorError("TOPIC", "No topic to collect.")
         listener = connector.add_listener(topics=list(topics))
         connector.set_topics(spec.job_id, list(topics.items()))
-        pending: dict[str, Sample] = {}
-        next_emit = 0.0
+        throttle = FieldThrottle(self.interval_s)
         try:
             while True:
-                timeout = max(0.0, next_emit - time.monotonic()) if pending else 5.0
+                held = throttle.wait(time.monotonic())
                 batch: list[Message] = []
                 try:
-                    batch.append(await bounded(listener.queue.get(), timeout=timeout))
+                    batch.append(await bounded(listener.queue.get(), timeout=5.0 if held is None else held))
                 except asyncio.TimeoutError:
                     pass
                 batch.extend(listener.drain_nowait())
                 if batch:
                     events, latest = map_mqtt_messages(spec.fields, spec.config, batch)
-                    pending.update(latest)
+                    throttle.offer(latest)
                     if events:
                         self._emit_push(events)
-                elif not pending:
+                elif held is None:
                     self._push_state(connector)
-                if pending and time.monotonic() >= next_emit:
-                    self._emit_push(list(pending.values()))
-                    pending.clear()
-                    next_emit = time.monotonic() + self.interval_s
+                ready = throttle.due(time.monotonic())
+                if ready:
+                    self._emit_push(ready)
         finally:
             connector.set_topics(spec.job_id, [])
             connector.remove_listener(listener)

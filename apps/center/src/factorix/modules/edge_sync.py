@@ -356,6 +356,7 @@ async def pull_commands(session: AsyncSession, edge: dict[str, Any]) -> dict[str
         "command_type": meta.get("command_type") or "COMMISSION",
         "mode": meta.get("mode") or "FULL",
         "fields": meta.get("fields") or [],
+        "test_path": meta.get("test_path"),
         "topic_filter": meta.get("topic_filter"),
         "topics": meta.get("topics") or [],
         # HTTP capture fetches one path; the wizard sends it as the capture filter.

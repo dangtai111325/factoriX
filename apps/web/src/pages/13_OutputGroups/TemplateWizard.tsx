@@ -5,7 +5,7 @@ import { Button } from '../../components/common/Button';
 import { ApplyResult, ModelTemplate } from './types';
 import { applyTemplate, deleteTemplate, errorText } from './modelApi';
 import { useTemplates } from './hooks';
-import { parentPathLabel } from './modelLogic';
+import { parentPathLabel, republishLabel } from './modelLogic';
 import { Banner, KindBadge, Modal } from './ui';
 
 interface Props {
@@ -256,6 +256,7 @@ export const TemplateWizard: React.FC<Props> = ({ open, onClose, onCreated, reso
                   <div className="text-[11px] text-[#657794] mt-1">
                     {t.members.length} fields · {signalFieldCount(t)} from signals
                   </div>
+                  <div className="text-[11px] text-[#334568] mt-0.5">{republishLabel(t.emit_policy?.republish_ms, t.kind)}</div>
                   <div className="mt-2 flex flex-wrap gap-1">
                     {t.members.map((m) => (
                       <span
@@ -356,7 +357,7 @@ export const TemplateWizard: React.FC<Props> = ({ open, onClose, onCreated, reso
                 <tr className="bg-slate-50 text-[#657794] font-semibold border-b border-slate-200">
                   <th className="text-left py-2 px-3 sticky left-0 bg-slate-50">Resource</th>
                   {chosenTemplates.map((t) => (
-                    <th key={t.id} className="py-2 px-3 text-center whitespace-nowrap">
+                    <th key={t.id} className="py-2 px-3 text-center whitespace-nowrap" title={republishLabel(t.emit_policy?.republish_ms, t.kind)}>
                       {t.display_name}
                     </th>
                   ))}

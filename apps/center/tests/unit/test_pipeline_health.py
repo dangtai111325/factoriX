@@ -514,7 +514,7 @@ def test_ingest_batch_flow_with_frozen_source_time() -> None:
             ("FROM configuration_releases", [{"revision": 4}]),
             ("FROM signal_bindings b", [binding]),
             ("FROM formula_dependencies d", []),
-            ("INSERT INTO ingest_dedup", [{"event_uid": "x"}]),
+            ("INSERT INTO ingest_dedup", [{"event_uid": "u-1"}]),  # batch dedup returns the uids it inserted
             ("INSERT INTO latest_signal_state", [{"signal_id": signal}]),
             ("WITH prev AS", [{"id": connection, "health": "HEALTHY", "old_health": "UNKNOWN", "last_error": None, "last_success_at": None}]),
         ]

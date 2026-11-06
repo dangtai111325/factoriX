@@ -22,6 +22,9 @@ from factorix_edge.store.outbox import Outbox
 logger = logging.getLogger("factorix_edge")
 
 ENROLL_RETRY_S = 5.0
+# Center writes the token right after the first connection creates the local edge; polling at
+# 0.5 s lets the collector enroll within about a second, so the first "Save & test" runs (R2-CN-02).
+TOKEN_POLL_S = 0.5
 
 
 def _waiting() -> bool:
@@ -91,7 +94,7 @@ async def _wait_for_token(credential_path: Path) -> str | None:
         if not logged:
             logger.info("Waiting for an enrollment token at %s", enroll_path)
             logged = True
-        await asyncio.sleep(2)
+        await asyncio.sleep(TOKEN_POLL_S)
 
 
 async def obtain_credential(client: httpx.AsyncClient, credential_path: Path) -> str:
@@ -154,4 +157,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=os.environ.get("FACTORIX_EDGE_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Per-request client logs would write several lines per second to the appliance log.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     asyncio.run(main())

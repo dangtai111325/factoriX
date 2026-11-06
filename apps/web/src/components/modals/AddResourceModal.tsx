@@ -7,6 +7,7 @@ import { slugifyResourceCode } from '../../utils/slugify';
 import { allowedChildTypes, buildResourceTree, HierarchyTreeNode } from '../../utils/resourceHierarchy';
 import { resourceTypeLabel } from '../common/ResourceTypeIcon';
 import { useDialogA11y } from './useDialogA11y';
+import { ModalPortal } from './ModalPortal';
 
 export interface NewResourceInput {
   name: string;
@@ -48,6 +49,46 @@ const FALLBACK_TYPES: ResourceTypeOption[] = [
 ].map((key) => ({ key, name: resourceTypeLabel(key) }));
 
 const CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+/** Generic examples per resource type (never customer data). */
+const EXAMPLES: Record<string, { name: string; code: string }> = {
+  enterprise: { name: 'e.g. Acme Manufacturing', code: 'e.g. ENT-01' },
+  site: { name: 'e.g. North site', code: 'e.g. SITE-01' },
+  plant: { name: 'e.g. Plant 1', code: 'e.g. PLANT-01' },
+  area: { name: 'e.g. Assembly area', code: 'e.g. AREA-01' },
+  zone: { name: 'e.g. Zone A', code: 'e.g. ZONE-01' },
+  line: { name: 'e.g. Assembly line 1', code: 'e.g. LINE-01' },
+  workshop: { name: 'e.g. Workshop 1', code: 'e.g. WS-01' },
+  cell: { name: 'e.g. Cell 1', code: 'e.g. CELL-01' },
+  utility_system: { name: 'e.g. Compressed air', code: 'e.g. UTIL-01' },
+  machine: { name: 'e.g. Press 1', code: 'e.g. MC-01' },
+  sensor: { name: 'e.g. Temperature sensor 1', code: 'e.g. SENS-01' },
+};
+
+/** Name and code placeholders for a resource type. */
+export function resourceExamples(type: string): { name: string; code: string } {
+  return EXAMPLES[type.toLowerCase()] || { name: 'e.g. Unit 1', code: 'e.g. UNIT-01' };
+}
+
+/** Neutral focus style: the brand red is reserved for errors and primary actions. */
+export const FIELD_BASE =
+  'w-full h-10 px-3 bg-white border rounded-lg text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2A82E7]/20';
+export const FIELD_OK = 'border-slate-200 focus:border-[#2A82E7]';
+export const FIELD_ERROR = 'border-red-500 focus:border-red-500 focus:ring-red-500/20';
+
+export function resourceNameProblem(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return 'Enter a name.';
+  if (FORBIDDEN_NAME.test(trimmed)) return 'Names cannot contain / # + $ or control characters.';
+  return '';
+}
+
+export function resourceCodeProblem(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return 'Enter a code.';
+  if (!CODE_PATTERN.test(trimmed)) return 'Start with a letter or digit; use only letters, digits, dot, underscore or hyphen (max 64).';
+  return '';
+}
 const FORBIDDEN_NAME = /[/#+$\x00-\x1F\x7F]/;
 
 function flattenTree(nodes: HierarchyTreeNode[], depth = 0, out: Array<{ resource: ResourceNode; depth: number }> = []) {
@@ -168,21 +209,13 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
     setCodeError('');
 
     const trimmedName = name.trim();
-    if (!trimmedName) {
-      setNameError('Enter a name.');
-      return;
-    }
-    if (FORBIDDEN_NAME.test(trimmedName)) {
-      setNameError('Names cannot contain / # + $ or control characters.');
-      return;
-    }
     const trimmedCode = code.trim();
-    if (!trimmedCode) {
-      setCodeError('Enter a code.');
-      return;
-    }
-    if (!CODE_PATTERN.test(trimmedCode)) {
-      setCodeError('Start with a letter or digit; use only letters, digits, dot, underscore or hyphen (max 64).');
+    const nameIssue = resourceNameProblem(name);
+    const codeIssue = resourceCodeProblem(code);
+    setNameError(nameIssue);
+    setCodeError(codeIssue);
+    if (nameIssue || codeIssue) {
+      document.getElementById(nameIssue ? 'add-resource-name' : 'add-resource-code')?.focus();
       return;
     }
     if (!type) {
@@ -215,226 +248,233 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
   };
 
   const parentLabel = parent ? parent.name : 'Top level';
+  const examples = resourceExamples(type);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-fadeIn"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !submitting) onClose();
-      }}
-    >
+    <ModalPortal>
       <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="add-resource-title"
-        aria-describedby="add-resource-desc"
-        tabIndex={-1}
-        className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh] outline-none"
+        className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-fadeIn"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !submitting) onClose();
+        }}
       >
-        <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-red-50 text-[#EF1B24] flex items-center justify-center">
-              <FolderPlus className="w-5 h-5" aria-hidden="true" />
-            </div>
-            <div>
-              <h2 id="add-resource-title" className="text-lg font-bold text-slate-900">
-                Add resource
-              </h2>
-              <p id="add-resource-desc" className="text-xs text-slate-500">
-                Add an enterprise, site, area, line, machine or other unit to the factory model.
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={submitting}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 transition-colors"
-            aria-label="Close"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        <form onSubmit={handleSubmit} noValidate className="p-6 space-y-4 overflow-y-auto flex-1 text-sm">
-          {error && (
-            <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-red-700 text-xs">
-              <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
-              <span>{error}</span>
-            </div>
-          )}
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="add-resource-parent" className="block text-xs font-semibold text-slate-700 mb-1">
-                Parent
-              </label>
-              <select
-                id="add-resource-parent"
-                value={parentId}
-                onChange={(event) => setParentId(event.target.value)}
-                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
-              >
-                <option value={TOP_LEVEL}>Top level (no parent)</option>
-                {parentOptions.map(({ resource }) => (
-                  <option key={resource.id} value={resource.id}>
-                    {`${resource.name} (${resourceTypeLabel(resource.type)})`}
-                  </option>
-                ))}
-              </select>
-              {parentPath && (
-                <p className="mt-1 text-[11px] text-slate-500 truncate" title={parentPath}>
-                  {parentPath}
-                </p>
-              )}
-            </div>
-            <div>
-              <label htmlFor="add-resource-type" className="block text-xs font-semibold text-slate-700 mb-1">
-                Type <span className="text-[#EF1B24]">*</span>
-              </label>
-              <select
-                id="add-resource-type"
-                value={type}
-                onChange={(event) => setType(event.target.value)}
-                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
-              >
-                {recommended.length > 0 && (
-                  <optgroup label={parent ? `Recommended under ${resourceTypeLabel(parent.type).toLowerCase()}` : 'Top level'}>
-                    {recommended.map((item) => (
-                      <option key={item.key} value={item.key}>
-                        {item.name}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                {others.length > 0 && (
-                  <optgroup label={recommended.length > 0 ? 'Other types' : 'Types'}>
-                    {others.map((item) => (
-                      <option key={item.key} value={item.key}>
-                        {item.name}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-              </select>
-              {parent && recommended.length === 0 && (
-                <p className="mt-1 text-[11px] text-amber-700">
-                  A {resourceTypeLabel(parent.type).toLowerCase()} normally has nothing under it. Choose a type only if your
-                  model needs it.
-                </p>
-              )}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label htmlFor="add-resource-name" className="block text-xs font-semibold text-slate-700">
-                  Name <span className="text-[#EF1B24]">*</span>
-                </label>
-                <span className="text-[11px] text-slate-400" aria-hidden="true">
-                  {name.length}/200
-                </span>
+        <div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="add-resource-title"
+          aria-describedby="add-resource-desc"
+          tabIndex={-1}
+          className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh] outline-none"
+        >
+          <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-lg bg-red-50 text-[#EF1B24] flex items-center justify-center">
+                <FolderPlus className="w-5 h-5" aria-hidden="true" />
               </div>
-              <input
-                id="add-resource-name"
-                type="text"
-                data-autofocus
-                maxLength={200}
-                value={name}
-                aria-invalid={Boolean(nameError)}
-                aria-describedby={nameError ? 'add-resource-name-error' : undefined}
-                onChange={(event) => {
-                  setName(event.target.value);
-                  if (nameError) setNameError('');
-                }}
-                placeholder={parent ? 'e.g. Assembly line 1' : 'e.g. Acme Manufacturing'}
-                className={`w-full px-3 py-2 bg-white border rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 ${
-                  nameError ? 'border-red-500' : 'border-slate-200 focus:border-[#EF1B24]'
-                }`}
-              />
-              {nameError && (
-                <p id="add-resource-name-error" className="mt-1 text-xs text-red-600 font-medium flex items-center gap-1">
-                  <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                  <span>{nameError}</span>
+              <div>
+                <h2 id="add-resource-title" className="text-lg font-bold text-slate-900">
+                  Add resource
+                </h2>
+                <p id="add-resource-desc" className="text-xs text-slate-500">
+                  Add an enterprise, site, area, line, machine or other unit to the factory model.
                 </p>
-              )}
+              </div>
             </div>
-            <div>
-              <label htmlFor="add-resource-code" className="block text-xs font-semibold text-slate-700 mb-1">
-                Code <span className="text-[#EF1B24]">*</span>
-              </label>
-              <input
-                id="add-resource-code"
-                type="text"
-                maxLength={64}
-                value={code}
-                aria-invalid={Boolean(codeError)}
-                aria-describedby="add-resource-code-hint"
-                onChange={(event) => {
-                  setCode(event.target.value);
-                  setCodeUserEdited(true);
-                  if (codeError) setCodeError('');
-                }}
-                placeholder="e.g. LINE-01"
-                className={`w-full px-3 py-2 bg-white border rounded-lg font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 ${
-                  codeError ? 'border-red-500 bg-red-50/50' : 'border-slate-200 focus:border-[#EF1B24]'
-                }`}
-              />
-              {codeError ? (
-                <p id="add-resource-code-hint" className="mt-1 text-xs text-red-600 font-medium flex items-center gap-1">
-                  <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                  <span>{codeError}</span>
-                </p>
-              ) : (
-                <p id="add-resource-code-hint" className="mt-1 text-[11px] text-slate-500">
-                  {codeUserEdited
-                    ? 'Identifier used in topics and paths.'
-                    : 'Suggested from the name. You can change it.'}
-                </p>
-              )}
-            </div>
-          </div>
-
-          <div>
-            <label htmlFor="add-resource-description" className="block text-xs font-semibold text-slate-700 mb-1">
-              Description
-            </label>
-            <textarea
-              id="add-resource-description"
-              rows={2}
-              value={description}
-              onChange={(event) => setDescription(event.target.value)}
-              placeholder="Optional notes about this resource"
-              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24]"
-            />
-          </div>
-
-          <p className="text-xs text-slate-500">
-            Codes must be unique among the resources directly under{' '}
-            <span className="font-semibold text-slate-700">{parentLabel}</span>.
-          </p>
-
-          <div className="pt-2 flex items-center justify-end gap-3">
             <button
               type="button"
               onClick={onClose}
               disabled={submitting}
-              className="px-4 py-2 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
+              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 transition-colors"
+              aria-label="Close"
             >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={submitting || !type}
-              className="px-4 py-2 bg-[#EF1B24] hover:bg-[#D9151E] text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 flex items-center gap-2"
-            >
-              {submitting ? 'Creating…' : 'Create resource'}
+              <X className="w-5 h-5" />
             </button>
           </div>
-        </form>
+
+          <form onSubmit={handleSubmit} noValidate className="p-6 space-y-4 overflow-y-auto flex-1 text-sm">
+            {error && (
+              <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-red-700 text-xs">
+                <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="add-resource-parent" className="block text-xs font-semibold text-slate-700 mb-1">
+                  Parent
+                </label>
+                <select
+                  id="add-resource-parent"
+                  value={parentId}
+                  onChange={(event) => setParentId(event.target.value)}
+                  className={`${FIELD_BASE} ${FIELD_OK}`}
+                >
+                  <option value={TOP_LEVEL}>Top level (no parent)</option>
+                  {parentOptions.map(({ resource }) => (
+                    <option key={resource.id} value={resource.id}>
+                      {`${resource.name} (${resourceTypeLabel(resource.type)})`}
+                    </option>
+                  ))}
+                </select>
+                {parentPath && (
+                  <p className="mt-1 text-[11px] text-slate-500 truncate" title={parentPath}>
+                    {parentPath}
+                  </p>
+                )}
+              </div>
+              <div>
+                <label htmlFor="add-resource-type" className="block text-xs font-semibold text-slate-700 mb-1">
+                  Type <span className="text-[#EF1B24]">*</span>
+                </label>
+                <select
+                  id="add-resource-type"
+                  value={type}
+                  onChange={(event) => setType(event.target.value)}
+                  className={`${FIELD_BASE} ${FIELD_OK}`}
+                >
+                  {recommended.length > 0 && (
+                    <optgroup label={parent ? `Recommended under ${resourceTypeLabel(parent.type).toLowerCase()}` : 'Top level'}>
+                      {recommended.map((item) => (
+                        <option key={item.key} value={item.key}>
+                          {item.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {others.length > 0 && (
+                    <optgroup label={recommended.length > 0 ? 'Other types' : 'Types'}>
+                      {others.map((item) => (
+                        <option key={item.key} value={item.key}>
+                          {item.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+                {parent && recommended.length === 0 && (
+                  <p className="mt-1 text-[11px] text-amber-700">
+                    A {resourceTypeLabel(parent.type).toLowerCase()} normally has nothing under it. Choose a type only if your
+                    model needs it.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+              <div>
+                <label htmlFor="add-resource-name" className="block text-xs font-semibold text-slate-700 mb-1">
+                  Name <span className="text-[#EF1B24]">*</span>
+                </label>
+                <input
+                  id="add-resource-name"
+                  type="text"
+                  data-autofocus
+                  maxLength={200}
+                  value={name}
+                  aria-invalid={Boolean(nameError)}
+                  aria-describedby="add-resource-name-hint"
+                  onChange={(event) => {
+                    setName(event.target.value);
+                    // Clear as soon as the input is valid again; new errors appear on blur or submit.
+                    if (nameError && !resourceNameProblem(event.target.value)) setNameError('');
+                  }}
+                  onBlur={() => {
+                    // Validate what was typed; an untouched empty field is only reported on submit.
+                    if (name) setNameError(resourceNameProblem(name));
+                  }}
+                  placeholder={examples.name}
+                  className={`${FIELD_BASE} ${nameError ? FIELD_ERROR : FIELD_OK}`}
+                />
+                <div id="add-resource-name-hint" className="mt-1 flex items-start justify-between gap-2 text-[11px]">
+                  {nameError ? (
+                    <span className="text-red-600 font-medium flex items-center gap-1">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      <span>{nameError}</span>
+                    </span>
+                  ) : (
+                    <span className="text-slate-500">Shown in the hierarchy and in data models.</span>
+                  )}
+                  <span className="text-slate-400 shrink-0 tabular-nums" aria-hidden="true">
+                    {name.length}/200
+                  </span>
+                </div>
+              </div>
+              <div>
+                <label htmlFor="add-resource-code" className="block text-xs font-semibold text-slate-700 mb-1">
+                  Code <span className="text-[#EF1B24]">*</span>
+                </label>
+                <input
+                  id="add-resource-code"
+                  type="text"
+                  maxLength={64}
+                  value={code}
+                  aria-invalid={Boolean(codeError)}
+                  aria-describedby="add-resource-code-hint"
+                  onChange={(event) => {
+                    setCode(event.target.value);
+                    setCodeUserEdited(true);
+                    if (codeError && !resourceCodeProblem(event.target.value)) setCodeError('');
+                  }}
+                  onBlur={() => {
+                    if (codeUserEdited) setCodeError(resourceCodeProblem(code));
+                  }}
+                  placeholder={examples.code}
+                  className={`${FIELD_BASE} font-mono ${codeError ? FIELD_ERROR : FIELD_OK}`}
+                />
+                {codeError ? (
+                  <p id="add-resource-code-hint" className="mt-1 text-[11px] text-red-600 font-medium flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>{codeError}</span>
+                  </p>
+                ) : (
+                  <p id="add-resource-code-hint" className="mt-1 text-[11px] text-slate-500">
+                    {codeUserEdited ? 'Identifier used in topics and paths.' : 'Suggested from the name. You can change it.'}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <label htmlFor="add-resource-description" className="block text-xs font-semibold text-slate-700 mb-1">
+                Description
+              </label>
+              <textarea
+                id="add-resource-description"
+                rows={2}
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                placeholder="Optional notes about this resource"
+                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2A82E7]/20 focus:border-[#2A82E7]"
+              />
+            </div>
+
+            <p className="text-xs text-slate-500">
+              Codes must be unique among the resources directly under{' '}
+              <span className="font-semibold text-slate-700">{parentLabel}</span>.
+            </p>
+
+            <div className="pt-2 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={submitting}
+                className="px-4 py-2 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={submitting || !type}
+                className="px-4 py-2 bg-[#EF1B24] hover:bg-[#D9151E] text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 flex items-center gap-2"
+              >
+                {submitting ? 'Creating…' : 'Create resource'}
+              </button>
+            </div>
+          </form>
+        </div>
       </div>
-    </div>
+    </ModalPortal>
   );
 };

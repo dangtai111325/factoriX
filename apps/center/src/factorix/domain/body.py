@@ -497,6 +497,9 @@ BUILTIN_TEMPLATES: tuple[dict[str, Any], ...] = (
         "display_name": "State",
         "description": "Machine state with operator.",
         "kind": "STATE",
+        # Re-publish unchanged bodies so consumers see a live stream (new publish_timestamp,
+        # same source_timestamp) even while a machine is stopped.
+        "emit_policy": {"republish_ms": 5000},
         "fields": _head(True) + [_sig(k) for k in ("status", "mode", "stop_error", "employee")],
     },
     {
@@ -504,6 +507,9 @@ BUILTIN_TEMPLATES: tuple[dict[str, Any], ...] = (
         "display_name": "Process",
         "description": "Speeds, program and uptime.",
         "kind": "STATE",
+        # Re-publish unchanged bodies so consumers see a live stream (new publish_timestamp,
+        # same source_timestamp) even while a machine is stopped.
+        "emit_policy": {"republish_ms": 5000},
         "fields": _head(True)
         + [_sig(k) for k in ("speed_1", "speed_2", "program_name", "program_no", "uptime_1", "uptime_2", "status", "employee")],
     },
@@ -512,6 +518,9 @@ BUILTIN_TEMPLATES: tuple[dict[str, Any], ...] = (
         "display_name": "Energy",
         "description": "Electrical measurements with machine status.",
         "kind": "STATE",
+        # Re-publish unchanged bodies so consumers see a live stream (new publish_timestamp,
+        # same source_timestamp) even while a machine is stopped.
+        "emit_policy": {"republish_ms": 5000},
         "fields": _head(True)
         + [
             _sig(k)
@@ -525,6 +534,9 @@ BUILTIN_TEMPLATES: tuple[dict[str, Any], ...] = (
         "display_name": "Condition",
         "description": "Temperatures, pressures, vibration and environment with machine status.",
         "kind": "STATE",
+        # Re-publish unchanged bodies so consumers see a live stream (new publish_timestamp,
+        # same source_timestamp) even while a machine is stopped.
+        "emit_policy": {"republish_ms": 5000},
         "fields": _head(True)
         + [
             _sig(k)
@@ -541,6 +553,9 @@ BUILTIN_TEMPLATES: tuple[dict[str, Any], ...] = (
         "display_name": "Order",
         "description": "Production order with operator.",
         "kind": "STATE",
+        # Re-publish unchanged bodies so consumers see a live stream (new publish_timestamp,
+        # same source_timestamp) even while a machine is stopped.
+        "emit_policy": {"republish_ms": 5000},
         "fields": _head(False) + [_sig(k) for k in ("so", "wo", "item", "order_qty", "cycle_time", "motor_no", "employee")],
     },
     {

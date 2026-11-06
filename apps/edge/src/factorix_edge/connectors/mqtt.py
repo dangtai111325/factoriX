@@ -270,6 +270,8 @@ class MqttConnector:
             if self._connected_event:
                 self._connected_event.set()
             return
+        if self.last_error_code is not None:
+            logger.info("MQTT %s:%s connected again after: %s", self.host, self.port, self.last_error)
         self.state = "UP"
         self.last_error_code = None
         self.last_error = None
@@ -279,6 +281,8 @@ class MqttConnector:
             self._connected_event.set()
 
     def _set_down(self, code: str, text: str) -> None:
+        if self.state == "UP":
+            logger.warning("MQTT %s:%s (client %s) went down: %s %s", self.host, self.port, self.client_id, code, text)
         if self.state != "AUTH_FAILED" or code != "NETWORK":
             self.state = "DOWN"
         self.last_error_code = code

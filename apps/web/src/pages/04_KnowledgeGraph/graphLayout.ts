@@ -15,9 +15,12 @@ export async function layoutGraph(
     layoutOptions: {
       'elk.algorithm': 'layered',
       'elk.direction': direction,
-      'elk.spacing.nodeNode': '40',
-      'elk.layered.spacing.nodeNodeBetweenLayers': '100',
+      'elk.spacing.nodeNode': '28',
+      'elk.layered.spacing.nodeNodeBetweenLayers': '84',
       'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF',
+      // Keep the input order (siblings are sorted by name before layout) instead of reshuffling them.
+      'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
+      'elk.layered.crossingMinimization.forceNodeModelOrder': 'true',
     },
     children: nodes.map((node) => {
       const width =
@@ -38,8 +41,8 @@ export async function layoutGraph(
           : node.type === 'edgeNode'
           ? 44
           : node.type === 'telemetryGroup'
-          ? 76
-          : 64;
+          ? 84
+          : 70;
       return {
         id: node.id,
         width,

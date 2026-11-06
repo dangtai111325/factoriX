@@ -26,6 +26,7 @@ import {
 } from '../lib/liveStream'
 import { CommissionResult, runConnectionTest } from '../lib/commissioning'
 import { normalizeQuality } from '../lib/format'
+import { endpointWithScheme } from '../lib/protocols'
 
 const EMPTY_PLANT: PlantScope = {
   id: '',
@@ -79,7 +80,19 @@ interface PreparedConnection {
   edgeId: string
 }
 
+/** Status of the shared metadata load (resources, connections, signals, edges). */
+export type LoadState = 'loading' | 'ready' | 'error'
+
 interface AppContextType {
+  /**
+   * 'loading' until the first successful load; 'error' when no load has succeeded yet (pages must show
+   * an error with Retry, never an empty state); 'ready' once data was loaded at least once. A later
+   * background failure keeps 'ready' (data stays visible) and only sets `loadError`.
+   */
+  loadState: LoadState
+  loadError: string | null
+  /** Re-run the metadata load (Retry button). */
+  retryLoad: () => Promise<void>
   revertToZero: (confirm: string) => Promise<void>
   refresh: () => Promise<void>
   isDemoMode: boolean
@@ -235,11 +248,12 @@ function mapConnection(row: Record<string, unknown>): ConnectionItem {
   const health = text(row.health).toUpperCase()
   const effectiveHealth = text(row.effective_health || row.health).toUpperCase()
   const config = (row.config_json as Record<string, unknown>) || (row.config as Record<string, unknown>) || {}
+  const protocol = protocolOf(text(row.protocol))
   return {
     id: text(row.id),
     name: text(row.name),
-    protocol: protocolOf(text(row.protocol)),
-    endpoint: text(row.endpoint_redacted),
+    protocol,
+    endpoint: endpointWithScheme(protocol, text(row.endpoint_redacted)),
     status: connectionDisplayState({ lifecycleStatus, effectiveHealth, health, signalsCount }),
     lifecycleStatus,
     health,
@@ -291,7 +305,7 @@ interface SignalMeta extends SignalItem {
   enabled: boolean
 }
 
-function mapSignal(row: Record<string, unknown>, connectionName: Map<string, string>): SignalMeta {
+function mapSignal(row: Record<string, unknown>, connectionName: Map<string, string>, listIndex = 0): SignalMeta {
   const dataType = text(row.data_type)
   const addressJson = (row.address_json as Record<string, unknown>) || undefined
   const addressKind = text(row.address_kind)
@@ -317,6 +331,8 @@ function mapSignal(row: Record<string, unknown>, connectionName: Map<string, str
     version: Number(row.version || 1),
     addressKind,
     addressJson,
+    sourceOrdinal: Number(row.source_ordinal ?? 0) || 0,
+    listIndex,
     bindingAddress: summary || undefined,
     topic: text(addressJson?.topic || addressJson?.path || addressJson?.node_id) || undefined,
     address: addressJson?.jsonpath ? text(addressJson.jsonpath) : summary || undefined,
@@ -347,6 +363,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [collectorLabel, setCollectorLabel] = useState('Collector: not enrolled')
+  const [loadState, setLoadState] = useState<LoadState>('loading')
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const loadedOnceRef = useRef(false)
   const streamStatus = useStreamStatus()
 
   // Live values live outside the metadata so a metadata refresh never wipes them.
@@ -473,14 +492,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [signals, currentPlant.id, resourceIds],
   )
 
-  const refresh = useCallback(async () => {
+  const loadMetadata = useCallback(async () => {
+    type Page = { items: Array<Record<string, unknown>> }
+    // Secondary lists must not block the core load: on failure they keep their previous content.
+    const optional = (path: string) =>
+      api<Page>(path).catch((error) => {
+        console.warn(`Optional list ${path} could not be loaded`, error)
+        return null
+      })
     const [resourcePage, connectionPage, signalPage, groupPage, auditPage, edgePage] = await Promise.all([
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/resources?view=all&limit=200'),
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/connections'),
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/signals?limit=1000'),
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/output-groups'),
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/audit-events?limit=50'),
-      api<{ items: Array<Record<string, unknown>> }>('/api/v1/edges'),
+      api<Page>('/api/v1/resources?view=all&limit=200'),
+      api<Page>('/api/v1/connections'),
+      api<Page>('/api/v1/signals?limit=1000'),
+      optional('/api/v1/output-groups'),
+      optional('/api/v1/audit-events?limit=50'),
+      api<Page>('/api/v1/edges'),
     ])
     const mappedResources: ResourceNode[] = (resourcePage.items || []).map((row) => ({
       id: text(row.id),
@@ -511,7 +537,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const connectionName = new Map(connectionRows.map((row) => [text(row.id), text(row.name)]))
     setConnections(connectionRows.map(mapConnection))
 
-    const metas = (signalPage.items || []).map((row) => mapSignal(row, connectionName))
+    const metas = (signalPage.items || []).map((row, index) => mapSignal(row, connectionName, index))
     const ids = metas.map((item) => item.id).filter(Boolean)
     signalIdsRef.current = ids
     // Forget live values of signals that no longer exist; keep everything else untouched.
@@ -524,7 +550,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     await fetchLatest(ids)
 
     setLayoutNodes([])
-    setOutputGroups(
+    if (groupPage) setOutputGroups(
       (groupPage.items || []).map((row) => ({
         id: text(row.id),
         name: text(row.display_name || row.key),
@@ -536,7 +562,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         samplePayload: '',
       })),
     )
-    setActivities(
+    if (auditPage) setActivities(
       (auditPage.items || []).map((row) => ({
         id: text(row.id),
         timestamp: text(row.occurred_at),
@@ -588,6 +614,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         })),
     )
   }, [fetchLatest])
+
+  const refresh = useCallback(async () => {
+    try {
+      await loadMetadata()
+      loadedOnceRef.current = true
+      setLoadState('ready')
+      setLoadError(null)
+    } catch (error) {
+      const message = error instanceof Error && error.message ? error.message : 'The server did not answer.'
+      setLoadError(message)
+      if (!loadedOnceRef.current) setLoadState('error')
+      throw error
+    }
+  }, [loadMetadata])
+
+  const retryLoad = useCallback(async () => {
+    if (!loadedOnceRef.current) setLoadState('loading')
+    try {
+      await refresh()
+    } catch (error) {
+      console.warn('Retry of the metadata load failed', error)
+    }
+  }, [refresh])
 
   // Initial load.
   useEffect(() => {
@@ -964,6 +1013,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }
 
   const value: AppContextType = {
+    loadState,
+    loadError,
+    retryLoad,
     revertToZero,
     refresh,
     isDemoMode: false,

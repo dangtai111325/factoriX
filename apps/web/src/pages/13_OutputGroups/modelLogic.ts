@@ -17,6 +17,8 @@ export const TOPIC_TOKENS = ['enterprise', 'site', 'plant', 'area', 'zone', 'wor
 /** Same default as the backend (domain/body.py DEFAULT_TEMPLATE_TOPIC). */
 export const DEFAULT_TOPIC = '{enterprise}/{site}/{area}/{zone}/{line}/{machine}/{group}';
 export const MAX_REPUBLISH_SEC = 86400;
+/** Model key rule of the backend (collect.GROUP_KEY_RE). */
+export const MODEL_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 
 // ---------------------------------------------------------------- time formatting
 
@@ -40,6 +42,27 @@ export function fmtTs(iso: string | null | undefined): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return String(iso);
   return d.toISOString();
+}
+
+/** "5 s", "2 min", "1 h 30 min" for a duration in seconds. */
+export function durationLabel(totalSec: number): string {
+  const s = Math.round(totalSec);
+  if (s < 60) return `${s} s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rest = s % 60;
+  const parts: string[] = [];
+  if (h) parts.push(`${h} h`);
+  if (m) parts.push(`${m} min`);
+  if (rest) parts.push(`${rest} s`);
+  return parts.join(' ');
+}
+
+/** Human description of emit_policy.republish_ms. Event models never re-publish. */
+export function republishLabel(republishMs: number | null | undefined, kind: ModelKind): string {
+  if (kind === 'EVENT') return 'One body per trigger; no periodic re-publish';
+  if (!republishMs) return 'No periodic re-publish (emits on change only)';
+  return `Re-publish every ${durationLabel(republishMs / 1000)} when unchanged`;
 }
 
 // ---------------------------------------------------------------- hierarchy
@@ -93,6 +116,27 @@ export function resolveTopicPreview(
   if (self) codes.resource = self.code;
   codes.group = groupKey || 'group';
   return template.replace(/\{([^}]+)\}/g, (all, name: string) => codes[name] ?? all);
+}
+
+/**
+ * Lower-cased text a catalog search matches against: name, key, the resolved topic and the whole
+ * breadcrumb of the scope resource (names and codes of every ancestor).
+ */
+export function modelSearchText(
+  resources: ResourceNode[],
+  model: { display_name: string; key: string; topic_template: string; resource_id: string; resource_name?: string; resource_code?: string },
+): string {
+  const chain = ancestorsOf(resources, model.resource_id);
+  const parts = [
+    model.display_name,
+    model.key,
+    model.topic_template,
+    model.resource_name || '',
+    model.resource_code || '',
+    ...chain.flatMap((r) => [r.name, r.code]),
+  ];
+  if (chain.length) parts.push(resolveTopicPreview(resources, model.resource_id, model.topic_template || DEFAULT_TOPIC, model.key));
+  return parts.join('\n').toLowerCase();
 }
 
 export function topicErrors(template: string): string | null {

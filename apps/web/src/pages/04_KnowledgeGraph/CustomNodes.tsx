@@ -27,17 +27,17 @@ export const ResourceNodeComponent: React.FC<NodeProps> = ({ data, selected }) =
     >
       <Handle type="target" position={Position.Left} className="!w-2 !h-2 !bg-[#134074]" />
       <div className="flex items-center justify-between gap-1 mb-1">
-        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-[#F1F5F9] text-[#475569]">
+        <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-1.5 py-0.5 rounded bg-[#F1F5F9] text-[#475569]">
           <ResourceTypeIcon type={typeKey} size={12} />
           {resourceTypeLabel(typeKey)}
         </span>
         {code && (
-          <span className="text-[10px] font-mono text-[#64748B] truncate" title={code}>
+          <span className="text-[11px] font-mono text-[#64748B] truncate" title={code}>
             {code}
           </span>
         )}
       </div>
-      <div className="text-xs font-bold text-[#0B2545] truncate" title={name}>
+      <div className="text-[14px] leading-snug font-bold text-[#0B2545] truncate" title={name}>
         {name}
       </div>
       <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-[#134074]" />
@@ -174,16 +174,16 @@ export const TelemetryGroupNodeComponent: React.FC<NodeProps> = ({ data, selecte
       <div className="flex items-center justify-between gap-1 mb-1">
         <div className="flex items-center gap-1.5">
           <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse" />
-          <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800">Data</span>
+          <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-800">Signals</span>
         </div>
         <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-200/80 text-emerald-900">
           {signalCount} {signalCount === 1 ? 'signal' : 'signals'}
         </span>
       </div>
-      <div className="text-xs font-bold text-slate-900 truncate" title={resourceName}>
+      <div className="text-[14px] leading-snug font-bold text-slate-900 truncate" title={resourceName}>
         {resourceName || 'Signals'}
       </div>
-      <div className="mt-1 flex items-center gap-1.5 text-[10px] text-emerald-800">
+      <div className="mt-1 flex items-center gap-1.5 text-[11px] text-emerald-800">
         <span className={`w-1.5 h-1.5 rounded-full ${tone}`} aria-hidden="true" />
         <span>
           {goodCount} of {signalCount} good

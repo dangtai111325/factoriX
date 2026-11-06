@@ -1,6 +1,6 @@
 import React from 'react';
 import { AlertCircle, CheckCircle2, Loader2, MinusCircle, XCircle } from 'lucide-react';
-import { CommissionResult } from '../../lib/commissioning';
+import { COLLECTOR_STARTING_MESSAGE, CommissionResult, useCollectorStarting } from '../../lib/commissioning';
 
 const STAGE_LABEL: Record<string, string> = {
   REACH: 'Reach endpoint',
@@ -28,6 +28,7 @@ function stageStatusLabel(status: string): string {
   if (s === 'PASSED' || s === 'COMPLETED') return 'Passed';
   if (s === 'FAILED' || s === 'ERROR') return 'Failed';
   if (s === 'NOT_APPLICABLE') return 'Not applicable';
+  if (s === 'SKIPPED') return 'Not verified';
   if (s === 'NOT_TESTED' || s === 'PENDING') return 'Not reached';
   return status;
 }
@@ -41,11 +42,12 @@ interface TestResultPanelProps {
 
 /** Renders the real stage results returned by the Edge collector (no invented timings). */
 export const TestResultPanel: React.FC<TestResultPanelProps> = ({ running, runningLabel, result, successLabel }) => {
+  const collectorStarting = useCollectorStarting();
   if (running) {
     return (
-      <div className="p-3 rounded-xl border border-[#CBD5E1] bg-[#F8FAFC] text-xs text-[#334568] flex items-center gap-2" role="status">
+      <div className="p-3 rounded-xl border border-[#CBD5E1] bg-[#F8FAFC] text-xs text-[#334568] flex items-center gap-2" role="status" aria-live="polite">
         <Loader2 className="w-4 h-4 animate-spin text-[#134074]" />
-        <span>{runningLabel || 'The Edge collector is running the test…'}</span>
+        <span>{collectorStarting ? COLLECTOR_STARTING_MESSAGE : runningLabel || 'The Edge collector is running the test…'}</span>
       </div>
     );
   }
@@ -69,11 +71,11 @@ export const TestResultPanel: React.FC<TestResultPanelProps> = ({ running, runni
             <li key={`${stage.stage}-${index}`} className="flex items-start gap-2">
               {stageIcon(stage.status)}
               <span className="font-semibold min-w-[110px]">{STAGE_LABEL[stage.stage] || stage.stage}</span>
-              <span className="min-w-[80px]">{stageStatusLabel(stage.status)}</span>
+              <span className={`min-w-[80px] ${stage.status.toUpperCase() === 'SKIPPED' ? 'text-[#657794]' : ''}`}>{stageStatusLabel(stage.status)}</span>
               {typeof stage.duration_ms === 'number' && stage.duration_ms > 0 && (
                 <span className="font-mono text-[#64748B]">{stage.duration_ms} ms</span>
               )}
-              {stage.detail && <span className="text-[#475569] break-all">{stage.detail}</span>}
+              {stage.detail && <span className={`break-all ${stage.status.toUpperCase() === 'SKIPPED' ? 'text-[#657794] italic' : 'text-[#475569]'}`}>{stage.detail}</span>}
             </li>
           ))}
         </ul>

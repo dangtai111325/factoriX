@@ -146,6 +146,10 @@ export interface SignalItem {
   version?: number;
   addressKind?: string;
   addressJson?: Record<string, unknown>;
+  /** Position of the source field in the request that created it (source order chosen in Add Data). */
+  sourceOrdinal?: number;
+  /** Position in the Center list (resource code, creation time, source ordinal). */
+  listIndex?: number;
   edgeName?: string;
   connectionProtocol?: string;
   sampleIntervalMs: number;

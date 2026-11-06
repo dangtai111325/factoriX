@@ -12,6 +12,15 @@ a new instant. Outgoing bodies leave the process through the after-commit queue 
 The background loop (:func:`run_maintenance`) re-publishes STATE bodies per ``emit_policy.republish_ms``
 (new ``publish_timestamp``, same ``source_timestamp``), finalises PENDING events after
 ``snapshot_grace_ms`` and prunes each EVENT model to ``max_events``.
+
+EVENT baseline rule (R2-DM-04, decided): an EVENT model emits only completions whose trigger
+``source_time`` is strictly after the moment the model was first published. When it is first
+published (:func:`set_event_baseline`) the current trigger state becomes the baseline and nothing
+is emitted for it; the baseline is stored in ``model_state`` (``content_hash`` ``baseline:...``,
+``source_ts`` = newest trigger ``source_time`` at publish, ``body_text`` empty) and is kept across
+unpublish/publish, so a re-publish never replays the completion that existed before the first
+publish. Afterwards the watermark is the newest emitted event (deduplicated by trigger instant).
+Production counts summed from the events therefore start at the first publish.
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ import logging
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -48,6 +57,9 @@ _CONTEXT_TTL_S = 15.0
 _context_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _EVENT_BATCH = 50
 _GROUP_COLUMNS = "g.id, g.tenant_id, g.resource_id, g.key, g.kind, g.status, g.projection_policy_json, g.emit_policy_json"
+BASELINE_PREFIX = "baseline:"
+# A baseline without any trigger data yet: every later completion is new.
+_NO_TRIGGER_DATA = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -311,6 +323,59 @@ async def _store_state(
     return [_body_event(group["tenant_id"], group["id"], result.body_text)]
 
 
+def baseline_from_triggers(rows: list[dict[str, Any] | None]) -> tuple[datetime | None, str]:
+    """Baseline of an EVENT model from the latest rows of its trigger signals (pure).
+
+    Returns ``(instant, dedupe)``: the newest trigger ``source_time`` (``_NO_TRIGGER_DATA`` when no
+    trigger has data yet) and the value key used by triggers without a source timestamp.
+    """
+    present = [row for row in rows if row is not None]
+    instants = [ts for ts in (as_utc(row.get("source_time")) for row in present) if ts is not None]
+    instant = max(instants) if instants else (_NO_TRIGGER_DATA if not present else None)
+    dedupe = event_dedupe_key(None, [row.get("value") for row in present]) if present and len(present) == len(rows) else ""
+    return instant, dedupe
+
+
+def event_watermark(last_event: dict[str, Any] | None, baseline: dict[str, Any] | None) -> tuple[datetime | None, str | None]:
+    """Newest of the last emitted event and the publish baseline: ``(instant, dedupe_key)``."""
+    last_ts = as_utc(last_event.get("source_ts")) if last_event else None
+    base_ts = as_utc(baseline.get("source_ts")) if baseline else None
+    if last_ts is not None and (base_ts is None or last_ts >= base_ts):
+        return last_ts, last_event.get("dedupe_key") if last_event else None
+    if baseline is not None:
+        return base_ts, str(baseline.get("content_hash") or "")[len(BASELINE_PREFIX):] or None
+    return None, None
+
+
+async def _load_baseline(session: AsyncSession, group_id: Any) -> dict[str, Any] | None:
+    row = await fetch_one(session, "SELECT source_ts, content_hash FROM model_state WHERE group_id = :id", {"id": group_id})
+    if row is None or not str(row.get("content_hash") or "").startswith(BASELINE_PREFIX):
+        return None
+    return row
+
+
+async def set_event_baseline(session: AsyncSession, group: dict[str, Any], members: list[Member], now: datetime) -> None:
+    """Record the trigger state at the first publish of an EVENT model without emitting it.
+
+    Kept when the row exists (re-publish after unpublish keeps the first-publish baseline).
+    """
+    triggers = [m for m in members if m.is_trigger and m.signal_id]
+    if not triggers:
+        return
+    tenant_id = UUID(str(group["tenant_id"]))
+    latest = await load_latest(session, tenant_id, _uuid_list(m.signal_id for m in triggers))
+    instant, dedupe = baseline_from_triggers([latest.get(m.signal_id or "") for m in triggers])
+    await execute(
+        session,
+        """
+        INSERT INTO model_state (group_id, tenant_id, body_text, content_hash, source_ts, last_publish_ts, updated_at)
+        VALUES (:group_id, :tenant_id, '', :hash, :source_ts, :now, :now)
+        ON CONFLICT (group_id) DO NOTHING
+        """,
+        {"group_id": group["id"], "tenant_id": tenant_id, "hash": f"{BASELINE_PREFIX}{dedupe}", "source_ts": instant, "now": now},
+    )
+
+
 async def _evaluate_events(
     session: AsyncSession, group: dict[str, Any], members: list[Member], context: dict[str, Any], now: datetime
 ) -> list[dict[str, Any]]:
@@ -329,28 +394,24 @@ async def _evaluate_events(
         """,
         {"tenant_id": tenant_id, "group_id": group["id"]},
     )
-    last_ts = last["source_ts"] if last else None
-    if last_ts is None:
-        candidates = await fetch_all(
-            session,
-            """
-            SELECT max(source_time) AS source_time FROM observations
-            WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids) AND source_time IS NOT NULL
-            """,
-            {"tenant_id": tenant_id, "ids": trigger_ids},
-        )
-    else:
-        candidates = await fetch_all(
-            session,
-            """
-            SELECT DISTINCT source_time FROM observations
-            WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids) AND source_time > :last_ts
-            ORDER BY source_time ASC
-            LIMIT :limit
-            """,
-            {"tenant_id": tenant_id, "ids": trigger_ids, "last_ts": last_ts, "limit": _EVENT_BATCH},
-        )
-    instants = new_trigger_times((row["source_time"] for row in candidates), last_ts, limit=_EVENT_BATCH)
+    baseline = await _load_baseline(session, group["id"])
+    if last is None and baseline is None:
+        # Published before baselines existed, or the baseline was reset by an edit: the current
+        # trigger state becomes the baseline and is not emitted (R2-DM-04).
+        await set_event_baseline(session, group, members, now)
+        return []
+    last_ts, last_dedupe = event_watermark(last, baseline)
+    candidates = await fetch_all(
+        session,
+        """
+        SELECT DISTINCT source_time FROM observations
+        WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids) AND source_time > :last_ts
+        ORDER BY source_time ASC
+        LIMIT :limit
+        """,
+        {"tenant_id": tenant_id, "ids": trigger_ids, "last_ts": last_ts or _NO_TRIGGER_DATA, "limit": _EVENT_BATCH},
+    )
+    instants = new_trigger_times((row["source_time"] for row in candidates), last_ts or _NO_TRIGGER_DATA, limit=_EVENT_BATCH)
 
     policy = _policy(group)
     status = "PENDING" if int(policy.get("snapshot_grace_ms") or 0) > 0 else "FINAL"
@@ -365,7 +426,7 @@ async def _evaluate_events(
             return []
         values = [r.get("value") for r in rows if r]
         dedupe = event_dedupe_key(None, values)
-        if last and last.get("dedupe_key") == dedupe:
+        if last_dedupe == dedupe:
             return []
         received = [as_utc(r.get("received_time")) for r in rows if r]
         at = max((ts for ts in received if ts is not None), default=None)

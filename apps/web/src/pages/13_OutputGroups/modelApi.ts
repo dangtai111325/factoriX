@@ -89,14 +89,19 @@ export async function unpublishModel(id: string, version: number): Promise<void>
   await api(`${BASE}/${id}/unpublish`, { method: 'POST', body: JSON.stringify({ version }) });
 }
 
+/** Only the emit policy changes; the server keeps members, topic and kind (OutputGroupPatch). */
+export async function setRepublishInterval(id: string, version: number, republishMs: number | null): Promise<void> {
+  await api(`${BASE}/${id}`, { method: 'PATCH', body: JSON.stringify({ version, emit_policy: { republish_ms: republishMs } }) });
+}
+
 export async function duplicateModel(
   id: string,
   resourceId: string,
-  displayName?: string,
+  opts: { displayName?: string; key?: string } = {},
 ): Promise<{ id: string | null; missingKeys: string[] }> {
   const res = await api<Raw>(`${BASE}/${id}/duplicate`, {
     method: 'POST',
-    body: JSON.stringify({ resource_id: resourceId, display_name: displayName || undefined }),
+    body: JSON.stringify({ resource_id: resourceId, display_name: opts.displayName || undefined, key: opts.key || undefined }),
   });
   const created = (res.created || {}) as Raw;
   const missing = Array.isArray(res.missing_keys) ? (res.missing_keys as unknown[]).map(String) : [];

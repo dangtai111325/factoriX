@@ -73,10 +73,15 @@ export function descendantIds(all: ResourceNode[], rootId: string): Set<string> 
   return keep
 }
 
+const NATURAL = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
+
+/** Natural order by name ("Line 2" before "Line 10"), then by code. */
+export function compareResourcesByName(a: ResourceNode, b: ResourceNode): number {
+  return NATURAL.compare(a.name || '', b.name || '') || NATURAL.compare(a.code || '', b.code || '')
+}
+
 export function childrenOf(all: ResourceNode[], parentId: string): ResourceNode[] {
-  return all
-    .filter((r) => r.parentId === parentId)
-    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+  return all.filter((r) => r.parentId === parentId).sort(compareResourcesByName)
 }
 
 export function hasChildren(all: ResourceNode[], resourceId: string): boolean {
@@ -84,7 +89,7 @@ export function hasChildren(all: ResourceNode[], resourceId: string): boolean {
 }
 
 function sortByName(a: ResourceNode, b: ResourceNode): number {
-  return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+  return compareResourcesByName(a, b)
 }
 
 /** Build a sorted forest from flat resources keyed by parentId. */

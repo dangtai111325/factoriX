@@ -34,7 +34,7 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
 
   return (
     <div className="overflow-x-auto border border-slate-200 rounded-lg">
-      <table className="w-full text-left text-[11px] min-w-[960px]">
+      <table className={`w-full text-left text-[11px] ${protocol === 'modbus' ? 'min-w-[1240px]' : 'min-w-[960px]'}`}>
         <thead>
           <tr className="border-b border-slate-200 bg-slate-50 text-[#657794] font-semibold text-[10px] uppercase tracking-wide">
             <th className={cell}>Key</th>
@@ -99,14 +99,14 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
                 {protocol === 'modbus' && (
                   <>
                     <td className={cell}>
-                      <select aria-label="Register area" value={row.registerArea || 'holding'} onChange={(e) => update(row.id, { registerArea: e.target.value as RegisterArea })} className={input}>
+                      <select aria-label="Register area" value={row.registerArea || 'holding'} onChange={(e) => update(row.id, { registerArea: e.target.value as RegisterArea })} className={`${input} min-w-[100px] bg-white`}>
                         {REGISTER_AREAS.map((a) => (
                           <option key={a} value={a}>{a}</option>
                         ))}
                       </select>
                     </td>
                     <td className={cell}>
-                      <input aria-label="Offset" type="number" min={0} value={row.offset ?? ''} onChange={(e) => update(row.id, { offset: e.target.value })} className={`${mono} w-20`} />
+                      <input aria-label="Offset" type="number" min={0} value={row.offset ?? ''} onChange={(e) => update(row.id, { offset: e.target.value })} className={`${mono} w-20 min-w-[72px]`} />
                     </td>
                     <td className={cell}>
                       <select
@@ -121,7 +121,7 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
                             nullable: next === 'ascii' ? true : row.nullable,
                           });
                         }}
-                        className={input}
+                        className={`${input} min-w-[96px] bg-white`}
                       >
                         {MODBUS_TYPES.map((t) => (
                           <option key={t} value={t}>{t}</option>
@@ -145,7 +145,7 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
                         value={row.wordOrder || 'big'}
                         disabled={(fixedCount ?? 1) < 2}
                         onChange={(e) => update(row.id, { wordOrder: e.target.value as 'big' | 'little' })}
-                        className={`${input} disabled:bg-slate-100`}
+                        className={`${input} min-w-[164px] bg-white disabled:bg-slate-100`}
                       >
                         <option value="big">big (high word first)</option>
                         <option value="little">little</option>
@@ -169,7 +169,7 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
                   </>
                 )}
                 <td className={cell}>
-                  <select aria-label="Signal type" value={row.dataType} onChange={(e) => update(row.id, { dataType: e.target.value as SignalDataType })} className={input}>
+                  <select aria-label="Signal type" value={row.dataType} onChange={(e) => update(row.id, { dataType: e.target.value as SignalDataType })} className={`${input} min-w-[100px] bg-white`}>
                     {(Object.keys(DATA_TYPE_LABEL) as SignalDataType[]).map((t) => (
                       <option key={t} value={t}>{DATA_TYPE_LABEL[t]}</option>
                     ))}

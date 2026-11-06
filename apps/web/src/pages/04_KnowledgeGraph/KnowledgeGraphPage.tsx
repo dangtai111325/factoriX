@@ -3,6 +3,7 @@ import {
   ReactFlow,
   MiniMap,
   Controls,
+  ControlButton,
   Background,
   useNodesState,
   useEdgesState,
@@ -12,7 +13,7 @@ import {
   ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Activity, Cable, ChevronRight, Crosshair, ListTree, Loader2, RotateCcw, X } from 'lucide-react';
+import { Activity, Cable, ChevronRight, Crosshair, ListTree, Loader2, Map as MapIcon, Maximize, RotateCcw, X } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useApp } from '../../store/AppContext';
 import { api } from '../../api/client';
@@ -20,7 +21,8 @@ import { ResourceNode, SignalItem } from '../../types';
 import { resourceTypeLabel } from '../../components/common/ResourceTypeIcon';
 import { formatValue, normalizeQuality, QUALITY_LABEL } from '../../lib/format';
 import { translateApiError } from '../../utils/apiErrors';
-import { ancestorPath, descendantIds } from '../../utils/resourceHierarchy';
+import { ancestorPath, compareResourcesByName, descendantIds } from '../../utils/resourceHierarchy';
+import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { layoutGraph } from './graphLayout';
 import { LabeledEdge } from './LabeledEdge';
 import {
@@ -31,6 +33,12 @@ import {
   ModelNodeComponent,
   TelemetryGroupNodeComponent,
 } from './CustomNodes';
+
+/**
+ * Frame the graph without shrinking it below a readable size: large models overflow and are panned
+ * (the overview map, toggled from the controls, helps to navigate).
+ */
+const FIT_VIEW_OPTIONS = { padding: 0.08, minZoom: 0.75, maxZoom: 1.25, duration: 300 };
 
 const nodeTypes = {
   resource: ResourceNodeComponent,
@@ -173,7 +181,7 @@ function buildExpansion(
 }
 
 export const KnowledgeGraphPage: React.FC = () => {
-  const { resources, signals, setSelectedResourceId } = useApp();
+  const { resources, signals, setSelectedResourceId, loadState } = useApp();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const focusParam = searchParams.get('resourceId') || '';
@@ -186,20 +194,52 @@ export const KnowledgeGraphPage: React.FC = () => {
   const [expansions, setExpansions] = useState<Record<string, Expansion>>({});
   const [expanding, setExpanding] = useState<string | null>(null);
   const [expandError, setExpandError] = useState<string | null>(null);
+  const [showMiniMap, setShowMiniMap] = useState(false);
   const nodesRef = useRef<Node[]>([]);
   nodesRef.current = nodes;
   const appliedLayoutTrigger = useRef(0);
   const flowRef = useRef<ReactFlowInstance | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * Fit the graph; when it is too large to fit at a readable zoom, start from its top-left corner
+   * (the root of the hierarchy) instead of showing the clipped middle.
+   */
+  const frameGraph = useCallback(async () => {
+    const instance = flowRef.current;
+    const canvas = canvasRef.current;
+    if (!instance || !canvas) return;
+    await instance.fitView(FIT_VIEW_OPTIONS);
+    const current = instance.getNodes();
+    if (!current.length) return;
+    const { zoom, x, y } = instance.getViewport();
+    if (zoom > FIT_VIEW_OPTIONS.minZoom + 0.001) return;
+    const bounds = instance.getNodesBounds(current);
+    const margin = 24;
+    const overflowX = bounds.width * zoom + 2 * margin > canvas.clientWidth;
+    const overflowY = bounds.height * zoom + 2 * margin > canvas.clientHeight;
+    if (!overflowX && !overflowY) return;
+    await instance.setViewport(
+      {
+        x: overflowX ? margin - bounds.x * zoom : x,
+        y: overflowY ? margin - bounds.y * zoom : y,
+        zoom,
+      },
+      { duration: 200 },
+    );
+  }, []);
 
   const resourceById = useMemo(() => new Map(resources.map((item) => [item.id, item])), [resources]);
   const focus = focusParam ? resourceById.get(focusParam) : undefined;
 
   // Resources in view: the whole model, or the focused resource with its ancestors and descendants.
+  // Sorted naturally by name: the layout keeps this order, so siblings read 01, 02, 03…
   const viewResources = useMemo(() => {
-    if (!focus) return resources;
+    const sorted = [...resources].sort(compareResourcesByName);
+    if (!focus) return sorted;
     const keep = descendantIds(resources, focus.id);
     ancestorPath(resources, focus.id).forEach((id) => keep.add(id));
-    return resources.filter((item) => keep.has(item.id));
+    return sorted.filter((item) => keep.has(item.id));
   }, [resources, focus]);
 
   const viewIds = useMemo(() => new Set(viewResources.map((item) => item.id)), [viewResources]);
@@ -263,7 +303,10 @@ export const KnowledgeGraphPage: React.FC = () => {
             rawEdges.push(labeledEdge(`${parent.id}->${r.id}-CONTAINS`, parent.id, r.id, 'CONTAINS', parent.name, r.name, '#134074'));
           }
         }
-        signalsByResource.forEach((list, resId) => {
+        // Data nodes follow the resource order (Map iteration order is insertion order, not sorted).
+        const dataOrder = viewResources.filter((r) => signalsByResource.has(r.id)).map((r) => r.id);
+        dataOrder.forEach((resId) => {
+          const list = signalsByResource.get(resId) || [];
           const res = resourceById.get(resId);
           const groupId = `telemetry-${resId}`;
           rawNodes.push({
@@ -278,7 +321,7 @@ export const KnowledgeGraphPage: React.FC = () => {
               goodCount: list.filter((s) => normalizeQuality(s.quality) === 'GOOD').length,
             },
           });
-          rawEdges.push(labeledEdge(`${resId}->${groupId}-HAS_SIGNAL`, resId, groupId, 'HAS_SIGNAL', res?.name || '', 'Data', '#10B981'));
+          rawEdges.push(labeledEdge(`${resId}->${groupId}-HAS_SIGNAL`, resId, groupId, 'HAS_SIGNAL', res?.name || '', 'Signals', '#10B981'));
         });
         const nodeIds = new Set(rawNodes.map((n) => n.id));
         for (const [, exp] of visibleExpansions) {
@@ -319,7 +362,7 @@ export const KnowledgeGraphPage: React.FC = () => {
         setEdges(layouted.edges);
         // Frame the new arrangement once React Flow has measured the nodes.
         window.setTimeout(() => {
-          if (active) void flowRef.current?.fitView({ padding: 0.15, duration: 300 });
+          if (active) void frameGraph();
         }, 60);
       } catch (err) {
         console.error('Failed to lay out the knowledge graph', err);
@@ -416,6 +459,17 @@ export const KnowledgeGraphPage: React.FC = () => {
   const roots = resources.filter((item) => !item.parentId || !resourceById.has(item.parentId));
   const groupCount = signalsByResource.size;
   const signalTotal = viewSignals.length;
+
+  if (resources.length === 0 && loadState !== 'ready') {
+    return (
+      <div className="space-y-3">
+        <h1 className="fx-page-title">Knowledge Graph</h1>
+        <div className="fx-card border border-[#E3EAF3]">
+          <LoadStateNotice subject="the factory model" />
+        </div>
+      </div>
+    );
+  }
 
   if (resources.length === 0) {
     return (
@@ -522,7 +576,7 @@ export const KnowledgeGraphPage: React.FC = () => {
       )}
 
       <div className="relative h-[720px] rounded-2xl border border-[#CBD5E1] bg-[#F8FAFC] shadow-sm overflow-hidden flex">
-        <div className="flex-1 h-full relative">
+        <div ref={canvasRef} className="flex-1 h-full relative">
           {isLoading && (
             <div className="absolute inset-0 bg-white/70 backdrop-blur-xs flex items-center justify-center z-10">
               <div className="flex items-center gap-2 text-xs font-semibold text-[#0B2545]">
@@ -546,21 +600,43 @@ export const KnowledgeGraphPage: React.FC = () => {
             }}
             nodesDraggable
             fitView
+            fitViewOptions={FIT_VIEW_OPTIONS}
             minZoom={0.15}
             maxZoom={2.5}
             defaultEdgeOptions={{ type: 'labeled' }}
           >
             <Background color="#CBD5E1" gap={20} size={1} />
-            <Controls className="!bg-white !border !border-[#E2E8F0] !shadow-sm !rounded-xl overflow-hidden" />
-            <MiniMap
-              nodeColor={(node) => {
-                if (node.type === 'telemetryGroup') return '#10B981';
-                if (node.type === 'connection') return '#3B82F6';
-                if (node.type === 'model') return '#7C3AED';
-                return '#64748B';
-              }}
-              className="!border !border-[#E2E8F0] !rounded-xl !overflow-hidden !shadow-sm"
-            />
+            <Controls
+              showFitView={false}
+              className="!bg-white !border !border-[#E2E8F0] !shadow-sm !rounded-xl overflow-hidden"
+            >
+              <ControlButton onClick={() => void frameGraph()} title="Fit the graph" aria-label="Fit the graph">
+                <Maximize className="w-3.5 h-3.5" aria-hidden="true" />
+              </ControlButton>
+              <ControlButton
+                onClick={() => setShowMiniMap((value) => !value)}
+                title={showMiniMap ? 'Hide overview map' : 'Show overview map'}
+                aria-label={showMiniMap ? 'Hide overview map' : 'Show overview map'}
+                aria-pressed={showMiniMap}
+              >
+                <MapIcon className="w-3.5 h-3.5" aria-hidden="true" />
+              </ControlButton>
+            </Controls>
+            {showMiniMap && (
+              <MiniMap
+                position="top-right"
+                pannable
+                zoomable
+                ariaLabel="Overview map"
+                nodeColor={(node) => {
+                  if (node.type === 'telemetryGroup') return '#10B981';
+                  if (node.type === 'connection') return '#3B82F6';
+                  if (node.type === 'model') return '#7C3AED';
+                  return '#64748B';
+                }}
+                className="!border !border-[#E2E8F0] !rounded-xl !overflow-hidden !shadow-sm"
+              />
+            )}
           </ReactFlow>
 
           <div className="absolute bottom-3 left-14 bg-white/95 backdrop-blur-sm px-3 py-1.5 rounded-xl border border-[#E2E8F0] shadow-sm flex flex-wrap items-center gap-3 text-[11px] font-medium text-[#475569] pointer-events-none">
@@ -570,7 +646,7 @@ export const KnowledgeGraphPage: React.FC = () => {
             </span>
             <span className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded bg-[#10B981]" />
-              Data (has data)
+              Signals (has data)
             </span>
             {visibleExpansions.some(([, exp]) => exp.connections + exp.models > 0) && (
               <>
@@ -598,7 +674,7 @@ export const KnowledgeGraphPage: React.FC = () => {
                   {selected.kind === 'resource' && drawerResource
                     ? resourceTypeLabel(drawerResource.type)
                     : selected.kind === 'telemetryGroup'
-                      ? 'Data'
+                      ? 'Signals'
                       : selected.kind === 'connection'
                         ? 'Connection'
                         : 'Data model'}
@@ -607,7 +683,7 @@ export const KnowledgeGraphPage: React.FC = () => {
                   {selected.kind === 'connection' || selected.kind === 'model'
                     ? selected.name
                     : selected.kind === 'telemetryGroup'
-                      ? `${drawerResource?.name || ''} data`
+                      ? `Signals of ${drawerResource?.name || ''}`
                       : drawerResource?.name}
                 </h2>
               </div>

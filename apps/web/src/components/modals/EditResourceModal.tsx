@@ -4,6 +4,8 @@ import { ApiError, api } from '../../api/client';
 import { Button } from '../common/Button';
 import { translateApiError } from '../../utils/apiErrors';
 import { useDialogA11y } from './useDialogA11y';
+import { FIELD_BASE, FIELD_ERROR, FIELD_OK, resourceCodeProblem, resourceExamples, resourceNameProblem } from './AddResourceModal';
+import { ModalPortal } from './ModalPortal';
 
 export interface EditResourceModalProps {
   isOpen: boolean;
@@ -12,6 +14,7 @@ export interface EditResourceModalProps {
     id: string;
     name: string;
     code: string;
+    type?: string;
     attributes?: Record<string, unknown>;
   } | null;
   onSuccess?: (updated: { name: string; code: string }) => void | Promise<void>;
@@ -25,9 +28,6 @@ interface ResourceDetail {
   properties_json?: Record<string, unknown> | null;
   version?: number;
 }
-
-const CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
-const FORBIDDEN_NAME = /[/#+$\x00-\x1F\x7F]/;
 
 /** Keys starting with "_" are maintained by the server (e.g. archive bookkeeping) and are never edited here. */
 function isInternalKey(key: string): boolean {
@@ -115,21 +115,13 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
     }
 
     const trimmedName = name.trim();
-    if (!trimmedName) {
-      setNameError('Enter a name.');
-      return;
-    }
-    if (FORBIDDEN_NAME.test(trimmedName)) {
-      setNameError('Names cannot contain / # + $ or control characters.');
-      return;
-    }
     const trimmedCode = code.trim();
-    if (!trimmedCode) {
-      setCodeError('Enter a code.');
-      return;
-    }
-    if (!CODE_PATTERN.test(trimmedCode)) {
-      setCodeError('Start with a letter or digit; use only letters, digits, dot, underscore or hyphen (max 64).');
+    const nameIssue = resourceNameProblem(name);
+    const codeIssue = resourceCodeProblem(code);
+    setNameError(nameIssue || null);
+    setCodeError(codeIssue || null);
+    if (nameIssue || codeIssue) {
+      document.getElementById(nameIssue ? 'edit-resource-name' : 'edit-resource-code')?.focus();
       return;
     }
 
@@ -191,198 +183,204 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-fadeIn"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !submitting) onClose();
-      }}
-    >
+    <ModalPortal>
       <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="edit-resource-title"
-        tabIndex={-1}
-        className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-xl overflow-hidden flex flex-col max-h-[90vh] outline-none"
+        className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4 animate-fadeIn"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !submitting) onClose();
+        }}
       >
-        <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between gap-3 bg-slate-50">
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="w-10 h-10 rounded-lg bg-red-50 text-[#EF1B24] flex items-center justify-center shrink-0">
-              <Edit2 className="w-5 h-5" aria-hidden="true" />
-            </div>
-            <div className="min-w-0">
-              <h2 id="edit-resource-title" className="text-lg font-bold text-slate-900 truncate" title={resource.name}>
-                Edit {resource.name}
-              </h2>
-              <p className="text-xs text-slate-500 font-mono truncate">Code: {originalCode}</p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={submitting}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 transition-colors"
-            aria-label="Close"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        <form onSubmit={handleSubmit} noValidate className="p-6 space-y-4 overflow-y-auto flex-1 text-sm">
-          {error && (
-            <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-red-700 text-xs">
-              <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
-              <span>{error}</span>
-            </div>
-          )}
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label htmlFor="edit-resource-name" className="block text-xs font-semibold text-slate-700">
-                  Name <span className="text-[#EF1B24]">*</span>
-                </label>
-                <span className="text-[11px] text-slate-400" aria-hidden="true">
-                  {name.length}/200
-                </span>
+        <div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="edit-resource-title"
+          tabIndex={-1}
+          className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-xl overflow-hidden flex flex-col max-h-[90vh] outline-none"
+        >
+          <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between gap-3 bg-slate-50">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-10 h-10 rounded-lg bg-red-50 text-[#EF1B24] flex items-center justify-center shrink-0">
+                <Edit2 className="w-5 h-5" aria-hidden="true" />
               </div>
-              <input
-                id="edit-resource-name"
-                type="text"
-                data-autofocus
-                maxLength={200}
-                value={name}
-                aria-invalid={Boolean(nameError)}
-                onChange={(event) => {
-                  setName(event.target.value);
-                  if (nameError) setNameError(null);
-                }}
-                className={`w-full px-3 py-2 bg-white border rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 ${
-                  nameError ? 'border-red-500' : 'border-slate-200 focus:border-[#EF1B24]'
-                }`}
-              />
-              {nameError && (
-                <p className="mt-1 text-xs text-red-600 font-medium flex items-center gap-1">
-                  <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                  <span>{nameError}</span>
-                </p>
-              )}
+              <div className="min-w-0">
+                <h2 id="edit-resource-title" className="text-lg font-bold text-slate-900 truncate" title={resource.name}>
+                  Edit {resource.name}
+                </h2>
+                <p className="text-xs text-slate-500 font-mono truncate">Code: {originalCode}</p>
+              </div>
             </div>
-            <div>
-              <label htmlFor="edit-resource-code" className="block text-xs font-semibold text-slate-700 mb-1">
-                Code <span className="text-[#EF1B24]">*</span>
-              </label>
-              <input
-                id="edit-resource-code"
-                type="text"
-                maxLength={64}
-                value={code}
-                aria-invalid={Boolean(codeError)}
-                onChange={(event) => {
-                  setCode(event.target.value);
-                  if (codeError) setCodeError(null);
-                }}
-                className={`w-full px-3 py-2 bg-white border rounded-lg font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 ${
-                  codeError ? 'border-red-500 bg-red-50/50' : 'border-slate-200 focus:border-[#EF1B24]'
-                }`}
-              />
-              {codeError && (
-                <p className="mt-1 text-xs text-red-600 font-medium flex items-center gap-1">
-                  <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                  <span>{codeError}</span>
-                </p>
-              )}
-            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={submitting}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 transition-colors"
+              aria-label="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
           </div>
 
-          {isCodeChanged && (
-            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-start gap-2.5 text-amber-800 text-xs">
-              <AlertTriangle className="w-4 h-4 shrink-0 text-amber-600 mt-0.5" aria-hidden="true" />
-              <span>Changing the code changes the topic and path of this resource and of everything under it.</span>
-            </div>
-          )}
-
-          <div>
-            <label htmlFor="edit-resource-description" className="block text-xs font-semibold text-slate-700 mb-1">
-              Description
-            </label>
-            <textarea
-              id="edit-resource-description"
-              rows={2}
-              value={description}
-              disabled={loading}
-              onChange={(event) => setDescription(event.target.value)}
-              placeholder={loading ? 'Loading…' : 'Optional notes about this resource'}
-              className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#EF1B24]/20 focus:border-[#EF1B24] disabled:bg-slate-50"
-            />
-          </div>
-
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs font-semibold text-slate-700">Properties</span>
-              <button
-                type="button"
-                disabled={loading}
-                onClick={() => setProperties((prev) => [...prev, { key: '', value: '' }])}
-                className="inline-flex items-center gap-1 text-xs text-[#EF1B24] font-medium hover:underline disabled:opacity-50"
-              >
-                <Plus className="w-3.5 h-3.5" aria-hidden="true" />
-                Add property
-              </button>
-            </div>
-            {loading ? (
-              <p className="text-xs text-slate-400">Loading properties…</p>
-            ) : properties.length === 0 ? (
-              <p className="text-xs text-slate-400">No properties yet.</p>
-            ) : (
-              <div className="space-y-2">
-                {properties.map((prop, idx) => (
-                  <div key={idx} className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      aria-label={`Property ${idx + 1} name`}
-                      placeholder="Name"
-                      value={prop.key}
-                      onChange={(event) =>
-                        setProperties((prev) => prev.map((item, i) => (i === idx ? { ...item, key: event.target.value } : item)))
-                      }
-                      className="w-1/2 px-2.5 py-1.5 border border-slate-200 rounded-md text-xs font-mono"
-                    />
-                    <input
-                      type="text"
-                      aria-label={`Property ${idx + 1} value`}
-                      placeholder="Value"
-                      value={prop.value}
-                      onChange={(event) =>
-                        setProperties((prev) => prev.map((item, i) => (i === idx ? { ...item, value: event.target.value } : item)))
-                      }
-                      className="w-1/2 px-2.5 py-1.5 border border-slate-200 rounded-md text-xs"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setProperties((prev) => prev.filter((_, i) => i !== idx))}
-                      className="p-1 text-slate-400 hover:text-red-500 rounded"
-                      aria-label={`Remove property ${prop.key || idx + 1}`}
-                      title="Remove property"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                ))}
+          <form onSubmit={handleSubmit} noValidate className="p-6 space-y-4 overflow-y-auto flex-1 text-sm">
+            {error && (
+              <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-red-700 text-xs">
+                <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+                <span>{error}</span>
               </div>
             )}
-          </div>
 
-          <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
-            <Button type="button" variant="secondary" onClick={onClose} disabled={submitting}>
-              Cancel
-            </Button>
-            <Button variant="primary" type="submit" disabled={submitting || loading || !detail}>
-              {submitting ? 'Saving…' : 'Save changes'}
-            </Button>
-          </div>
-        </form>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
+              <div>
+                <label htmlFor="edit-resource-name" className="block text-xs font-semibold text-slate-700 mb-1">
+                  Name <span className="text-[#EF1B24]">*</span>
+                </label>
+                <input
+                  id="edit-resource-name"
+                  type="text"
+                  data-autofocus
+                  maxLength={200}
+                  value={name}
+                  aria-invalid={Boolean(nameError)}
+                  aria-describedby="edit-resource-name-hint"
+                  onChange={(event) => {
+                    setName(event.target.value);
+                    if (nameError && !resourceNameProblem(event.target.value)) setNameError(null);
+                  }}
+                  onBlur={() => setNameError(resourceNameProblem(name) || null)}
+                  placeholder={resourceExamples(resource.type || '').name}
+                  className={`${FIELD_BASE} ${nameError ? FIELD_ERROR : FIELD_OK}`}
+                />
+                <div id="edit-resource-name-hint" className="mt-1 flex items-start justify-between gap-2 text-[11px]">
+                  {nameError ? (
+                    <span className="text-red-600 font-medium flex items-center gap-1">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      <span>{nameError}</span>
+                    </span>
+                  ) : (
+                    <span />
+                  )}
+                  <span className="text-slate-400 shrink-0 tabular-nums" aria-hidden="true">
+                    {name.length}/200
+                  </span>
+                </div>
+              </div>
+              <div>
+                <label htmlFor="edit-resource-code" className="block text-xs font-semibold text-slate-700 mb-1">
+                  Code <span className="text-[#EF1B24]">*</span>
+                </label>
+                <input
+                  id="edit-resource-code"
+                  type="text"
+                  maxLength={64}
+                  value={code}
+                  aria-invalid={Boolean(codeError)}
+                  aria-describedby={codeError ? 'edit-resource-code-error' : undefined}
+                  onChange={(event) => {
+                    setCode(event.target.value);
+                    if (codeError && !resourceCodeProblem(event.target.value)) setCodeError(null);
+                  }}
+                  onBlur={() => setCodeError(resourceCodeProblem(code) || null)}
+                  placeholder={resourceExamples(resource.type || '').code}
+                  className={`${FIELD_BASE} font-mono ${codeError ? FIELD_ERROR : FIELD_OK}`}
+                />
+                {codeError && (
+                  <p id="edit-resource-code-error" className="mt-1 text-[11px] text-red-600 font-medium flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>{codeError}</span>
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {isCodeChanged && (
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-start gap-2.5 text-amber-800 text-xs">
+                <AlertTriangle className="w-4 h-4 shrink-0 text-amber-600 mt-0.5" aria-hidden="true" />
+                <span>Changing the code changes the topic and path of this resource and of everything under it.</span>
+              </div>
+            )}
+
+            <div>
+              <label htmlFor="edit-resource-description" className="block text-xs font-semibold text-slate-700 mb-1">
+                Description
+              </label>
+              <textarea
+                id="edit-resource-description"
+                rows={2}
+                value={description}
+                disabled={loading}
+                onChange={(event) => setDescription(event.target.value)}
+                placeholder={loading ? 'Loading…' : 'Optional notes about this resource'}
+                className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2A82E7]/20 focus:border-[#2A82E7] disabled:bg-slate-50"
+              />
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-slate-700">Properties</span>
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={() => setProperties((prev) => [...prev, { key: '', value: '' }])}
+                  className="inline-flex items-center gap-1 text-xs text-[#EF1B24] font-medium hover:underline disabled:opacity-50"
+                >
+                  <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+                  Add property
+                </button>
+              </div>
+              {loading ? (
+                <p className="text-xs text-slate-400">Loading properties…</p>
+              ) : properties.length === 0 ? (
+                <p className="text-xs text-slate-400">No properties yet.</p>
+              ) : (
+                <div className="space-y-2">
+                  {properties.map((prop, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        aria-label={`Property ${idx + 1} name`}
+                        placeholder="Name"
+                        value={prop.key}
+                        onChange={(event) =>
+                          setProperties((prev) => prev.map((item, i) => (i === idx ? { ...item, key: event.target.value } : item)))
+                        }
+                        className="w-1/2 px-2.5 py-1.5 border border-slate-200 rounded-md text-xs font-mono"
+                      />
+                      <input
+                        type="text"
+                        aria-label={`Property ${idx + 1} value`}
+                        placeholder="Value"
+                        value={prop.value}
+                        onChange={(event) =>
+                          setProperties((prev) => prev.map((item, i) => (i === idx ? { ...item, value: event.target.value } : item)))
+                        }
+                        className="w-1/2 px-2.5 py-1.5 border border-slate-200 rounded-md text-xs"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setProperties((prev) => prev.filter((_, i) => i !== idx))}
+                        className="p-1 text-slate-400 hover:text-red-500 rounded"
+                        aria-label={`Remove property ${prop.key || idx + 1}`}
+                        title="Remove property"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
+              <Button type="button" variant="secondary" onClick={onClose} disabled={submitting}>
+                Cancel
+              </Button>
+              <Button variant="primary" type="submit" disabled={submitting || loading || !detail}>
+                {submitting ? 'Saving…' : 'Save changes'}
+              </Button>
+            </div>
+          </form>
+        </div>
       </div>
-    </div>
+    </ModalPortal>
   );
 };

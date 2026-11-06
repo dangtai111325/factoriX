@@ -243,7 +243,6 @@ export const Sidebar: React.FC = () => {
     if (path === '/collector/signals') {
       return (
         location.pathname === '/collector/signals' ||
-        location.pathname === '/collector/add-data' ||
         location.pathname === '/signals' ||
         location.pathname === '/live/monitor'
       );
@@ -268,10 +267,24 @@ export const Sidebar: React.FC = () => {
       return location.pathname === group.path;
     }
     if (group.children) {
-      return group.children.some((c) => isChildActive(c.path));
+      // Pages of a group that are not menu items (e.g. the Add Data wizard under /collector/...) mark the
+      // group as active without highlighting an unrelated child.
+      const prefixes = Array.from(new Set(group.children.map((c) => c.path.split('/').slice(0, 2).join('/')).filter((p) => p.length > 1)));
+      return (
+        group.children.some((c) => isChildActive(c.path)) ||
+        prefixes.some((prefix) => location.pathname.startsWith(`${prefix}/`))
+      );
     }
     return false;
   };
+
+  // Reveal the group of the current page (e.g. Data Collector while the Add Data wizard is open).
+  useEffect(() => {
+    const activeGroup = mainNav.find((group) => group.children?.length && isGroupActive(group));
+    if (activeGroup) setOpenGroups((prev) => (prev[activeGroup.id] ? prev : { ...prev, [activeGroup.id]: true }));
+    // isGroupActive only depends on the location.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.pathname]);
 
   return (
     <>

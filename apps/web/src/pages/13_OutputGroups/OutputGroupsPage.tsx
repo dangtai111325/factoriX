@@ -39,6 +39,7 @@ export const OutputGroupsPage: React.FC = () => {
           key={modelParam}
           modelId={modelParam}
           resources={resources}
+          models={models}
           initialResourceId={resourceParam}
           flash={flash}
           onBack={() => openModel(null)}

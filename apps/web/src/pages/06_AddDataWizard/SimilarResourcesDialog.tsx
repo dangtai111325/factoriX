@@ -2,15 +2,22 @@ import React, { useEffect, useId, useMemo, useState } from 'react';
 import { AlertTriangle, CheckCircle2, X } from 'lucide-react';
 import { ProtocolType, ResourceNode } from '../../types';
 import { Button } from '../../components/common/Button';
+import { ModalPortal } from '../../components/modals/ModalPortal';
 import {
+  ADDRESS_KEY_LABEL,
+  AddressSettings,
   FieldRow,
   TargetRewrite,
   applyRewrite,
+  buildAddress,
   defaultRewrite,
   describeAddress,
   parseOffsetList,
   parseOffsetMatrix,
   rewriteProblems,
+  rewriteText,
+  staleReferences,
+  targetAddress,
 } from './wizardModel';
 
 interface SimilarResourcesDialogProps {
@@ -19,6 +26,8 @@ interface SimilarResourcesDialogProps {
   source: ResourceNode;
   candidates: ResourceNode[];
   rows: FieldRow[];
+  /** Address settings of the source machine (source time node / path, QoS…); rewritten per target. */
+  settings: AddressSettings;
   sourceUnitId: number;
   /** Rewrites confirmed earlier (edited again when the dialog reopens). */
   initial: TargetRewrite[];
@@ -37,6 +46,7 @@ export const SimilarResourcesDialog: React.FC<SimilarResourcesDialogProps> = ({
   source,
   candidates,
   rows,
+  settings,
   sourceUnitId,
   initial,
   onCancel,
@@ -71,10 +81,22 @@ export const SimilarResourcesDialog: React.FC<SimilarResourcesDialogProps> = ({
   const problems = useMemo(() => {
     const out: Record<string, string[]> = {};
     ordered.forEach((rw) => {
-      out[rw.resourceId] = rewriteProblems(protocol, rows, rw);
+      out[rw.resourceId] = rewriteProblems(protocol, rows, rw, { settings, sourceCode: source.code });
     });
     return out;
-  }, [ordered, protocol, rows]);
+  }, [ordered, protocol, rows, settings, source.code]);
+
+  /** Source-time address shared by every field (OPC timestamp node or custom JSON timestamp path). */
+  const sourceTime = useMemo((): { field: string; value: string; note?: string } | null => {
+    if (!rows.length || protocol === 'modbus') return null;
+    const address = buildAddress(rows[0], settings);
+    const field = protocol === 'opcua' ? 'timestamp_node_id' : 'timestamp_path';
+    const value = address[field];
+    if (typeof value === 'string' && value) return { field, value };
+    if (protocol === 'opcua') return { field, value: '', note: 'DataValue.SourceTimestamp of each node' };
+    if (value === '') return { field, value: '', note: 'None (read time only)' };
+    return { field, value: '', note: 'Sibling source_timestamp of each field' };
+  }, [protocol, rows, settings]);
   const blocking = ordered.some((rw) => (problems[rw.resourceId] || []).length > 0);
 
   if (!isOpen) return null;
@@ -118,6 +140,7 @@ export const SimilarResourcesDialog: React.FC<SimilarResourcesDialogProps> = ({
   const textInput = 'px-2 py-1 border border-slate-300 rounded text-[11px] font-mono';
 
   return (
+    <ModalPortal>
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
       <div role="dialog" aria-modal="true" aria-labelledby={titleId} className="w-full max-w-5xl max-h-[90vh] bg-white border border-slate-300 shadow-xl rounded-xl flex flex-col overflow-hidden">
         <div className="p-4 border-b border-slate-200 flex items-start justify-between gap-3">
@@ -153,8 +176,9 @@ export const SimilarResourcesDialog: React.FC<SimilarResourcesDialogProps> = ({
           {ordered.length > 0 && protocol !== 'modbus' && (
             <div className="space-y-3">
               <p className="text-[11px] text-[#657794]">
-                Each field address of <span className="font-mono">{source.code}</span> is rewritten by replacing the text below
-                {protocol === 'opcua' ? ' and the namespace index (ns=…)' : ''}. Adjust when the source uses another identifier for the machine.
+                Every address of <span className="font-mono">{source.code}</span>, including the source time {protocol === 'opcua' ? 'node' : 'path'}, is
+                rewritten by replacing the text below{protocol === 'opcua' ? ' and the namespace index (ns=…)' : ''}. Adjust when the source uses another
+                identifier for the machine. Addresses that would still point at {source.code} are marked red and block the confirmation.
               </p>
               {ordered.map((rw) => (
                 <div key={rw.resourceId} className="border border-slate-200 rounded-lg">
@@ -179,19 +203,44 @@ export const SimilarResourcesDialog: React.FC<SimilarResourcesDialogProps> = ({
                     {(problems[rw.resourceId] || []).length === 0 ? (
                       <span className="ml-auto flex items-center gap-1 text-emerald-700 text-[11px]"><CheckCircle2 className="w-3.5 h-3.5" /> Ready</span>
                     ) : (
-                      <span className="ml-auto flex items-center gap-1 text-red-700 text-[11px]"><AlertTriangle className="w-3.5 h-3.5" /> {problems[rw.resourceId][0]}</span>
+                      <span className="ml-auto flex items-start gap-1 text-red-700 text-[11px] max-w-[60%]" role="alert">
+                        <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                        <span className="break-all">
+                          {problems[rw.resourceId][0]}
+                          {problems[rw.resourceId].length > 1 ? ` (+${problems[rw.resourceId].length - 1} more)` : ''}
+                        </span>
+                      </span>
                     )}
                   </div>
-                  <div className="max-h-40 overflow-y-auto">
+                  <div className="max-h-56 overflow-y-auto">
                     <table className="w-full text-[11px] font-mono">
+                      <thead className="bg-white sticky top-0 text-[10px] font-sans font-semibold uppercase text-[#657794]">
+                        <tr className="border-b border-slate-200">
+                          <th className="px-2 py-1 text-left w-36">Field</th>
+                          <th className="px-2 py-1 text-left">{source.name || source.code}</th>
+                          <th className="px-2 py-1 text-left">{rw.resourceName}</th>
+                        </tr>
+                      </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {rows.map((row) => (
-                          <tr key={row.id}>
-                            <td className="px-2 py-1 font-semibold text-[#111B37] w-32">{row.key}</td>
-                            <td className="px-2 py-1 text-slate-500 break-all">{describeAddress(row, protocol)}</td>
-                            <td className="px-2 py-1 text-[#111B37] break-all">{describeAddress(applyRewrite(protocol, row, rw), protocol)}</td>
-                          </tr>
-                        ))}
+                        {sourceTime && <SourceTimeRow protocol={protocol} sourceCode={source.code} sourceTime={sourceTime} rewrite={rw} />}
+                        {rows.map((row) => {
+                          const stale = staleReferences(protocol, source.code, targetAddress(row, settings, rw), rw).filter(
+                            (ref) => ref.field !== 'timestamp_node_id' && ref.field !== 'timestamp_path',
+                          );
+                          return (
+                            <tr key={row.id}>
+                              <td className="px-2 py-1 font-semibold text-[#111B37]">{row.key}</td>
+                              <td className="px-2 py-1 text-slate-500 break-all">{describeAddress(row, protocol)}</td>
+                              <td
+                                className={`px-2 py-1 break-all ${stale.length ? 'text-red-700 bg-red-50 font-semibold' : 'text-[#111B37]'}`}
+                                title={stale.length ? stale.map((ref) => `${ADDRESS_KEY_LABEL[ref.field] || ref.field} ${ref.reason}`).join('; ') : undefined}
+                              >
+                                {describeAddress(applyRewrite(protocol, row, rw), protocol)}
+                                {stale.length > 0 && <StaleMark />}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -291,12 +340,47 @@ export const SimilarResourcesDialog: React.FC<SimilarResourcesDialogProps> = ({
             <Button variant="outline" size="sm" onClick={onCancel}>
               Cancel
             </Button>
-            <Button variant="primary" size="sm" disabled={blocking} onClick={() => onConfirm(ordered)}>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={blocking}
+              title={blocking ? 'Fix the problems marked red first.' : undefined}
+              onClick={() => onConfirm(ordered)}
+            >
               {ordered.length ? 'Confirm addresses' : 'Apply to no other machine'}
             </Button>
           </div>
         </div>
       </div>
     </div>
+    </ModalPortal>
+  );
+};
+
+const StaleMark: React.FC = () => (
+  <AlertTriangle role="img" aria-label="Still points at the source machine" className="inline w-3 h-3 ml-1 align-[-2px]" />
+);
+
+/** Confirmation-table row for the source time node / path shared by every field of the target. */
+const SourceTimeRow: React.FC<{
+  protocol: ProtocolType;
+  sourceCode: string;
+  sourceTime: { field: string; value: string; note?: string };
+  rewrite: TargetRewrite;
+}> = ({ protocol, sourceCode, sourceTime, rewrite }) => {
+  const target = sourceTime.value ? rewriteText(sourceTime.value, protocol, rewrite) : '';
+  const stale = sourceTime.value ? staleReferences(protocol, sourceCode, { [sourceTime.field]: target }, rewrite) : [];
+  return (
+    <tr className="bg-blue-50/40">
+      <td className="px-2 py-1 font-sans font-semibold text-[#111B37]">Source time</td>
+      <td className="px-2 py-1 text-slate-500 break-all">{sourceTime.value || <span className="font-sans italic">{sourceTime.note}</span>}</td>
+      <td
+        className={`px-2 py-1 break-all ${stale.length ? 'text-red-700 bg-red-50 font-semibold' : 'text-[#111B37]'}`}
+        title={stale.length ? `${ADDRESS_KEY_LABEL[sourceTime.field]} ${stale[0].reason}` : undefined}
+      >
+        {sourceTime.value ? target : <span className="font-sans italic text-slate-500">{sourceTime.note}</span>}
+        {stale.length > 0 && <StaleMark />}
+      </td>
+    </tr>
   );
 };

@@ -24,6 +24,7 @@ import { Badge, BadgeVariant } from '../../components/common/Badge';
 import { MenuButton } from '../../components/common/MenuButton';
 import { ResourceTypeIcon, resourceTypeLabel } from '../../components/common/ResourceTypeIcon';
 import { useApp } from '../../store/AppContext';
+import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { useAuth } from '../../features/auth';
 import { ApiError, api } from '../../api/client';
 import { ResourceNode, SignalItem } from '../../types';
@@ -162,11 +163,11 @@ const TreeRow: React.FC<TreeRowProps> = ({
             ? `${resource.name}, ${typeLabel}, archived`
             : `${resource.name}, ${typeLabel}${signalCount ? `, ${signalCount} signals` : ''}`
         }
+        aria-level={depth + 1}
         aria-expanded={hasKids ? isExpanded : undefined}
         aria-selected={isSelected}
-        aria-disabled={archived || undefined}
+        data-archived={archived || undefined}
         tabIndex={isSelected ? 0 : -1}
-        title={archived ? `${resource.name} (archived)` : resource.name}
         style={{ paddingLeft: `${depth * 14 + 8}px` }}
         className={`group flex items-center justify-between py-1.5 pr-2 rounded-lg text-[13px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[#EF1B24]/40 ${
           archived
@@ -202,23 +203,30 @@ const TreeRow: React.FC<TreeRowProps> = ({
           <span className={isSelected ? 'text-current' : 'text-[#7A8AA3]'}>
             <ResourceTypeIcon type={resource.type} />
           </span>
-          <span className={`truncate ${archived ? 'line-through decoration-[#CBD5E1]' : ''}`}>{resource.name}</span>
+          <span
+            className={`truncate ${archived ? 'line-through decoration-[#CBD5E1]' : ''}`}
+            title={archived ? `${resource.name} (archived)` : resource.name}
+          >
+            {resource.name}
+          </span>
         </div>
         {archived ? (
           <span className="flex items-center gap-1.5 ml-2 flex-shrink-0">
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-[#94A3B8]">Archived</span>
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-[#94A3B8]" aria-hidden="true">Archived</span>
             <button
               type="button"
               onClick={(event) => {
                 event.stopPropagation();
-                onRestore(resource);
+                if (restoringId !== resource.id) onRestore(resource);
               }}
-              disabled={restoringId === resource.id}
+              onKeyDown={(event) => event.stopPropagation()}
+              aria-busy={restoringId === resource.id || undefined}
               aria-label={`Restore ${resource.name}`}
-              title={`Restore ${resource.name}`}
-              className="p-1 rounded-md text-[#475569] hover:text-[#111B37] hover:bg-[#E2E8F0] disabled:opacity-50"
+              title={`Restore "${resource.name}" and its contents to the active hierarchy`}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-[#D4DFEC] bg-white text-[11px] font-semibold text-[#334568] hover:text-[#111B37] hover:bg-[#F1F5FA] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#EF1B24]/40"
             >
-              <ArchiveRestore className="w-3.5 h-3.5" />
+              <ArchiveRestore className={`w-3.5 h-3.5 ${restoringId === resource.id ? 'animate-pulse' : ''}`} aria-hidden="true" />
+              {restoringId === resource.id ? 'Restoring…' : 'Restore'}
             </button>
           </span>
         ) : signalCount > 0 ? (
@@ -235,19 +243,30 @@ const TreeRow: React.FC<TreeRowProps> = ({
         <div role="group">
           {hasDirectData && (
             <div
+              role="treeitem"
+              aria-level={depth + 2}
+              aria-selected={false}
+              aria-label={`Signals of ${resource.name}, ${signalCount} ${signalCount === 1 ? 'signal' : 'signals'}`}
+              tabIndex={-1}
               style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}
-              className="flex items-center justify-between py-1 pr-2 rounded-lg cursor-pointer text-[12px] transition-colors text-emerald-700 hover:bg-emerald-50/70"
+              className="flex items-center justify-between py-1 pr-2 rounded-lg cursor-pointer text-[12px] transition-colors text-emerald-700 hover:bg-emerald-50/70 outline-none focus-visible:ring-2 focus-visible:ring-[#EF1B24]/40"
               title={`Signals of ${resource.name}`}
               onClick={(e) => {
                 e.stopPropagation();
                 onSelectData(resource.id);
               }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onSelectData(resource.id);
+                }
+              }}
             >
               <div className="flex items-center gap-2 truncate min-w-0 pl-[22px]">
-                <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse shrink-0" />
-                <span className="truncate font-semibold">Data</span>
+                <Activity className="w-3.5 h-3.5 text-emerald-600 animate-pulse shrink-0" aria-hidden="true" />
+                <span className="truncate font-semibold">Signals</span>
               </div>
-              <span className="text-[10px] font-mono px-1.5 rounded font-bold bg-emerald-100 text-emerald-800">
+              <span className="text-[10px] font-mono px-1.5 rounded font-bold bg-emerald-100 text-emerald-800" aria-hidden="true">
                 {signalCount}
               </span>
             </div>
@@ -284,6 +303,7 @@ export const FactoryStructurePage: React.FC = () => {
     addResource,
     moveResource,
     refresh,
+    loadState,
   } = useApp();
   const { state: authState } = useAuth();
   const navigate = useNavigate();
@@ -701,6 +721,22 @@ export const FactoryStructurePage: React.FC = () => {
       </button>
     </div>
   );
+
+  if (!selectedResource && loadState !== 'ready') {
+    // Never show the "empty" onboarding while the model is loading or could not be loaded.
+    return (
+      <div className="space-y-4">
+        <div>
+          <h1 className="fx-page-title">Hierarchy Structure</h1>
+          <p className="fx-page-subtitle">Sites, areas, lines and machines of the factory, and the data bound to them.</p>
+        </div>
+        <Card className="border border-[#E3EAF3]">
+          <LoadStateNotice subject="the factory model" />
+        </Card>
+        {toastView}
+      </div>
+    );
+  }
 
   if (!selectedResource) {
     return (

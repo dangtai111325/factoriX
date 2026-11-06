@@ -475,33 +475,125 @@ function replaceAll(value: string | undefined, find: string, replace: string): s
   return value.split(find).join(replace);
 }
 
-/** Rewrite one row for a target machine. */
+/**
+ * address_json keys whose string values are enumerations, never machine-specific; every other string
+ * value of an address (topic, path, jsonpath, node_id, timestamp_node_id, timestamp_path, …) is rewritten.
+ */
+const ENUM_ADDRESS_KEYS = new Set(['method', 'register_area', 'native_type', 'word_order', 'role']);
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** OPC UA namespace prefix "ns=<n>;" at the start of a node id. */
+function nsPattern(ns: string): RegExp {
+  return new RegExp(`^ns=${escapeRegExp(ns)};`);
+}
+
+/** Rewrite one address string: machine identifier text, then the OPC namespace index. */
+export function rewriteText(value: string, protocol: ProtocolType, rewrite: TargetRewrite): string {
+  let out = replaceAll(value, rewrite.find, rewrite.replace) || '';
+  if (protocol === 'opcua' && rewrite.nsFrom !== '' && rewrite.nsTo !== '') {
+    out = out.replace(nsPattern(rewrite.nsFrom), `ns=${rewrite.nsTo};`);
+  }
+  return out;
+}
+
+/** Rewrite one row for a target machine (row-level fields, used for display and key validation). */
 export function applyRewrite(protocol: ProtocolType, row: FieldRow, rewrite: TargetRewrite): FieldRow {
   const next: FieldRow = { ...row, id: `${row.id}@${rewrite.resourceId}` };
   if (protocol === 'modbus') {
     next.offset = rewrite.offsets[row.id] ?? '';
     return next;
   }
-  next.topic = replaceAll(row.topic, rewrite.find, rewrite.replace);
-  next.path = replaceAll(row.path, rewrite.find, rewrite.replace);
-  next.jsonpath = replaceAll(row.jsonpath, rewrite.find, rewrite.replace);
-  next.nodeId = replaceAll(row.nodeId, rewrite.find, rewrite.replace);
-  if (protocol === 'opcua' && rewrite.nsFrom !== '' && rewrite.nsTo !== '' && next.nodeId) {
-    next.nodeId = next.nodeId.replace(new RegExp(`^ns=${rewrite.nsFrom};`), `ns=${rewrite.nsTo};`);
-  }
+  const rw = (value: string | undefined) => (value === undefined ? undefined : rewriteText(value, protocol, rewrite));
+  next.topic = rw(row.topic);
+  next.path = rw(row.path);
+  next.jsonpath = rw(row.jsonpath);
+  next.nodeId = rw(row.nodeId);
   return next;
 }
 
-export function rewriteText(value: string, protocol: ProtocolType, rewrite: TargetRewrite): string {
-  let out = replaceAll(value, rewrite.find, rewrite.replace) || '';
-  if (protocol === 'opcua' && rewrite.nsFrom !== '' && rewrite.nsTo !== '') {
-    out = out.replace(new RegExp(`^ns=${rewrite.nsFrom};`), `ns=${rewrite.nsTo};`);
-  }
+/**
+ * Generic rewrite of a built address_json: every string value except enumerations is rewritten, so
+ * fields added to an address schema later (timestamp_node_id, timestamp_path, …) are never copied
+ * from the source machine silently.
+ */
+export function rewriteAddress(protocol: ProtocolType, address: Record<string, unknown>, rewrite: TargetRewrite): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  Object.entries(address).forEach(([key, value]) => {
+    out[key] = typeof value === 'string' && !ENUM_ADDRESS_KEYS.has(key) ? rewriteText(value, protocol, rewrite) : value;
+  });
   return out;
 }
 
+/** address_json of one source row on a target machine (what "Start collecting" sends). */
+export function targetAddress(row: FieldRow, settings: AddressSettings, rewrite: TargetRewrite): Record<string, unknown> {
+  if (settings.protocol === 'modbus') {
+    return buildAddress(applyRewrite('modbus', row, rewrite), { ...settings, modbusUnitId: Number(rewrite.unitId) });
+  }
+  return rewriteAddress(settings.protocol, buildAddress(row, settings), rewrite);
+}
+
+/** Human label of an address_json key. */
+export const ADDRESS_KEY_LABEL: Record<string, string> = {
+  topic: 'Topic',
+  path: 'Path',
+  jsonpath: 'JSONPath',
+  node_id: 'Node ID',
+  timestamp_node_id: 'Source time node',
+  timestamp_path: 'Source time JSONPath',
+};
+
+export interface StaleReference {
+  /** address_json key, e.g. "timestamp_node_id". */
+  field: string;
+  value: string;
+  reason: string;
+}
+
+/**
+ * Address strings of a rewritten target address that still point at the source machine: they contain
+ * the source machine code / replaced text, or keep the source OPC namespace index.
+ */
+export function staleReferences(
+  protocol: ProtocolType,
+  sourceCode: string,
+  rewritten: Record<string, unknown>,
+  rewrite: TargetRewrite,
+): StaleReference[] {
+  if (protocol === 'modbus') return [];
+  const out: StaleReference[] = [];
+  const needles = Array.from(new Set([rewrite.find, sourceCode].filter((n) => n && n !== rewrite.replace)));
+  Object.entries(rewritten).forEach(([field, value]) => {
+    if (typeof value !== 'string' || ENUM_ADDRESS_KEYS.has(field) || !value) return;
+    // A needle contained in the target identifier itself (e.g. "AA10-1" in "AA10-12") is not a stale reference.
+    const hit = needles.find((needle) => value.split(rewrite.replace).join('').includes(needle));
+    if (hit) {
+      out.push({ field, value, reason: `still contains "${hit}" of the source machine` });
+      return;
+    }
+    if (
+      protocol === 'opcua' &&
+      rewrite.nsFrom !== '' &&
+      rewrite.nsTo !== '' &&
+      rewrite.nsFrom !== rewrite.nsTo &&
+      nsPattern(rewrite.nsFrom).test(value)
+    ) {
+      out.push({ field, value, reason: `still uses namespace ns=${rewrite.nsFrom} of the source machine` });
+    }
+  });
+  return out;
+}
+
+export interface RewriteContext {
+  settings: AddressSettings;
+  /** Code of the source machine (the resource the fields were mapped on). */
+  sourceCode: string;
+}
+
 /** Problems that block confirming a target rewrite. */
-export function rewriteProblems(protocol: ProtocolType, rows: FieldRow[], rewrite: TargetRewrite): string[] {
+export function rewriteProblems(protocol: ProtocolType, rows: FieldRow[], rewrite: TargetRewrite, context: RewriteContext): string[] {
   const problems: string[] = [];
   if (protocol === 'modbus') {
     const unit = Number(rewrite.unitId);
@@ -516,12 +608,21 @@ export function rewriteProblems(protocol: ProtocolType, rows: FieldRow[], rewrit
   if (!rewrite.find) problems.push('Enter the text to replace (the source machine identifier).');
   if (protocol === 'opcua' && (rewrite.nsFrom === '') !== (rewrite.nsTo === '')) problems.push('Enter both namespace indexes or none.');
   const unchanged = rows.filter((row) => {
-    const out = applyRewrite(protocol, row, rewrite);
-    return out.topic === row.topic && out.path === row.path && out.jsonpath === row.jsonpath && out.nodeId === row.nodeId;
+    const source = buildAddress(row, context.settings);
+    return JSON.stringify(rewriteAddress(protocol, source, rewrite)) === JSON.stringify(source);
   });
   if (unchanged.length) {
     problems.push(`${unchanged.length} field address(es) would stay identical to the source machine (${unchanged.map((r) => r.key).slice(0, 4).join(', ')}).`);
   }
+  const stale = new Map<string, StaleReference>();
+  rows.forEach((row) => {
+    staleReferences(protocol, context.sourceCode, targetAddress(row, context.settings, rewrite), rewrite).forEach((ref) => {
+      if (!stale.has(ref.field)) stale.set(ref.field, ref);
+    });
+  });
+  stale.forEach((ref) => {
+    problems.push(`${ADDRESS_KEY_LABEL[ref.field] || ref.field} ${ref.reason}: ${ref.value}`);
+  });
   return problems;
 }
 

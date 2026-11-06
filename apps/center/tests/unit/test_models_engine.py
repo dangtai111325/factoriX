@@ -119,11 +119,17 @@ class FakeDB:
                 return None
             self.events[key] = {"id": params["id"], "source_ts": params["source_ts"], "dedupe_key": params["dedupe"], "body_text": params["body"], "status": params["status"]}
             return {"id": params["id"]}
+        if "FROM model_state WHERE group_id = :id" in sql:
+            return self.state.get(str(params["id"]))
         raise AssertionError(f"unexpected fetch_one: {sql[:80]}")
 
     async def execute(self, _session, sql, params):
         if "INSERT INTO model_state" in sql:
-            self.state[str(params["group_id"])] = {"body_text": params["body"], "content_hash": params["hash"], "source_ts": params["source_ts"]}
+            row = {"body_text": params.get("body", ""), "content_hash": params["hash"], "source_ts": params["source_ts"]}
+            if "DO NOTHING" in sql:
+                self.state.setdefault(str(params["group_id"]), row)
+            else:
+                self.state[str(params["group_id"])] = row
             return
         raise AssertionError(f"unexpected execute: {sql[:80]}")
 
@@ -209,26 +215,35 @@ async def test_event_model_snapshots_order_at_completion_and_dedupes(patch_db):
             {"kind": "signal", "alias": "lot_serial", "signal_id": lot, "is_trigger": True},
         ],
     )
+    c0 = T0 + timedelta(minutes=5)  # completion that happened before the model was published
     c1 = T0 + timedelta(minutes=10)
     order_change = c1 + timedelta(seconds=30)  # new order starts after the completion
 
     def obs(sid, value, ts):
         return {"signal_id": sid, "value_json": {"v": value}, "quality": "GOOD", "unit": None, "source_time": ts, "received_time": ts + timedelta(seconds=1), "event_time": ts + timedelta(seconds=1)}
 
-    observations = [
-        obs(so, "SO-1", T0), obs(wo, "WO-1", T0),
-        obs(qty, 5, c1), obs(lot, "LOT-1", c1),
-        obs(so, "SO-2", order_change), obs(wo, "WO-2", order_change),
-    ]
-    db = patch_db(FakeDB([group], _member_rows(group["id"], members), {}, observations))
+    observations = [obs(so, "SO-1", T0), obs(wo, "WO-1", T0), obs(qty, 3, c0), obs(lot, "LOT-0", c0)]
+    latest = {qty: obs(qty, 3, c0), lot: obs(lot, "LOT-0", c0)}
+    db = patch_db(FakeDB([group], _member_rows(group["id"], members), latest, observations))
 
+    # R2-DM-04: publishing sets the baseline from the current trigger state and emits nothing.
+    publish = FakeSession()
+    await models_engine.set_event_baseline(publish, group, members, T0 + timedelta(minutes=6))
+    await models_engine.on_signals_changed(publish, TENANT, {qty, lot})
+    assert publish.info.get("fx_events", []) == []
+    assert db.state[str(group["id"])]["source_ts"] == c0
+    # a re-publish keeps the first-publish baseline
+    await models_engine.set_event_baseline(publish, group, members, T0 + timedelta(minutes=8))
+    assert db.state[str(group["id"])]["source_ts"] == c0
+
+    db.observations += [obs(qty, 5, c1), obs(lot, "LOT-1", c1), obs(so, "SO-2", order_change), obs(wo, "WO-2", order_change)]
     session = FakeSession()
     await models_engine.on_signals_changed(session, TENANT, {qty, lot})
     events = session.info.get("fx_events", [])
     assert [e["kind"] for e in events] == ["model_event"]
     body = json.loads(events[0]["body"])
     assert list(body) == ["zone_name", "line_name", "source_timestamp", "publish_timestamp", "so", "wo", "qty", "lot_serial"]
-    assert body["so"] == "SO-1" and body["wo"] == "WO-1"
+    assert body["so"] == "SO-1" and body["wo"] == "WO-1" and body["qty"] == 5
     assert body["source_timestamp"] == "2026-06-20T08:10:00.000Z"
 
     # the same completion polled again: idempotent
@@ -245,7 +260,34 @@ async def test_event_model_snapshots_order_at_completion_and_dedupes(patch_db):
     assert len(events3) == 1
     body3 = json.loads(events3[0]["body"])
     assert body3["wo"] == "WO-2" and body3["qty"] == 7
-    assert len(db.events) == 2
+    assert len(db.events) == 2  # c0 (before the first publish) was never emitted
+
+
+async def test_event_model_published_before_baselines_starts_silently(patch_db):
+    qty = str(uuid4())
+    group = _group("EVENT", key="order_progress")
+    members = normalize_members("EVENT", _head(False) + [{"kind": "signal", "alias": "qty", "signal_id": qty, "is_trigger": True}])
+    c0 = T0 + timedelta(minutes=5)
+    row = {"signal_id": qty, "value_json": {"v": 3}, "quality": "GOOD", "unit": None, "source_time": c0, "received_time": c0, "event_time": c0}
+    db = patch_db(FakeDB([group], _member_rows(group["id"], members), {qty: row}, [row]))
+    session = FakeSession()
+    await models_engine.on_signals_changed(session, TENANT, {qty})
+    assert session.info.get("fx_events", []) == [] and db.events == {}
+    assert db.state[str(group["id"])]["content_hash"].startswith(models_engine.BASELINE_PREFIX)
+
+
+def test_baseline_and_watermark_rules():
+    c0, c1 = T0, T0 + timedelta(minutes=1)
+    assert models_engine.baseline_from_triggers([]) == (models_engine._NO_TRIGGER_DATA, "")
+    instant, dedupe = models_engine.baseline_from_triggers([{"source_time": c0, "value": 1}, {"source_time": c1, "value": "L"}])
+    assert instant == c1 and dedupe.startswith("v:")
+    no_ts, _ = models_engine.baseline_from_triggers([{"source_time": None, "value": 1}])
+    assert no_ts is None  # trigger without a source timestamp: the value change decides
+    baseline = {"source_ts": c1, "content_hash": "baseline:v:abc"}
+    assert models_engine.event_watermark(None, baseline) == (c1, "v:abc")
+    assert models_engine.event_watermark({"source_ts": c0, "dedupe_key": "ts:x"}, baseline) == (c1, "v:abc")
+    later = c1 + timedelta(seconds=1)
+    assert models_engine.event_watermark({"source_ts": later, "dedupe_key": "ts:y"}, baseline) == (later, "ts:y")
 
 
 # ---- member resolution (collect) -----------------------------------------------------------

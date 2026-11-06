@@ -1,11 +1,12 @@
-import React, { useMemo, useState } from 'react';
-import { Boxes, LayoutTemplate, Plus, RefreshCw, Search } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Archive, Boxes, Clock, LayoutTemplate, Plus, RefreshCw, Rocket, Search, Undo2, X } from 'lucide-react';
 import type { ResourceNode } from '../../types';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import type { ModelListItem } from './types';
-import { parentPathLabel, timeAgo } from './modelLogic';
+import { durationLabel, modelSearchText, parentPathLabel, republishLabel, timeAgo } from './modelLogic';
 import { Banner, KindBadge, ModelStatusBadge } from './ui';
+import { BulkAction, BulkActionDialog, BulkModel } from './BulkActions';
 
 interface Props {
   models: ModelListItem[];
@@ -21,11 +22,16 @@ interface Props {
 const selectCls =
   'h-8 px-2 border border-[#D4DFEC] rounded-lg text-[12px] bg-white text-[#334568] focus:outline-none focus:border-blue-500';
 
+const byText = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+
 export const ModelCatalog: React.FC<Props> = ({ models, loading, error, onReload, resources, onOpen, onNew, onFromTemplate }) => {
   const [q, setQ] = useState('');
   const [scope, setScope] = useState('');
   const [kind, setKind] = useState('');
   const [status, setStatus] = useState('');
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulk, setBulk] = useState<{ action: BulkAction; items: BulkModel[] } | null>(null);
+  const headerBoxRef = useRef<HTMLInputElement>(null);
 
   const rows = useMemo(() => {
     const byId = new Map(resources.map((r) => [r.id, r]));
@@ -36,27 +42,61 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, error, onReload
           m,
           scopeName: res?.name || m.resource_name || m.resource_code || 'Unknown resource',
           scopePath: res ? parentPathLabel(resources, res.id) : '',
+          haystack: modelSearchText(resources, m),
         };
       })
-      .sort((a, b) => a.scopePath.localeCompare(b.scopePath) || a.scopeName.localeCompare(b.scopeName) || a.m.display_name.localeCompare(b.m.display_name));
+      .sort((a, b) => byText(a.scopePath, b.scopePath) || byText(a.scopeName, b.scopeName) || byText(a.m.display_name, b.m.display_name));
   }, [models, resources]);
 
   const scopes = useMemo(() => {
     const seen = new Map<string, string>();
     rows.forEach((r) => seen.set(r.m.resource_id, r.scopeName));
-    return Array.from(seen.entries()).sort((a, b) => a[1].localeCompare(b[1]));
+    return Array.from(seen.entries()).sort((a, b) => byText(a[1], b[1]));
   }, [rows]);
 
-  const filtered = rows.filter(({ m, scopeName, scopePath }) => {
+  const needle = q.trim().toLowerCase();
+  const filtered = rows.filter(({ m, haystack }) => {
     if (scope && m.resource_id !== scope) return false;
     if (kind && m.kind !== kind) return false;
     if (status && m.status !== status) return false;
-    if (q.trim()) {
-      const needle = q.trim().toLowerCase();
-      return [m.display_name, m.key, scopeName, scopePath, m.topic_template].some((v) => v.toLowerCase().includes(needle));
-    }
-    return true;
+    return !needle || haystack.includes(needle);
   });
+
+  // Drop selections of models that no longer exist (archived, reloaded).
+  useEffect(() => {
+    setSelected((prev) => {
+      const ids = new Set(models.map((m) => m.id));
+      const next = new Set(Array.from(prev).filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [models]);
+
+  const visibleIds = filtered.map(({ m }) => m.id);
+  const visibleSelected = visibleIds.filter((id) => selected.has(id)).length;
+  const allVisibleSelected = visibleIds.length > 0 && visibleSelected === visibleIds.length;
+  useEffect(() => {
+    if (headerBoxRef.current) headerBoxRef.current.indeterminate = visibleSelected > 0 && !allVisibleSelected;
+  }, [visibleSelected, allVisibleSelected]);
+
+  const toggleOne = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const toggleVisible = () =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) visibleIds.forEach((id) => next.delete(id));
+      else visibleIds.forEach((id) => next.add(id));
+      return next;
+    });
+
+  const selectedRows = rows.filter(({ m }) => selected.has(m.id));
+  const hiddenSelected = selectedRows.length - visibleSelected;
+  const openBulk = (action: BulkAction) =>
+    setBulk({ action, items: selectedRows.map(({ m, scopeName }) => ({ model: m, scopeName })) });
 
   const published = models.filter((m) => m.status === 'PUBLISHED').length;
   const filtersActive = Boolean(q || scope || kind || status);
@@ -94,6 +134,7 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, error, onReload
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder="Search name, key, resource or topic"
+              aria-label="Search models"
               className="w-full h-8 pl-8 pr-2 border border-[#D4DFEC] rounded-lg text-[12px] focus:outline-none focus:border-blue-500"
             />
           </div>
@@ -123,14 +164,46 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, error, onReload
           <span className="ml-auto text-[11px] text-[#657794]">
             {models.length} model{models.length === 1 ? '' : 's'} · {published} published
           </span>
-          <Button size="sm" variant="ghost" onClick={onReload} aria-label="Reload" disabled={loading}>
+          <Button size="sm" variant="ghost" onClick={onReload} aria-label="Reload" title="Reload" disabled={loading}>
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           </Button>
         </div>
 
+        {selected.size > 0 && (
+          <div
+            role="toolbar"
+            aria-label="Bulk actions"
+            className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-blue-100 bg-blue-50/60 text-[12px]"
+          >
+            <span className="font-semibold text-[#111B37]">
+              {selected.size} selected
+              {hiddenSelected > 0 && <span className="font-normal text-[#657794]"> ({hiddenSelected} hidden by the filters)</span>}
+            </span>
+            <div className="flex flex-wrap items-center gap-1.5 ml-2">
+              <Button size="sm" variant="outline" icon={<Rocket className="w-3.5 h-3.5" />} onClick={() => openBulk('publish')}>
+                Publish
+              </Button>
+              <Button size="sm" variant="outline" icon={<Undo2 className="w-3.5 h-3.5" />} onClick={() => openBulk('unpublish')}>
+                Unpublish
+              </Button>
+              <Button size="sm" variant="outline" icon={<Clock className="w-3.5 h-3.5" />} onClick={() => openBulk('republish')}>
+                Set re-publish interval…
+              </Button>
+              <Button size="sm" variant="danger" icon={<Archive className="w-3.5 h-3.5" />} onClick={() => openBulk('archive')}>
+                Archive…
+              </Button>
+            </div>
+            <Button size="sm" variant="ghost" className="ml-auto" icon={<X className="w-3.5 h-3.5" />} onClick={() => setSelected(new Set())}>
+              Clear selection
+            </Button>
+          </div>
+        )}
+
         {loading && models.length === 0 ? (
-          <div className="p-12 text-center text-[12px] text-[#657794]">Loading data models…</div>
-        ) : models.length === 0 && !error ? (
+          <div role="status" className="p-12 text-center text-[12px] text-[#657794]">Loading data models…</div>
+        ) : models.length === 0 && error ? (
+          <div className="p-10 text-center text-[12px] text-[#657794]">The catalog could not be loaded. Use Retry above.</div>
+        ) : models.length === 0 ? (
           <div className="p-12 text-center text-[#657794]">
             <Boxes className="w-10 h-10 text-slate-300 mx-auto mb-3" />
             <h3 className="text-[14px] font-bold text-[#111B37]">No data models yet</h3>
@@ -153,6 +226,16 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, error, onReload
             <table className="w-full text-left text-[12px]">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/50 text-[#657794] font-semibold">
+                  <th className="py-2.5 pl-4 pr-1 w-8">
+                    <input
+                      ref={headerBoxRef}
+                      type="checkbox"
+                      checked={allVisibleSelected}
+                      onChange={toggleVisible}
+                      aria-label={allVisibleSelected ? 'Deselect all shown models' : `Select all ${visibleIds.length} shown models`}
+                      title={allVisibleSelected ? 'Deselect all shown' : 'Select all shown'}
+                    />
+                  </th>
                   <th className="py-2.5 px-4">Name</th>
                   <th className="py-2.5 px-4">Scope</th>
                   <th className="py-2.5 px-4">Kind</th>
@@ -162,39 +245,67 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, error, onReload
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {filtered.map(({ m, scopeName, scopePath }) => (
-                  <tr
-                    key={m.id}
-                    tabIndex={0}
-                    onClick={() => onOpen(m.id)}
-                    onKeyDown={(e) => e.key === 'Enter' && onOpen(m.id)}
-                    className="hover:bg-slate-50 cursor-pointer transition focus:outline-none focus:bg-blue-50/40"
-                  >
-                    <td className="py-3 px-4">
-                      <div className="font-bold text-[#111B37]">{m.display_name || m.key}</div>
-                      <div className="font-mono text-[10px] text-[#657794]">{m.key}</div>
-                    </td>
-                    <td className="py-3 px-4">
-                      <div className="font-semibold text-[#111B37]">{scopeName}</div>
-                      {scopePath && <div className="text-[10px] text-[#657794]">{scopePath}</div>}
-                    </td>
-                    <td className="py-3 px-4">
-                      <KindBadge kind={m.kind} />
-                    </td>
-                    <td className="py-3 px-4">
-                      <ModelStatusBadge status={m.status} />
-                    </td>
-                    <td className="py-3 px-4 text-right font-semibold text-[#111B37]">{m.member_count}</td>
-                    <td className="py-3 px-4 text-right text-[#657794]" title={m.updated_at || undefined}>
-                      {timeAgo(m.updated_at)}
-                    </td>
-                  </tr>
-                ))}
+                {filtered.map(({ m, scopeName, scopePath }) => {
+                  const isSelected = selected.has(m.id);
+                  const republishMs = m.emit_policy?.republish_ms ?? null;
+                  return (
+                    <tr
+                      key={m.id}
+                      tabIndex={0}
+                      aria-selected={isSelected}
+                      onClick={() => onOpen(m.id)}
+                      onKeyDown={(e) => e.key === 'Enter' && e.target === e.currentTarget && onOpen(m.id)}
+                      className={`cursor-pointer transition focus:outline-none focus:bg-blue-50/40 ${isSelected ? 'bg-blue-50/50 hover:bg-blue-50' : 'hover:bg-slate-50'}`}
+                    >
+                      <td className="py-3 pl-4 pr-1" onClick={(e) => e.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => toggleOne(m.id)}
+                          aria-label={`Select ${m.display_name || m.key} on ${scopeName}`}
+                        />
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-bold text-[#111B37]">{m.display_name || m.key}</div>
+                        <div className="font-mono text-[10px] text-[#657794]">{m.key}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="font-semibold text-[#111B37]">{scopeName}</div>
+                        {scopePath && <div className="text-[10px] text-[#657794]">{scopePath}</div>}
+                      </td>
+                      <td className="py-3 px-4">
+                        <KindBadge kind={m.kind} />
+                        {m.kind === 'STATE' && m.emit_policy && (
+                          <div className="text-[10px] text-[#657794] mt-0.5 whitespace-nowrap" title={republishLabel(republishMs, m.kind)}>
+                            {republishMs ? `Re-publish ${durationLabel(republishMs / 1000)}` : 'On change only'}
+                          </div>
+                        )}
+                      </td>
+                      <td className="py-3 px-4">
+                        <ModelStatusBadge status={m.status} />
+                      </td>
+                      <td className="py-3 px-4 text-right font-semibold text-[#111B37]">{m.member_count}</td>
+                      <td className="py-3 px-4 text-right text-[#657794]" title={m.updated_at || undefined}>
+                        {timeAgo(m.updated_at)}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
       </Card>
+
+      <BulkActionDialog
+        action={bulk?.action ?? null}
+        items={bulk?.items ?? []}
+        onClose={() => setBulk(null)}
+        onFinished={() => {
+          setSelected(new Set());
+          onReload();
+        }}
+      />
     </div>
   );
 };

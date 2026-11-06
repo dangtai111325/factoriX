@@ -18,7 +18,7 @@ import type { ResourceNode } from '../../types';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { ConfirmDialog } from '../../components/common/ConfirmDialog';
-import { MemberRow, ModelDetail, ModelKind, memberToRow, rowToMember } from './types';
+import { MemberRow, ModelDetail, ModelKind, ModelListItem, memberToRow, rowToMember } from './types';
 import {
   archiveModel,
   createModel,
@@ -36,7 +36,9 @@ import {
   DEFAULT_TOPIC,
   TOPIC_TOKENS,
   modelKeyFromName,
+  MAX_REPUBLISH_SEC,
   parentPathLabel,
+  republishLabel,
   resolveTopicPreview,
   standardHeaderRows,
   validateModel,
@@ -49,6 +51,8 @@ import { Banner, KindBadge, ModelStatusBadge } from './ui';
 interface Props {
   modelId: string; // 'new' for a new model
   resources: ResourceNode[];
+  /** Catalog rows (non-archived), used by "Duplicate to…" to flag targets that already use a key. */
+  models: ModelListItem[];
   initialResourceId?: string;
   onBack: () => void;
   onChanged: () => void; // reload the catalog
@@ -81,7 +85,7 @@ function formFromDetail(d: ModelDetail): FormState {
 
 type Confirm = null | 'publish' | 'unpublish' | 'archive' | 'discard';
 
-export const ModelEditor: React.FC<Props> = ({ modelId, resources, initialResourceId, onBack, onChanged, onOpen, flash }) => {
+export const ModelEditor: React.FC<Props> = ({ modelId, resources, models, initialResourceId, onBack, onChanged, onOpen, flash }) => {
   const isNew = modelId === 'new';
   const [detail, setDetail] = useState<ModelDetail | null>(null);
   const [loading, setLoading] = useState(!isNew);
@@ -191,6 +195,11 @@ export const ModelEditor: React.FC<Props> = ({ modelId, resources, initialResour
   const groupKey = detail?.key || modelKeyFromName(form.name);
   const topicPreview = resolveTopicPreview(resources, form.resourceId, form.topic, groupKey);
   const status = detail?.status ?? 'DRAFT';
+  const republishSecNum = Number(form.republishSec);
+  const republishPreviewMs =
+    form.republishSec.trim() && Number.isFinite(republishSecNum) && republishSecNum >= 1 && republishSecNum <= MAX_REPUBLISH_SEC
+      ? Math.round(republishSecNum * 1000)
+      : null;
   const errorCount = Object.keys(validation.form).length + Object.values(validation.rows).reduce((n, l) => n + l.length, 0);
 
   const payload = () => ({
@@ -351,7 +360,15 @@ export const ModelEditor: React.FC<Props> = ({ modelId, resources, initialResour
                 Publish
               </Button>
             ))}
-          <Button variant="primary" size="sm" loading={busy === 'save'} disabled={!!busy || (!dirty && !isNew)} onClick={() => void save()} icon={<Save className="w-3.5 h-3.5" />}>
+          <Button
+            variant="primary"
+            size="sm"
+            loading={busy === 'save'}
+            disabled={!!busy || (!dirty && !isNew)}
+            title={!busy && !dirty && !isNew ? 'No unsaved changes' : undefined}
+            onClick={() => void save()}
+            icon={<Save className="w-3.5 h-3.5" />}
+          >
             {isNew ? 'Create model' : 'Save'}
           </Button>
           {!isNew && (
@@ -476,7 +493,15 @@ export const ModelEditor: React.FC<Props> = ({ modelId, resources, initialResour
                 {showErrors && validation.form.trigger && <p className="text-[11px] text-red-600 mt-1">{validation.form.trigger}</p>}
               </Field>
               {form.kind === 'STATE' && (
-                <Field label="Re-publish when unchanged" error={showErrors ? validation.form.republish : undefined} hint="Leave empty to emit only on change. Re-published bodies keep source_timestamp and get a new publish_timestamp.">
+                <Field
+                  label="Re-publish when unchanged"
+                  error={showErrors ? validation.form.republish : undefined}
+                  hint={
+                    republishPreviewMs
+                      ? `${republishLabel(republishPreviewMs, form.kind)}. Re-published bodies keep source_timestamp and get a new publish_timestamp. Leave empty to emit only on change.`
+                      : `${republishLabel(null, form.kind)}. Enter seconds to re-send the last body periodically while nothing changes.`
+                  }
+                >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
@@ -575,8 +600,10 @@ export const ModelEditor: React.FC<Props> = ({ modelId, resources, initialResour
           onClose={() => setDupOpen(false)}
           modelId={detail.id}
           modelName={detail.display_name}
+          modelKey={detail.key}
           sourceResource={resource}
           resources={resources}
+          existing={models}
           onDone={(id, missing) => {
             setDupOpen(false);
             onChanged();

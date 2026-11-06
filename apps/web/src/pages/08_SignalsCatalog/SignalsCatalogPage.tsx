@@ -19,6 +19,8 @@ import {
   AlertCircle,
   Activity,
   BarChart2,
+  Pencil,
+  X,
 } from 'lucide-react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { useApp } from '../../store/AppContext';
@@ -31,7 +33,11 @@ import { TrendChart } from './TrendChart';
 import { SignalSparkline } from './SignalSparkline';
 import { SignalInspector } from './SignalInspector';
 import { SignalEditDialog } from './SignalEditDialog';
+import { BulkAddressDialog } from './BulkAddressDialog';
+import { sortBySourceOrder } from './signalOrder';
+import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { api } from '../../api/client';
+import { PROTOCOL_LABEL } from '../../lib/protocols';
 import { formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
 
 interface CatalogTreeNodeProps {
@@ -42,6 +48,7 @@ interface CatalogTreeNodeProps {
   onToggle: (id: string, e: React.MouseEvent) => void;
   rollupCounts: Map<string, number>;
   directCounts: Map<string, number>;
+  depth?: number;
 }
 
 const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
@@ -52,6 +59,7 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
   onToggle,
   rollupCounts,
   directCounts,
+  depth = 0,
 }) => {
   const isSelected = selectedFilter === node.resource.id;
   const isExpanded = expanded[node.resource.id] !== false; // default open
@@ -65,10 +73,23 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
   const isDataSelected = selectedFilter === dataFilterKey;
 
   return (
-    <div className="text-[12px] select-none">
+    <div className="text-[12px] select-none" role="none">
       {/* Asset Structure Row */}
       <div
+        role="treeitem"
+        aria-level={depth + 1}
+        aria-selected={isSelected}
+        aria-expanded={hasExpandable ? isExpanded : undefined}
+        aria-label={`${node.resource.name || node.resource.code}, ${rollupCount} signal${rollupCount === 1 ? '' : 's'}`}
+        tabIndex={0}
+        title={node.resource.name}
         onClick={() => onSelect(node.resource.id)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onSelect(node.resource.id);
+          }
+        }}
         className={`flex items-center justify-between py-1 px-1.5 rounded-lg cursor-pointer transition ${
           isSelected
             ? 'bg-[#0B2545] text-white font-bold shadow-xs'
@@ -79,6 +100,8 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
           {hasExpandable ? (
             <button
               type="button"
+              tabIndex={-1}
+              aria-label={isExpanded ? `Collapse ${node.resource.name}` : `Expand ${node.resource.name}`}
               onClick={(e) => onToggle(node.resource.id, e)}
               className="p-0.5 hover:bg-black/10 rounded shrink-0"
             >
@@ -91,7 +114,7 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
           ) : (
             <span className="w-4 shrink-0" />
           )}
-          <span className="truncate max-w-[145px]">{node.resource.name}</span>
+          <span className="truncate">{node.resource.name}</span>
         </div>
         <span
           className={`text-[10px] font-mono px-1.5 py-0.2 rounded font-semibold shrink-0 ${
@@ -107,11 +130,23 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
 
       {/* Expanded Sub-tree: Special Data Nav + Child Units */}
       {hasExpandable && isExpanded && (
-        <div className="pl-3 border-l border-slate-200 ml-2 mt-0.5 space-y-0.5">
+        <div role="group" className="pl-3 border-l border-slate-200 ml-2 mt-0.5 space-y-0.5">
           {/* Distinct Special Data Nav Child */}
           {hasDirectData && (
             <div
+              role="treeitem"
+              aria-level={depth + 2}
+              aria-selected={isDataSelected}
+              aria-label={`Signals of ${node.resource.name} (${directCount})`}
+              tabIndex={0}
+              title={`Signals bound directly to ${node.resource.name}`}
               onClick={() => onSelect(dataFilterKey)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onSelect(dataFilterKey);
+                }
+              }}
               className={`flex items-center justify-between py-1 px-1.5 rounded-lg cursor-pointer transition ${
                 isDataSelected
                   ? 'bg-emerald-700 text-white font-bold shadow-xs'
@@ -121,7 +156,7 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
               <div className="flex items-center gap-1.5 min-w-0 pr-1">
                 <Activity className={`w-3.5 h-3.5 shrink-0 ${isDataSelected ? 'text-white' : 'text-emerald-600 animate-pulse'}`} />
                 <span className="truncate font-bold text-[11px]">
-                  Data
+                  Signals
                 </span>
               </div>
               <span
@@ -148,6 +183,7 @@ const CatalogTreeItem: React.FC<CatalogTreeNodeProps> = ({
               onToggle={onToggle}
               rollupCounts={rollupCounts}
               directCounts={directCounts}
+              depth={depth + 1}
             />
           ))}
         </div>
@@ -167,7 +203,13 @@ function classifyType(typeStr: string | undefined): 'number' | 'integer' | 'bool
 export const SignalsCatalogPage: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { signals, resources, connections, edges, refresh } = useApp();
+  const { signals, resources, connections, refresh, loadState } = useApp();
+  const [bulkAddressOpen, setBulkAddressOpen] = useState(false);
+
+  // R2-SG-02: arriving from Add Data (or any navigation) starts at the top of the page.
+  useEffect(() => {
+    window.scrollTo({ top: 0 });
+  }, []);
 
   // URL Query Sync
   const viewMode = searchParams.get('view') === 'live' ? 'live' : 'table';
@@ -288,9 +330,10 @@ export const SignalsCatalogPage: React.FC = () => {
     setExpandedTreeNodes(next);
   };
 
-  // Filtered Signals
+  // Filtered Signals, in source order (R2-SG-02).
+  const orderedSignals = useMemo(() => sortBySourceOrder(signals, resources), [signals, resources]);
   const filteredSignals = useMemo(() => {
-    return signals.filter((s) => {
+    return orderedSignals.filter((s) => {
       // 1. Hierarchy Tree Filter
       if (selectedFilter !== 'all') {
         if (selectedFilter.startsWith('data:')) {
@@ -339,7 +382,7 @@ export const SignalsCatalogPage: React.FC = () => {
       return true;
     });
   }, [
-    signals,
+    orderedSignals,
     selectedFilter,
     resourceFilter,
     connectionFilter,
@@ -496,7 +539,16 @@ export const SignalsCatalogPage: React.FC = () => {
           <Button
             variant="primary"
             size="sm"
-            onClick={() => navigate('/collector/add-data')}
+            onClick={() => {
+              // R2-AD-02: open the wizard on the resource the catalog is filtered by.
+              const target =
+                resourceFilter !== 'all'
+                  ? resourceFilter
+                  : selectedFilter !== 'all'
+                    ? selectedFilter.replace(/^data:/, '')
+                    : '';
+              navigate(target ? `/collector/add-data?resourceId=${encodeURIComponent(target)}` : '/collector/add-data');
+            }}
           >
             <Plus className="w-3.5 h-3.5 mr-1.5" />
             Add data
@@ -546,7 +598,7 @@ export const SignalsCatalogPage: React.FC = () => {
             </div>
           </div>
 
-          <div className="h-[calc(100vh-260px)] min-h-[550px] overflow-y-auto space-y-1 pr-1">
+          <div role="tree" aria-label="Filter signals by resource" className="h-[calc(100vh-260px)] min-h-[550px] overflow-y-auto space-y-1 pr-1">
             {(() => {
               // Build tree roots
               const map = new Map<string, any>();
@@ -561,6 +613,12 @@ export const SignalsCatalogPage: React.FC = () => {
                 }
               });
 
+              const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+              const sortTree = (nodes: any[]) => {
+                nodes.sort((a, b) => collator.compare(a.resource.name || a.resource.code, b.resource.name || b.resource.code));
+                nodes.forEach((n) => sortTree(n.children));
+              };
+              sortTree(roots);
               return roots.map((root) => (
                 <CatalogTreeItem
                   key={root.resource.id}
@@ -586,7 +644,7 @@ export const SignalsCatalogPage: React.FC = () => {
                 <span className="font-bold">Filtered by:</span>
                 <span className="font-semibold text-blue-900">
                   {selectedFilter.startsWith('data:')
-                    ? `${resources.find((r) => r.id === selectedFilter.replace('data:', ''))?.name || ''} Telemetry Data`
+                    ? `Signals bound directly to ${resources.find((r) => r.id === selectedFilter.replace('data:', ''))?.name || ''}`
                     : resources.find((r) => r.id === selectedFilter)?.name || selectedFilter}
                 </span>
                 <span className="text-[#64748B] font-mono">({filteredSignals.length} signals)</span>
@@ -649,7 +707,7 @@ export const SignalsCatalogPage: React.FC = () => {
                   <option value="all">All Connections</option>
                   {connections.map((c) => (
                     <option key={c.id} value={c.id}>
-                      {c.name} ({c.protocol})
+                      {c.name} ({PROTOCOL_LABEL[c.protocol]})
                     </option>
                   ))}
                 </select>
@@ -701,8 +759,26 @@ export const SignalsCatalogPage: React.FC = () => {
             </div>
           </Card>
 
+          {/* Bulk actions for the selected signals */}
+          {selectedIds.length > 0 && (
+            <div role="toolbar" aria-label="Selected signals" className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-xl border border-blue-200 bg-blue-50/70 text-[12px] text-[#0B2545]">
+              <span className="font-bold">{selectedIds.length} selected</span>
+              <Button variant="outline" size="sm" onClick={() => setBulkAddressOpen(true)}>
+                <Pencil className="w-3.5 h-3.5" /> Edit source address…
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setSelectedIds([])}>
+                <X className="w-3.5 h-3.5" /> Clear selection
+              </Button>
+            </div>
+          )}
+
           {/* VIEW: LIVE CARDS */}
-          {viewMode === 'live' && (
+          {viewMode === 'live' && loadState !== 'ready' && (
+            <Card className="border border-[#CBD5E1] bg-white">
+              <LoadStateNotice subject="the signals" />
+            </Card>
+          )}
+          {viewMode === 'live' && loadState === 'ready' && (
             <div className="space-y-4">
               {trendSignals.length > 0 && (
                 <Card className="p-4 border border-[#CBD5E1] bg-white">
@@ -804,12 +880,14 @@ export const SignalsCatalogPage: React.FC = () => {
           {/* VIEW: TABLE */}
           {viewMode === 'table' && (
             <Card className="border border-[#CBD5E1] bg-white overflow-hidden">
-              {filteredSignals.length === 0 ? (
+              {loadState !== 'ready' ? (
+                <LoadStateNotice subject="the signals" />
+              ) : filteredSignals.length === 0 ? (
                 <div className="p-12 text-center text-[#657794]">
                   <Search className="w-8 h-8 text-slate-300 mx-auto mb-2" />
-                  <p className="text-[13px] font-semibold text-[#111B37]">No signals found</p>
+                  <p className="text-[13px] font-semibold text-[#111B37]">{signals.length ? 'No signals found' : 'No signals yet'}</p>
                   <p className="text-[12px] text-[#657794] mt-1">
-                    Try adjusting your hierarchy filter or search term.
+                    {signals.length ? 'Try adjusting your hierarchy filter or search term.' : 'Use "Add data" to map source fields of a connection to signals.'}
                   </p>
                 </div>
               ) : (
@@ -825,6 +903,7 @@ export const SignalsCatalogPage: React.FC = () => {
                               selectedIds.length === filteredSignals.length
                             }
                             onChange={handleToggleSelectAll}
+                            aria-label="Select all shown signals"
                             className="rounded border-slate-300 text-blue-600 focus:ring-0"
                           />
                         </th>
@@ -862,6 +941,8 @@ export const SignalsCatalogPage: React.FC = () => {
                                 type="checkbox"
                                 checked={isChecked}
                                 onChange={() => handleToggleSelect(sig.id)}
+                                onClick={(e) => e.stopPropagation()}
+                                aria-label={`Select ${sig.key || sig.name}`}
                                 className="rounded border-slate-300 text-blue-600 focus:ring-0"
                               />
                             </td>
@@ -876,7 +957,7 @@ export const SignalsCatalogPage: React.FC = () => {
                                 </div>
                               )}
                             </td>
-                            <td className="py-2.5 px-3 text-[#657794] font-mono text-[11px]">
+                            <td className="py-2.5 px-3 text-[#657794] font-mono text-[11px] max-w-[220px] truncate" title={res?.name || sig.resourcePath}>
                               {res?.name || sig.resourcePath || '—'}
                             </td>
                             <td className="py-2.5 px-3 font-mono font-black text-xs text-[#0B2545] tabular-nums">
@@ -942,6 +1023,17 @@ export const SignalsCatalogPage: React.FC = () => {
           }}
         />
       )}
+
+      <BulkAddressDialog
+        isOpen={bulkAddressOpen}
+        signals={signals.filter((s) => selectedIds.includes(s.id))}
+        resources={resources}
+        onClose={() => setBulkAddressOpen(false)}
+        onApplied={(updated, unchanged) => {
+          void refresh().catch((error) => console.warn('Refresh after the address change failed', error));
+          showToast(`Source address updated on ${updated} signal${updated === 1 ? '' : 's'}${unchanged ? `; ${unchanged} unchanged` : ''}. The collector receives the new configuration.`);
+        }}
+      />
 
       <ConfirmDialog
         isOpen={Boolean(deleteTarget)}

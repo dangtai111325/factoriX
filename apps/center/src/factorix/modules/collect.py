@@ -31,6 +31,7 @@ from factorix.domain.formula import FormulaError, bind, detect_cycles, evaluate,
 from factorix.domain.jsonpath import MappingError, apply_cardinality, compile_path, evaluate as eval_path, suggest_type
 from factorix.domain.units import add_units
 from factorix.domain.signal_state import evaluate_signal_state
+from factorix.domain.source_address import AddressCheck, validate_address_patch
 from factorix.domain.uns import TopicError, render_topic
 from factorix.modules import models_engine
 from factorix.domain.health import effective_connection_health, effective_edge_health
@@ -46,6 +47,7 @@ from factorix.modules.protocols import (
     stored_protocol,
     unmask_config,
     validate_interval,
+    validate_mqtt_topic,
 )
 from factorix.platform.errors import AppError
 from factorix.platform.security import encrypt_secret, new_token, hash_token
@@ -108,6 +110,19 @@ class SignalPatch(BaseModel):
     expected_interval_ms: int | None = None
     enabled: bool | None = None
     connection_id: str | None = None
+    # Source address change of a bound signal (R2-SG-03): merged into the current address_json;
+    # a key set to null is removed. Validated per protocol; the signal id stays the same.
+    address_patch: dict[str, Any] | None = None
+
+
+class SignalAddressItem(BaseModel):
+    signal_id: str
+    version: int
+    address_patch: dict[str, Any]
+
+
+class SignalBulkAddressIn(BaseModel):
+    items: list[SignalAddressItem]
 
 
 class SignalBulkActionIn(BaseModel):
@@ -228,6 +243,32 @@ class EdgePatch(BaseModel):
 
 class ReleaseIn(BaseModel):
     edge_id: str
+
+
+async def _assert_edge_can_run(session: AsyncSession, edge: dict[str, Any]) -> None:
+    """A test or capture may be queued for an enrolled edge, or for one whose enrollment is pending.
+
+    Pending means the appliance's built-in collector (Center writes its enrollment token right after
+    the first connection creates the edge row, R2-CN-02) or an edge with an unused, unexpired
+    enrollment token. The command then waits as PENDING; the edge pulls it once it has enrolled, and
+    the reaper fails it with "Collector did not start" if it is never picked up.
+    """
+    status = str(edge.get("enrollment_status") or "")
+    if status == "ENROLLED":
+        return
+    if status != "REVOKED":
+        from factorix.platform.settings import get_settings
+
+        if get_settings().appliance:
+            return
+        token = await fetch_one(
+            session,
+            "SELECT 1 AS ok FROM edge_enrollment_tokens WHERE edge_id = :edge_id AND used_at IS NULL AND expires_at > :now LIMIT 1",
+            {"edge_id": as_uuid(edge["id"]), "now": utcnow()},
+        )
+        if token is not None:
+            return
+    raise AppError(409, "EDGE_NOT_ENROLLED", "No enrolled collector for this site. Enroll the Edge first.")
 
 
 async def _owned_edge(session: AsyncSession, tenant_id: UUID, edge_id: UUID) -> dict[str, Any]:
@@ -792,8 +833,7 @@ async def capture_connection(
 ) -> dict[str, Any]:
     conn = await get_connection(session, tenant_id, connection_id)
     edge = await _owned_edge(session, tenant_id, as_uuid(conn["edge_id"]))
-    if edge.get("enrollment_status") != "ENROLLED":
-        raise AppError(409, "EDGE_NOT_ENROLLED", "No enrolled collector for this site. Enroll the Edge first.")
+    await _assert_edge_can_run(session, edge)
 
     topic_filter = body.topic_filter or (body.topics[0] if body.topics else "#")
     meta = {
@@ -916,7 +956,9 @@ async def bulk_signals(
         raise AppError(422, "BULK_REJECTED", "No signals were created because some rows have errors.", field_errors=errors)
     created: list[str] = []
     now = utcnow()
-    for item in prepared:
+    # R2-SG-02: the source field ordinal keeps the order of the request (= source order chosen in the
+    # wizard); every signal of one request shares created_at, so it is the only stable ordering.
+    for position, item in enumerate(prepared):
         signal_id = uuid4()
         await execute(
             session,
@@ -960,11 +1002,12 @@ async def bulk_signals(
                 session,
                 """
                 INSERT INTO source_fields (id, acquisition_job_id, address_kind, address_json, native_datatype, decode_json, ordinal)
-                VALUES (:id, :job_id, :kind, CAST(:address AS jsonb), :native, CAST(:decode AS jsonb), 0)
+                VALUES (:id, :job_id, :kind, CAST(:address AS jsonb), :native, CAST(:decode AS jsonb), :ordinal)
                 """,
                 {
                     "id": field_id,
                     "job_id": job_id,
+                    "ordinal": position,
                     "kind": source.get("address_kind", "modbus_register"),
                     "address": jsonb(source.get("address", {})),
                     "native": source.get("address", {}).get("native_type", item["data_type"]),
@@ -1116,6 +1159,187 @@ async def _rebind_signal(session: AsyncSession, tenant_id: UUID, signal_id: UUID
     return {as_uuid(current["edge_id"]), as_uuid(target["edge_id"])}
 
 
+_SOURCE_SQL = """
+SELECT DISTINCT ON (b.signal_id)
+       b.signal_id, b.id AS binding_id, b.revision, b.enabled, b.transform_chain_json,
+       f.id AS source_field_id, f.acquisition_job_id, f.address_kind, f.address_json, f.native_datatype, f.decode_json, f.ordinal,
+       c.id AS connection_id, c.protocol, c.edge_id, c.status AS connection_status
+FROM signal_bindings b
+JOIN source_fields f ON f.id = b.source_field_id
+JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+JOIN connections c ON c.id = j.connection_id
+WHERE b.signal_id = ANY(:ids) AND b.valid_to IS NULL AND c.tenant_id = :tenant_id
+ORDER BY b.signal_id, b.valid_from DESC, b.revision DESC
+"""
+
+
+async def _current_sources(session: AsyncSession, tenant_id: UUID, signal_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
+    if not signal_ids:
+        return {}
+    rows = await fetch_all(session, _SOURCE_SQL, {"ids": signal_ids, "tenant_id": tenant_id})
+    return {as_uuid(row["signal_id"]): row for row in rows}
+
+
+def check_address_change(signal: dict[str, Any], source: dict[str, Any] | None, patch: dict[str, Any]) -> AddressCheck:
+    """Validate one address patch against the signal's current source (no I/O)."""
+    if source is None:
+        check = AddressCheck(address={})
+        check.error("address_patch", "NO_BINDING", "This signal has no source binding; its address cannot be edited.")
+        return check
+    if source.get("connection_status") == "ARCHIVED":
+        check = AddressCheck(address=dict(source.get("address_json") or {}))
+        check.error("address_patch", "ARCHIVED", "The signal's connection is archived.")
+        return check
+    return validate_address_patch(
+        str(source["protocol"]),
+        source.get("address_json") or {},
+        patch,
+        data_type=str(signal.get("data_type") or ""),
+        topic_error=validate_mqtt_topic,
+    )
+
+
+async def _readdress(session: AsyncSession, signal_id: UUID, source: dict[str, Any], check: AddressCheck) -> UUID:
+    """Point the signal at the new address: close the current binding and bind a new source field
+    on the same acquisition job (revision + 1). Observations keep the provenance of the address that
+    produced them; the signal id, and so every data model member, stays the same. Returns the new
+    source field id.
+    """
+    now = utcnow()
+    await execute(session, "UPDATE signal_bindings SET valid_to = :now WHERE id = :id", {"now": now, "id": as_uuid(source["binding_id"])})
+    field_id = uuid4()
+    await execute(
+        session,
+        """
+        INSERT INTO source_fields (id, acquisition_job_id, address_kind, address_json, native_datatype, decode_json, ordinal)
+        VALUES (:id, :job_id, :kind, CAST(:address AS jsonb), :native, CAST(:decode AS jsonb), :ordinal)
+        """,
+        {
+            "id": field_id,
+            "job_id": as_uuid(source["acquisition_job_id"]),
+            "kind": source["address_kind"],
+            "address": jsonb(check.address),
+            "native": check.native_type or source["native_datatype"],
+            "decode": jsonb(source.get("decode_json") or {}),
+            "ordinal": int(source.get("ordinal") or 0),
+        },
+    )
+    await execute(
+        session,
+        """
+        INSERT INTO signal_bindings (id, signal_id, source_field_id, transform_chain_json, enabled, revision, valid_from)
+        VALUES (:id, :signal_id, :field_id, CAST(:chain AS jsonb), :enabled, :revision, :now)
+        """,
+        {
+            "id": uuid4(),
+            "signal_id": signal_id,
+            "field_id": field_id,
+            "chain": jsonb(source.get("transform_chain_json") or []),
+            "enabled": bool(source["enabled"]),
+            "revision": int(source.get("revision") or 1) + 1,
+            "now": now,
+        },
+    )
+    return field_id
+
+
+def _source_view(source: dict[str, Any] | None, *, address: dict[str, Any] | None = None, field_id: Any = None) -> dict[str, Any] | None:
+    if source is None:
+        return None
+    return {
+        "source_field_id": str(field_id or source["source_field_id"]),
+        "connection_id": str(source["connection_id"]),
+        "protocol": public_protocol(str(source["protocol"])),
+        "address_kind": source["address_kind"],
+        "address_json": address if address is not None else (source.get("address_json") or {}),
+    }
+
+
+async def bulk_address_signals(session: AsyncSession, tenant_id: UUID, actor: UUID, body: SignalBulkAddressIn, correlation_id: str) -> dict[str, Any]:
+    """Apply an address patch to many signals at once, all or nothing (R2-SG-03).
+
+    Every item is validated first; if any item is invalid nothing is written and the 422 lists the
+    errors per item. Otherwise each changed signal is re-addressed, its version is bumped and one
+    configuration release per affected edge is published so the edge applies the new addresses.
+    """
+    if not body.items or len(body.items) > 1000:
+        raise AppError(422, "LIMIT", "Send between 1 and 1000 items.")
+    item_errors: list[dict[str, Any]] = []
+    ids: list[UUID | None] = []
+    seen: set[UUID] = set()
+    for index, item in enumerate(body.items):
+        try:
+            signal_id = parse_uuid(item.signal_id)
+        except AppError:
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": "signal_id", "code": "INVALID_ID", "message": "Invalid signal id."})
+            ids.append(None)
+            continue
+        if signal_id in seen:
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": "signal_id", "code": "DUPLICATE", "message": "The signal appears more than once."})
+        seen.add(signal_id)
+        ids.append(signal_id)
+    known = [sid for sid in ids if sid is not None]
+    signals = {
+        as_uuid(row["id"]): row
+        for row in await fetch_all(
+            session,
+            "SELECT id, version, status, data_type, display_name FROM signal_definitions WHERE tenant_id = :tenant_id AND id = ANY(:ids)",
+            {"tenant_id": tenant_id, "ids": known},
+        )
+    } if known else {}
+    sources = await _current_sources(session, tenant_id, known)
+    planned: list[tuple[UUID, dict[str, Any], dict[str, Any], AddressCheck]] = []
+    for index, (item, signal_id) in enumerate(zip(body.items, ids)):
+        if signal_id is None:
+            continue
+        signal = signals.get(signal_id)
+        if signal is None:
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": "signal_id", "code": "NOT_FOUND", "message": "Signal not found."})
+            continue
+        if signal["status"] != "ACTIVE":
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": "signal_id", "code": "ARCHIVED", "message": "Archived signals cannot be modified."})
+            continue
+        if int(signal["version"]) != item.version:
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": "version", "code": "RESOURCE_VERSION_CONFLICT", "message": "This signal was modified elsewhere. Reload it and try again."})
+            continue
+        check = check_address_change(signal, sources.get(signal_id), item.address_patch)
+        for error in check.errors:
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": f"address_patch.{error['path']}", "code": error["code"], "message": error["message"]})
+        if check.ok:
+            planned.append((signal_id, signal, sources[signal_id], check))
+    if item_errors:
+        raise AppError(
+            422,
+            "BULK_ADDRESS_REJECTED",
+            f"No signal was changed because {len({e['index'] for e in item_errors})} item(s) have errors.",
+            field_errors=[{"path": f"items[{e['index']}].{e['path']}", "code": e["code"]} for e in item_errors],
+            extra={"item_errors": item_errors},
+        )
+    updated: list[dict[str, Any]] = []
+    unchanged: list[str] = []
+    edges: set[UUID] = set()
+    now = utcnow()
+    for signal_id, signal, source, check in planned:
+        before = source.get("address_json") or {}
+        if check.address == before:
+            unchanged.append(str(signal_id))
+            continue
+        bumped = await fetch_one(
+            session,
+            "UPDATE signal_definitions SET version = version + 1, updated_at = :now WHERE id = :id AND tenant_id = :tenant_id AND version = :version RETURNING version",
+            {"now": now, "id": signal_id, "tenant_id": tenant_id, "version": int(signal["version"])},
+        )
+        if bumped is None:
+            raise AppError(409, "RESOURCE_VERSION_CONFLICT", "A signal was modified elsewhere during the update. Nothing was changed; reload and try again.", extra={"signal_id": str(signal_id)})
+        field_id = await _readdress(session, signal_id, source, check)
+        edges.add(as_uuid(source["edge_id"]))
+        await audit(session, tenant_id=tenant_id, event_type="SIGNAL_ADDRESS_UPDATE", actor_id=actor, entity_type="signal", entity_id=signal_id, before={"address": before, "version": int(signal["version"])}, after={"address": check.address, "version": int(bumped["version"]), "bulk": True}, correlation_id=correlation_id)
+        updated.append({"signal_id": str(signal_id), "version": int(bumped["version"]), "source": _source_view(source, address=check.address, field_id=field_id)})
+    for edge_id in sorted(edges, key=str):
+        await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=edge_id)
+    return {"updated": updated, "unchanged": unchanged, "count": len(updated)}
+
+
 async def patch_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, signal_id: UUID, body: SignalPatch, correlation_id: str) -> dict[str, Any]:
     current = await _signal(session, tenant_id, signal_id)
     if int(current["version"]) != body.version:
@@ -1124,6 +1348,22 @@ async def patch_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, sign
         raise AppError(409, "ARCHIVED", "Archived signals cannot be modified.")
     if body.expected_interval_ms is not None and not (100 <= body.expected_interval_ms <= 86_400_000):
         raise AppError(422, "INTERVAL", "Expected interval must be between 100 ms and one day.", field_errors=[{"path": "expected_interval_ms", "code": "RANGE"}])
+    if body.address_patch is not None and body.connection_id:
+        raise AppError(422, "ADDRESS_AND_MOVE", "Change the address or move the signal to another connection, not both at once.", field_errors=[{"path": "address_patch", "code": "CONFLICT"}])
+    source = (await _current_sources(session, tenant_id, [signal_id])).get(signal_id)
+    address_check: AddressCheck | None = None
+    if body.address_patch is not None:
+        address_check = check_address_change(current, source, body.address_patch)
+        if not address_check.ok:
+            first = address_check.errors[0]
+            raise AppError(
+                422,
+                first["code"] if len(address_check.errors) == 1 else "ADDRESS_INVALID",
+                first["message"] if len(address_check.errors) == 1 else "The source address has errors.",
+                field_errors=[{"path": f"address_patch.{e['path']}", "code": e["code"], "message": e["message"]} for e in address_check.errors],
+            )
+        if address_check.address == (source or {}).get("address_json"):
+            address_check = None  # nothing to change
     updated = await execute_rowcount(
         session,
         """
@@ -1146,6 +1386,10 @@ async def patch_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, sign
     if updated != 1:
         raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This signal was modified elsewhere. Reload it and try again.")
     edges: set[UUID] = set()
+    new_field_id: UUID | None = None
+    if address_check is not None and source is not None:
+        new_field_id = await _readdress(session, signal_id, source, address_check)
+        edges.add(as_uuid(source["edge_id"]))
     if body.connection_id:
         edges |= await _rebind_signal(session, tenant_id, signal_id, parse_uuid(body.connection_id))
     if body.enabled is not None:
@@ -1167,10 +1411,16 @@ async def patch_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, sign
             "version": int(current["version"]) + 1,
             **({"enabled": body.enabled} if body.enabled is not None else {}),
             **({"connection_id": body.connection_id} if body.connection_id else {}),
+            **({"address": address_check.address} if address_check is not None else {}),
         },
         correlation_id=correlation_id,
     )
-    return await _signal(session, tenant_id, signal_id)
+    if address_check is not None and source is not None:
+        await audit(session, tenant_id=tenant_id, event_type="SIGNAL_ADDRESS_UPDATE", actor_id=actor, entity_type="signal", entity_id=signal_id, before={"address": source.get("address_json") or {}}, after={"address": address_check.address}, correlation_id=correlation_id)
+    result = await _signal(session, tenant_id, signal_id)
+    latest_source = (await _current_sources(session, tenant_id, [signal_id])).get(signal_id)
+    result["source"] = _source_view(latest_source)
+    return result
 
 
 async def delete_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, signal_id: UUID, correlation_id: str) -> dict[str, Any]:
@@ -1246,7 +1496,7 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
                r.code AS resource_code, r.name AS resource_name, r.path_code,
                c.id AS connection_id, c.name AS connection_name, c.protocol AS connection_protocol,
                e.id AS edge_id, e.name AS edge_name,
-               f.address_kind, f.address_json, j.id AS job_id, b.enabled AS binding_enabled
+               f.address_kind, f.address_json, COALESCE(f.ordinal, 0) AS source_ordinal, j.id AS job_id, b.enabled AS binding_enabled
         FROM signal_definitions s
         JOIN resources r ON r.id = s.resource_id
         LEFT JOIN LATERAL (
@@ -1261,7 +1511,7 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
         LEFT JOIN connections c ON c.id = j.connection_id
         LEFT JOIN edge_nodes e ON e.id = c.edge_id
         WHERE {' AND '.join(where)}
-        ORDER BY r.code, s.key
+        ORDER BY r.code, s.created_at, COALESCE(f.ordinal, 0), s.key
         LIMIT :limit
         """,
         params,
@@ -1915,11 +2165,15 @@ async def _publish_group(session: AsyncSession, tenant_id: UUID, actor: UUID | N
     _resolved, missing = await _resolve_members(session, tenant_id, as_uuid(current["resource_id"]), normalized, rekey=False)
     if missing:
         raise AppError(422, "MEMBERS_UNRESOLVED", "Some signal keys do not exist on this resource.", extra={"missing_keys": missing})
+    now = utcnow()
     await execute(
         session,
         "UPDATE output_groups SET status = 'PUBLISHED', version = version + 1, updated_at = :now WHERE id = :id AND tenant_id = :tenant_id",
-        {"id": group_id, "tenant_id": tenant_id, "now": utcnow()},
+        {"id": group_id, "tenant_id": tenant_id, "now": now},
     )
+    if (current.get("kind") or "STATE") == "EVENT":
+        # Completions that happened before the first publish are not emitted (R2-DM-04).
+        await models_engine.set_event_baseline(session, current, members, now)
     await models_engine.refresh_groups(session, tenant_id, [group_id])
     await audit(session, tenant_id=tenant_id, event_type="OUTPUT_GROUP_PUBLISH", actor_id=actor, entity_type="output_group", entity_id=group_id, before={"status": current["status"], "version": current["version"]}, after={"status": "PUBLISHED", "version": int(current["version"]) + 1}, correlation_id=correlation_id)
     return await get_output_group(session, tenant_id, group_id)
@@ -2055,8 +2309,11 @@ async def preview_output_group(session: AsyncSession, tenant_id: UUID, group_id:
 
 async def latest_output_group(session: AsyncSession, tenant_id: UUID, group_id: UUID) -> dict[str, Any]:
     group = await _group_row(session, tenant_id, group_id)
-    state = await fetch_one(session, "SELECT body_text, source_ts, last_publish_ts FROM model_state WHERE group_id = :id AND tenant_id = :tenant_id", {"id": group_id, "tenant_id": tenant_id})
-    if state is None and (group.get("kind") or "STATE") == "EVENT":
+    state = None
+    if (group.get("kind") or "STATE") == "STATE":
+        state = await fetch_one(session, "SELECT body_text, source_ts, last_publish_ts FROM model_state WHERE group_id = :id AND tenant_id = :tenant_id", {"id": group_id, "tenant_id": tenant_id})
+    else:
+        # EVENT models: model_state only holds the publish baseline; the latest body is the newest event.
         state = await fetch_one(
             session,
             "SELECT body_text, source_ts, created_at AS last_publish_ts FROM model_events WHERE group_id = :id AND tenant_id = :tenant_id AND status = 'FINAL' ORDER BY source_ts DESC, created_at DESC LIMIT 1",
@@ -2160,9 +2417,8 @@ def _template_fields(kind: str, fields: list[dict[str, Any]]) -> list[dict[str, 
 
 
 async def _seed_builtin_templates(session: AsyncSession, tenant_id: UUID) -> None:
-    count = await fetch_one(session, "SELECT count(*) AS n FROM model_templates WHERE tenant_id = :tenant_id AND is_builtin", {"tenant_id": tenant_id})
-    if count and int(count["n"] or 0) >= len(BUILTIN_TEMPLATES):
-        return
+    """Built-in templates are owned by the product: insert missing ones and bring existing
+    built-in rows up to the shipped definition (user templates are never touched)."""
     now = utcnow()
     for spec in BUILTIN_TEMPLATES:
         await execute(
@@ -2175,7 +2431,18 @@ async def _seed_builtin_templates(session: AsyncSession, tenant_id: UUID) -> Non
                 :id, :tenant_id, :key, :name, :description, :kind, :topic, CAST(:fields AS jsonb),
                 CAST(:emit AS jsonb), TRUE, 1, :now, :now
             )
-            ON CONFLICT (tenant_id, key) DO NOTHING
+            ON CONFLICT (tenant_id, key) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                description = EXCLUDED.description,
+                kind = EXCLUDED.kind,
+                fields_json = EXCLUDED.fields_json,
+                emit_policy_json = EXCLUDED.emit_policy_json,
+                version = model_templates.version + 1,
+                updated_at = EXCLUDED.updated_at
+            WHERE model_templates.is_builtin
+              AND (model_templates.fields_json IS DISTINCT FROM EXCLUDED.fields_json
+                   OR model_templates.emit_policy_json IS DISTINCT FROM EXCLUDED.emit_policy_json
+                   OR model_templates.description IS DISTINCT FROM EXCLUDED.description)
             """,
             {
                 "id": uuid4(),
@@ -2186,7 +2453,7 @@ async def _seed_builtin_templates(session: AsyncSession, tenant_id: UUID) -> Non
                 "kind": spec["kind"],
                 "topic": DEFAULT_TEMPLATE_TOPIC,
                 "fields": jsonb(_template_fields(spec["kind"], spec["fields"])),
-                "emit": jsonb(dict(DEFAULT_EMIT_POLICY)),
+                "emit": jsonb({**DEFAULT_EMIT_POLICY, **spec.get("emit_policy", {})}),
                 "now": now,
             },
         )
@@ -2511,6 +2778,9 @@ async def delete_edge(session: AsyncSession, tenant_id: UUID, actor: UUID, edge_
 class TestIn(BaseModel):
     mode: str = "FULL"
     fields: list[dict[str, Any]] = []
+    # HTTP: a relative data path used to prove authentication when the test has no fields and the
+    # connection has no ``path`` (R2-CN-01). Without any path AUTH is reported SKIPPED.
+    test_path: str | None = Field(default=None, max_length=512)
     # Optional unsaved edits of the connection form: validated like a PATCH and sent to the edge
     # for this test only (the stored configuration is not changed).
     config: dict[str, Any] | None = None
@@ -2526,18 +2796,17 @@ async def request_commission(
     mode: str = "FULL",
     fields: list[dict[str, Any]] | None = None,
     config: dict[str, Any] | None = None,
+    test_path: str | None = None,
 ) -> dict[str, Any]:
     """Dispatch a real commissioning test to the edge; results come back via GET /commissioning/{id}."""
     connection = await _connection_row(session, tenant_id, connection_id)
     if connection["status"] == "ARCHIVED":
         raise AppError(409, "ARCHIVED", "Archived connections cannot be tested.")
     edge = await _owned_edge(session, tenant_id, as_uuid(connection["edge_id"]))
-    if edge.get("enrollment_status") != "ENROLLED":
-        raise AppError(
-            409,
-            "EDGE_NOT_ENROLLED",
-            "No enrolled collector for this site. Enroll the Edge first.",
-        )
+    await _assert_edge_can_run(session, edge)
+    probe_path = (test_path or "").strip() or None
+    if probe_path is not None and ("://" in probe_path or probe_path.startswith("//")):
+        raise AppError(422, "TEST_PATH", "The test path must be relative to the base URL, for example /api/v1/status.", field_errors=[{"path": "test_path", "code": "INVALID"}])
     protocol = str(connection["protocol"])
     mode_upper = mode.upper()
     if mode_upper not in {"CONNECTIVITY", "FULL"}:
@@ -2553,6 +2822,8 @@ async def request_commission(
     ]
     job_id = uuid4()
     meta: dict[str, Any] = {"mode": mode_upper, "fields": fields or []}
+    if probe_path is not None:
+        meta["test_path"] = probe_path
     if config:
         _, raw_config, _interval = accept_connection(protocol, unmask_config(config, connection["config_json"] or {}))
         meta["config_override"] = parse_config(protocol, raw_config)

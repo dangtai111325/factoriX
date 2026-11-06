@@ -127,3 +127,50 @@ async def test_center_down_does_not_count_attempts(outbox: Outbox) -> None:
             _, failed = await runtime.flush_once(budget_s=1)
             assert failed
     assert outbox.count_by_state() == {"PENDING": 1}
+
+
+def test_pending_count_and_latest_index_stay_exact(tmp_path: Path) -> None:
+    """R2-SG-01: counters and the latest-lane index are maintained, never rescanned on the hot path."""
+    box = Outbox(tmp_path / "o.sqlite")
+    box.add_many([_row("a1", "A"), _row("b1", "B"), _row("a2", "A"), _row("c1", "C")])
+    assert box.pending_count() == 4
+    box.mark_sent(["a2"])  # newest A delivered: A has no latest-lane row any more
+    box.mark_sent(["a2"])  # repeated ack does not count twice
+    assert box.pending_count() == 3
+    assert [r["event_uid"] for r in box.latest_pending(500)] == ["b1", "c1"]
+    box.note_attempt(["c1"], max_attempts=1)  # dead-lettered
+    assert box.pending_count() == 2
+    assert box.enforce_cap(1) == 1
+    assert box.pending_count() == 1 == box.count_by_state()["PENDING"]
+    box.add_many([_row("b2", "B")])
+    box.close()
+    reopened = Outbox(tmp_path / "o.sqlite")  # restart with a backlog rebuilds both from the table
+    assert reopened.pending_count() == reopened.count_by_state()["PENDING"] == 2
+    assert [r["event_uid"] for r in reopened.latest_pending(500)] == ["b2"]
+    reopened.close()
+
+
+def test_prune_in_bounded_chunks(outbox: Outbox) -> None:
+    outbox.add_many([_row(f"r{i}", "A", "2026-11-06T00:00:00.000Z") for i in range(5)])
+    outbox.mark_sent([f"r{i}" for i in range(5)])
+    assert outbox.prune("2026-11-06T01:00:00.000Z", chunk=2, max_chunks=1) == 2
+    assert outbox.prune("2026-11-06T01:00:00.000Z", chunk=2) == 3
+
+
+@pytest.mark.asyncio
+async def test_history_slice_is_one_batch_after_the_latest_lane(outbox: Outbox) -> None:
+    outbox.add_many([_row(f"h{i}", "A") for i in range(600)] + [_row("a2", "A"), _row("b1", "B")])
+    batches: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        uids = [item["event_uid"] for item in json.loads(request.content)["observations"]]
+        batches.append(uids)
+        return httpx.Response(200, json={"results": [{"event_uid": u, "status": "committed"} for u in uids]})
+
+    runtime, client = _runtime(outbox, handler)
+    async with client:
+        await runtime.flush_once(budget_s=0)
+    # latest lane first, then exactly one history batch (never starved, never more than a slice)
+    assert batches[0] == ["a2", "b1"]
+    assert len(batches) == 2 and batches[1][:2] == ["h0", "h1"] and len(batches[1]) == 500
+    assert outbox.pending_count() == 100

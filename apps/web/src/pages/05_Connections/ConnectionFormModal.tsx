@@ -3,7 +3,10 @@ import { X, RadioTower, Network, Cable, Cloud, AlertCircle, Eye, EyeOff, Activit
 import { ProtocolType, ConnectionItem, EdgeItem } from '../../types';
 import { api, ApiError } from '../../api/client';
 import { CommissionResult, runConnectionTest } from '../../lib/commissioning';
+import { useApp } from '../../store/AppContext';
+import { ModalPortal } from '../../components/modals/ModalPortal';
 import { TestResultPanel } from './TestResultPanel';
+import { httpPathsOfConnection, rateBudget } from './httpRate';
 
 export interface SavedConnection {
   id: string;
@@ -161,6 +164,9 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
   const [httpHeaders, setHttpHeaders] = useState<HeaderRow[]>([]);
   const [httpTimeout, setHttpTimeout] = useState(5000);
   const [httpRateLimit, setHttpRateLimit] = useState(60);
+  /** HTTP: optional relative path used only by the test to prove authentication (not stored). */
+  const [httpTestPath, setHttpTestPath] = useState('');
+  const { signals } = useApp();
 
   // WebSocket
   const [wsUrl, setWsUrl] = useState('');
@@ -208,6 +214,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
     setHttpHeaders([]);
     setHttpTimeout(5000);
     setHttpRateLimit(60);
+    setHttpTestPath('');
     setWsUrl('');
     setWsHeaders([]);
     setWsTimeout(5000);
@@ -276,6 +283,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
     setGeneralError(null);
     setTestResult(null);
     setSecret('');
+    setHttpTestPath('');
     setShowSecret(false);
     setDirty(false);
     let cancelled = false;
@@ -534,7 +542,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
       if (Object.keys(errors).length) return;
       setIsTesting(true);
       setTestResult(null);
-      const result = await runConnectionTest(savedId, { mode: 'CONNECTIVITY', config: buildConfig() });
+      const result = await runConnectionTest(savedId, { mode: 'CONNECTIVITY', config: buildConfig(), testPath: protocol === 'http' ? httpTestPath : undefined });
       setTestResult(result);
       setIsTesting(false);
       return;
@@ -543,7 +551,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
     if (!id) return;
     setIsTesting(true);
     setTestResult(null);
-    const result = await runConnectionTest(id, { mode: 'CONNECTIVITY' });
+    const result = await runConnectionTest(id, { mode: 'CONNECTIVITY', testPath: protocol === 'http' ? httpTestPath : undefined });
     setTestResult(result);
     setIsTesting(false);
   };
@@ -641,6 +649,10 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
     </div>
   );
 
+  // R2-CN-04: the rate limit applies to the whole connection, i.e. every distinct path bound on it.
+  const httpPaths = protocol === 'http' && savedId ? httpPathsOfConnection(signals, savedId) : new Set<string>();
+  const httpBudget = protocol === 'http' && httpPaths.size > 0 && intervalMs > 0 ? rateBudget(httpPaths.size, intervalMs, httpRateLimit || 1) : null;
+
   const intervalHint =
     protocol === 'http'
       ? 'Each distinct path is requested once per interval. Keep requests per minute under the source rate limit (5000 ms recommended).'
@@ -649,6 +661,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
         : 'How often the collector reads the source.';
 
   return (
+    <ModalPortal>
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
       <div
         role="dialog"
@@ -1000,6 +1013,22 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
                 </div>
               </div>
               {headerEditor(httpHeaders, setHttpHeaders, 'Sent with every request. Do not put credentials here; use Authentication so they are stored encrypted.')}
+              <div className="pt-2 border-t border-[#E2E8F0]">
+                <label className={labelCls} htmlFor={`${titleId}-test-path`}>Test path (optional)</label>
+                <input
+                  id={`${titleId}-test-path`}
+                  value={httpTestPath}
+                  onChange={(e) => {
+                    setHttpTestPath(e.target.value.trim());
+                    setTestResult(null);
+                  }}
+                  placeholder="/api/v1/machines/<machine>/status"
+                  className={`${inputCls} font-mono`}
+                />
+                <p className="text-[10px] text-[#64748B] mt-0.5">
+                  A data path that requires the credentials. The test requests it to prove authentication; without it, Authenticate is reported as not verified. Not stored.
+                </p>
+              </div>
             </div>
           )}
 
@@ -1030,6 +1059,14 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
                 {err('intervalMs')}
               </div>
               <p className="text-[10px] text-[#64748B] self-end pb-1">{intervalHint}</p>
+              {httpBudget && (
+                <p
+                  role={httpBudget.over ? 'alert' : undefined}
+                  className={`col-span-2 p-2.5 rounded-lg border text-[11px] ${httpBudget.over ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-white border-[#E2E8F0] text-[#64748B]'}`}
+                >
+                  {httpBudget.message}
+                </p>
+              )}
             </div>
           )}
 
@@ -1066,5 +1103,6 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
         </form>
       </div>
     </div>
+    </ModalPortal>
   );
 };

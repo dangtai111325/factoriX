@@ -2,6 +2,7 @@
 import React, { useEffect, useState } from 'react';
 import { AlertTriangle, Check, Copy, X } from 'lucide-react';
 import type { ModelKind, ModelStatus } from './types';
+import { ModalPortal } from '../../components/modals/ModalPortal';
 
 export const KindBadge: React.FC<{ kind: ModelKind }> = ({ kind }) => (
   <span
@@ -130,6 +131,7 @@ export const Modal: React.FC<{
   if (!open) return null;
   const w = { md: 'max-w-lg', lg: 'max-w-3xl', xl: 'max-w-6xl' }[width];
   return (
+    <ModalPortal>
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onMouseDown={onClose}>
       <div
         role="dialog"
@@ -150,6 +152,7 @@ export const Modal: React.FC<{
         {footer && <div className="px-5 py-3 border-t border-slate-200 flex items-center justify-end gap-2">{footer}</div>}
       </div>
     </div>
+    </ModalPortal>
   );
 };
 

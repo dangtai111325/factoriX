@@ -282,6 +282,18 @@ async def _evaluate_connections(session: AsyncSession) -> None:
         )
 
 
+def commissioning_timeout(status: str, timeout_s: int) -> tuple[str, str]:
+    """Reaper verdict. PENDING = no collector ever picked the command up (not running, or still not
+    enrolled); RUNNING = the collector started it but never reported a result."""
+    if status == "PENDING":
+        return (
+            "EDGE_NOT_STARTED",
+            f"Collector did not start: no Edge collector picked up this test within {timeout_s} seconds. "
+            "Check that the collector is running and enrolled, then test again.",
+        )
+    return "TIMEOUT", f"The Edge collector started the test but did not report a result within {timeout_s} seconds."
+
+
 async def _reap_commissioning(session: AsyncSession) -> None:
     now = utcnow()
     stale_jobs = await fetch_all(
@@ -295,16 +307,15 @@ async def _reap_commissioning(session: AsyncSession) -> None:
         {"cutoff": now - timedelta(seconds=COMMISSION_TIMEOUT_S)},
     )
     for job in stale_jobs:
+        error_code, diagnostic = commissioning_timeout(job["status"], COMMISSION_TIMEOUT_S)
         await execute(
             session,
             """
             UPDATE commissioning_jobs
-            SET status = 'FAILED', error_code = 'TIMEOUT',
-                diagnostic = 'The edge did not answer within 30 seconds.',
-                completed_at = :now
+            SET status = 'FAILED', error_code = :error_code, diagnostic = :diagnostic, completed_at = :now
             WHERE id = :id
             """,
-            {"id": job["id"], "now": now},
+            {"id": job["id"], "now": now, "error_code": error_code, "diagnostic": diagnostic},
         )
         await audit(
             session,
@@ -314,7 +325,7 @@ async def _reap_commissioning(session: AsyncSession) -> None:
             entity_type="commissioning",
             entity_id=as_uuid(job["id"]),
             before={"status": job["status"]},
-            after={"status": "FAILED", "error_code": "TIMEOUT"},
+            after={"status": "FAILED", "error_code": error_code},
             correlation_id=f"reaper-{uuid4().hex[:8]}",
             severity="WARN",
         )
@@ -935,7 +946,9 @@ async def commission(connection_id: str, request: Request, body: TestIn | None =
     mode = body.mode if body and body.mode else "FULL"
     fields = body.fields if body else None
     config = body.config if body else None
-    return await collect.request_commission(session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request), mode=mode, fields=fields, config=config)
+    return await collect.request_commission(
+        session, tenant_id, actor, parse_uuid(connection_id), correlation_id(request), mode=mode, fields=fields, config=config, test_path=body.test_path if body else None
+    )
 
 
 @app.get("/api/v1/commissioning/{job_id}")
@@ -1032,6 +1045,12 @@ async def patch_signal(signal_id: str, body: SignalPatch, request: Request, prin
 async def delete_signal(signal_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await collect.delete_signal(session, tenant_id, actor, parse_uuid(signal_id), correlation_id(request))
+
+
+@app.post("/api/v1/signals/bulk-address")
+async def signal_bulk_address(body: collect.SignalBulkAddressIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, actor = _ids(principal)
+    return await collect.bulk_address_signals(session, tenant_id, actor, body, correlation_id(request))
 
 
 @app.post("/api/v1/signals/bulk-action")
@@ -1488,7 +1507,7 @@ async def audit_events(
         params["entity_type"] = entity_type
     if entity_id:
         clauses.append("entity_id = :entity_id")
-        params["entity_id"] = entity_id
+        params["entity_id"] = parse_uuid(entity_id)
     if cursor:
         try:
             cursor_dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
