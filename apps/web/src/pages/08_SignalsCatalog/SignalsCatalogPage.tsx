@@ -34,6 +34,7 @@ import { SignalSparkline } from './SignalSparkline';
 import { SignalInspector } from './SignalInspector';
 import { SignalEditDialog } from './SignalEditDialog';
 import { BulkAddressDialog } from './BulkAddressDialog';
+import { BulkPropertiesDialog } from './BulkPropertiesDialog';
 import { sortBySourceOrder } from './signalOrder';
 import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { api } from '../../api/client';
@@ -211,6 +212,7 @@ export const SignalsCatalogPage: React.FC = () => {
   const navigate = useNavigate();
   const { signals, resources, connections, refresh, loadState } = useApp();
   const [bulkAddressOpen, setBulkAddressOpen] = useState(false);
+  const [bulkPropertiesOpen, setBulkPropertiesOpen] = useState(false);
 
   // R2-SG-02: arriving from Add Data (or any navigation) starts at the top of the page.
   useEffect(() => {
@@ -848,6 +850,9 @@ export const SignalsCatalogPage: React.FC = () => {
               <Button variant="danger" size="sm" onClick={() => openBulk('delete')}>
                 <Trash2 className="w-3.5 h-3.5" /> Delete…
               </Button>
+              <Button variant="outline" size="sm" onClick={() => setBulkPropertiesOpen(true)}>
+                <Pencil className="w-3.5 h-3.5" /> Edit properties…
+              </Button>
               <Button variant="outline" size="sm" onClick={() => setBulkAddressOpen(true)}>
                 <Pencil className="w-3.5 h-3.5" /> Edit source address…
               </Button>
@@ -1117,6 +1122,16 @@ export const SignalsCatalogPage: React.FC = () => {
           }}
         />
       )}
+
+      <BulkPropertiesDialog
+        isOpen={bulkPropertiesOpen}
+        signals={signals.filter((s) => selectedIds.includes(s.id))}
+        onClose={() => setBulkPropertiesOpen(false)}
+        onApplied={(updated, unchanged) => {
+          void refresh().catch((error) => console.warn('Refresh after the property change failed', error));
+          showToast(`Properties updated on ${updated} signal${updated === 1 ? '' : 's'}${unchanged ? `; ${unchanged} already had these values` : ''}.`);
+        }}
+      />
 
       <BulkAddressDialog
         isOpen={bulkAddressOpen}

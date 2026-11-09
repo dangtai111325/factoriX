@@ -4,7 +4,7 @@ import { AlertTriangle, Check, Copy, Info, X } from 'lucide-react';
 import { ModalPortal } from '../../components/modals/ModalPortal';
 import { useDialogA11y } from '../../components/modals/useDialogA11y';
 import { formatJsonText, jsonTokens } from './json';
-import type { ModelState } from './types';
+import type { FieldQuality, ModelState, QualitySummary } from './types';
 
 export const StateChip: React.FC<{ state: ModelState | 'NEW'; size?: 'sm' | 'md' }> = ({ state, size = 'sm' }) => {
   const map = {
@@ -20,6 +20,75 @@ export const StateChip: React.FC<{ state: ModelState | 'NEW'; size?: 'sm' | 'md'
     >
       <span className={`w-1.5 h-1.5 rounded-full ${map.dot}`} aria-hidden="true" />
       {map.label}
+    </span>
+  );
+};
+
+// ------------------------------------------------------------------ data quality (R4-DM-08)
+
+export const QUALITY_TEXT: Record<FieldQuality, string> = {
+  good: 'Good',
+  uncertain: 'Uncertain',
+  stale: 'Stale',
+  paused: 'Paused',
+  no_data: 'No data',
+  disabled: 'Disabled',
+  bad: 'Bad',
+  missing: 'Missing',
+};
+
+const QUALITY_CLS: Record<FieldQuality, { chip: string; dot: string }> = {
+  good: { chip: 'bg-emerald-50 text-emerald-800 border-emerald-200', dot: 'bg-[#0DBA67]' },
+  uncertain: { chip: 'bg-amber-50 text-amber-900 border-amber-200', dot: 'bg-amber-400' },
+  stale: { chip: 'bg-amber-50 text-amber-900 border-amber-200', dot: 'bg-amber-400' },
+  paused: { chip: 'bg-slate-100 text-slate-700 border-slate-300', dot: 'bg-slate-400' },
+  no_data: { chip: 'bg-slate-100 text-slate-700 border-slate-300', dot: 'bg-slate-300' },
+  disabled: { chip: 'bg-slate-100 text-slate-700 border-slate-300', dot: 'bg-slate-400' },
+  bad: { chip: 'bg-red-50 text-red-800 border-red-200', dot: 'bg-red-500' },
+  missing: { chip: 'bg-red-50 text-red-800 border-red-200', dot: 'bg-red-500' },
+};
+
+/** Small marker of a field's source quality (shown only when it is not good). */
+export const QualityDot: React.FC<{ quality: FieldQuality; reason?: string | null }> = ({ quality, reason }) => (
+  <span
+    className={`inline-flex items-center gap-1 shrink-0 px-1 rounded border text-[9px] font-bold uppercase ${QUALITY_CLS[quality].chip}`}
+    title={reason || QUALITY_TEXT[quality]}
+  >
+    <span className={`w-1.5 h-1.5 rounded-full ${QUALITY_CLS[quality].dot}`} aria-hidden="true" />
+    {QUALITY_TEXT[quality]}
+  </span>
+);
+
+/** Model-level data chip: "Live data", "1 source paused", "3 fields stale"… */
+export function qualityHeadline(q: QualitySummary | null | undefined): { tone: FieldQuality; text: string } | null {
+  if (!q) return null;
+  if (q.status === 'good') return { tone: 'good', text: 'All sources live' };
+  const n = q.affectedFields;
+  const fields = `${n} field${n === 1 ? '' : 's'}`;
+  if (q.pausedSources.length) return { tone: 'paused', text: `${q.pausedSources.length} source${q.pausedSources.length === 1 ? '' : 's'} paused · ${fields} affected` };
+  if (q.status === 'missing') return { tone: 'missing', text: `${q.counts.missing || n} field(s) with missing data points` };
+  if (q.staleSources.length || q.status === 'stale') return { tone: 'stale', text: `${fields} stale (no fresh value)` };
+  return { tone: q.status, text: `${fields}: ${QUALITY_TEXT[q.status].toLowerCase()}` };
+}
+
+export const QualityChip: React.FC<{ quality: QualitySummary | null | undefined }> = ({ quality }) => {
+  const head = qualityHeadline(quality);
+  if (!head) return null;
+  const details = quality
+    ? [
+        quality.pausedSources.length ? `Paused: ${quality.pausedSources.join(', ')}` : '',
+        quality.staleSources.length ? `Stale: ${quality.staleSources.join(', ')}` : '',
+        Object.entries(quality.counts)
+          .map(([k, v]) => `${QUALITY_TEXT[k as FieldQuality]}: ${v}`)
+          .join(' · '),
+      ]
+        .filter(Boolean)
+        .join('\n')
+    : '';
+  return (
+    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12px] font-semibold whitespace-nowrap ${QUALITY_CLS[head.tone].chip}`} title={details} role="status">
+      <span className={`w-1.5 h-1.5 rounded-full ${QUALITY_CLS[head.tone].dot}`} aria-hidden="true" />
+      {head.text}
     </span>
   );
 };

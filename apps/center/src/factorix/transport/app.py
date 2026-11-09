@@ -1062,6 +1062,28 @@ async def signal_usage(signal_id: str, principal: dict[str, Any] = Depends(admin
     return {"signal_id": str(signal), "models": await usage.models_using_signal(session, tenant_id, signal)}
 
 
+class SignalUsageIn(BaseModel):
+    signal_ids: list[str]
+
+
+@app.post("/api/v1/signals/usage")
+async def signals_usage(body: SignalUsageIn, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    """Data models that read any of the signals, in one query (R4-SG-01: the bulk Disable / Delete
+    dialog asked once per selected signal and waited behind the page's other requests)."""
+    tenant_id, _actor = _ids(principal)
+    if len(body.signal_ids) > 5000:
+        raise AppError(422, "LIMIT", "At most 5000 signals per usage lookup.")
+    ids = list(dict.fromkeys(parse_uuid(item) for item in body.signal_ids))
+    return {"signal_ids": [str(item) for item in ids], "models": await usage.models_using_signals(session, tenant_id, ids) if ids else []}
+
+
+@app.post("/api/v1/signals/bulk-properties")
+async def signal_bulk_properties(body: collect.SignalBulkPropertiesIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    """Set unit, expected interval and/or round digits on many signals, all or nothing (R4-SG-02)."""
+    tenant_id, actor = _ids(principal)
+    return await collect.bulk_properties_signals(session, tenant_id, actor, body, correlation_id(request))
+
+
 @app.post("/api/v1/signals/bulk-address")
 async def signal_bulk_address(body: collect.SignalBulkAddressIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)

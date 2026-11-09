@@ -31,7 +31,15 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
+# Rule size limits (R4-DM-02). The character budget measures what the user writes: every data
+# point / resource reference counts as ONE character, whatever its stored token or display length
+# (``{{sig:<uuid>}}`` is 44 characters, ``$machine[AA10-01].machine_temp_1`` 32). Without that a
+# generated ``latest_ts(<336 refs>)`` failed the 4000-character limit although it is trivially
+# simple. Complexity is bounded by the AST node cap (references excluded) and the reference cap;
+# MAX_TEXT_LEN is only a hard parser guard.
 MAX_EXPR_LEN = 4000
+MAX_REFS = 2000  # = body.MAX_FIELDS: one latest_ts() can cover every signal of a full model
+MAX_TEXT_LEN = 200_000
 MAX_NODES = 500
 MAX_DEPTH = 64
 MAX_STEPS = 20_000
@@ -396,6 +404,82 @@ def missing_text(label: str | None) -> str:
     return f"${_MISSING}[{text}]"
 
 
+def expr_too_long(text: str) -> RuleError | None:
+    """Size check of a rule (display text or stored tokens): references count as one character."""
+    if len(text) > MAX_TEXT_LEN:
+        return RuleError("EXPR_TOO_LONG", f"A rule is limited to {MAX_EXPR_LEN} characters plus {MAX_REFS} references.")
+    if len(text) <= MAX_EXPR_LEN:
+        return None
+    sc = scan(text)
+    refs = sc.refs
+    if len(refs) > MAX_REFS:
+        return RuleError("LIMIT", f"A rule can use at most {MAX_REFS} references ({len(refs)}).")
+    size = len(text) - sum(r.end - r.start for r in refs) + len(refs)
+    if size > MAX_EXPR_LEN:
+        return RuleError(
+            "EXPR_TOO_LONG",
+            f"A rule is limited to {MAX_EXPR_LEN} characters (each data point reference counts as one); this one has {size}.",
+        )
+    return None
+
+
+def describe_ref(catalog: Catalog | None, kind: str, ident: str, label: str | None) -> str:
+    """Readable name of a (possibly deleted) target for messages: ``'humidity' on M1`` / ``machine M1``.
+
+    Uses the current names when the target row still exists (renamed, then disabled/archived), else
+    the last known label; never the internal ``$⚠missing[...]`` syntax (R4-DM-12).
+    """
+    if catalog is not None:
+        if kind == "sig":
+            sig = catalog.signal(ident)
+            res = catalog.resource(sig.resource_id) if sig else None
+            if sig is not None:
+                return f"'{sig.key}' on {res.name}" if res else f"'{sig.key}'"
+        else:
+            res = catalog.resource(ident)
+            if res is not None:
+                return f"{res.type_key} {res.name}" if res.type_key else res.name
+    text = (label or "").strip()
+    if text.startswith("$" + _MISSING):
+        text = text[len(_MISSING) + 2 : -1] if text.endswith("]") else text
+    if text.startswith("$"):
+        try:
+            ref, end = _scan_path_ref(text, 0)
+        except RuleError:
+            ref, end = None, 0
+        if isinstance(ref, PathRef) and end == len(text):
+            type_key, name = ref.segments[-1]
+            if ref.key is not None:
+                return f"'{ref.key}' on {name}"
+            return f"{type_key} {name}"
+    return text or ("data point" if kind == "sig" else "resource")
+
+
+def missing_message(catalog: Catalog | None, kind: str, ident: str, label: str | None) -> str:
+    what = describe_ref(catalog, kind, ident, label)
+    if kind == "sig":
+        return f"Data point {what} was deleted or disabled. Pick another one in the data tree."
+    return f"Resource {what} was deleted or archived."
+
+
+def refresh_label(catalog: Catalog, kind: str, ident: str, label: str | None) -> str | None:
+    """Label of a target with the current names, also when it is no longer live (renamed, then deleted)."""
+    current = current_label(catalog, kind, ident)
+    if current:
+        return current
+    if kind == "sig":
+        sig = catalog.signal(ident)
+        if sig is not None and catalog.resource(sig.resource_id) is not None:
+            base = catalog.resource_path_text(sig.resource_id)
+            if base:
+                return f"{base}.{key_text(sig.key)}"
+    else:
+        res = catalog.resource(ident)
+        if res is not None:
+            return f"${res.type_key}[{escape_name(res.name)}]"
+    return label
+
+
 # ============================================================================================
 # Scanning: references inside rule text
 # ============================================================================================
@@ -744,8 +828,9 @@ def resolve(text: str, catalog: Catalog, labels: Mapping[str, str] | None = None
     for key, label in labels.items():
         reverse.setdefault(label, []).append(key)
     issues: list[RuleError] = []
-    if len(text) > MAX_EXPR_LEN:
-        return Resolved(text, [], [RuleError("EXPR_TOO_LONG", f"A rule is limited to {MAX_EXPR_LEN} characters.")], labels)
+    too_long = expr_too_long(text)
+    if too_long is not None:
+        return Resolved(text, [], [too_long], labels)
     sc = scan(text)
     issues.extend(sc.issues)
     out: list[str] = []
@@ -988,7 +1073,7 @@ _fn("replace", "string", 3, 3, "replace(s, old, new)", "Replace every occurrence
 _fn("format", "string", 2, 2, "format(x, digits)", "Fixed-point text with the given number of decimals.")
 _fn("now", "time", 0, 0, "now()", "Platform clock at sampling time.")
 _fn("ts", "time", 1, 1, "ts($ref)", "Source timestamp of the signal's group (source time, else received time).", ref_args=(0,))
-_fn("latest_ts", "time", 1, MAX_ARGS, "latest_ts($ref, ...)", "Latest ts() of the given signals (source_timestamp of a clean body).", ref_args=(-1,))
+_fn("latest_ts", "time", 1, MAX_REFS, "latest_ts($ref, ...)", "Latest ts() of the given signals (source_timestamp of a clean body).", ref_args=(-1,))
 _fn("age", "time", 1, 1, "age($ref)", "Seconds since the signal value was received.", ref_args=(0,))
 _fn("quality", "time", 1, 1, "quality($ref)", "Quality of the signal's latest sample: GOOD, UNCERTAIN or BAD.", ref_args=(0,))
 _fn("value_at", "time", 2, 2, "value_at($ref, time)", "Value the signal had at a past instant (snapshot).", ref_args=(0,))
@@ -1080,8 +1165,9 @@ def compile_rule(stored: str) -> Program:
     """Compile canonical rule text. Raises :class:`RuleError` with ``pos`` on any problem."""
     if not isinstance(stored, str) or not stored.strip():
         raise RuleError("EXPR_EMPTY", "The rule is empty.")
-    if len(stored) > MAX_EXPR_LEN:
-        raise RuleError("EXPR_TOO_LONG", f"A rule is limited to {MAX_EXPR_LEN} characters.")
+    too_long = expr_too_long(stored)
+    if too_long is not None:
+        raise too_long
     sc = scan(stored)
     if sc.issues:
         raise sc.issues[0]
@@ -1170,7 +1256,9 @@ class _Builder:
         stack: list[tuple[ast.AST, int]] = [(tree.body, 1)]
         while stack:
             node, depth = stack.pop()
-            count += 1
+            # References have their own cap (MAX_REFS); load/store contexts are not elements.
+            if not isinstance(node, ast.expr_context) and not (isinstance(node, ast.Name) and node.id.startswith("__fxr")):
+                count += 1
             if count > MAX_NODES:
                 raise RuleError("LIMIT", f"The rule is too long (more than {MAX_NODES} elements).")
             if depth > MAX_DEPTH:

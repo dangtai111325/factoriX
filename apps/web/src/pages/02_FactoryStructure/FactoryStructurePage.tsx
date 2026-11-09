@@ -54,11 +54,11 @@ import {
  * Paused (connection paused) and disabled signals are neutral: they are not problems (R3-CN-02).
  * While the appliance cannot be reached the status is unknown, not "no good data" (R3-OV-01).
  */
-function dataStatus(signals: SignalItem[]): { label: string; variant: BadgeVariant } {
+function dataStatus(signals: SignalItem[], scope = ''): { label: string; variant: BadgeVariant } {
   const total = signals.length;
   if (total === 0) return { label: 'No data bound', variant: 'neutral' };
   const qualities = signals.map((s) => normalizeQuality(s.quality));
-  const noun = total === 1 ? 'signal' : 'signals';
+  const noun = (total === 1 ? 'signal' : 'signals') + scope;
   if (qualities.some((q) => q === 'NO_CONNECTION')) {
     return { label: `Unknown · no connection to appliance · ${total} ${noun}`, variant: 'neutral' };
   }
@@ -70,11 +70,44 @@ function dataStatus(signals: SignalItem[]): { label: string; variant: BadgeVaria
   const inactive = [paused ? `${paused} paused` : '', disabled ? `${disabled} disabled` : ''].filter(Boolean).join(', ');
   const suffix = inactive ? ` · ${inactive}` : '';
   if (active === 0) return { label: paused ? `Paused · ${total} ${noun}` : `Disabled · ${total} ${noun}`, variant: 'neutral' };
-  const activeNoun = active === 1 ? 'signal' : 'signals';
+  const activeNoun = (active === 1 ? 'signal' : 'signals') + scope;
   if (good === active) return { label: `Receiving data · ${active} ${activeNoun}${suffix}`, variant: 'good' };
   if (good > 0) return { label: `${good} of ${active} ${activeNoun} good${suffix}`, variant: 'warning' };
   if (reporting === 0) return { label: `Waiting for data · ${active} ${activeNoun}${suffix}`, variant: 'neutral' };
   return { label: `No good data · ${active} ${activeNoun}${suffix}`, variant: 'error' };
+}
+
+/**
+ * Status of a child card (R4-HS-02): its own signals, or, when it has none (a line or zone), the
+ * signals of everything below it, e.g. "Receiving data · 56 signals in 1 machine".
+ */
+function aggregateStatus(
+  resourceId: string,
+  signalsByResource: Map<string, SignalItem[]>,
+  childrenByParent: Map<string, ResourceNode[]>,
+): { label: string; variant: BadgeVariant; count: number } {
+  const own = signalsByResource.get(resourceId) || [];
+  if (own.length > 0) return { ...dataStatus(own), count: own.length };
+  const below: SignalItem[] = [];
+  const holders: ResourceNode[] = [];
+  const seen = new Set<string>([resourceId]);
+  const queue = [...(childrenByParent.get(resourceId) || [])];
+  while (queue.length) {
+    const node = queue.shift() as ResourceNode;
+    if (seen.has(node.id)) continue;
+    seen.add(node.id);
+    const bound = signalsByResource.get(node.id) || [];
+    if (bound.length) {
+      below.push(...bound);
+      holders.push(node);
+    }
+    queue.push(...(childrenByParent.get(node.id) || []));
+  }
+  if (!below.length) return { ...dataStatus([]), count: 0 };
+  const types = new Set(holders.map((h) => String(h.type || '')));
+  const typeName = types.size === 1 ? resourceTypeLabel(holders[0].type).toLowerCase() : 'sub-unit';
+  const where = ` in ${holders.length} ${holders.length === 1 ? typeName : `${typeName}s`}`;
+  return { ...dataStatus(below, where), count: below.length };
 }
 
 /** Quality chip colours: neutral gray for states that are not data problems. */
@@ -469,6 +502,26 @@ export const FactoryStructurePage: React.FC = () => {
     () => signals.filter((s) => s.resourceId === selectedId),
     [signals, selectedId],
   );
+  // Indexes for the child cards' aggregated data status (R4-HS-02).
+  const signalsByResource = useMemo(() => {
+    const map = new Map<string, SignalItem[]>();
+    for (const s of signals) {
+      const list = map.get(s.resourceId);
+      if (list) list.push(s);
+      else map.set(s.resourceId, [s]);
+    }
+    return map;
+  }, [signals]);
+  const childrenByParent = useMemo(() => {
+    const map = new Map<string, ResourceNode[]>();
+    for (const r of resources) {
+      if (!r.parentId) continue;
+      const list = map.get(r.parentId);
+      if (list) list.push(r);
+      else map.set(r.parentId, [r]);
+    }
+    return map;
+  }, [resources]);
   const selectedStatus = dataStatus(selectedSignals);
 
   // Default tab per selected resource: its children when it has any, otherwise its signals.
@@ -1102,9 +1155,8 @@ export const FactoryStructurePage: React.FC = () => {
                 </div>
               ) : (
                 childResources.map((child) => {
-                  const childSignals = signals.filter((s) => s.resourceId === child.id);
-                  const childStatus = dataStatus(childSignals);
-                  const grandChildren = resources.filter((item) => item.parentId === child.id).length;
+                  const childStatus = aggregateStatus(child.id, signalsByResource, childrenByParent);
+                  const grandChildren = (childrenByParent.get(child.id) || []).length;
                   return (
                     <button
                       key={child.id}
@@ -1125,7 +1177,7 @@ export const FactoryStructurePage: React.FC = () => {
                           {resourceTypeLabel(child.type)}
                           {grandChildren > 0 ? ` · ${grandChildren} ${grandChildren === 1 ? 'sub-unit' : 'sub-units'}` : ''}
                         </span>
-                        <Badge variant={childStatus.variant} dot={childSignals.length > 0}>
+                        <Badge variant={childStatus.variant} dot={childStatus.count > 0}>
                           {childStatus.label}
                         </Badge>
                       </div>

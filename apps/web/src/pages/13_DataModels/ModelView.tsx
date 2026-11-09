@@ -4,14 +4,14 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, ArrowLeft, ChevronDown, ChevronRight, Clock, Copy, CopyPlus, Download, Pause, Pencil, Play, Radio, RefreshCw, Send, Trash2 } from 'lucide-react';
 import { Button } from '../../components/common/Button';
 import { errorText, getModel, getSnapshots } from './api';
-import { useCatalog, useModelBody } from './hooks';
+import { useCatalog, useModelBody, useModelQuality } from './hooks';
 import { downloadText, formatJsonText, nodeAt, nodeText, safeFileName, tryParse } from './json';
-import { signalRef, signalTooltip } from './rules';
+import { missingLabel, signalRef, signalTooltip } from './rules';
 import { errorsByUid, flatten, fromApi } from './spec';
-import type { FieldNode, ModelDetail, ModelListItem, Snapshot } from './types';
+import type { FieldNode, FieldQualityRow, ModelDetail, ModelListItem, Snapshot } from './types';
 import { isContainer } from './types';
 import { RuleText } from './wizard/RuleEditor';
-import { Banner, CopyButton, JsonBlock, Skeleton, StateChip, sampleLabel, timeAgo, useNow } from './ui';
+import { Banner, CopyButton, JsonBlock, QualityChip, QualityDot, Skeleton, StateChip, sampleLabel, timeAgo, useNow } from './ui';
 
 interface Props {
   modelId: string;
@@ -54,6 +54,13 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
   const live = useModelBody(modelId, { enabled: Boolean(info), initial: detail?.latest?.body ?? summary?.latest_body ?? null, pollMs: Math.max(1000, info?.sample_ms || 1000) });
   const body = live.body ?? detail?.latest?.body ?? null;
   const errors = live.errors.length ? live.errors : detail?.latest?.errors || [];
+  const q = useModelQuality(modelId, { enabled: Boolean(info), initial: detail?.latest ?? null, pollMs: 5000 });
+  const qualityByUid = useMemo(() => {
+    const out = new Map<string, FieldQualityRow>();
+    q.fields.forEach((f) => f.nodeId && out.set(f.nodeId, f));
+    return out;
+  }, [q.fields]);
+  const healthy = !q.quality || q.quality.status === 'good';
 
   const loadSnapshots = useCallback(async () => {
     try {
@@ -83,7 +90,19 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
         <Button variant="ghost" size="sm" icon={<ArrowLeft className="w-3.5 h-3.5" />} onClick={onBack}>
           Data models
         </Button>
-        <Banner tone="error" action={<Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>}>
+        <Banner
+          tone="error"
+          action={
+            <div className="flex gap-2">
+              <Button size="sm" variant="outline" onClick={() => void load()}>
+                Retry
+              </Button>
+              <Button size="sm" variant="primary" onClick={onBack}>
+                Back to catalog
+              </Button>
+            </div>
+          }
+        >
           {error}
         </Banner>
       </div>
@@ -102,6 +121,7 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
               <div className="flex flex-wrap items-center gap-2">
                 <h1 className="text-[20px] font-bold text-[#111B37] truncate">{info.name}</h1>
                 <StateChip state={info.state} size="md" />
+                {running && <QualityChip quality={q.quality} />}
               </div>
               {info.description && <p className="text-[13px] text-[#657794]">{info.description}</p>}
               <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-[#334568]">
@@ -147,15 +167,31 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
           Some references point to deleted or archived data. Those fields output null; the model keeps running. Edit the model to fix them.
         </Banner>
       )}
+      {running && q.quality && q.quality.pausedSources.length > 0 && (
+        <Banner tone="warning">
+          Source connection paused: <strong>{q.quality.pausedSources.join(', ')}</strong>. The model keeps sampling, but {q.quality.affectedFields} field(s) repeat their
+          last value and source_timestamp does not move until the connection is resumed.
+        </Banner>
+      )}
+      {running && q.quality && !q.quality.pausedSources.length && q.quality.staleSources.length > 0 && (
+        <Banner tone="warning">
+          No fresh data from <strong>{q.quality.staleSources.join(', ')}</strong>: {q.quality.affectedFields} field(s) repeat their last value.
+        </Banner>
+      )}
 
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)] gap-4">
         <section aria-label="Live body" className="bg-white border border-[#CBD5E1] rounded-xl p-4 flex flex-col min-h-[360px]">
           <div className="flex flex-wrap items-center gap-2 mb-2">
             <h2 className="text-[14px] font-bold text-[#111B37] mr-auto inline-flex items-center gap-2">
               Live body
-              {running && live.stream === 'open' && (
+              {running && live.stream === 'open' && healthy && (
                 <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700">
                   <span className="w-1.5 h-1.5 rounded-full bg-[#0DBA67] animate-pulse" /> live
+                </span>
+              )}
+              {running && !healthy && (
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800" title="Some sources are paused, stale or missing; see the Fields table.">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400" /> sampling, sources degraded
                 </span>
               )}
             </h2>
@@ -257,6 +293,7 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
                 <th scope="col" className="text-left font-bold px-2 py-2">Type</th>
                 <th scope="col" className="text-left font-bold px-2 py-2">Mapping / Rule</th>
                 <th scope="col" className="text-left font-bold px-2 py-2">Current value</th>
+                <th scope="col" className="text-left font-bold px-2 py-2">Data</th>
                 <th scope="col" className="text-left font-bold px-4 py-2">Error</th>
               </tr>
             </thead>
@@ -264,7 +301,7 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
               {!root &&
                 Array.from({ length: 5 }).map((_, i) => (
                   <tr key={i}>
-                    <td colSpan={5} className="px-4 py-2">
+                    <td colSpan={6} className="px-4 py-2">
                       <Skeleton className="h-3 w-full" />
                     </td>
                   </tr>
@@ -274,8 +311,10 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
                 const errs = issueMap.get(n.uid) || [];
                 const container = isContainer(n);
                 const f = container ? null : (n as FieldNode);
-                const ref = f && f.mode === 'mapping' ? (f.signalId && !f.missing ? signalRef(index, f.signalId) : null) || f.refDisplay : '';
+                const currentRef = f && f.mode === 'mapping' && f.signalId && !f.missing ? signalRef(index, f.signalId) : null;
+                const ref = f && f.mode === 'mapping' ? currentRef || (f.missing && f.refDisplay ? `Missing: ${missingLabel(f.refDisplay)}` : f.refDisplay) : '';
                 const value = container ? '' : nodeText(nodeAt(parsed, r.segments));
+                const fq = container ? undefined : qualityByUid.get(n.uid);
                 return (
                   <tr key={n.uid} className={errs.length ? 'bg-red-50/40' : ''}>
                     <td className="px-4 py-1.5 font-mono text-[#111B37] whitespace-nowrap" style={{ paddingLeft: 16 + r.depth * 14 }}>
@@ -286,7 +325,10 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
                       {container ? (
                         <span className="text-[#94A3B8]">{n.children.length} item(s)</span>
                       ) : f!.mode === 'mapping' ? (
-                        <span className={`font-mono text-[11px] ${f!.missing ? 'text-red-700' : 'text-[#1D4ED8]'}`} title={f!.signalId && index.sigById.has(f!.signalId) ? signalTooltip(index, f!.signalId) : f!.refTooltip}>
+                        <span
+                          className={`font-mono text-[11px] ${f!.missing ? 'text-red-700' : 'text-[#1D4ED8]'}`}
+                          title={f!.missing ? f!.missingReason || 'The mapped data point was deleted or disabled.' : f!.signalId && index.sigById.has(f!.signalId) ? signalTooltip(index, f!.signalId) : f!.refTooltip}
+                        >
                           {ref || '—'}
                         </span>
                       ) : (
@@ -296,6 +338,7 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
                     <td className="px-2 py-1.5 font-mono text-[11px] text-[#334568] max-w-[260px] truncate" title={value}>
                       {value || (container ? '' : '—')}
                     </td>
+                    <td className="px-2 py-1.5">{fq && running ? <QualityDot quality={fq.quality} reason={fq.reason} /> : null}</td>
                     <td className="px-4 py-1.5 text-[11px] text-red-700">{errs.map((e: { message: string }) => e.message).join(' · ')}</td>
                   </tr>
                 );

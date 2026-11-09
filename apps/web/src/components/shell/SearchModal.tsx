@@ -180,7 +180,7 @@ export const SearchModal: React.FC = () => {
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search resources, signals, connections, data models…"
-              aria-label="Search resources, signals and connections"
+              aria-label="Search resources, signals, connections and data models"
               className="flex-1 min-w-0 text-[15px] text-[#111B37] placeholder-[#94A3B8] outline-none"
             />
             {searchQuery && (

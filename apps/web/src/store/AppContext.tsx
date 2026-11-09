@@ -854,7 +854,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       })
       siteId = site.id
     }
-    const created = await api<{ id: string }>('/api/v1/resources', {
+    const created = await api<{ id: string; code?: string; name?: string; site_id?: string | null; parent_id?: string | null; version?: number }>('/api/v1/resources', {
       method: 'POST',
       body: JSON.stringify({
         type_key: typeKey,
@@ -868,7 +868,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }),
     })
     // Site creation does not auto-create fake edge (Review 4 S5.1)
-    await refresh()
+    if (typeKey === 'site' || typeKey === 'plant' || typeKey === 'enterprise') {
+      await refresh() // sites and plants also change the scope lists
+    } else {
+      // R4-HS-01: "Creating…" waited for the full metadata reload (resources, signals, models,
+      // audit, …), seconds on a busy appliance. Show the new resource at once; reload behind it.
+      const node: ResourceNode = {
+        id: text(created.id),
+        name: text(created.name || name),
+        type: typeKey as ResourceNode['type'],
+        code: text(created.code || code),
+        status: 'idle',
+        parentId: created.parent_id ? text(created.parent_id) : parent?.id || undefined,
+        attributes: { siteId: text(created.site_id || siteId), version: text(created.version || 1) },
+      }
+      setAllResources((prev) => (prev.some((item) => item.id === node.id) ? prev : [...prev, node]))
+      void refresh().catch((error) => console.warn('Refresh after creating a resource failed', error))
+    }
     setSelectedResourceId(created.id)
     if (typeKey === 'plant') {
       setCurrentPlant({

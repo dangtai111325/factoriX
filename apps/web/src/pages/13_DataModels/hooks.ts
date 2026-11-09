@@ -251,6 +251,36 @@ export function useModelBody(modelId: string | null, opts: { enabled: boolean; p
   return { ...state, loading, error, stream, pushes, refresh: fetchNow };
 }
 
+/**
+ * Source quality of a saved model's fields (R4-DM-08): GET /latest every `pollMs` while visible. The
+ * pushed bodies carry no quality, so this runs next to useModelBody.
+ */
+export function useModelQuality(modelId: string | null, opts: { enabled: boolean; initial?: LatestBody | null; pollMs?: number }) {
+  const visible = useVisibleDocument();
+  const [state, setState] = useState<{ fields: NonNullable<LatestBody['fields']>; quality: LatestBody['quality'] }>({
+    fields: opts.initial?.fields || [],
+    quality: opts.initial?.quality ?? null,
+  });
+  useEffect(() => {
+    if (opts.initial?.quality !== undefined) setState({ fields: opts.initial.fields || [], quality: opts.initial.quality ?? null });
+  }, [opts.initial]);
+  const pollMs = Math.max(3000, opts.pollMs ?? POLL_MS);
+  useEffect(() => {
+    if (!modelId || !opts.enabled || !visible) return;
+    let alive = true;
+    const pull = () =>
+      getLatest(modelId)
+        .then((r) => alive && r.quality !== undefined && setState({ fields: r.fields || [], quality: r.quality ?? null }))
+        .catch(() => undefined); // the body hook reports connection problems
+    const t = window.setInterval(pull, pollMs);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [modelId, opts.enabled, visible, pollMs]);
+  return state;
+}
+
 // ------------------------------------------------------------------ editor preview / validation
 
 /**

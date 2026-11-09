@@ -26,7 +26,7 @@ from factorix_edge.connectors.errors import ConnectorError
 from factorix_edge.connectors.http_pull import HttpPullConnector
 from factorix_edge.connectors.modbus import ModbusConnector, decode_block
 from factorix_edge.connectors.mqtt import Message, MqttConnector
-from factorix_edge.connectors.opcua import OpcUaConnector
+from factorix_edge.connectors.opcua import CONNECT_FACTOR as OPC_CONNECT_FACTOR, OpcUaConnector
 from factorix_edge.connectors.ws import WebSocketConnector
 from factorix_edge.mapping import Sample, field_address, project_field, project_json
 from factorix_edge.timeutil import from_epoch_ms, normalize_time, now_iso
@@ -38,6 +38,11 @@ MIN_INTERVAL_MS = {"http": 1000}
 DEFAULT_MIN_INTERVAL_MS = 200
 DEFAULT_MODBUS_MERGE_GAP = 16
 MAX_BACKOFF_S = 30.0
+# Failures caused by the Center (e.g. the connection secret could not be fetched while the Center
+# starts or is overloaded) say nothing about the device. The connection is reported failed only
+# after this many in a row, so a short Center hiccup does not raise "stopped receiving data" for a
+# healthy source (R4-ENV-01).
+CENTER_FAILURE_GRACE = 3
 
 
 # --------------------------------------------------------------------------- specs
@@ -187,6 +192,11 @@ def read_budget_s(spec: JobSpec) -> float:
         return min(120.0, len(paths) * (timeout_s + 60.0 / rate) + 1.0)
     if spec.protocol == "modbus_tcp":
         return modbus_cycle_budget_s(spec.fields, spec.config, timeout_s)
+    if spec.protocol == "opcua":
+        # A poll may first have to re-open the session (bounded by CONNECT_FACTOR timeouts). With
+        # the former 2 × timeout + 1 (9 s) the budget cancelled a reconnect that needed 11 s and
+        # reported TIMEOUT for a server that was answering again (R4-ENV-01).
+        return min(45.0, max(2.0, timeout_s * (OPC_CONNECT_FACTOR + 2) + 1.0))
     return min(30.0, max(2.0, timeout_s * 2 + 1.0))
 
 
@@ -496,6 +506,7 @@ class JobRunner:
         self.host = host
         self.stats = JobStats()
         self.partial_error: ConnectorError | None = None
+        self._unreported = False  # failures held back by CENTER_FAILURE_GRACE
 
     @property
     def interval_s(self) -> float:
@@ -589,10 +600,17 @@ class JobRunner:
 
     async def _failed(self, error: ConnectorError) -> None:
         self.stats.failures += 1
+        if error.code == "CENTER" and self.stats.failures < CENTER_FAILURE_GRACE:
+            logger.info("Job %s (%s): %s; retrying (%d/%d)", self.spec.job_id, self.spec.protocol, error, self.stats.failures, CENTER_FAILURE_GRACE)
+            self._unreported = True
+            return
+        # First reported failure of this streak (earlier ones may have been Center grace).
+        transition = self.stats.failures == 1 or self._unreported
+        self._unreported = False
         self.host.record_failure(self.spec.connection_id, error)
-        if self.stats.failures == 1:
+        if transition:
             logger.warning("Job %s (%s) failed: %s %s", self.spec.job_id, self.spec.protocol, error.code, error)
-        if self.stats.failures == 1 and error.code != "RATE_LIMITED":
+        if transition and error.code != "RATE_LIMITED":
             # One BAD sample per field on the transition, so the reason is visible on the signal.
             received = now_iso()
             self.host.emit(self.spec, [Sample(str(f["id"]), None, "BAD", None, error.code, received) for f in self.spec.fields])

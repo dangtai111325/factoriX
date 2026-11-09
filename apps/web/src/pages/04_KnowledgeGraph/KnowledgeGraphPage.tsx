@@ -25,7 +25,7 @@ import { translateApiError } from '../../utils/apiErrors';
 import { ancestorPath, compareResourcesByName, descendantIds } from '../../utils/resourceHierarchy';
 import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { layoutGraph } from './graphLayout';
-import { LabeledEdge } from './LabeledEdge';
+import { LabeledEdge, relationVerb } from './LabeledEdge';
 import {
   ResourceNodeComponent,
   SignalNodeComponent,
@@ -40,6 +40,10 @@ import {
  * (the overview map, toggled from the controls, helps to navigate).
  */
 const FIT_VIEW_OPTIONS = { padding: 0.08, minZoom: 0.75, maxZoom: 1.25, duration: 300 };
+/** The Fit button shows every node (R4-KG-01: the readable minimum zoom cut nodes at both edges). */
+const FIT_ALL_OPTIONS = { padding: 0.06, minZoom: 0.1, maxZoom: 1.25, duration: 300 };
+/** Space kept between revealed nodes and the canvas edge, in screen pixels. */
+const REVEAL_MARGIN = 32;
 
 const nodeTypes = {
   resource: ResourceNodeComponent,
@@ -103,6 +107,8 @@ function labeledEdge(id: string, source: string, target: string, relation: strin
     source,
     target,
     type: 'labeled',
+    // R4-KG-01: screen readers read names, not "Edge from <uuid> to <uuid>".
+    ariaLabel: `${sourceLabel || 'Item'} ${relationVerb(relation)} ${targetLabel || 'item'}`,
     markerEnd: { type: MarkerType.ArrowClosed, color },
     data: { relation_code: relation, sourceLabel, targetLabel },
   };
@@ -206,6 +212,8 @@ export const KnowledgeGraphPage: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [layoutTrigger, setLayoutTrigger] = useState(0);
   const [expansions, setExpansions] = useState<Record<string, Expansion>>({});
+  const expansionsRef = useRef(expansions);
+  expansionsRef.current = expansions;
   const [expanding, setExpanding] = useState<string | null>(null);
   const [expandError, setExpandError] = useState<string | null>(null);
   const [showMiniMap, setShowMiniMap] = useState(false);
@@ -242,6 +250,42 @@ export const KnowledgeGraphPage: React.FC = () => {
       { duration: 200 },
     );
   }, []);
+
+  /** Fit button: every node inside the canvas (the canvas excludes the details panel). */
+  const fitAll = useCallback(async () => {
+    const instance = flowRef.current;
+    if (!instance) return;
+    await instance.fitView(FIT_ALL_OPTIONS);
+  }, []);
+
+  /**
+   * Bring the given nodes into the visible canvas without changing the zoom when they fit
+   * (R4-KG-01: a node selected or added by "Show in graph" ended up under the details panel).
+   */
+  const revealNodes = useCallback(async (ids: string[]) => {
+    const instance = flowRef.current;
+    const canvas = canvasRef.current;
+    if (!instance || !canvas || !ids.length) return;
+    const wanted = new Set(ids);
+    const targets = instance.getNodes().filter((node) => wanted.has(node.id));
+    if (!targets.length) return;
+    const bounds = instance.getNodesBounds(targets);
+    const { x, y, zoom } = instance.getViewport();
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    const left = bounds.x * zoom + x;
+    const top = bounds.y * zoom + y;
+    const right = left + bounds.width * zoom;
+    const bottom = top + bounds.height * zoom;
+    if (left >= REVEAL_MARGIN && top >= REVEAL_MARGIN && right <= width - REVEAL_MARGIN && bottom <= height - REVEAL_MARGIN) return;
+    if (bounds.width * zoom + 2 * REVEAL_MARGIN <= width && bounds.height * zoom + 2 * REVEAL_MARGIN <= height) {
+      await instance.setCenter(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, { zoom, duration: 250 });
+      return;
+    }
+    await instance.fitView({ nodes: targets.map((node) => ({ id: node.id })), padding: 0.1, minZoom: 0.1, maxZoom: zoom, duration: 250 });
+  }, []);
+  /** Nodes to reveal once the next layout is applied (set by "Show in graph"). */
+  const pendingReveal = useRef<string | null>(null);
 
   const resourceById = useMemo(() => new Map(resources.map((item) => [item.id, item])), [resources]);
   const focus = focusParam ? resourceById.get(focusParam) : undefined;
@@ -366,6 +410,14 @@ export const KnowledgeGraphPage: React.FC = () => {
           if (rawNodes.every((n) => positions.has(n.id))) {
             setNodes(rawNodes.map((n) => ({ ...n, position: positions.get(n.id) || n.position })));
             setEdges(rawEdges);
+            const reveal = pendingReveal.current;
+            pendingReveal.current = null;
+            if (reveal) {
+              const extra = expansionsRef.current[reveal]?.nodes.map((node) => node.id) || [];
+              window.setTimeout(() => {
+                if (active) void revealNodes([reveal, `telemetry-${reveal}`, ...extra]);
+              }, 60);
+            }
             return;
           }
         }
@@ -376,9 +428,18 @@ export const KnowledgeGraphPage: React.FC = () => {
         appliedLayoutTrigger.current = layoutTrigger;
         setNodes(layouted.nodes);
         setEdges(layouted.edges);
-        // Frame the new arrangement once React Flow has measured the nodes.
+        // Frame the new arrangement once React Flow has measured the nodes. After "Show in graph"
+        // the expanded resource and its new neighbours are brought into view instead.
+        const reveal = pendingReveal.current;
+        pendingReveal.current = null;
         window.setTimeout(() => {
-          if (active) void frameGraph();
+          if (!active) return;
+          if (reveal) {
+            const extra = expansionsRef.current[reveal]?.nodes.map((node) => node.id) || [];
+            void revealNodes([reveal, `telemetry-${reveal}`, ...extra]);
+          } else {
+            void frameGraph();
+          }
         }, 60);
       } catch (err) {
         console.error('Failed to lay out the knowledge graph', err);
@@ -436,6 +497,7 @@ export const KnowledgeGraphPage: React.FC = () => {
         );
         const live = (payload.nodes || []).filter((node) => !node.archived_at);
         const exp = buildExpansion({ nodes: live, edges: payload.edges }, resourceNames);
+        pendingReveal.current = resourceId;
         setExpansions((prev) => ({ ...prev, [resourceId]: exp }));
       } catch (caught) {
         setExpandError(translateApiError(caught));
@@ -445,6 +507,25 @@ export const KnowledgeGraphPage: React.FC = () => {
     },
     [resourceNames],
   );
+
+  // Keep the selected node visible when the details panel opens and narrows the canvas (R4-KG-01).
+  const selectedNodeId = !selected
+    ? null
+    : selected.kind === 'resource'
+      ? selected.id
+      : selected.kind === 'telemetryGroup'
+        ? `telemetry-${selected.resourceId}`
+        : selected.kind === 'connection'
+          ? `conn-${selected.id}`
+          : `model-${selected.id}`;
+  useEffect(() => {
+    if (!selectedNodeId) return;
+    // Two frames: the panel is rendered and the canvas has its new width before measuring.
+    let frame = window.requestAnimationFrame(() => {
+      frame = window.requestAnimationFrame(() => void revealNodes([selectedNodeId]));
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [selectedNodeId, revealNodes]);
 
   // Escape closes the details panel (unless a dialog is open or focus is in a text field).
   useEffect(() => {
@@ -646,7 +727,7 @@ export const KnowledgeGraphPage: React.FC = () => {
               showFitView={false}
               className="!bg-white !border !border-[#E2E8F0] !shadow-sm !rounded-xl overflow-hidden"
             >
-              <ControlButton onClick={() => void frameGraph()} title="Fit the graph" aria-label="Fit the graph">
+              <ControlButton onClick={() => void fitAll()} title="Fit the graph" aria-label="Fit the graph">
                 <Maximize className="w-3.5 h-3.5" aria-hidden="true" />
               </ControlButton>
               <ControlButton

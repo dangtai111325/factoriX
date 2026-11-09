@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain import body as B
 from factorix.domain import rules as R
+from factorix.domain.signal_state import evaluate_signal_state
 from factorix.modules import models_engine as E
 from factorix.modules.common import as_uuid, audit, execute, execute_rowcount, fetch_all, fetch_one, iso_ms, jsonb, parse_uuid, utcnow
 from factorix.platform.errors import AppError
@@ -75,6 +76,9 @@ class DuplicateIn(BaseModel):
     source_resource_id: str | None = None
     state: str | None = None
     dry_run: bool = False
+    # R4-DM-15: a copy whose references cannot all be re-pointed would keep reading the source
+    # machine. With skip_unmatched those targets are not created (reported with skipped: true).
+    skip_unmatched: bool = False
 
 
 # ============================================================================================
@@ -241,6 +245,68 @@ def _latest_out(row: dict[str, Any] | None) -> dict[str, Any]:
     return {"body": row.get("body_text"), "sampled_at": iso_ms(row.get("sampled_at")), "errors": errors if isinstance(errors, list) else []}
 
 
+async def signal_states(session: AsyncSession, tenant_id: UUID, signal_ids: Iterable[str]) -> dict[str, B.SignalStatus]:
+    """Effective status (GOOD / STALE / PAUSED / …, canonical rules of signal_state) of each signal (R4-DM-08)."""
+    ids = E._uuids(signal_ids)
+    if not ids:
+        return {}
+    rows = await fetch_all(
+        session,
+        """
+        SELECT s.id AS signal_id, s.status AS signal_status, s.expected_interval_ms,
+               l.signal_id AS has_obs, l.quality, l.value_json, l.event_time, l.received_time,
+               l.last_good_value_json, l.last_good_event_time,
+               nb.nullable, nb.enabled, nb.connection_status, nb.connection_id, nb.connection_name
+        FROM signal_definitions s
+        LEFT JOIN latest_signal_state l ON l.tenant_id = s.tenant_id AND l.signal_id = s.id
+        LEFT JOIN LATERAL (
+            SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable, b.enabled,
+                   c.status AS connection_status, c.id AS connection_id, c.name AS connection_name
+            FROM signal_bindings b
+            JOIN source_fields f ON f.id = b.source_field_id
+            LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+            LEFT JOIN connections c ON c.id = j.connection_id
+            WHERE b.signal_id = s.id AND b.valid_to IS NULL
+            ORDER BY b.enabled DESC, b.valid_from DESC
+            LIMIT 1
+        ) nb ON TRUE
+        WHERE s.tenant_id = :tenant_id AND s.id = ANY(:ids)
+        """,
+        {"tenant_id": tenant_id, "ids": ids},
+    )
+    now = utcnow()
+    out: dict[str, B.SignalStatus] = {}
+    for row in rows:
+        value_json = E._json(row.get("value_json"))
+        good_json = E._json(row.get("last_good_value_json"))
+        result = evaluate_signal_state(
+            has_observation=row.get("has_obs") is not None,
+            raw_quality=row.get("quality"),
+            raw_value=value_json.get("v") if isinstance(value_json, dict) else None,
+            event_time=row.get("event_time"),
+            last_acquired_at=row.get("received_time"),
+            expected_interval_ms=row.get("expected_interval_ms"),
+            last_good_value=good_json.get("v") if isinstance(good_json, dict) else None,
+            last_good_time=row.get("last_good_event_time"),
+            null_allowed=bool(row.get("nullable")),
+            binding_enabled=row.get("enabled") is not False and str(row.get("signal_status") or "ACTIVE") == "ACTIVE",
+            connection_paused=str(row.get("connection_status") or "") == "PAUSED",
+            now=now,
+        )
+        out[str(row["signal_id"]).lower()] = B.SignalStatus(
+            status=result.effective_status,
+            reason=result.reason_code,
+            connection_id=str(row["connection_id"]) if row.get("connection_id") else None,
+            connection_name=row.get("connection_name"),
+        )
+    return out
+
+
+async def _quality_of(session: AsyncSession, tenant_id: UUID, compiled: B.CompiledSpec, catalog: R.Catalog) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    states = await signal_states(session, tenant_id, compiled.signal_ids)
+    return B.field_qualities(compiled, states, catalog)
+
+
 def _summary(row: dict[str, Any], catalog: R.Catalog, state_row: dict[str, Any] | None) -> dict[str, Any]:
     stored = _spec_of(row)
     machines, machine_ids, ref_count = involved(stored, catalog)
@@ -313,13 +379,19 @@ async def get_model(session: AsyncSession, tenant_id: UUID, model_id: UUID) -> d
     out["spec"] = rendered
     out["issues"] = issues
     out["latest"] = _latest_out(state_row)
+    out["latest"]["fields"], out["latest"]["quality"] = await _quality_of(session, tenant_id, B.compile_spec(stored), catalog)
     return out
 
 
 async def latest(session: AsyncSession, tenant_id: UUID, model_id: UUID) -> dict[str, Any]:
-    await _model_row(session, tenant_id, model_id)
+    """Latest body + per-field data quality (good / stale / paused / missing …) of its sources."""
+    model = await _model_row(session, tenant_id, model_id)
     row = await fetch_one(session, "SELECT body_text, sampled_at, errors_json FROM model_state WHERE group_id = :id", {"id": model_id})
-    return _latest_out(row)
+    out = _latest_out(row)
+    compiled = B.compile_spec(_spec_of(model))
+    catalog = await E.load_catalog(session, tenant_id, compiled.signal_ids)
+    out["fields"], out["quality"] = await _quality_of(session, tenant_id, compiled, catalog)
+    return out
 
 
 async def snapshots(session: AsyncSession, tenant_id: UUID, model_id: UUID, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -442,7 +514,7 @@ async def patch_model(session: AsyncSession, tenant_id: UUID, actor: UUID, model
     stored = _spec_of(current)
     if body.spec is not None:
         catalog = await E.load_catalog(session, tenant_id)
-        stored, issues = B.resolve_spec(body.spec, catalog, stored.get("labels") or {})
+        stored, issues = B.resolve_spec(body.spec, catalog, B.refresh_labels(stored.get("labels") or {}, catalog))
         if B.has_errors(issues):
             raise _spec_error(issues)
     try:
@@ -546,7 +618,7 @@ async def set_state(session: AsyncSession, tenant_id: UUID, actor: UUID, model_i
 # ============================================================================================
 
 
-async def _labels_of(session: AsyncSession, tenant_id: UUID, model_id: str | None) -> dict[str, str]:
+async def _labels_of(session: AsyncSession, tenant_id: UUID, model_id: str | None, catalog: R.Catalog) -> dict[str, str]:
     if not model_id:
         return {}
     row = await fetch_one(
@@ -554,12 +626,13 @@ async def _labels_of(session: AsyncSession, tenant_id: UUID, model_id: str | Non
         "SELECT spec_json FROM output_groups WHERE id = :id AND tenant_id = :tenant_id",
         {"id": parse_uuid(model_id), "tenant_id": tenant_id},
     )
-    return dict((_spec_of(row).get("labels") or {})) if row else {}
+    # Refreshed like the rendered spec, so a typed $⚠missing[<current label>] maps back (R4-DM-12).
+    return B.refresh_labels(_spec_of(row).get("labels") or {}, catalog) if row else {}
 
 
 async def validate(session: AsyncSession, tenant_id: UUID, body: SpecIn) -> dict[str, Any]:
     catalog = await E.load_catalog(session, tenant_id)
-    stored, issues = B.resolve_spec(body.spec, catalog, await _labels_of(session, tenant_id, body.model_id))
+    stored, issues = B.resolve_spec(body.spec, catalog, await _labels_of(session, tenant_id, body.model_id, catalog))
     signals, _resources = B.spec_refs(stored)
     rendered, _missing = B.render_spec(stored, catalog, await _signal_meta(session, signals))
     machines, machine_ids, ref_count = involved(stored, catalog)
@@ -596,9 +669,9 @@ async def preview(session: AsyncSession, tenant_id: UUID, body: SpecIn) -> dict[
     """Evaluate an unsaved spec once against current data (the editor's live preview)."""
     now = utcnow()
     catalog = await E.load_catalog(session, tenant_id)
-    stored, issues = B.resolve_spec(body.spec, catalog, await _labels_of(session, tenant_id, body.model_id))
+    stored, issues = B.resolve_spec(body.spec, catalog, await _labels_of(session, tenant_id, body.model_id, catalog))
     if any(item["code"] == "INVALID_SPEC" for item in issues):
-        return {"body": None, "sampled_at": iso_ms(now), "errors": issues, "fields": []}
+        return {"body": None, "sampled_at": iso_ms(now), "errors": issues, "fields": [], "quality": None}
     compiled = B.compile_spec(stored)
     result = await E.evaluate_once(session, tenant_id, compiled, catalog, now, _preview_state(tenant_id, body.session_id))
     blocking: dict[str, dict[str, Any]] = {}
@@ -607,12 +680,13 @@ async def preview(session: AsyncSession, tenant_id: UUID, body: SpecIn) -> dict[
             blocking.setdefault(item["path"], item)
     errors = [item for item in issues if item.get("severity", "error") == "error"]
     errors.extend(err for err in result.errors if err["path"] not in blocking)
+    quality_rows, quality = await _quality_of(session, tenant_id, compiled, catalog)
     fields = []
-    for row in result.fields:
+    for row, q in zip(result.fields, quality_rows):
         if row["path"] in blocking:
             row = {**row, "value": None, "error": blocking[row["path"]]["message"]}
-        fields.append(row)
-    return {"body": result.text, "sampled_at": iso_ms(now), "errors": errors, "fields": fields}
+        fields.append({**row, "quality": q["quality"], "quality_reason": q.get("reason")})
+    return {"body": result.text, "sampled_at": iso_ms(now), "errors": errors, "fields": fields, "quality": quality}
 
 
 def functions() -> dict[str, Any]:
@@ -654,8 +728,20 @@ def retarget_plan(stored: dict[str, Any], catalog: R.Catalog, pairs: list[tuple[
     """
     mapping: dict[str, str] = {}
     unmatched: list[dict[str, Any]] = []
+    by_ref: dict[str, dict[str, Any]] = {}  # one entry per unmatched reference, listing every field using it (R4-DM-15)
     labels = stored.get("labels") or {}
-    seen: set[tuple[str, str]] = set()
+
+    def miss(key: str, path: str, node: dict[str, Any], label: str, reason: str) -> None:
+        entry = by_ref.get(key)
+        if entry is None:
+            entry = {"path": path, **({"node_id": node["id"]} if node.get("id") else {}), "ref": label, "reason": reason, "paths": [], "count": 0}
+            by_ref[key] = entry
+            unmatched.append(entry)
+        if path not in entry["paths"]:
+            entry["paths"].append(path)
+            entry["count"] = len(entry["paths"])
+
+    failed: set[str] = set()
     for path_parts, node in B.iter_fields(stored):
         path = B.pointer(path_parts)
         if node.get("mode") == "mapping":
@@ -666,6 +752,9 @@ def retarget_plan(stored: dict[str, Any], catalog: R.Catalog, pairs: list[tuple[
         for kind, ident in tokens:
             key = f"{kind}:{ident}"
             if key in mapping:
+                continue
+            if key in failed:
+                miss(key, path, node, by_ref[key]["ref"], by_ref[key]["reason"])
                 continue
             owner = catalog.signal(ident).resource_id if kind == "sig" and catalog.signal(ident) else (ident if kind == "res" else None)
             if owner is None:
@@ -679,12 +768,8 @@ def retarget_plan(stored: dict[str, Any], catalog: R.Catalog, pairs: list[tuple[
                 target_info = catalog.resource(target)
                 target_name = target_info.name if target_info else target
                 if target_res is None:
-                    if (key, path) not in seen:
-                        unmatched.append(
-                            {"path": path, **({"node_id": node["id"]} if node.get("id") else {}), "ref": label,
-                             "reason": f"No resource {' › '.join(r.name for r in rel)} under {target_name}"}
-                        )
-                        seen.add((key, path))
+                    miss(key, path, node, label, f"No resource {' › '.join(r.name for r in rel)} under {target_name}")
+                    failed.add(key)
                     break
                 if kind == "res":
                     mapping[key] = target_res.id
@@ -693,12 +778,8 @@ def retarget_plan(stored: dict[str, Any], catalog: R.Catalog, pairs: list[tuple[
                 assert sig is not None
                 new = catalog.signal_by_key(target_res.id, sig.key)
                 if new is None:
-                    if (key, path) not in seen:
-                        unmatched.append(
-                            {"path": path, **({"node_id": node["id"]} if node.get("id") else {}), "ref": label,
-                             "reason": f"No signal '{sig.key}' under {target_res.name}"}
-                        )
-                        seen.add((key, path))
+                    miss(key, path, node, label, f"No signal '{sig.key}' under {target_res.name}")
+                    failed.add(key)
                 else:
                     mapping[key] = new.id
                 break
@@ -761,6 +842,7 @@ async def duplicate(session: AsyncSession, tenant_id: UUID, actor: UUID, model_i
     created: list[dict[str, Any]] = []
     for target, pairs, explicit in plans:
         mapping, unmatched, replaced = retarget_plan(stored, catalog, pairs)
+        skipped = bool(body.skip_unmatched and target is not None and unmatched)
         copy_spec = B.retarget_spec(stored, mapping)
         copy_spec, _issues = B.resolve_spec(copy_spec, catalog, stored.get("labels") or {})
         target_info = catalog.resource(target) if target else None
@@ -772,7 +854,9 @@ async def duplicate(session: AsyncSession, tenant_id: UUID, actor: UUID, model_i
         else:
             name = await _free_name(session, tenant_id, copy_name(source["display_name"], source_name, target_info.name if target_info else None), reserved)
         new_id: UUID | None = None
-        if not body.dry_run:
+        if skipped:
+            reserved.discard(name.lower())
+        if not body.dry_run and not skipped:
             new_id = await _insert(
                 session,
                 tenant_id,
@@ -795,7 +879,15 @@ async def duplicate(session: AsyncSession, tenant_id: UUID, actor: UUID, model_i
             )
             _changed(session, tenant_id, new_id)
         created.append(
-            {"id": str(new_id) if new_id else None, "name": name, "target_resource_id": target, "replaced": replaced, "unmatched": unmatched}
+            {
+                "id": str(new_id) if new_id else None,
+                "name": name,
+                "target_resource_id": target,
+                "replaced": replaced,
+                "unmatched": unmatched,
+                "unmatched_fields": sum(int(u.get("count") or 1) for u in unmatched),
+                "skipped": skipped,
+            }
         )
     return {"created": created}
 

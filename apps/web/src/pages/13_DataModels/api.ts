@@ -10,11 +10,14 @@ import type {
   CatalogSignal,
   DuplicateOutcome,
   FieldError,
+  FieldQuality,
+  FieldQualityRow,
   LatestBody,
   ModelDetail,
   ModelListItem,
   ModelState,
   PreviewResult,
+  QualitySummary,
   RuleFunctionInfo,
   Snapshot,
   UnmatchedRef,
@@ -54,8 +57,22 @@ function bodyText(v: unknown): string | null {
   }
 }
 
+/** The request never reached FactoriX (browser offline, appliance unreachable, gateway down). */
+export function isNetworkError(err: unknown): boolean {
+  if (err instanceof ApiError) return err.status === 502 || err.status === 503 || err.status === 504;
+  if (err instanceof DOMException && err.name === 'AbortError') return false;
+  if (err instanceof DOMException && err.name === 'TimeoutError') return true;
+  // fetch() rejects with a TypeError: "Failed to fetch" (Chrome), "NetworkError when attempting…" (Firefox), "Load failed" (Safari).
+  if (err instanceof TypeError && /fetch|network|load failed/i.test(err.message)) return true;
+  return typeof navigator !== 'undefined' && navigator.onLine === false && !(err instanceof ApiError);
+}
+
+export const NETWORK_MESSAGE = "Can't reach FactoriX. Your changes are kept on this page — check the connection and retry.";
+
 /** Human readable message from any thrown value. */
 export function errorText(err: unknown, fallback = 'Request failed.'): string {
+  // R4-DM-13: "Failed to fetch" / gateway errors become one friendly message.
+  if (isNetworkError(err)) return NETWORK_MESSAGE;
   if (err instanceof ApiError) {
     if (err.code === 'DUPLICATE_NAME') return err.message || 'A data model with this name already exists.';
     if (err.code === 'VERSION_CONFLICT') return 'Someone else changed this model meanwhile. Reload it to see the latest version.';
@@ -115,10 +132,53 @@ function normState(v: unknown): ModelState {
   return String(v || '').toUpperCase() === 'PAUSED' ? 'PAUSED' : 'RUNNING';
 }
 
+const QUALITIES: FieldQuality[] = ['missing', 'bad', 'disabled', 'no_data', 'paused', 'stale', 'uncertain', 'good'];
+
+function normQuality(v: unknown): FieldQuality | undefined {
+  const q = String(v ?? '').toLowerCase() as FieldQuality;
+  return QUALITIES.includes(q) ? q : undefined;
+}
+
+function normQualitySummary(v: unknown): QualitySummary | null {
+  if (!v || typeof v !== 'object') return null;
+  const r = v as Raw;
+  const counts: Partial<Record<FieldQuality, number>> = {};
+  if (r.counts && typeof r.counts === 'object') {
+    Object.entries(r.counts as Raw).forEach(([k, n]) => {
+      const q = normQuality(k);
+      if (q) counts[q] = num(n);
+    });
+  }
+  const list = (x: unknown) => (Array.isArray(x) ? x.map((i) => String(i)).filter(Boolean) : []);
+  return {
+    status: normQuality(r.status) || 'good',
+    counts,
+    affectedFields: num(r.affected_fields),
+    pausedSources: list(r.paused_sources),
+    staleSources: list(r.stale_sources),
+  };
+}
+
+function normQualityRows(v: unknown): FieldQualityRow[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  return (v as Raw[]).map((f) => ({
+    path: pathText(f.path ?? ''),
+    nodeId: strOrNull(f.node_id) ?? undefined,
+    quality: normQuality(f.quality) || 'good',
+    reason: strOrNull(f.reason),
+  }));
+}
+
 function normLatest(v: unknown): LatestBody | null {
   if (!v || typeof v !== 'object') return null;
   const r = v as Raw;
-  return { body: bodyText(r.body), sampledAt: strOrNull(r.sampled_at), errors: normErrors(r.errors) };
+  return {
+    body: bodyText(r.body),
+    sampledAt: strOrNull(r.sampled_at),
+    errors: normErrors(r.errors),
+    fields: normQualityRows(r.fields),
+    quality: normQualitySummary(r.quality),
+  };
 }
 
 function normListItem(r: Raw): ModelListItem {
@@ -178,12 +238,12 @@ export interface ModelWrite {
   spec: ApiSpec;
 }
 
-export async function createModel(body: ModelWrite & { state?: ModelState }): Promise<ModelDetail> {
-  return normDetail(await api<Raw>(BASE, { method: 'POST', body: JSON.stringify(body) }));
+export async function createModel(body: ModelWrite & { state?: ModelState }, signal?: AbortSignal): Promise<ModelDetail> {
+  return normDetail(await api<Raw>(BASE, { method: 'POST', body: JSON.stringify(body), signal }));
 }
 
-export async function updateModel(id: string, version: number, body: ModelWrite): Promise<ModelDetail> {
-  return normDetail(await api<Raw>(`${BASE}/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ ...body, version }) }));
+export async function updateModel(id: string, version: number, body: ModelWrite, signal?: AbortSignal): Promise<ModelDetail> {
+  return normDetail(await api<Raw>(`${BASE}/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ ...body, version }), signal }));
 }
 
 export async function deleteModel(id: string, version?: number): Promise<void> {
@@ -233,7 +293,10 @@ export async function previewSpec(spec: ApiSpec, opts: { sessionId: string; mode
       nodeId: strOrNull(f.node_id) ?? undefined,
       value: f.value,
       error: strOrNull(f.error),
+      quality: normQuality(f.quality),
+      qualityReason: strOrNull(f.quality_reason),
     })),
+    quality: normQualitySummary(r.quality),
   };
 }
 
@@ -255,17 +318,26 @@ export async function getSnapshots(id: string, limit = 20): Promise<Snapshot[]> 
 }
 
 function normOutcome(r: Raw): DuplicateOutcome {
-  const unmatched: UnmatchedRef[] = items(r.unmatched).map((u) => ({
-    path: pathText(u.path ?? ''),
-    ref: str(u.ref ?? u.label),
-    reason: str(u.reason ?? u.message),
-  }));
+  // One entry per reference (the server merges the fields using it); merged here too for older servers.
+  const byRef = new Map<string, UnmatchedRef>();
+  items(r.unmatched).forEach((u) => {
+    const ref = str(u.ref ?? u.label);
+    const paths = Array.isArray(u.paths) ? (u.paths as unknown[]).map(pathText) : [pathText(u.path ?? '')];
+    const hit = byRef.get(ref);
+    if (hit) {
+      paths.forEach((p) => !hit.paths.includes(p) && hit.paths.push(p));
+      hit.count = hit.paths.length;
+    } else byRef.set(ref, { path: paths[0] || '', ref, reason: str(u.reason ?? u.message), paths, count: paths.length });
+  });
+  const unmatched = Array.from(byRef.values());
   return {
     targetId: strOrNull(r.target_resource_id),
     createdId: strOrNull(r.id),
     createdName: str(r.name),
     replaced: num(r.replaced),
     unmatched,
+    unmatchedFields: r.unmatched_fields !== undefined ? num(r.unmatched_fields) : unmatched.reduce((n, u) => n + u.count, 0),
+    skipped: Boolean(r.skipped),
   };
 }
 
@@ -281,12 +353,12 @@ export async function duplicateToTargets(
   id: string,
   sourceResourceId: string,
   targetIds: string[],
-  opts: { dryRun: boolean },
+  opts: { dryRun: boolean; skipUnmatched?: boolean },
 ): Promise<DuplicateOutcome[]> {
   const r =
     (await api<Raw>(`${BASE}/${encodeURIComponent(id)}/duplicate`, {
       method: 'POST',
-      body: JSON.stringify({ source_resource_id: sourceResourceId, targets: targetIds, dry_run: opts.dryRun }),
+      body: JSON.stringify({ source_resource_id: sourceResourceId, targets: targetIds, dry_run: opts.dryRun, skip_unmatched: Boolean(opts.skipUnmatched) }),
     })) || {};
   return items(r, 'created').map(normOutcome);
 }

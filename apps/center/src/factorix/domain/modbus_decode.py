@@ -196,6 +196,38 @@ def decode_ascii(words: list[int]) -> str | None:
         raise ModbusPlanError("DECODE", "Register bytes are not ASCII text.") from exc
 
 
+def shortest_float32(value: float) -> float:
+    """The shortest decimal that is the same IEEE-754 single as ``value``.
+
+    A float32 widened to a Python float carries the binary error of the single format:
+    321.4 stored as float32 reads back as 321.3999938964844. The device meant 321.4, and
+    321.4 packs to exactly the same 32 bits, so that is the value to report (R4-DM-01).
+    Non-finite values and values outside the float32 range are returned unchanged.
+    """
+    if not math.isfinite(value):
+        return value
+    try:
+        bits = struct.pack(">f", value)
+    except (OverflowError, struct.error):
+        return value
+    for digits in range(1, 10):  # 9 significant digits always round-trip a float32
+        candidate = float(f"{value:.{digits}g}")
+        try:
+            if struct.pack(">f", candidate) == bits:
+                return candidate
+        except (OverflowError, struct.error):
+            continue
+    return value
+
+
+def clean_scaled(value: float) -> float:
+    """Drop the binary noise of ``raw * scale + offset`` (0.1 * 3 = 0.30000000000000004):
+    15 significant digits are exact for every double, so nothing measurable is lost."""
+    if not math.isfinite(value):
+        return value
+    return float(f"{value:.15g}")
+
+
 def decode_registers(
     words: list[int],
     *,
@@ -240,8 +272,12 @@ def decode_registers(
         raise ModbusPlanError("NON_FINITE", f"{kind.capitalize()} value is not finite.")
     if not math.isfinite(scale) or not math.isfinite(offset):
         raise ModbusPlanError("SCALE", "Scale or offset is not finite.")
-    if kind.startswith("float") or scale != 1.0 or offset != 0.0:
-        return float(value) * scale + offset
+    if kind == "float32":
+        value = shortest_float32(float(value))
+    if scale != 1.0 or offset != 0.0:
+        return clean_scaled(float(value) * scale + offset)
+    if kind.startswith("float"):
+        return float(value)
     return int(value)
 
 

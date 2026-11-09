@@ -1,8 +1,8 @@
 """OPC UA read-only client. Write services are not exposed.
 
 One persistent session per connection. The asyncua watchdog probes the server every
-``watchdog_s``; on loss the session is marked down and the next read reconnects (the
-job loop applies backoff). Subscriptions are owned by the job that created them and are
+``watchdog_s`` and gives each probe the same time to answer; on loss the session is marked
+down and the next read reconnects (the job loop applies backoff). Subscriptions are owned by the job that created them and are
 re-created after a reconnect (``generation`` changes).
 """
 
@@ -16,12 +16,16 @@ from typing import Any, Callable
 from asyncua import Client, ua
 from asyncua.client.ua_client import UaClientState
 
+from factorix.domain.modbus_decode import shortest_float32
 from factorix.domain.network import AllowedEndpoint, assert_url
 from factorix_edge.aio import bounded
 from factorix_edge.connectors.errors import ConnectorError
 from factorix_edge.timeutil import iso_ms, now_iso
 
 logger = logging.getLogger(__name__)
+
+WATCHDOG_MIN_S = 5.0
+CONNECT_FACTOR = 3  # connect() may take this many request timeouts (TCP, channel, session, activate)
 
 _AUTH_STATUS = {
     "BadUserAccessDenied",
@@ -101,7 +105,7 @@ class OpcUaConnector:
         security_policy: Any = "None",
         username: str | None = None,
         password: str | None = None,
-        watchdog_s: float = 2.0,
+        watchdog_s: float | None = None,
     ) -> None:
         assert_url(endpoint, allowlist)
         check_security(security_mode, security_policy)
@@ -109,7 +113,11 @@ class OpcUaConnector:
         self.timeout_s = timeout_s
         self.username = username or None
         self.password = password
-        self.watchdog_s = watchdog_s
+        # asyncua waits min(watchdog, session timeout / 2) for each ServerStatus probe and drops the
+        # whole session on the first late answer. With 2 s, one slow probe while the appliance was
+        # busy tore down a healthy session and the reconnect overran the read (R4-ENV-01, OPC UA
+        # TIMEOUT bursts). A dead server is still caught by the read timeout of every poll.
+        self.watchdog_s = watchdog_s if watchdog_s is not None else max(WATCHDOG_MIN_S, float(timeout_s))
         self.client: Client | None = None
         self.generation = 0
         self._lost = False
@@ -132,7 +140,7 @@ class OpcUaConnector:
 
         client.connection_lost_callback = _lost
         try:
-            await bounded(client.connect(), timeout=self.timeout_s * 3)
+            await bounded(client.connect(), timeout=self.timeout_s * CONNECT_FACTOR)
         except asyncio.CancelledError:
             await _quiet_disconnect(client)
             raise
@@ -273,6 +281,8 @@ def data_value_row(data: Any) -> dict[str, Any]:
     uncertain = status is not None and _is_uncertain(status)
     variant = getattr(data, "Value", None)
     value = _plain(getattr(variant, "Value", None)) if variant is not None else None
+    if variant is not None and getattr(variant, "VariantType", None) == ua.VariantType.Float:
+        value = _float32(value)
     source = getattr(data, "SourceTimestamp", None)
     row: dict[str, Any] = {
         "value": value if (good or uncertain) else None,
@@ -296,6 +306,15 @@ def _is_uncertain(status: Any) -> bool:
         return bool(status.is_uncertain())
     except AttributeError:
         return "Uncertain" in str(status)
+
+
+def _float32(value: Any) -> Any:
+    """OPC UA Float is single precision: report 321.4, not its widened 321.3999938964844 (R4-DM-01)."""
+    if isinstance(value, float):
+        return shortest_float32(value)
+    if isinstance(value, list):
+        return [_float32(item) for item in value]
+    return value
 
 
 def _plain(value: Any) -> Any:

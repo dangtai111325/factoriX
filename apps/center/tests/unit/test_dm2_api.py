@@ -141,7 +141,8 @@ async def test_create_resolves_refs_writes_index_audits_and_notifies(store: Stor
     nodes = detail["spec"]["root"]["children"]
     assert nodes[0]["expr"] == f"{{{{res:{M1}}}}}.@name" and nodes[0]["expr_display"] == "$machine[AA10-01].@name"
     assert nodes[1]["ref"] == {"signal_id": S1["status"]} and nodes[1]["ref_display"] == "$machine[AA10-01].status" and nodes[1]["value_type"] == "int"
-    assert detail["latest"] == {"body": None, "sampled_at": None, "errors": []}
+    assert {k: detail["latest"][k] for k in ("body", "sampled_at", "errors")} == {"body": None, "sampled_at": None, "errors": []}
+    assert [f["quality"] for f in detail["latest"]["fields"]] == ["good", "no_data", "no_data"]  # R4-DM-08: no sample yet
     assert sorted(store.refs[detail["id"]]) == sorted([("signal", S1["status"]), ("signal", S1["temp"]), ("resource", M1)])
     assert store.audits == ["DATA_MODEL_CREATED"]
     assert session.info["fx_events"] == [{"kind": E.CHANGE_EVENT, "tenant_id": str(TENANT), "model_id": detail["id"]}]
@@ -232,7 +233,7 @@ async def test_validate_and_preview_unsaved_spec(store: Store) -> None:
     preview = await DM.preview(Session(), TENANT, DM.SpecIn(spec=raw, session_id="s1"))  # type: ignore[arg-type]
     assert json.loads(preview["body"]) == {"ok": 10, "typo": None, "n": 0}
     assert [e["code"] for e in preview["errors"]] == ["UNKNOWN_SIGNAL"]
-    assert preview["fields"][1] == {"path": "/typo", "value": None, "error": issue["message"], "node_id": "r2"}
+    assert preview["fields"][1] == {"path": "/typo", "value": None, "error": issue["message"], "node_id": "r2", "quality": "good", "quality_reason": None}
     broken = await DM.preview(Session(), TENANT, DM.SpecIn(spec={"version": 2, "root": []}))  # type: ignore[arg-type]
     assert broken["body"] is None and broken["errors"][0]["code"] == "INVALID_SPEC"
 

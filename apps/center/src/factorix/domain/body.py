@@ -38,6 +38,11 @@ MAX_FIELDS = 2000
 MAX_KEY_LEN = 128
 MAX_NODE_ID_LEN = 64
 MAX_LABEL_LEN = 1000
+MAX_ROUND_DIGITS = 12
+# Calculated numbers are normalised to 15 significant digits (DBL_DIG: every decimal of up to 15
+# significant digits survives a round trip through a double), which removes binary noise such as
+# avg() -> 30.364800000000002 without losing information from any real source (R4-DM-17).
+FLOAT_SIG_DIGITS = 15
 DATA_TYPE_VALUE_TYPE = {
     "bool": "bool",
     "boolean": "bool",
@@ -205,10 +210,18 @@ def _children(
             if not isinstance(expr, str) or not expr.strip():
                 issues.append(_issue(where, node_id, "EXPR_EMPTY", "The rule is empty."))
                 expr = ""
-            elif len(expr) > R.MAX_EXPR_LEN:
-                issues.append(_issue(where, node_id, "EXPR_TOO_LONG", f"A rule is limited to {R.MAX_EXPR_LEN} characters."))
+            else:
+                too_long = R.expr_too_long(expr)
+                if too_long is not None:
+                    issues.append(_issue(where, node_id, too_long.code, too_long.message))
             node["expr"] = expr
             node["value_type"] = value_type or "auto"
+        if item.get("round_digits") is not None:
+            digits = item.get("round_digits")
+            if isinstance(digits, bool) or not isinstance(digits, int) or not 0 <= digits <= MAX_ROUND_DIGITS:
+                issues.append(_issue(where, node_id, "INVALID_ROUND", f"Round digits must be a whole number from 0 to {MAX_ROUND_DIGITS}."))
+            else:
+                node["round_digits"] = digits
         out.append(node)
     return out
 
@@ -292,13 +305,11 @@ def resolve_spec(raw: Any, catalog: R.Catalog, labels: Mapping[str, str] | None 
                     issues.extend(_rule_issue(path, node_id, e) for e in resolved.issues)
             if signal_id:
                 node["ref"] = {"signal_id": signal_id}
-                label = R.current_label(catalog, "sig", signal_id) or known.get(f"sig:{signal_id}")
+                label = R.refresh_label(catalog, "sig", signal_id, known.get(f"sig:{signal_id}"))
                 if label:
                     new_labels[f"sig:{signal_id}"] = label
                 if not catalog.signal_live(signal_id):
-                    issues.append(
-                        _issue(path, node_id, "MISSING_REF", f"The data point {label or signal_id} no longer exists.", severity="warning")
-                    )
+                    issues.append(_issue(path, node_id, "MISSING_REF", R.missing_message(catalog, "sig", signal_id, label), severity="warning"))
                 if node.get("value_type") is None:
                     sig = catalog.signal(signal_id)
                     node["value_type"] = DATA_TYPE_VALUE_TYPE.get(sig.data_type, "auto") if sig else "auto"
@@ -312,7 +323,9 @@ def resolve_spec(raw: Any, catalog: R.Catalog, labels: Mapping[str, str] | None 
         resolved = R.resolve(expr, catalog, known)
         node["expr"] = resolved.stored
         issues.extend(_rule_issue(path, node_id, e) for e in resolved.issues)
-        new_labels.update(resolved.labels)
+        for label_key, label in resolved.labels.items():
+            kind, _sep, ident = label_key.partition(":")
+            new_labels[label_key] = R.refresh_label(catalog, kind, ident, label) or label
         if resolved.ok:
             try:
                 R.compile_rule(resolved.stored)
@@ -332,7 +345,8 @@ def render_spec(
     Returns (rendered spec, warnings for missing targets).
     """
     spec = copy.deepcopy(dict(stored))
-    labels = spec.get("labels") or {}
+    labels = refresh_labels(spec.get("labels") or {}, catalog)
+    spec["labels"] = labels
     issues: list[dict[str, Any]] = []
     meta = signal_meta or {}
     for path_parts, node in iter_fields(spec):
@@ -342,8 +356,11 @@ def render_spec(
             text = R.current_label(catalog, "sig", signal_id) if signal_id else None
             node["missing"] = text is None
             if text is None:
-                text = R.missing_text(labels.get(f"sig:{signal_id}") or (node.get("ref") or {}).get("text") or "data point")
-                issues.append(_issue(path, node.get("id"), "MISSING_REF", "The referenced data point no longer exists.", severity="warning"))
+                label = labels.get(f"sig:{signal_id}") or (node.get("ref") or {}).get("text")
+                text = R.missing_text(label or "data point")
+                message = R.missing_message(catalog, "sig", str(signal_id or ""), label)
+                node["missing_reason"] = message
+                issues.append(_issue(path, node.get("id"), "MISSING_REF", message, severity="warning"))
                 node["ref_info"] = None
             else:
                 sig = catalog.signal(signal_id)
@@ -368,8 +385,22 @@ def render_spec(
         node["expr_display"] = display
         node["missing"] = bool(missing)
         if missing:
-            issues.append(_issue(path, node.get("id"), "MISSING_REF", "A referenced target no longer exists.", severity="warning"))
+            kind, _sep, ident = missing[0].partition(":")
+            message = R.missing_message(catalog, kind, ident, labels.get(missing[0]))
+            if len(missing) > 1:
+                message += f" ({len(missing)} references are missing.)"
+            node["missing_reason"] = message
+            issues.append(_issue(path, node.get("id"), "MISSING_REF", message, severity="warning"))
     return spec, issues
+
+
+def refresh_labels(labels: Mapping[str, str], catalog: R.Catalog) -> dict[str, str]:
+    """Labels with current names (a renamed-then-deleted target shows its latest name, R4-DM-12)."""
+    out: dict[str, str] = {}
+    for key, label in labels.items():
+        kind, _sep, ident = str(key).partition(":")
+        out[key] = R.refresh_label(catalog, kind, ident, label) or label
+    return out
 
 
 def retarget_spec(stored: Mapping[str, Any], mapping: Mapping[str, str]) -> dict[str, Any]:
@@ -400,6 +431,7 @@ class CompiledField:
     signal_id: str | None = None
     program: R.Program | None = None
     error: R.RuleError | None = None
+    round_digits: int | None = None
 
 
 @dataclass
@@ -425,7 +457,9 @@ def compile_spec(stored: Mapping[str, Any]) -> CompiledSpec:
             return ("obj", tuple((child["key"], build(child, [*path, child["key"]])) for child in node.get("children", [])))
         if kind == "array":
             return ("arr", tuple(build(child, [*path, index]) for index, child in enumerate(node.get("children", []))))
-        item = CompiledField(len(fields), pointer(path), node.get("id"), node["mode"], node.get("value_type") or "auto")
+        item = CompiledField(
+            len(fields), pointer(path), node.get("id"), node["mode"], node.get("value_type") or "auto", round_digits=node.get("round_digits")
+        )
         if node["mode"] == "mapping":
             item.signal_id = (node.get("ref") or {}).get("signal_id")
             if item.signal_id:
@@ -508,6 +542,23 @@ def cast_value(value: Any, value_type: str) -> Any:
     raise R.RuleRuntimeError("CAST", f"Unknown value type {value_type}.")
 
 
+def normalize_number(value: Any) -> Any:
+    """Float result without binary noise: 15 significant digits (see FLOAT_SIG_DIGITS)."""
+    if isinstance(value, float) and math.isfinite(value) and value != 0.0:
+        return float(f"{value:.{FLOAT_SIG_DIGITS}g}")
+    return value
+
+
+def round_number(value: Any, digits: int) -> Any:
+    """Field-level "Round digits": numbers rounded half away from zero; other values unchanged."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if isinstance(value, float) and not math.isfinite(value):
+        return value
+    rounded = R._round_half_up(value, digits)
+    return int(rounded) if isinstance(value, int) else float(rounded)
+
+
 def dumps_ordered(body: Any) -> str:
     """Exact output text: key order kept, compact, UTF-8 (no ASCII escaping)."""
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
@@ -561,8 +612,8 @@ def evaluate_detailed(
         elif item.mode == "mapping":
             assert item.signal_id is not None
             if ctx.catalog is not None and not ctx.catalog.signal_live(item.signal_id):
-                label = compiled.labels.get(f"sig:{item.signal_id}") or "data point"
-                error = _field_error(item, "MISSING_REF", f"The referenced data point {label} no longer exists.")
+                label = compiled.labels.get(f"sig:{item.signal_id}")
+                error = _field_error(item, "MISSING_REF", R.missing_message(ctx.catalog, "sig", item.signal_id, label))
             else:
                 sample = values.get(item.signal_id)
                 value = None if sample is None else sample.value
@@ -578,6 +629,10 @@ def evaluate_detailed(
         if error is None:
             try:
                 value = cast_value(value, item.value_type)
+                if item.mode == "calculated":
+                    value = normalize_number(value)
+                if item.round_digits is not None:
+                    value = round_number(value, item.round_digits)
             except R.RuleRuntimeError as exc:
                 error = _field_error(item, exc.code, exc.message)
         if error is not None:
@@ -602,6 +657,97 @@ def evaluate_detailed(
     else:
         filter_state.discard()
     return EvalResult(dumps_ordered(body), body, errors, rows, pending)
+
+
+# ============================================================================================
+# Data quality of the fields (R4-DM-08)
+# ============================================================================================
+
+
+@dataclass(frozen=True)
+class SignalStatus:
+    """Effective status of a source signal (``factorix.domain.signal_state`` codes)."""
+
+    status: str  # GOOD | UNCERTAIN | BAD | STALE | NO_DATA | DISABLED | PAUSED
+    reason: str | None = None
+    connection_id: str | None = None
+    connection_name: str | None = None
+
+
+# Worst first. "missing" = a referenced signal / resource was deleted or archived.
+QUALITY_ORDER = ("missing", "bad", "disabled", "no_data", "paused", "stale", "uncertain", "good")
+_QUALITY_RANK = {q: i for i, q in enumerate(QUALITY_ORDER)}
+_QUALITY_REASON = {
+    "missing": "A referenced data point was deleted or archived.",
+    "bad": "The source reports bad quality.",
+    "disabled": "The data point is disabled.",
+    "no_data": "No value received yet.",
+    "paused": "The source connection is paused; the last value is repeated.",
+    "stale": "No fresh value from the source; the last value is repeated.",
+    "uncertain": "The source reports uncertain quality.",
+}
+
+
+def _worst(qualities: list[str]) -> str:
+    return min(qualities, key=lambda q: _QUALITY_RANK.get(q, 0)) if qualities else "good"
+
+
+def field_qualities(
+    compiled: CompiledSpec, states: Mapping[str, SignalStatus], catalog: R.Catalog | None = None
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Per-field data quality and a model summary.
+
+    A mapping field has the quality of its signal; a rule the worst quality of the signals it reads
+    (a rule without signal references, e.g. a constant or ``now()``, is ``good``). Rows are in the
+    order of ``compiled.fields`` (= the ``fields`` of an evaluation).
+    """
+    rows: list[dict[str, Any]] = []
+    paused: dict[str, str] = {}
+    stale: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for item in compiled.fields:
+        if item.mode == "mapping":
+            signal_ids = [item.signal_id] if item.signal_id else []
+            resource_ids: list[str] = []
+        elif item.program is not None:
+            signal_ids = sorted(item.program.signal_ids)
+            resource_ids = sorted(item.program.resource_ids)
+        else:
+            signal_ids, resource_ids = [], []
+        found: list[str] = []
+        for sid in signal_ids:
+            if catalog is not None and not catalog.signal_live(sid):
+                found.append("missing")
+                continue
+            state = states.get(sid)
+            quality = (state.status if state else "NO_DATA").lower()
+            found.append(quality)
+            if state and state.connection_name:
+                if quality == "paused":
+                    paused[state.connection_id or state.connection_name] = state.connection_name
+                elif quality == "stale":
+                    stale[state.connection_id or state.connection_name] = state.connection_name
+        if catalog is not None and any(not catalog.resource_live(rid) for rid in resource_ids):
+            found.append("missing")
+        if item.mode == "mapping" and not item.signal_id:
+            found.append("no_data")  # not mapped yet
+        quality = _worst(found)
+        counts[quality] = counts.get(quality, 0) + 1
+        row: dict[str, Any] = {"path": item.path, "quality": quality}
+        if item.node_id:
+            row["node_id"] = item.node_id
+        if quality != "good":
+            row["reason"] = _QUALITY_REASON.get(quality)
+        rows.append(row)
+    overall = _worst(list(counts))
+    summary = {
+        "status": overall,
+        "counts": counts,
+        "affected_fields": sum(n for q, n in counts.items() if q != "good"),
+        "paused_sources": sorted(paused.values(), key=str.lower),
+        "stale_sources": sorted(stale.values(), key=str.lower),
+    }
+    return rows, summary
 
 
 def evaluate(

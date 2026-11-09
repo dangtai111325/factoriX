@@ -1136,36 +1136,92 @@ class _IngestRate:
 _INGEST_RATE = _IngestRate()
 _TOTALS_TTL_S = 300.0
 _totals_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-_totals_lock = asyncio.Lock()
+_totals_refreshing: set[str] = set()
+_totals_tasks: set["asyncio.Task[None]"] = set()
+
+
+async def _compute_observation_totals(session: AsyncSession, tenant_id: UUID) -> dict[str, Any]:
+    row = await fetch_one(
+        session,
+        """
+        SELECT count(*) AS observations, min(event_time) AS oldest, max(event_time) AS newest
+        FROM observations WHERE tenant_id = :tenant_id
+        """,
+        {"tenant_id": tenant_id},
+    )
+    totals = dict(row) if row else {"observations": 0, "oldest": None, "newest": None}
+    # ingest_dedup holds a key per sample for 7 days: as large as the history itself.
+    quarantine = await fetch_one(session, "SELECT count(*) AS count FROM observation_quarantine WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
+    dedup = await fetch_one(session, "SELECT count(*) AS count FROM ingest_dedup WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
+    totals["quarantine"] = int(quarantine["count"]) if quarantine else 0
+    totals["dedup_keys"] = int(dedup["count"]) if dedup else 0
+    totals["approximate"] = False
+    return totals
+
+
+async def _estimated_totals(session: AsyncSession) -> dict[str, Any]:
+    """Planner row estimates (instant, approximate) for the first Overview after a start, while the
+    exact counts are computed in the background."""
+    totals: dict[str, Any] = {"observations": 0, "oldest": None, "newest": None, "quarantine": 0, "dedup_keys": 0, "approximate": True}
+    try:
+        async with session.begin_nested():
+            row = await fetch_one(
+                session,
+                """
+                SELECT
+                  COALESCE((SELECT sum(GREATEST(c.reltuples, 0)) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+                            WHERE i.inhparent = 'observations'::regclass), 0) AS observations,
+                  COALESCE((SELECT GREATEST(reltuples, 0) FROM pg_class WHERE oid = 'ingest_dedup'::regclass), 0) AS dedup_keys
+                """,
+                {},
+            )
+        if row:
+            totals["observations"] = int(row["observations"] or 0)
+            totals["dedup_keys"] = int(row["dedup_keys"] or 0)
+    except SQLAlchemyError:
+        pass
+    return totals
+
+
+async def _refresh_totals(tenant_id: UUID) -> None:
+    from factorix.platform.db import session_factory
+
+    key = str(tenant_id)
+    try:
+        async with session_factory()() as session:
+            totals = await _compute_observation_totals(session, tenant_id)
+            await session.rollback()
+        _totals_cache[key] = (time.monotonic(), totals)
+    except Exception:  # noqa: BLE001 - a failed refresh keeps the last figures
+        logger.warning("storage totals refresh failed", exc_info=True)
+    finally:
+        _totals_refreshing.discard(key)
+
+
+def _schedule_totals_refresh(tenant_id: UUID) -> None:
+    key = str(tenant_id)
+    if key in _totals_refreshing:
+        return
+    _totals_refreshing.add(key)
+    task = asyncio.get_running_loop().create_task(_refresh_totals(tenant_id))
+    _totals_tasks.add(task)
+    task.add_done_callback(_totals_tasks.discard)
 
 
 async def _observation_totals(session: AsyncSession, tenant_id: UUID) -> dict[str, Any]:
-    """Size figures of stored history (count, oldest, newest, quarantine, dedup keys), refreshed at
-    most every 5 minutes with a single query in flight; they scan large tables."""
+    """Size figures of stored history (count, oldest, newest, quarantine, dedup keys).
+
+    They scan the largest tables, so a request never waits for them: the last figures (or planner
+    estimates right after a start) are returned at once and an exact refresh runs in the background
+    at most every 5 minutes, one at a time (R4 finding: a cold Overview took 28 s and held others)."""
     key = str(tenant_id)
     cached = _totals_cache.get(key)
     if cached and time.monotonic() - cached[0] < _TOTALS_TTL_S:
         return cached[1]
-    async with _totals_lock:
-        cached = _totals_cache.get(key)
-        if cached and time.monotonic() - cached[0] < _TOTALS_TTL_S:
-            return cached[1]
-        row = await fetch_one(
-            session,
-            """
-            SELECT count(*) AS observations, min(event_time) AS oldest, max(event_time) AS newest
-            FROM observations WHERE tenant_id = :tenant_id
-            """,
-            {"tenant_id": tenant_id},
-        )
-        totals = dict(row) if row else {"observations": 0, "oldest": None, "newest": None}
-        # ingest_dedup holds a key per sample for 7 days: as large as the history itself.
-        quarantine = await fetch_one(session, "SELECT count(*) AS count FROM observation_quarantine WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
-        dedup = await fetch_one(session, "SELECT count(*) AS count FROM ingest_dedup WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
-        totals["quarantine"] = int(quarantine["count"]) if quarantine else 0
-        totals["dedup_keys"] = int(dedup["count"]) if dedup else 0
-        _totals_cache[key] = (time.monotonic(), totals)
-        return totals
+    _schedule_totals_refresh(tenant_id)
+    if cached:
+        return cached[1]
+    return await _estimated_totals(session)
 
 
 async def storage_overview(session: AsyncSession, tenant_id: UUID) -> dict[str, Any]:
@@ -1198,6 +1254,7 @@ async def storage_overview(session: AsyncSession, tenant_id: UUID) -> dict[str, 
         "dedup_keys": int(dedup["count"]) if dedup else 0,
         "backlog": int(backlog["pending"]) if backlog else 0,
         "disk_bytes": None,
+        "approximate": bool(totals.get("approximate")),
         "note": "Disk usage is shown only when the server can measure it.",
     }
 

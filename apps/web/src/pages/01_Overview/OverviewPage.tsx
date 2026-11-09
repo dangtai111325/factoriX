@@ -24,6 +24,15 @@ import { formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../l
 import { connectivityDelay, onConnectivityRestored, useConnectivity } from '../../lib/connectivity';
 import { qualityLine, summarizeQualities, useValuesReady } from './signalSummary';
 
+/** Local wall-clock time of a timestamp (today: HH:MM:SS, else date and time), for "last known" values. */
+function clockTime(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '—';
+  const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return date.toDateString() === new Date().toDateString() ? time : `${date.toLocaleDateString()} ${time}`;
+}
+
 interface OverviewStats {
   resources: number;
   machines: number;
@@ -141,7 +150,14 @@ export const OverviewPage: React.FC = () => {
   const { state: authState } = useAuth();
   const collector = useCollectorHealth();
   // R3-OV-01: nothing on this page is current while the appliance cannot be reached.
-  const { lost: connectionLost } = useConnectivity();
+  const { lost: connectionLost, lastOkAt } = useConnectivity();
+  // R4-OV-01: relative times ("12 s ago") are computed at render; tick so they keep counting even
+  // when no new data arrives (offline, the page otherwise froze at "0 s ago").
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockTick((n) => n + 1), 5000);
+    return () => window.clearInterval(timer);
+  }, []);
   const valuesReady = useValuesReady(loadState, signals);
 
   const [stats, setStats] = useState<OverviewStats | null>(null);
@@ -622,14 +638,20 @@ export const OverviewPage: React.FC = () => {
             <div className="p-3 bg-slate-50/70 rounded-lg border border-slate-100">
               <div className="text-[11px] text-[#657794] uppercase font-semibold">Last data received</div>
               <div className="text-[18px] font-bold text-[#111B37] mt-1" title={lastDataAt ? formatTimestamp(lastDataAt) : undefined}>
-                {lastDataAt ? timeAgo(lastDataAt) : '—'}
+                {connectionLost ? '—' : lastDataAt ? timeAgo(lastDataAt) : '—'}
               </div>
+              {connectionLost && (
+                <div className="text-[10px] text-[#657794] mt-0.5">
+                  {lastDataAt ? `Last known: ${clockTime(lastDataAt)}` : 'Unknown while offline'}
+                </div>
+              )}
             </div>
             <div className="p-3 bg-slate-50/70 rounded-lg border border-slate-100">
               <div className="text-[11px] text-[#657794] uppercase font-semibold">Ingestion rate</div>
               <div className="text-[18px] font-bold text-[#111B37] mt-1 tabular-nums">
-                {messagesPerMin > 0 ? `${messagesPerMin} values/min` : '—'}
+                {!connectionLost && messagesPerMin > 0 ? `${messagesPerMin} values/min` : '—'}
               </div>
+              {connectionLost && <div className="text-[10px] text-[#657794] mt-0.5">Unknown while offline</div>}
             </div>
           </div>
 
@@ -693,8 +715,12 @@ export const OverviewPage: React.FC = () => {
         <section className="fx-card lg:col-span-2 p-5 border border-[#CBD5E1] bg-white">
           <div className="flex items-center justify-between pb-3 border-b border-slate-100">
             <div>
-              <h3 className="text-[14px] font-bold text-[#111B37]">Latest values</h3>
-              <p className="text-[12px] text-[#657794]">Most recently updated signals</p>
+              <h3 className="text-[14px] font-bold text-[#111B37]">{connectionLost ? 'Last known values' : 'Latest values'}</h3>
+              <p className="text-[12px] text-[#657794]">
+                {connectionLost
+                  ? `No connection to the appliance${lastOkAt ? ` since ${clockTime(new Date(lastOkAt).toISOString())}` : ''}; these values may be out of date.`
+                  : 'Most recently updated signals'}
+              </p>
             </div>
             <button
               type="button"
@@ -740,7 +766,7 @@ export const OverviewPage: React.FC = () => {
                         <td className="py-2.5 px-3 text-[#657794] max-w-[200px] truncate" title={resourceName}>
                           {resourceName}
                         </td>
-                        <td className="py-2.5 px-3 font-semibold text-[#111B37] tabular-nums font-mono">
+                        <td className={`py-2.5 px-3 font-semibold tabular-nums font-mono ${connectionLost ? 'text-[#94A3B8]' : 'text-[#111B37]'}`}>
                           {formatValue(sig.value)}{' '}
                           {sig.unit ? <span className="font-normal font-sans text-[#657794] text-[11px]">{sig.unit}</span> : null}
                         </td>
@@ -748,7 +774,7 @@ export const OverviewPage: React.FC = () => {
                           <StatusBadge status={normalizeQuality(sig.quality)} />
                         </td>
                         <td className="py-2.5 px-3 text-right text-[#657794] whitespace-nowrap" title={formatTimestamp(sig.lastUpdated)}>
-                          {timeAgo(sig.lastUpdated)}
+                          {connectionLost ? clockTime(sig.lastUpdated) : timeAgo(sig.lastUpdated)}
                         </td>
                       </tr>
                     );

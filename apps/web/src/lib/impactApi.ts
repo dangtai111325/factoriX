@@ -93,10 +93,20 @@ export async function fetchSignalUsage(signalId: string): Promise<ImpactModel[]>
   }
 }
 
-/** Models that use any signal of a connection (pause impact). Derived from the per-signal usage. */
+/**
+ * Models that use any of the signals (bulk disable / delete, pause impact): one request,
+ * `POST /api/v1/signals/usage` (R4-SG-01: one request per signal queued behind the page's other
+ * requests and took 15–20 s). Falls back to the per-signal lookup on an older Center.
+ */
 export async function fetchSignalsUsage(signalIds: string[]): Promise<ImpactModel[]> {
   const unique = Array.from(new Set(signalIds.filter(Boolean)))
   if (!unique.length) return []
+  try {
+    const res = await api<unknown>('/api/v1/signals/usage', { method: 'POST', body: JSON.stringify({ signal_ids: unique }) })
+    if (hasKey(res, 'models')) return activeSorted(itemsOf(res.models).map(toModel))
+  } catch (error) {
+    if (!isMissingEndpoint(error)) throw error
+  }
   const lists = await mapLimited(unique, 6, (id) => fetchSignalUsage(id))
   const byId = new Map<string, ImpactModel>()
   lists.flat().forEach((model) => byId.set(model.id, model))

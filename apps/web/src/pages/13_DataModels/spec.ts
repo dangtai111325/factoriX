@@ -48,6 +48,8 @@ export function newField(key: string, init: Partial<FieldNode> = {}): FieldNode 
     refDisplay: '',
     refTooltip: '',
     missing: false,
+    missingReason: '',
+    roundDigits: null,
     ...init,
   };
 }
@@ -97,6 +99,8 @@ function fromApiNode(node: ApiNode, seen: Set<string>): BodyNode {
       refDisplay: f.ref_display ? String(f.ref_display) : '',
       refTooltip: refInfoText(f),
       missing: Boolean(f.missing),
+      missingReason: f.missing_reason ? String(f.missing_reason) : '',
+      roundDigits: typeof f.round_digits === 'number' && Number.isInteger(f.round_digits) ? f.round_digits : null,
     }),
     uid,
   };
@@ -112,12 +116,14 @@ export function fromApi(spec: ApiSpec): ContainerNode {
 function toApiNode(node: BodyNode, inArray: boolean): ApiNode {
   const keyPart = inArray ? { id: node.uid } : { id: node.uid, key: node.key };
   if (isContainer(node)) return { ...keyPart, type: node.type, children: node.children.map((c) => toApiNode(c, node.type === 'array')) };
+  // Sent only when set, so specs without rounding stay byte-identical (dirty check, existing models).
+  const round = node.roundDigits !== null && node.roundDigits !== undefined ? { round_digits: node.roundDigits } : {};
   if (node.mode === 'mapping') {
-    return { ...keyPart, type: 'field', mode: 'mapping', value_type: node.valueType, ref: node.signalId ? { signal_id: node.signalId } : null };
+    return { ...keyPart, type: 'field', mode: 'mapping', value_type: node.valueType, ref: node.signalId ? { signal_id: node.signalId } : null, ...round };
   }
   // Unchanged rules keep their canonical tokens; edited ones send the typed text (the server resolves it).
   const expr = node.exprEdited || !node.exprRaw ? node.exprText : node.exprRaw;
-  return { ...keyPart, type: 'field', mode: 'calculated', value_type: node.valueType, expr };
+  return { ...keyPart, type: 'field', mode: 'calculated', value_type: node.valueType, expr, ...round };
 }
 
 export function toApi(root: ContainerNode, labels?: Record<string, string>): ApiSpec {
@@ -360,16 +366,30 @@ export function wrapIntoObject(root: ContainerNode, uids: string[], key: string)
   return { root: next, uid: obj.uid };
 }
 
-/** Mapping ↔ rule. A mapping becomes a rule referencing the same signal; a single-ref rule becomes a mapping. */
-export function convertField(field: FieldNode, index: CatalogIndex | null): Partial<FieldNode> {
+export interface ConvertResult {
+  patch: Partial<FieldNode>;
+  /** What was dropped when a rule became a mapping (shown to the user, undoable). */
+  note: string | null;
+}
+
+/**
+ * Mapping ↔ rule. A mapping becomes a rule referencing the same signal. A rule becomes a mapping of its
+ * first referenced signal (R4-DM-06: the reference is kept); the rest of the expression is reported.
+ */
+export function convertField(field: FieldNode, index: CatalogIndex | null): ConvertResult {
   if (field.mode === 'mapping') {
     const ref = (index && field.signalId && signalRef(index, field.signalId)) || field.refDisplay || '';
-    return { mode: 'calculated', exprText: ref, exprEdited: true, exprRaw: '' };
+    return { patch: { mode: 'calculated', exprText: ref, exprEdited: true, exprRaw: '' }, note: null };
   }
   const text = field.exprText.trim();
-  const sigs = referencedSignals(text, index);
-  const single = sigs.length === 1 && /^\$[^\s()+*/%,<>=!]+$/.test(text);
-  return { mode: 'mapping', signalId: single ? sigs[0] : '', exprText: '', exprRaw: '', exprEdited: false };
+  const sigs = Array.from(new Set(referencedSignals(text, index)));
+  const plain = sigs.length === 1 && /^\$[^\s()+*/%,<>=!]+$/.test(text);
+  const patch: Partial<FieldNode> = { mode: 'mapping', signalId: sigs[0] || '', exprText: '', exprRaw: '', exprEdited: false, missing: false };
+  if (!sigs.length) return { patch, note: text ? 'The rule referenced no data point: pick a signal in the data tree.' : null };
+  if (plain) return { patch, note: null };
+  const ref = (index && signalRef(index, sigs[0])) || 'its first data point';
+  const more = sigs.length > 1 ? ` (${sigs.length - 1} other reference${sigs.length > 2 ? 's' : ''} dropped)` : '';
+  return { patch, note: `Now maps ${ref}${more}; the rule "${text.length > 60 ? `${text.slice(0, 57)}…` : text}" was removed.` };
 }
 
 // ------------------------------------------------------------------ validation (local, instant)
@@ -495,6 +515,17 @@ export function contextRule(index: CatalogIndex, resourceId: string, type: strin
 
 const keyFromLabel = (label: string) => (label || 'item').trim().slice(0, KEY_MAX);
 
+function collectIds(node: ContainerNode): Set<string> {
+  const ids = new Set<string>();
+  const walk = (n: ContainerNode) =>
+    n.children.forEach((c) => {
+      if (isContainer(c)) walk(c);
+      else if (c.mode === 'mapping' && c.signalId) ids.add(c.signalId);
+    });
+  walk(node);
+  return ids;
+}
+
 export function buildAutoMap(index: CatalogIndex, resourceId: string, opts: MapAllOptions): BodyNode[] {
   const res = index.resById.get(resourceId);
   if (!res) return [];
@@ -551,8 +582,33 @@ export function buildAutoMap(index: CatalogIndex, resourceId: string, opts: MapA
 
   if (opts.includeTimestamps && sigs.length) {
     // Every mapped signal contributes its raw group's timestamp (ts); the body takes the latest.
-    const refs = sigs.map((s) => signalRef(index, s.id)).filter(Boolean) as string[];
-    out.splice(tsInsertAt, 0, newRule('source_timestamp', `latest_ts(${refs.join(', ')})`, 'timestamp'), newRule('publish_timestamp', 'now()', 'timestamp'));
+    // R4-DM-02: with several machines in per-machine objects (nested / grouped), each object gets its
+    // own source_timestamp over its own signals (that is the clean-body semantics per machine and keeps
+    // every rule short); a flat body keeps one root source_timestamp over all mapped signals.
+    const refsOf = (list: CatalogSignal[]) => list.map((s) => signalRef(index, s.id)).filter(Boolean) as string[];
+    const perObject = opts.layout !== 'flat' && owners.length > 1;
+    if (perObject) {
+      const stamp = (nodes: BodyNode[]) => {
+        nodes.forEach((n) => {
+          if (!isContainer(n)) return;
+          const own = n.children.filter((c) => !isContainer(c) && c.mode === 'mapping' && c.signalId) as FieldNode[];
+          const ownIds = new Set(own.map((c) => c.signalId));
+          const grouped = n.children.filter(isContainer).every((c) => c.children.every((x) => !isContainer(x)));
+          // nested: the object holds the machine's signals directly; grouped: one object per owner holding source groups.
+          const signalsHere =
+            own.length > 0 ? sigs.filter((s) => ownIds.has(s.id)) : opts.layout === 'grouped' && grouped ? sigs.filter((s) => collectIds(n).has(s.id)) : [];
+          if (signalsHere.length) n.children.unshift(newRule('source_timestamp', `latest_ts(${refsOf(signalsHere).join(', ')})`, 'timestamp'));
+          if (opts.layout === 'nested') stamp(n.children);
+        });
+      };
+      stamp(out);
+      const rootOwn = sigs.filter((s) => s.resourceId === resourceId);
+      const rootRules = [newRule('publish_timestamp', 'now()', 'timestamp')];
+      if (rootOwn.length && opts.layout === 'nested') rootRules.unshift(newRule('source_timestamp', `latest_ts(${refsOf(rootOwn).join(', ')})`, 'timestamp'));
+      out.splice(tsInsertAt, 0, ...rootRules);
+    } else {
+      out.splice(tsInsertAt, 0, newRule('source_timestamp', `latest_ts(${refsOf(sigs).join(', ')})`, 'timestamp'), newRule('publish_timestamp', 'now()', 'timestamp'));
+    }
   }
   // Unique keys within each object.
   const dedupe = (nodes: BodyNode[]) => {
@@ -601,6 +657,39 @@ export interface SkeletonStats {
   context: number;
   timestamps: number;
   unmatched: string[];
+  /** R4-DM-11: paths whose content was deeper than the 16-level limit (cut there). */
+  truncated: string[];
+  /** R4-DM-11: number of empty keys ("") that were renamed. */
+  emptyKeys: number;
+  /** Fields turned into value_at() snapshots by the event-style option. */
+  snapshots: number;
+}
+
+/**
+ * Event-style body (R4-DM-03): the body describes an event (a piece / lot completed) and carries the
+ * order context valid at that moment. Generic vocabulary only, no customer data:
+ *   trigger keys  — count / identity of the produced unit (qty, count, lot, serial, batch, barcode…);
+ *   context keys  — the order / job the unit belongs to (so, wo, order, job, item, product…).
+ * With the option, context fields become value_at(ref, ts(<first trigger>)) and source_timestamp
+ * becomes latest_ts(<triggers>), so a context change right after the event is not reported with it.
+ */
+const TRIGGER_TOKENS = new Set(['qty', 'quantity', 'count', 'counter', 'pcs', 'pieces', 'piece', 'lot', 'serial', 'sn', 'batch', 'barcode', 'scrap', 'reject', 'rejects', 'good', 'ng']);
+const CONTEXT_TOKENS = new Set(['so', 'wo', 'mo', 'po', 'order', 'orders', 'job', 'item', 'sku', 'product', 'part', 'material', 'recipe']);
+
+const keyTokens = (key: string) => key.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+export function eventKeyRole(key: string): 'trigger' | 'context' | null {
+  const tokens = keyTokens(key);
+  if (tokens.some((t) => CONTEXT_TOKENS.has(t))) return 'context';
+  if (tokens.some((t) => TRIGGER_TOKENS.has(t))) return 'trigger';
+  return null;
+}
+
+export interface EventOption {
+  /** Keys whose change is the event (their ts is the event time). */
+  triggers: string[];
+  /** Keys snapshotted at the event time. */
+  snapshots: string[];
 }
 
 /**
@@ -608,13 +697,31 @@ export interface SkeletonStats {
  * case/punctuation-insensitive); `<type>_name` / `<type>_code` keys become context rules when the scope
  * has a resource of that type in its path; `source_timestamp` / `publish_timestamp` become timestamp rules.
  */
+/** Event-style candidates of a sample (keys matched to signals of the scope), or null when it does not look like one. */
+export function detectEventBody(sample: JNode, index: CatalogIndex | null, scopeId: string | null): EventOption | null {
+  const { nodes } = buildSkeleton(sample, index, scopeId, true);
+  const triggers: string[] = [];
+  const snapshots: string[] = [];
+  const walk = (list: BodyNode[]) =>
+    list.forEach((n) => {
+      if (isContainer(n)) return walk(n.children);
+      if (n.mode !== 'mapping' || !n.signalId) return;
+      const role = eventKeyRole(n.key);
+      if (role === 'trigger' && !triggers.includes(n.key)) triggers.push(n.key);
+      if (role === 'context' && !snapshots.includes(n.key)) snapshots.push(n.key);
+    });
+  walk(nodes);
+  return triggers.length && snapshots.length ? { triggers, snapshots } : null;
+}
+
 export function buildSkeleton(
   sample: JNode,
   index: CatalogIndex | null,
   scopeId: string | null,
   recognise: boolean,
+  event: EventOption | null = null,
 ): { nodes: BodyNode[]; stats: SkeletonStats } {
-  const stats: SkeletonStats = { fields: 0, matched: 0, context: 0, timestamps: 0, unmatched: [] };
+  const stats: SkeletonStats = { fields: 0, matched: 0, context: 0, timestamps: 0, unmatched: [], truncated: [], emptyKeys: 0, snapshots: 0 };
   const pool = index && scopeId ? signalsUnder(index, scopeId) : [];
   const path = index && scopeId ? resourcePath(index, scopeId) : [];
   const scopeSel = index && scopeId ? resourceSelector(index, scopeId) : '';
@@ -656,29 +763,62 @@ export function buildSkeleton(
     return newField(key, { valueType: vt });
   };
 
+  const refOf = (f: FieldNode) => (index && f.signalId ? signalRef(index, f.signalId) : null);
+
   const fill = (container: ContainerNode) => {
     container.children.forEach((c) => {
       if (isContainer(c)) fill(c);
     });
-    container.children.forEach((c) => {
-      if (!isContainer(c) && c.mode === 'calculated' && c.key === 'source_timestamp' && !c.exprText) {
-        const refs = mappedRefsIn(container, index);
+    const fields = container.children.filter((c) => !isContainer(c)) as FieldNode[];
+    const triggerRefs = event
+      ? (fields.filter((f) => f.mode === 'mapping' && event.triggers.includes(f.key)).map(refOf).filter(Boolean) as string[])
+      : [];
+    if (event && triggerRefs.length) {
+      fields.forEach((f) => {
+        const ref = refOf(f);
+        if (f.mode !== 'mapping' || !ref || !event.snapshots.includes(f.key)) return;
+        Object.assign(f, { mode: 'calculated', signalId: '', exprText: `value_at(${ref}, ts(${triggerRefs[0]}))`, exprEdited: true });
+        stats.snapshots += 1;
+      });
+    }
+    fields.forEach((c) => {
+      if (c.mode === 'calculated' && c.key === 'source_timestamp' && !c.exprText) {
+        const refs = triggerRefs.length ? triggerRefs : mappedRefsIn(container, index);
         c.exprText = refs.length ? `latest_ts(${refs.join(', ')})` : 'now()';
       }
     });
   };
 
-  const build = (node: JNode, key: string, depth: number): BodyNode => {
+  const childKey = (k: string, i: number, siblings: number) => {
+    if (k.trim()) return k;
+    stats.emptyKeys += 1;
+    return siblings > 1 ? `field_${i + 1}` : 'field';
+  };
+
+  const build = (node: JNode, key: string, depth: number, at: string): BodyNode => {
+    if ((node.kind === 'object' || node.kind === 'array') && depth >= DEPTH_MAX) {
+      const size = node.kind === 'object' ? node.entries.length : node.items.length;
+      if (size) stats.truncated.push(at || key);
+    }
     if (node.kind === 'object' && depth < DEPTH_MAX) {
-      return newContainer('object', key, node.entries.map(([k, v]) => build(v, k, depth + 1)));
+      return newContainer('object', key, node.entries.map(([k, v], i) => {
+        const name = childKey(k, i, node.entries.length);
+        return build(v, name, depth + 1, at ? `${at}.${name}` : name);
+      }));
     }
     if (node.kind === 'array' && depth < DEPTH_MAX) {
-      return newContainer('array', key, node.items.map((v) => build(v, '', depth + 1)));
+      return newContainer('array', key, node.items.map((v, i) => build(v, '', depth + 1, `${at}[${i}]`)));
     }
     return leaf(key, node);
   };
 
-  const top = sample.kind === 'object' ? sample.entries.map(([k, v]) => build(v, k, 1)) : [build(sample, 'value', 1)];
+  const top =
+    sample.kind === 'object'
+      ? sample.entries.map(([k, v], i) => {
+          const name = childKey(k, i, sample.entries.length);
+          return build(v, name, 1, name);
+        })
+      : [build(sample, 'value', 1, 'value')];
   const holder = newContainer('object', '', top);
   fill(holder);
   return { nodes: holder.children, stats };

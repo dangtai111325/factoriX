@@ -106,6 +106,21 @@ class SignalBulkAddressIn(BaseModel):
     items: list[SignalAddressItem]
 
 
+class SignalPropertyItem(BaseModel):
+    signal_id: str
+    version: int
+
+
+class SignalBulkPropertiesIn(BaseModel):
+    """Properties set on every listed signal in one change (R4-SG-02). A property that is not sent
+    is left unchanged; ``round_digits: null`` removes rounding, ``unit: ""`` clears the unit."""
+
+    items: list[SignalPropertyItem]
+    unit: str | None = None
+    expected_interval_ms: int | None = None
+    round_digits: int | None = None
+
+
 class SignalBulkActionIn(BaseModel):
     signal_ids: list[str]
     action: str  # "enable" | "disable" | "delete"
@@ -1257,6 +1272,140 @@ async def bulk_address_signals(session: AsyncSession, tenant_id: UUID, actor: UU
         edges.add(as_uuid(source["edge_id"]))
         await audit(session, tenant_id=tenant_id, event_type="SIGNAL_ADDRESS_UPDATE", actor_id=actor, entity_type="signal", entity_id=signal_id, before={"address": before, "version": int(signal["version"])}, after={"address": check.address, "version": int(bumped["version"]), "bulk": True}, correlation_id=correlation_id)
         updated.append({"signal_id": str(signal_id), "version": int(bumped["version"]), "source": _source_view(source, address=check.address, field_id=field_id)})
+    for edge_id in sorted(edges, key=str):
+        await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=edge_id)
+    return {"updated": updated, "unchanged": unchanged, "count": len(updated)}
+
+
+BULK_PROPERTY_KEYS = ("unit", "expected_interval_ms", "round_digits")
+NUMERIC_SIGNAL_TYPES = frozenset({"int64", "float64"})
+
+
+async def bulk_properties_signals(session: AsyncSession, tenant_id: UUID, actor: UUID, body: SignalBulkPropertiesIn, correlation_id: str) -> dict[str, Any]:
+    """Set unit, expected interval (Stale timeout) and/or round digits on many signals at once,
+    all or nothing (R4-SG-02). Runs in the request transaction: every item is validated first and a
+    422 lists the errors per item; otherwise each changed signal gets one version bump and one audit
+    entry, a changed rounding re-addresses the source (as the single edit does) and one configuration
+    release per affected edge is published."""
+    sent = [key for key in BULK_PROPERTY_KEYS if key in body.model_fields_set]
+    if not sent:
+        raise AppError(422, "REQUIRED", "Choose at least one property to change.")
+    if not body.items or len(body.items) > 1000:
+        raise AppError(422, "LIMIT", "Send between 1 and 1000 signals.")
+    if "unit" in sent and body.unit is not None and len(body.unit.strip()) > 32:
+        raise AppError(422, "UNIT", "Unit must be at most 32 characters.", field_errors=[{"path": "unit", "code": "LENGTH"}])
+    if "expected_interval_ms" in sent and (body.expected_interval_ms is None or not 100 <= body.expected_interval_ms <= 86_400_000):
+        raise AppError(422, "INTERVAL", "Expected interval must be between 100 ms and one day.", field_errors=[{"path": "expected_interval_ms", "code": "RANGE"}])
+    if "round_digits" in sent and body.round_digits is not None and not 0 <= body.round_digits <= 10:
+        raise AppError(422, "RANGE", "Round digits must be a whole number from 0 to 10.", field_errors=[{"path": "round_digits", "code": "RANGE"}])
+    unit = (body.unit or "").strip() if "unit" in sent else None
+
+    item_errors: list[dict[str, Any]] = []
+    ids: list[UUID | None] = []
+    seen: set[UUID] = set()
+    for index, item in enumerate(body.items):
+        try:
+            signal_id = parse_uuid(item.signal_id)
+        except AppError:
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": "signal_id", "code": "INVALID_ID", "message": "Invalid signal id."})
+            ids.append(None)
+            continue
+        if signal_id in seen:
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": "signal_id", "code": "DUPLICATE", "message": "The signal appears more than once."})
+        seen.add(signal_id)
+        ids.append(signal_id)
+    known = [sid for sid in ids if sid is not None]
+    signals = {
+        as_uuid(row["id"]): row
+        for row in await fetch_all(
+            session,
+            "SELECT id, version, status, data_type, display_name, unit, expected_interval_ms FROM signal_definitions WHERE tenant_id = :tenant_id AND id = ANY(:ids)",
+            {"tenant_id": tenant_id, "ids": known},
+        )
+    } if known else {}
+    sources = await _current_sources(session, tenant_id, known) if "round_digits" in sent else {}
+    planned: list[tuple[UUID, dict[str, Any], AddressCheck | None]] = []
+    for index, (item, signal_id) in enumerate(zip(body.items, ids)):
+        if signal_id is None:
+            continue
+        signal = signals.get(signal_id)
+        label = (signal or {}).get("display_name") or item.signal_id
+
+        def fail(path: str, code: str, message: str) -> None:
+            item_errors.append({"index": index, "signal_id": item.signal_id, "path": path, "code": code, "message": f"{label}: {message}"})
+
+        if signal is None:
+            fail("signal_id", "NOT_FOUND", "Signal not found.")
+            continue
+        if signal["status"] != "ACTIVE":
+            fail("signal_id", "ARCHIVED", "Archived signals cannot be modified.")
+            continue
+        if int(signal["version"]) != item.version:
+            fail("version", "RESOURCE_VERSION_CONFLICT", "This signal was modified elsewhere. Reload it and try again.")
+            continue
+        check: AddressCheck | None = None
+        if "round_digits" in sent:
+            if str(signal.get("data_type")) not in NUMERIC_SIGNAL_TYPES:
+                fail("round_digits", "TYPE", "Rounding applies to numeric signals only.")
+                continue
+            check = check_address_change(signal, sources.get(signal_id), {"round_digits": body.round_digits})
+            for error in check.errors:
+                fail(error["path"], error["code"], error["message"])
+            if not check.ok:
+                continue
+            if check.address == (sources[signal_id].get("address_json") or {}):
+                check = None
+        planned.append((signal_id, signal, check))
+    if item_errors:
+        raise AppError(
+            422,
+            "BULK_PROPERTIES_REJECTED",
+            f"No signal was changed because {len({e['index'] for e in item_errors})} signal(s) have errors.",
+            field_errors=[{"path": f"items[{e['index']}].{e['path']}", "code": e["code"]} for e in item_errors],
+            extra={"item_errors": item_errors},
+        )
+
+    updated: list[dict[str, Any]] = []
+    unchanged: list[str] = []
+    edges: set[UUID] = set()
+    now = utcnow()
+    for signal_id, signal, check in planned:
+        before: dict[str, Any] = {}
+        after: dict[str, Any] = {}
+        if unit is not None and (signal.get("unit") or "") != unit:
+            before["unit"], after["unit"] = signal.get("unit"), unit
+        if "expected_interval_ms" in sent and signal.get("expected_interval_ms") != body.expected_interval_ms:
+            before["expected_interval_ms"], after["expected_interval_ms"] = signal.get("expected_interval_ms"), body.expected_interval_ms
+        if check is not None:
+            before["round_digits"] = (sources[signal_id].get("address_json") or {}).get("round_digits")
+            after["round_digits"] = body.round_digits
+        if not after:
+            unchanged.append(str(signal_id))
+            continue
+        bumped = await fetch_one(
+            session,
+            """
+            UPDATE signal_definitions
+            SET unit = :unit, expected_interval_ms = :interval, version = version + 1, updated_at = :now
+            WHERE id = :id AND tenant_id = :tenant_id AND version = :version RETURNING version
+            """,
+            {
+                "unit": after.get("unit", signal.get("unit")),
+                "interval": after.get("expected_interval_ms", signal.get("expected_interval_ms")),
+                "now": now,
+                "id": signal_id,
+                "tenant_id": tenant_id,
+                "version": int(signal["version"]),
+            },
+        )
+        if bumped is None:
+            raise AppError(409, "RESOURCE_VERSION_CONFLICT", "A signal was modified elsewhere during the update. Nothing was changed; reload and try again.", extra={"signal_id": str(signal_id)})
+        if check is not None:
+            await _readdress(session, signal_id, sources[signal_id], check)
+            edges.add(as_uuid(sources[signal_id]["edge_id"]))
+        before["version"], after["version"] = int(signal["version"]), int(bumped["version"])
+        await audit(session, tenant_id=tenant_id, event_type="SIGNAL_UPDATE", actor_id=actor, entity_type="signal", entity_id=signal_id, before=before, after={**after, "bulk": True}, correlation_id=correlation_id)
+        updated.append({"signal_id": str(signal_id), "version": int(bumped["version"]), "changed": sorted(k for k in after if k != "version")})
     for edge_id in sorted(edges, key=str):
         await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=edge_id)
     return {"updated": updated, "unchanged": unchanged, "count": len(updated)}

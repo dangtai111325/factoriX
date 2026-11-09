@@ -144,9 +144,10 @@ export const DataTree: React.FC<Props> = ({ index, loading, error, onReload, tar
       >
         <GripVertical className="w-3 h-3 text-slate-300 group-hover:text-slate-400 shrink-0" aria-hidden="true" />
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${qualityDot(quality)}`} aria-hidden="true" />
-        <span className={`flex-1 min-w-0 font-mono truncate ${used ? 'text-blue-800 font-semibold' : 'text-[#111B37]'}`}>{s.key}</span>
+        {/* R4-DM-07: full key, wrapped (machine_temp_1 … _7 stay distinguishable at any pane width). */}
+        <span className={`flex-1 min-w-0 font-mono break-all leading-snug ${used ? 'text-blue-800 font-semibold' : 'text-[#111B37]'}`}>{s.key}</span>
         {used && <span className="sr-only">(used in the body)</span>}
-        <span className="font-mono text-[11px] text-[#657794] truncate max-w-[40%] shrink-0" title={formatValue(value)}>
+        <span className="font-mono text-[11px] text-[#657794] truncate max-w-[38%] shrink-0 text-right" title={formatValue(value)}>
           {formatValue(value)}
         </span>
       </div>
@@ -187,7 +188,7 @@ export const DataTree: React.FC<Props> = ({ index, loading, error, onReload, tar
             <span className="w-3.5" />
           )}
           {resourceTypeGlyph(r.type)}
-          <span className="flex-1 min-w-0 text-[12px] font-semibold text-[#111B37] truncate" title={`${r.name || r.code} (${index.catalog.typeNames[r.type] || r.type})`}>
+          <span className="flex-1 min-w-0 text-[12px] font-semibold text-[#111B37] break-words leading-snug" title={`${r.name || r.code} (${index.catalog.typeNames[r.type] || r.type})`}>
             {r.name || r.code}
           </span>
           <span className="hidden 2xl:inline text-[9px] uppercase font-bold px-1 py-0.5 bg-slate-100 text-slate-600 rounded shrink-0">{index.catalog.typeNames[r.type] || r.type}</span>

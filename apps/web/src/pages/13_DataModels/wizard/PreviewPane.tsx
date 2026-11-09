@@ -2,7 +2,7 @@
 import React, { useState } from 'react';
 import { AlertTriangle, Pause, Play, RefreshCw } from 'lucide-react';
 import type { FieldError, PreviewResult } from '../types';
-import { CopyButton, JsonBlock, sampleLabel, timeAgo, useNow } from '../ui';
+import { CopyButton, JsonBlock, QualityChip, sampleLabel, timeAgo, useNow } from '../ui';
 import { formatJsonText } from '../json';
 
 interface Props {
@@ -56,6 +56,11 @@ export const PreviewPane: React.FC<Props> = ({ result, error, running, unsupport
           <RefreshCw className={`w-3.5 h-3.5 ${running ? 'animate-spin' : ''}`} />
         </button>
       </div>
+      {result?.quality && result.quality.status !== 'good' && (
+        <div className="mb-1.5">
+          <QualityChip quality={result.quality} />
+        </div>
+      )}
       <p className="text-[11px] text-[#657794] mb-2" aria-live="polite">
         {unsupported
           ? 'Live preview is not available on this server version.'

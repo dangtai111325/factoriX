@@ -3,8 +3,8 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { ClipboardPaste, Wand2 } from 'lucide-react';
 import { Button } from '../../../components/common/Button';
 import { CatalogIndex, resourceLabel, signalsUnder } from '../rules';
-import { BodyNode, CatalogResource, isContainer } from '../types';
-import { MapLayout, SkeletonError, SkeletonStats, buildAutoMap, buildSkeleton, contextLevels, parseSkeleton } from '../spec';
+import { BodyNode, CatalogResource, DEPTH_MAX, isContainer } from '../types';
+import { EventOption, MapLayout, SkeletonError, SkeletonStats, buildAutoMap, buildSkeleton, contextLevels, detectEventBody, parseSkeleton } from '../spec';
 import { Dialog } from '../ui';
 
 function countFields(nodes: BodyNode[]): number {
@@ -54,6 +54,8 @@ export const MapAllDialog: React.FC<{
     [resource, index, layout, includeContext, contextTypes, includeTimestamps],
   );
   const total = resource ? signalsUnder(index, resource.id).length : 0;
+  const owners = resource ? new Set(signalsUnder(index, resource.id).map((s) => s.resourceId)).size : 0;
+  const perObject = layout !== 'flat' && owners > 1;
 
   return (
     <Dialog
@@ -121,7 +123,10 @@ export const MapAllDialog: React.FC<{
               <span>
                 Add <code className="font-mono">source_timestamp</code> and <code className="font-mono">publish_timestamp</code>
                 <span className="block text-[11px] font-normal text-[#657794]">
-                  source_timestamp = latest_ts(all mapped signals) · publish_timestamp = now(). Raw signals with these keys are not mapped again.
+                  {perObject
+                    ? `One source_timestamp per resource object = latest_ts(its own signals) (${owners} resources) · publish_timestamp = now().`
+                    : 'source_timestamp = latest_ts(all mapped signals) · publish_timestamp = now().'}{' '}
+                  Raw signals with these keys are not mapped again.
                 </span>
               </span>
             </label>
@@ -151,10 +156,31 @@ export const PasteJsonDialog: React.FC<{
   const [text, setText] = useState('');
   const [scopeId, setScopeId] = useState('');
   const [recognise, setRecognise] = useState(true);
+  // R4-DM-03: event-style is an explicit, optional choice; detection only offers it and pre-fills the keys.
+  const [eventOn, setEventOn] = useState(false);
+  const [eventKeys, setEventKeys] = useState<EventOption>({ triggers: [], snapshots: [] });
 
   useEffect(() => {
     if (open) setScopeId(defaultScopeId);
   }, [open, defaultScopeId]);
+
+  const sample = useMemo(() => {
+    if (!text.trim()) return null;
+    try {
+      return parseSkeleton(text);
+    } catch {
+      return null;
+    }
+  }, [text]);
+  const detected = useMemo(() => (sample && recognise ? detectEventBody(sample, index, scopeId || null) : null), [sample, index, scopeId, recognise]);
+  const detectedKey = detected ? `${detected.triggers.join(',')}|${detected.snapshots.join(',')}` : '';
+  useEffect(() => {
+    setEventKeys(detected || { triggers: [], snapshots: [] });
+    if (!detected) setEventOn(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detectedKey]);
+  const toggleEventKey = (kind: keyof EventOption, key: string) =>
+    setEventKeys((prev) => ({ ...prev, [kind]: prev[kind].includes(key) ? prev[kind].filter((k) => k !== key) : [...prev[kind], key] }));
 
   const scopes = useMemo(
     () =>
@@ -167,11 +193,12 @@ export const PasteJsonDialog: React.FC<{
   const parsed = useMemo((): { nodes: BodyNode[]; stats: SkeletonStats } | { error: string } | null => {
     if (!text.trim()) return null;
     try {
-      return buildSkeleton(parseSkeleton(text), index, scopeId || null, recognise);
+      const event = eventOn && eventKeys.triggers.length && eventKeys.snapshots.length ? eventKeys : null;
+      return buildSkeleton(parseSkeleton(text), index, scopeId || null, recognise, event);
     } catch (err) {
       return { error: err instanceof SkeletonError || err instanceof Error ? err.message : 'Invalid JSON.' };
     }
-  }, [text, index, scopeId, recognise]);
+  }, [text, index, scopeId, recognise, eventOn, eventKeys]);
 
   const ok = parsed && 'nodes' in parsed ? parsed : null;
 
@@ -198,6 +225,7 @@ export const PasteJsonDialog: React.FC<{
             onClick={() => {
               if (ok) onApply(ok.nodes);
               setText('');
+              setEventOn(false);
             }}
           >
             Create {ok ? ok.stats.fields : 0} field(s)
@@ -239,11 +267,71 @@ export const PasteJsonDialog: React.FC<{
             {parsed.error}
           </p>
         )}
+        {detected && (
+          <div className="rounded-lg border border-blue-200 bg-blue-50/60 p-3 text-[12px] text-[#334568] space-y-2">
+            <label className="flex items-start gap-2 font-semibold text-[#111B37] cursor-pointer">
+              <input type="checkbox" checked={eventOn} onChange={(e) => setEventOn(e.target.checked)} className="mt-0.5" />
+              <span>
+                This looks like an event body. Snapshot the order context at the event time?
+                <span className="block text-[11px] font-normal text-[#657794]">
+                  Context keys become <code className="font-mono">value_at(key, ts(trigger))</code> and source_timestamp becomes{' '}
+                  <code className="font-mono">latest_ts(triggers)</code>, so an order change right after the event is not reported with it.
+                </span>
+              </span>
+            </label>
+            {eventOn && (
+              <div className="ml-6 space-y-1.5">
+                {(['triggers', 'snapshots'] as const).map((kind) => (
+                  <div key={kind} className="flex flex-wrap items-center gap-1.5">
+                    <span className="w-32 text-[11px] font-semibold text-[#334568]">{kind === 'triggers' ? 'Event (trigger) keys' : 'Snapshot keys'}</span>
+                    {detected[kind].map((k) => {
+                      const on = eventKeys[kind].includes(k);
+                      return (
+                        <label
+                          key={k}
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] font-mono cursor-pointer ${on ? 'border-blue-300 bg-white text-blue-900' : 'border-[#E2E8F0] text-[#657794]'}`}
+                        >
+                          <input type="checkbox" checked={on} onChange={() => toggleEventKey(kind, k)} />
+                          {k}
+                        </label>
+                      );
+                    })}
+                  </div>
+                ))}
+                {(!eventKeys.triggers.length || !eventKeys.snapshots.length) && (
+                  <p className="text-[11px] text-amber-800">Keep at least one trigger and one snapshot key, or untick the option.</p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        {ok && (ok.stats.truncated.length > 0 || ok.stats.emptyKeys > 0) && (
+          <div role="alert" className="text-[12px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-1">
+            {ok.stats.truncated.length > 0 && (
+              <div>
+                The sample is nested deeper than {DEPTH_MAX} levels. Content below <span className="font-mono">{ok.stats.truncated.slice(0, 3).join(', ')}</span>
+                {ok.stats.truncated.length > 3 ? ` and ${ok.stats.truncated.length - 3} more` : ''} is not created; those keys become plain fields.
+              </div>
+            )}
+            {ok.stats.emptyKeys > 0 && (
+              <div>
+                {ok.stats.emptyKeys} empty key{ok.stats.emptyKeys === 1 ? ' was' : 's were'} renamed to <span className="font-mono">field</span>
+                {ok.stats.emptyKeys > 1 ? '_N' : ''}. Rename {ok.stats.emptyKeys === 1 ? 'it' : 'them'} after creating.
+              </div>
+            )}
+          </div>
+        )}
         {ok && (
           <div className="text-[12px] text-[#334568] bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg p-3 space-y-1">
             <div>
               <strong>{ok.stats.fields}</strong> field(s): <strong className="text-emerald-700">{ok.stats.matched}</strong> matched to signals,{' '}
-              <strong>{ok.stats.context}</strong> context, <strong>{ok.stats.timestamps}</strong> timestamp rule(s).
+              <strong>{ok.stats.context}</strong> context, <strong>{ok.stats.timestamps}</strong> timestamp rule(s)
+              {ok.stats.snapshots > 0 && (
+                <>
+                  , <strong>{ok.stats.snapshots}</strong> snapshot rule(s)
+                </>
+              )}
+              .
             </div>
             {ok.stats.unmatched.length > 0 && (
               <div className="text-amber-800">

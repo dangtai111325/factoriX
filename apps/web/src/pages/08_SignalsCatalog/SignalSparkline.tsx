@@ -6,6 +6,44 @@ interface SignalSparklineProps {
   quality: string;
 }
 
+/**
+ * At most this many sparkline history requests in flight (R4-SG-01). The table renders one
+ * sparkline per signal; unthrottled, hundreds of history requests filled the browser's six
+ * connections to the appliance, so a dialog's own request (e.g. "Checking which data models use
+ * it…") waited 15–20 s behind them.
+ */
+const SPARKLINE_CONCURRENCY = 2;
+let sparklinesInFlight = 0;
+const sparklineQueue: Array<() => void> = [];
+
+function runSparkline<T>(task: () => Promise<T>, isWanted: () => boolean): Promise<T | null> {
+  return new Promise((resolve, reject) => {
+    const start = () => {
+      if (!isWanted()) {
+        resolve(null); // unmounted while queued: never sent
+        next();
+        return;
+      }
+      sparklinesInFlight += 1;
+      task()
+        .then(resolve, reject)
+        .finally(() => {
+          sparklinesInFlight -= 1;
+          next();
+        });
+    };
+    if (sparklinesInFlight < SPARKLINE_CONCURRENCY) start();
+    else sparklineQueue.push(start);
+  });
+}
+
+function next(): void {
+  while (sparklinesInFlight < SPARKLINE_CONCURRENCY && sparklineQueue.length) {
+    const start = sparklineQueue.shift();
+    if (start) start();
+  }
+}
+
 export const SignalSparkline: React.FC<SignalSparklineProps> = ({ signalId, quality }) => {
   const [points, setPoints] = useState<number[] | null>(null);
 
@@ -13,9 +51,11 @@ export const SignalSparkline: React.FC<SignalSparklineProps> = ({ signalId, qual
     let isCurrent = true;
     const fetchHistory = async () => {
       try {
-        const res = await api<{ items: Array<{ value: unknown }> }>(
-          `/api/v1/observations/history?signal_id=${signalId}&from=now-15m&limit=30`
+        const res = await runSparkline(
+          () => api<{ items: Array<{ value: unknown }> }>(`/api/v1/observations/history?signal_id=${signalId}&from=now-15m&limit=30`),
+          () => isCurrent,
         );
+        if (res === null) return;
         const numericValues = (res.items || [])
           .map((item) => Number(item.value))
           .filter((v) => !isNaN(v));

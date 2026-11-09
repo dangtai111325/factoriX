@@ -16,6 +16,7 @@ import {
   Token,
   completions,
   localProblems,
+  missingLabel,
   tokenize,
 } from '../rules';
 import { ApiSpec, FieldError, KEY_MAX, ValueType, VALUE_TYPES } from '../types';
@@ -37,16 +38,24 @@ const TOKEN_CLS: Record<Token['kind'], string> = {
   error: 'text-red-700 underline decoration-wavy decoration-red-500',
 };
 
-function highlight(tokens: Token[], errorRange?: { pos: number; end: number } | null): React.ReactNode[] {
+function highlight(tokens: Token[], errorRange?: { pos: number; end: number } | null, friendlyMissing = false): React.ReactNode[] {
   return tokens.map((t, i) => {
     const inRange = errorRange && t.start < errorRange.end && t.start + t.text.length > errorRange.pos && t.kind !== 'space';
+    // Read-only views show a deleted reference as "⚠ missing: humidity on M1", not the internal $⚠missing[…] text (R4-DM-12).
+    const missing = friendlyMissing && t.kind === 'broken' && t.text.startsWith('$⚠missing[');
     return (
       <span
         key={i}
         className={`${TOKEN_CLS[t.kind]} ${inRange ? 'underline decoration-wavy decoration-red-500' : ''}`}
-        title={t.message ? `${t.message}${t.suggestions?.length ? `\nDid you mean: ${t.suggestions.join(', ')}` : ''}` : undefined}
+        title={
+          missing
+            ? 'This data point was deleted or disabled. The field outputs null; edit the rule to pick another one.'
+            : t.message
+            ? `${t.message}${t.suggestions?.length ? `\nDid you mean: ${t.suggestions.join(', ')}` : ''}`
+            : undefined
+        }
       >
-        {t.text}
+        {missing ? `⚠ missing: ${missingLabel(t.text.replace(/\.@[\w.@]+$/, ''))}` : t.text}
       </span>
     );
   });
@@ -56,7 +65,7 @@ function highlight(tokens: Token[], errorRange?: { pos: number; end: number } | 
 export const RuleText: React.FC<{ text: string; index: CatalogIndex | null; className?: string }> = ({ text, index, className = '' }) => {
   const tokens = useMemo(() => tokenize(text, index), [text, index]);
   if (!text.trim()) return <span className="text-[11px] italic text-slate-400">empty rule</span>;
-  return <code className={`font-mono [font-variant-ligatures:none] text-[11px] whitespace-pre-wrap break-all ${className}`}>{highlight(tokens)}</code>;
+  return <code className={`font-mono [font-variant-ligatures:none] text-[11px] whitespace-pre-wrap break-all ${className}`}>{highlight(tokens, null, true)}</code>;
 };
 
 // ------------------------------------------------------------------ function reference (server list when available)
@@ -108,6 +117,8 @@ interface Props {
   open: boolean;
   /** Whether the key can be edited (array items have no key). */
   keyed: boolean;
+  /** For an array item: its position, e.g. "temps[3]" (array items are index-based). */
+  itemLabel?: string | null;
   initial: RuleDraft;
   index: CatalogIndex | null;
   /** Mapped references of the body, used to fill the examples. */
@@ -122,8 +133,26 @@ interface Props {
   onClose: () => void;
 }
 
-export const RuleEditorDialog: React.FC<Props> = ({ open, keyed, initial, index, exampleRefs, buildSpec, nodeId, modelId, siblingKeys, onApply, onClose }) => {
+export const RuleEditorDialog: React.FC<Props> = ({ open, keyed, itemLabel, initial, index, exampleRefs, buildSpec, nodeId, modelId, siblingKeys, onApply, onClose }) => {
   const [draft, setDraft] = useState<RuleDraft>(initial);
+  /** R4-DM-04: closing with unsaved typing asks first (Esc, ×, Cancel, click outside). */
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const keepRef = useRef<HTMLSpanElement>(null);
+  const changed = draft.expr !== initial.expr || draft.key !== initial.key || draft.valueType !== initial.valueType;
+  const requestClose = () => {
+    if (changed && !confirmDiscard) {
+      setConfirmDiscard(true);
+      window.requestAnimationFrame(() => keepRef.current?.querySelector<HTMLButtonElement>('button')?.focus());
+      return;
+    }
+    if (confirmDiscard) {
+      // A second Escape while asking means "keep editing".
+      setConfirmDiscard(false);
+      window.requestAnimationFrame(() => taRef.current?.focus());
+      return;
+    }
+    onClose();
+  };
   const [cursor, setCursor] = useState(initial.expr.length);
   const [acOpen, setAcOpen] = useState(false);
   const [acIndex, setAcIndex] = useState(0);
@@ -147,6 +176,7 @@ export const RuleEditorDialog: React.FC<Props> = ({ open, keyed, initial, index,
       setDraft(initial);
       setCursor(initial.expr.length);
       setAcOpen(false);
+      setConfirmDiscard(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -275,21 +305,35 @@ export const RuleEditorDialog: React.FC<Props> = ({ open, keyed, initial, index,
   return (
     <Dialog
       open={open}
-      onClose={onClose}
+      onClose={requestClose}
       escapeCloses={!(acOpen && suggestions.length > 0) && !examplesOpen}
       width="xl"
       title="Rule"
       subtitle="An expression evaluated at every sample. Type $ to reference data, Ctrl+Space for suggestions, Ctrl+Enter to apply."
       footer={
-        <>
-          <span className="mr-auto text-[11px] text-[#657794]">Runtime errors (e.g. division by zero) output null for this field only.</span>
-          <Button variant="outline" size="sm" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button variant="primary" size="sm" disabled={blocking} onClick={() => onApply(draft)} title={blocking ? 'Fix the errors first' : undefined}>
-            Apply rule
-          </Button>
-        </>
+        confirmDiscard ? (
+          <div role="alertdialog" aria-label="Discard changes" className="w-full flex flex-wrap items-center justify-end gap-2">
+            <span className="mr-auto text-[12px] font-semibold text-amber-900">Discard the changes to this rule?</span>
+            <span ref={keepRef}>
+              <Button variant="outline" size="sm" onClick={() => setConfirmDiscard(false)}>
+                Keep editing
+              </Button>
+            </span>
+            <Button variant="danger" size="sm" onClick={onClose}>
+              Discard
+            </Button>
+          </div>
+        ) : (
+          <>
+            <span className="mr-auto text-[11px] text-[#657794]">Runtime errors (e.g. division by zero) output null for this field only.</span>
+            <Button variant="outline" size="sm" onClick={requestClose}>
+              Cancel
+            </Button>
+            <Button variant="primary" size="sm" disabled={blocking} onClick={() => onApply(draft)} title={blocking ? 'Fix the errors first' : undefined}>
+              Apply rule
+            </Button>
+          </>
+        )
       }
     >
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
@@ -362,6 +406,12 @@ export const RuleEditorDialog: React.FC<Props> = ({ open, keyed, initial, index,
             </div>
           </div>
           {keyError && <p className="text-[11px] text-red-700">{keyError}</p>}
+          {!keyed && (
+            <p className="text-[11px] text-[#657794]">
+              Array item{itemLabel ? <span className="font-mono font-semibold text-[#334568]"> {itemLabel}</span> : ''}: array items have no key, their position is their
+              index. Use an object instead of an array for named fields.
+            </p>
+          )}
 
           <div>
             <div className="flex items-stretch border border-[#D4DFEC] rounded-lg bg-white focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 overflow-hidden">

@@ -16,6 +16,14 @@ export interface CardActions {
   remove: (m: ModelListItem) => void;
 }
 
+/** Actions on several selected cards (UX#4); each one confirms with the count first. */
+export interface BulkActions {
+  pause: (models: ModelListItem[]) => void;
+  resume: (models: ModelListItem[]) => void;
+  remove: (models: ModelListItem[]) => void;
+  duplicateToMachines: (models: ModelListItem[]) => void;
+}
+
 interface Props {
   models: ModelListItem[];
   loading: boolean;
@@ -24,8 +32,12 @@ interface Props {
   onReload: () => void;
   onCreate: () => void;
   actions: CardActions;
+  bulk: BulkActions;
   /** Ids with a pause/resume request running (in-flight guard). */
   busyIds: Set<string>;
+  /** Selected card ids (kept by the page so a bulk action can clear it when done). */
+  selection: Set<string>;
+  onSelection: (next: Set<string>) => void;
 }
 
 function useInView<T extends Element>(): [React.RefObject<T>, boolean] {
@@ -46,7 +58,14 @@ function useInView<T extends Element>(): [React.RefObject<T>, boolean] {
 
 const PREVIEW_LINES = 6;
 
-const ModelCard: React.FC<{ model: ModelListItem; actions: CardActions; busy: boolean; now: number }> = ({ model, actions, busy, now }) => {
+const ModelCard: React.FC<{ model: ModelListItem; actions: CardActions; busy: boolean; now: number; selected: boolean; onToggle: (shift: boolean) => void }> = ({
+  model,
+  actions,
+  busy,
+  now,
+  selected,
+  onToggle,
+}) => {
   const [ref, visible] = useInView<HTMLDivElement>();
   const running = model.state === 'RUNNING';
   const live = useModelBody(model.id, { enabled: visible && running, initial: model.latest_body, pollMs: Math.max(5000, model.sample_ms) });
@@ -78,9 +97,20 @@ const ModelCard: React.FC<{ model: ModelListItem; actions: CardActions; busy: bo
     <div
       ref={ref}
       role="listitem"
-      className="group relative flex flex-col bg-white border border-[#CBD5E1] rounded-xl shadow-sm hover:shadow-md hover:border-[#9FB4D1] transition focus-within:ring-2 focus-within:ring-blue-300"
+      className={`group relative flex flex-col bg-white border rounded-xl shadow-sm hover:shadow-md transition focus-within:ring-2 focus-within:ring-blue-300 ${
+        selected ? 'border-blue-500 ring-1 ring-blue-300' : 'border-[#CBD5E1] hover:border-[#9FB4D1]'
+      }`}
     >
       <div className="flex items-start gap-2 px-4 pt-3.5">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={() => undefined}
+          onClick={(e) => onToggle(e.shiftKey)}
+          aria-label={`Select ${model.name}`}
+          title="Select (Shift+click selects a range)"
+          className="mt-1 shrink-0"
+        />
         <button
           type="button"
           onClick={() => actions.open(model)}
@@ -145,11 +175,12 @@ const ModelCard: React.FC<{ model: ModelListItem; actions: CardActions; busy: bo
 
 const selectCls = 'h-8 px-2 border border-[#D4DFEC] rounded-lg text-[12px] bg-white text-[#334568] focus:outline-none focus:border-blue-500';
 
-export const ModelCatalog: React.FC<Props> = ({ models, loading, loaded, error, onReload, onCreate, actions, busyIds }) => {
+export const ModelCatalog: React.FC<Props> = ({ models, loading, loaded, error, onReload, onCreate, actions, bulk, busyIds, selection, onSelection }) => {
   const [q, setQ] = useState('');
   const [machine, setMachine] = useState('');
   const [state, setState] = useState('');
   const now = useNow(5000);
+  const anchor = useRef<string | null>(null);
 
   const machineOptions = useMemo(() => Array.from(new Set(models.flatMap((m) => m.machines))).sort((a, b) => a.localeCompare(b, undefined, { numeric: true })), [models]);
   const needle = q.trim().toLowerCase();
@@ -157,8 +188,24 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, loaded, error, 
     .filter((m) => (!state || m.state === state) && (!machine || m.machines.includes(machine)))
     .filter((m) => !needle || m.name.toLowerCase().includes(needle) || m.description.toLowerCase().includes(needle) || m.machines.some((x) => x.toLowerCase().includes(needle)))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
-  const running = models.filter((m) => m.state === 'RUNNING').length;
   const filtersActive = Boolean(q || machine || state);
+  // R4-DM-09: the counter describes what is shown ("11 of 47 models · 9 running").
+  const runningShown = filtered.filter((m) => m.state === 'RUNNING').length;
+  const selectedModels = models.filter((m) => selection.has(m.id));
+  const hiddenSelected = selectedModels.filter((m) => !filtered.some((f) => f.id === m.id)).length;
+
+  const toggle = (id: string, shift: boolean) => {
+    const next = new Set(selection);
+    const from = anchor.current ? filtered.findIndex((m) => m.id === anchor.current) : -1;
+    const to = filtered.findIndex((m) => m.id === id);
+    if (shift && from >= 0 && to >= 0) {
+      filtered.slice(Math.min(from, to), Math.max(from, to) + 1).forEach((m) => next.add(m.id));
+    } else if (next.has(id)) next.delete(id);
+    else next.add(id);
+    anchor.current = id;
+    onSelection(next);
+  };
+  const allShownSelected = filtered.length > 0 && filtered.every((m) => selection.has(m.id));
 
   return (
     <div className="space-y-4">
@@ -209,12 +256,54 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, loaded, error, 
               Clear
             </Button>
           )}
-          <span className="ml-auto text-[11px] text-[#657794]">
-            {models.length} model{models.length === 1 ? '' : 's'} · {running} running
+          <span className="ml-auto text-[11px] text-[#657794]" aria-live="polite">
+            {filtersActive ? `${filtered.length} of ${models.length}` : models.length} model{models.length === 1 ? '' : 's'} · {runningShown} running
           </span>
           <button type="button" onClick={onReload} disabled={loading} aria-label="Reload" title="Reload" className="p-1.5 rounded text-slate-500 hover:bg-slate-100 disabled:opacity-50">
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           </button>
+        </div>
+      )}
+
+      {filtered.length > 0 && (
+        <div
+          role="toolbar"
+          aria-label="Selection"
+          className={`flex flex-wrap items-center gap-2 rounded-xl px-3 py-2 text-[12px] ${selection.size ? 'bg-blue-50/70 border border-blue-100' : ''}`}
+        >
+          <label className="inline-flex items-center gap-2 font-semibold text-[#334568] cursor-pointer">
+            <input
+              type="checkbox"
+              checked={allShownSelected}
+              onChange={() => {
+                const next = new Set(selection);
+                filtered.forEach((m) => (allShownSelected ? next.delete(m.id) : next.add(m.id)));
+                onSelection(next);
+              }}
+              aria-label="Select all shown models"
+            />
+            {selection.size ? `${selection.size} selected` : 'Select'}
+            {hiddenSelected > 0 && <span className="font-normal text-[#657794]">({hiddenSelected} hidden by the filters)</span>}
+          </label>
+          {selection.size > 0 && (
+            <>
+              <Button size="sm" variant="outline" icon={<Pause className="w-3.5 h-3.5" />} onClick={() => bulk.pause(selectedModels)}>
+                Pause
+              </Button>
+              <Button size="sm" variant="outline" icon={<Play className="w-3.5 h-3.5" />} onClick={() => bulk.resume(selectedModels)}>
+                Resume
+              </Button>
+              <Button size="sm" variant="outline" icon={<CopyPlus className="w-3.5 h-3.5" />} onClick={() => bulk.duplicateToMachines(selectedModels)}>
+                Duplicate to machines…
+              </Button>
+              <Button size="sm" variant="danger" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => bulk.remove(selectedModels)}>
+                Delete…
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => onSelection(new Set())}>
+                Clear
+              </Button>
+            </>
+          )}
         </div>
       )}
 
@@ -235,7 +324,7 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, loaded, error, 
       ) : (
         <div role="list" aria-label="Data models" className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-4">
           {filtered.map((m) => (
-            <ModelCard key={m.id} model={m} actions={actions} busy={busyIds.has(m.id)} now={now} />
+            <ModelCard key={m.id} model={m} actions={actions} busy={busyIds.has(m.id)} now={now} selected={selection.has(m.id)} onToggle={(shift) => toggle(m.id, shift)} />
           ))}
         </div>
       )}

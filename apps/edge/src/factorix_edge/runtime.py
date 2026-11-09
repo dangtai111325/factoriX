@@ -60,6 +60,10 @@ PRUNE_CHUNK = 500  # ~0.1 s per step on a 1 GB outbox, then PRUNE_PAUSE_S
 # Pause between prune steps so acquisition, heartbeat and flushing run in between (R3 P1).
 PRUNE_PAUSE_S = 0.02
 SLOW_LOOP_STEP_S = 1.0
+# Connection secret fetch (R4-ENV-01): a Center that is starting up or briefly overloaded must not
+# fail the job. Transient answers (not reachable, timeout, 5xx, 429) are retried after these pauses.
+SECRET_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+SECRET_TIMEOUT_S = 10.0
 ACKED_RETENTION = timedelta(minutes=10)
 
 
@@ -141,6 +145,9 @@ class EdgeRuntime:
         self._connector_locks: dict[str, asyncio.Lock] = {}
         self.conn_states: dict[str, dict[str, Any]] = {}
         self._secrets: dict[str, str] = {}
+        # Cached secrets to re-read from Center before the next use (set on a new revision).
+        self._stale_secrets: set[str] = set()
+        self._secret_locks: dict[str, asyncio.Lock] = {}
         self.config_ok = True
         self.activation_error: str | None = None
         self.storage_error: str | None = None
@@ -169,18 +176,48 @@ class EdgeRuntime:
         return payload if isinstance(payload, dict) else {"items": payload}
 
     async def secret(self, secret_ref: str) -> str:
-        """Connection secret, fetched once per configuration revision."""
-        if secret_ref in self._secrets:
-            return self._secrets[secret_ref]
-        try:
-            body = await self._request("GET", f"/api/v1/edge-sync/secrets/{secret_ref}")
-        except httpx.HTTPStatusError as exc:
-            raise ConnectorError("AUTH", f"The connection secret is not available (Center answered {exc.response.status_code}).") from exc
-        except httpx.HTTPError as exc:
-            raise ConnectorError("CENTER", "Cannot fetch the connection secret from Center.") from exc
-        value = str(body.get("secret") or "")
-        self._secrets[secret_ref] = value
-        return value
+        """Connection secret, cached and re-read from Center once per configuration revision.
+
+        A transient Center failure (not reachable yet at appliance start, timeout or 5xx under
+        load) is retried with backoff. When it persists and a value is cached, the cached value
+        is used: secret refs are immutable (a changed secret gets a new ref and a new revision),
+        so it is still the right one (R4-ENV-01). Only a definite answer (404/403) is AUTH.
+        """
+        cached = self._secrets.get(secret_ref)
+        if cached is not None and secret_ref not in self._stale_secrets:
+            return cached
+        lock = self._secret_locks.setdefault(secret_ref, asyncio.Lock())
+        async with lock:  # concurrent jobs of one connection share a single fetch
+            cached = self._secrets.get(secret_ref)
+            if cached is not None and secret_ref not in self._stale_secrets:
+                return cached
+            value = await self._fetch_secret(secret_ref, cached)
+            self._secrets[secret_ref] = value
+            self._stale_secrets.discard(secret_ref)
+            return value
+
+    async def _fetch_secret(self, secret_ref: str, cached: str | None) -> str:
+        attempt = 0
+        while True:
+            try:
+                body = await self._request("GET", f"/api/v1/edge-sync/secrets/{secret_ref}", timeout=SECRET_TIMEOUT_S)
+                return str(body.get("secret") or "")
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status < 500 and status != 429:
+                    self._secrets.pop(secret_ref, None)
+                    self._stale_secrets.discard(secret_ref)
+                    raise ConnectorError("AUTH", f"The connection secret is not available (Center answered {status}).") from exc
+                error: Exception = exc
+            except httpx.HTTPError as exc:
+                error = exc
+            if attempt >= len(SECRET_RETRY_DELAYS_S):
+                if cached is not None:
+                    logger.warning("Cannot re-read connection secret %s from Center (%r); using the cached value", secret_ref, error)
+                    return cached
+                raise ConnectorError("CENTER", "Cannot fetch the connection secret from Center.") from error
+            await asyncio.sleep(SECRET_RETRY_DELAYS_S[attempt])
+            attempt += 1
 
     # ------------------------------------------------------------------ allowlist and connectors
 
@@ -456,7 +493,12 @@ class EdgeRuntime:
         specs = build_specs(snapshot)
         rotated: set[str] = set()
         if revision != self.revision:
-            self._secrets.clear()
+            # Keep the cache (a Center hiccup must not leave jobs without their secret) but re-read
+            # every secret before its next use; forget secrets no connection references any more.
+            referenced = {str(c["secret_ref"]) for c in snapshot.get("connections") or [] if c.get("secret_ref")}
+            for ref in [ref for ref in self._secrets if ref not in referenced]:
+                del self._secrets[ref]
+            self._stale_secrets = set(self._secrets)
             rotated = await self._rotated_secrets()
         allow = list(self.env_allowlist)
         for connection in snapshot.get("connections") or []:

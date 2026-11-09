@@ -5,6 +5,7 @@ import { api, ApiError } from '../../api/client';
 import { CommissionResult, runConnectionTest } from '../../lib/commissioning';
 import { useApp } from '../../store/AppContext';
 import { ModalPortal } from '../../components/modals/ModalPortal';
+import { ConfirmDialog } from '../../components/common/ConfirmDialog';
 import { TestResultPanel } from './TestResultPanel';
 import { httpPathsOfConnection, rateBudget } from './httpRate';
 import { pollIntervalMin, validatePollInterval } from './pollInterval';
@@ -333,15 +334,29 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, connectionToEdit?.id]);
 
-  // Escape closes the dialog.
+  // R4-CN-01: Cancel, Close (X) and Escape ask before throwing away unsaved edits.
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const hasUnsavedEdits = dirty || secret !== '';
+  const requestClose = () => {
+    if (isSaving) return;
+    if (hasUnsavedEdits) setConfirmDiscard(true);
+    else onClose();
+  };
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) setConfirmDiscard(false);
+  }, [isOpen]);
+
+  // Escape closes the dialog (asking first when there are unsaved edits).
+  useEffect(() => {
+    if (!isOpen || confirmDiscard) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !isSaving && !isTesting) onClose();
+      if (event.key === 'Escape' && !isSaving && !isTesting) requestClose();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [isOpen, isSaving, isTesting, onClose]);
+    // requestClose reads the current state; the listener is renewed when it changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, isSaving, isTesting, onClose, confirmDiscard, hasUnsavedEdits]);
 
   const markDirty = () => {
     setDirty(true);
@@ -709,7 +724,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={requestClose}
             aria-label="Close"
             className="p-1.5 rounded-lg text-[#64748B] hover:text-[#0B2545] hover:bg-[#E2E8F0] transition-colors"
           >
@@ -1141,8 +1156,8 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
               <span>{testLabel}</span>
             </button>
             <div className="flex items-center gap-2">
-              <button type="button" onClick={onClose} className="py-2 px-4 rounded-xl border border-[#CBD5E1] text-xs font-semibold text-[#475569] hover:bg-[#F8FAFC]">
-                {isEdit && !dirty ? 'Close' : 'Cancel'}
+              <button type="button" onClick={requestClose} className="py-2 px-4 rounded-xl border border-[#CBD5E1] text-xs font-semibold text-[#475569] hover:bg-[#F8FAFC]">
+                {isEdit && !hasUnsavedEdits ? 'Close' : 'Cancel'}
               </button>
               <button
                 type="submit"
@@ -1156,6 +1171,23 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
         </form>
       </div>
     </div>
+    <ConfirmDialog
+      isOpen={confirmDiscard}
+      title="Discard unsaved changes?"
+      message={
+        isEdit
+          ? 'The changes to this connection are not saved. If you close the dialog, they are discarded and the connection keeps its current settings.'
+          : 'This connection is not created yet. If you close the dialog, the settings you entered are discarded.'
+      }
+      variant="warning"
+      confirmText="Discard changes"
+      cancelText="Keep editing"
+      onConfirm={() => {
+        setConfirmDiscard(false);
+        onClose();
+      }}
+      onCancel={() => setConfirmDiscard(false)}
+    />
     </ModalPortal>
   );
 };

@@ -21,14 +21,16 @@ import {
   MoreVertical,
   Pencil,
   Plus,
+  Sigma,
   Trash2,
+  Undo2,
   X,
 } from 'lucide-react';
 import { Button } from '../../../components/common/Button';
-import { CatalogIndex, signalRef, signalTooltip } from '../rules';
+import { CatalogIndex, missingLabel, signalRef, signalTooltip } from '../rules';
 import { FlatRow, flatten } from '../spec';
-import { BodyNode, ContainerNode, FieldError, FieldNode, VALUE_TYPES, ValueType, isContainer } from '../types';
-import { IconMenu } from '../ui';
+import { BodyNode, ContainerNode, FieldError, FieldNode, FieldQuality, ROUND_DIGITS_MAX, VALUE_TYPES, ValueType, isContainer } from '../types';
+import { Dialog, IconMenu, QualityDot } from '../ui';
 import { RuleText } from './RuleEditor';
 import { SIGNAL_DRAG_TYPE } from './DataTree';
 
@@ -51,6 +53,16 @@ export interface RowActions {
   editRule: (uid: string) => void;
   dropRow: (uid: string, targetUid: string, place: DropPlace) => void;
   dropSignal: (signalId: string, targetUid: string | null, place: DropPlace) => void;
+  /** Field-level output rounding (null = off). */
+  setRound: (uid: string, digits: number | null) => void;
+}
+
+/** Live value of a row in the editor preview. */
+export interface LiveCell {
+  text: string;
+  error: string | null;
+  quality?: FieldQuality;
+  qualityReason?: string | null;
 }
 
 interface Props {
@@ -58,12 +70,16 @@ interface Props {
   index: CatalogIndex | null;
   selected: string | null;
   onSelect: (uid: string | null) => void;
+  /** Where "+ Field / Rule / Object / Array" and a signal click add (shown above the table). */
+  targetLabel: string;
+  canUndo: boolean;
+  onUndo: () => void;
   checked: Set<string>;
   onChecked: (next: Set<string>) => void;
   collapsed: Set<string>;
   onCollapsed: (next: Set<string>) => void;
   errors: Map<string, FieldError[]>;
-  values: Map<string, { text: string; error: string | null }>;
+  values: Map<string, LiveCell>;
   actions: RowActions;
   onAdd: (kind: 'field' | 'rule' | 'object' | 'array') => void;
   onPaste: () => void;
@@ -78,9 +94,13 @@ function mappingText(f: FieldNode, index: CatalogIndex | null): { text: string; 
   if (!f.signalId) return { text: '', tip: '', broken: false };
   const fromCatalog = index ? signalRef(index, f.signalId) : null;
   if (fromCatalog && !f.missing) return { text: fromCatalog, tip: index ? signalTooltip(index, f.signalId) : f.refTooltip, broken: false };
-  if (f.refDisplay) return { text: f.refDisplay, tip: f.refTooltip || f.refDisplay, broken: f.missing || f.refDisplay.includes('⚠') };
-  return { text: '$⚠missing[signal]', tip: 'The mapped signal no longer exists (deleted or archived). The field outputs null.', broken: true };
+  const reason = f.missingReason || 'The mapped data point no longer exists (deleted or disabled). The field outputs null.';
+  if (f.refDisplay && (f.missing || f.refDisplay.includes('⚠'))) return { text: `Missing: ${missingLabel(f.refDisplay)}`, tip: `${reason}\nPick another signal in the data tree.`, broken: true };
+  if (f.refDisplay) return { text: f.refDisplay, tip: f.refTooltip || f.refDisplay, broken: false };
+  return { text: 'Missing data point', tip: reason, broken: true };
 }
+
+const GRID = 'grid grid-cols-[24px_minmax(180px,1.3fr)_88px_minmax(150px,1.5fr)_minmax(110px,0.8fr)_52px]';
 
 const KeyInput: React.FC<{ value: string; disabled: boolean; invalid: boolean; onCommit: (v: string) => void; autoFocus: boolean; onFocused: () => void; label: string }> = ({
   value,
@@ -106,6 +126,7 @@ const KeyInput: React.FC<{ value: string; disabled: boolean; invalid: boolean; o
     <input
       ref={ref}
       value={text}
+      title={text}
       aria-label={label}
       aria-invalid={invalid}
       data-key-input
@@ -137,6 +158,9 @@ export const BodyTable: React.FC<Props> = ({
   index,
   selected,
   onSelect,
+  targetLabel,
+  canUndo,
+  onUndo,
   checked,
   onChecked,
   collapsed,
@@ -152,7 +176,10 @@ export const BodyTable: React.FC<Props> = ({
   const rows = useMemo(() => flatten(root, collapsed), [root, collapsed]);
   const [drop, setDrop] = useState<{ uid: string | null; place: DropPlace } | null>(null);
   const [bulkType, setBulkType] = useState<ValueType | ''>('');
+  const [roundFor, setRoundFor] = useState<FieldNode | null>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
+  /** Anchor of Shift-click range selection (R4-DM-14). */
+  const anchorRef = useRef<string | null>(null);
   const rootErrors = errors.get(root.uid) || [];
   const checkedRows = rows.filter((r) => checked.has(r.node.uid));
   const allChecked = rows.length > 0 && checkedRows.length === rows.length;
@@ -165,6 +192,18 @@ export const BodyTable: React.FC<Props> = ({
     const next = new Set(checked);
     if (next.has(uid)) next.delete(uid);
     else next.add(uid);
+    anchorRef.current = uid;
+    onChecked(next);
+  };
+
+  /** Shift-click: select every visible row between the anchor and this one (inclusive). */
+  const checkRange = (uid: string) => {
+    const anchor = anchorRef.current && rows.some((r) => r.node.uid === anchorRef.current) ? anchorRef.current : selected;
+    const a = rows.findIndex((r) => r.node.uid === anchor);
+    const b = rows.findIndex((r) => r.node.uid === uid);
+    if (a < 0 || b < 0) return toggleCheck(uid);
+    const next = new Set(checked);
+    rows.slice(Math.min(a, b), Math.max(a, b) + 1).forEach((r) => next.add(r.node.uid));
     onChecked(next);
   };
 
@@ -211,7 +250,12 @@ export const BodyTable: React.FC<Props> = ({
       else (e.currentTarget as HTMLElement).querySelector<HTMLInputElement>('[data-key-input]')?.focus();
     } else if (e.key === ' ') {
       e.preventDefault();
-      toggleCheck(uid);
+      if (e.shiftKey) checkRange(uid);
+      else toggleCheck(uid);
+    } else if (e.key === 'Escape') {
+      // R4-DM-05: Escape drops the selection, so new fields go to the body root again.
+      if (checked.size) onChecked(new Set());
+      else if (selected) onSelect(null);
     } else if ((e.key === 'd' || e.key === 'D') && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       actions.duplicate(uid);
@@ -256,6 +300,28 @@ export const BodyTable: React.FC<Props> = ({
         <Button size="sm" variant="ghost" icon={<ClipboardPaste className="w-3.5 h-3.5" />} onClick={onPaste} title="Create the key skeleton from a sample JSON body">
           Paste JSON
         </Button>
+        <button
+          type="button"
+          onClick={onUndo}
+          disabled={!canUndo}
+          aria-label="Undo the last change (Ctrl+Z)"
+          title="Undo the last change (Ctrl+Z)"
+          className="w-8 h-8 inline-flex items-center justify-center rounded-lg border border-[#D4DFEC] bg-white text-[#334568] hover:bg-[#F1F5FA] disabled:opacity-40"
+        >
+          <Undo2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* R4-DM-05: where new fields go, and a way back to the root at any time. */}
+      <div className="flex flex-wrap items-center gap-1.5 mb-2 text-[11px] text-[#657794]">
+        <span>
+          New fields go to <span className="font-semibold text-[#334568]">{targetLabel}</span>
+        </span>
+        {selected && (
+          <button type="button" onClick={() => onSelect(null)} className="px-1.5 py-0.5 rounded border border-[#D4DFEC] bg-white font-semibold text-[#134074] hover:bg-[#EEF5FF]" title="Esc">
+            Use body root
+          </button>
+        )}
       </div>
 
       {checked.size > 0 && (
@@ -298,11 +364,20 @@ export const BodyTable: React.FC<Props> = ({
         </div>
       )}
 
-      <div className="flex-1 min-h-[240px] border border-slate-200 rounded-xl bg-white overflow-auto">
-        <div className="min-w-[576px]">
+      {rows.length === 0 && (
+        // Outside the scrolling table so it is never clipped on narrow screens (R4-UI-03).
+        <div className="mb-2 px-4 py-6 text-center text-[12px] text-[#657794] border border-dashed border-slate-200 rounded-xl">
+          <p className="font-semibold text-[#334568] mb-1">The body is empty.</p>
+          <p>Click a signal in the data tree, use “Map all” on a machine, or paste a sample JSON body.</p>
+        </div>
+      )}
+
+      {/* The table keeps a minimum width and scrolls horizontally inside its own box (R4-UI-03). */}
+      <div className="flex-1 min-h-[240px] min-w-0 max-w-full border border-slate-200 rounded-xl bg-white overflow-auto overscroll-x-contain">
+        <div className="min-w-[660px]">
           <div
             role="row"
-            className="sticky top-0 z-10 grid grid-cols-[24px_minmax(140px,1.1fr)_80px_minmax(150px,1.5fr)_minmax(90px,0.8fr)_52px] items-center gap-2 px-2 h-8 bg-[#F8FAFC] border-b border-slate-200 text-[10px] font-bold uppercase tracking-wide text-[#657794]"
+            className={`sticky top-0 z-10 ${GRID} items-center gap-2 px-2 h-8 bg-[#F8FAFC] border-b border-slate-200 text-[10px] font-bold uppercase tracking-wide text-[#657794]`}
           >
             <input
               type="checkbox"
@@ -334,14 +409,12 @@ export const BodyTable: React.FC<Props> = ({
             onDrop={(e) => {
               if (e.target === e.currentTarget) onDropAt(e, null, 'into');
             }}
+            onClick={(e) => {
+              // A click on the empty area below the rows targets the body root again (R4-DM-05).
+              if (e.target === e.currentTarget) onSelect(null);
+            }}
             className={`min-h-[180px] pb-10 ${drop?.uid === null ? 'bg-blue-50/40' : ''}`}
           >
-            {rows.length === 0 && (
-              <div className="px-6 py-10 text-center text-[12px] text-[#657794] pointer-events-none">
-                <p className="font-semibold text-[#334568] mb-1">The body is empty.</p>
-                <p>Click a signal in the data tree, use “Map all” on a machine, or paste a sample JSON body.</p>
-              </div>
-            )}
             {rows.map((row, i) => {
               const n = row.node;
               const uid = n.uid;
@@ -361,6 +434,12 @@ export const BodyTable: React.FC<Props> = ({
                   onSelect: () => actions.convert(uid),
                 },
                 field && field.mode === 'calculated' && { key: 'edit', label: 'Edit rule…', icon: <Pencil className="w-3.5 h-3.5" />, onSelect: () => actions.editRule(uid) },
+                field && {
+                  key: 'round',
+                  label: field.roundDigits !== null ? `Round digits: ${field.roundDigits}…` : 'Round digits…',
+                  icon: <Sigma className="w-3.5 h-3.5" />,
+                  onSelect: () => setRoundFor(field),
+                },
                 container && {
                   key: 'ctype',
                   label: n.type === 'object' ? 'Change to array' : 'Change to object',
@@ -390,7 +469,19 @@ export const BodyTable: React.FC<Props> = ({
                   aria-expanded={container ? !collapsed.has(uid) : undefined}
                   data-row={uid}
                   tabIndex={isSel || (!selected && i === 0) ? 0 : -1}
-                  onClick={() => onSelect(isSel && container ? uid : uid)}
+                  onClick={(e) => {
+                    if (e.shiftKey) {
+                      e.preventDefault();
+                      checkRange(uid);
+                      return;
+                    }
+                    if (e.ctrlKey || e.metaKey) {
+                      toggleCheck(uid);
+                      return;
+                    }
+                    anchorRef.current = uid;
+                    onSelect(uid);
+                  }}
                   onKeyDown={(e) => onRowKey(e, row, i)}
                   onDragOver={(e) => {
                     if (!accepts(e)) return;
@@ -402,13 +493,25 @@ export const BodyTable: React.FC<Props> = ({
                     e.stopPropagation();
                     onDropAt(e, uid, placeFor(e, row));
                   }}
-                  className={`relative grid grid-cols-[24px_minmax(140px,1.1fr)_80px_minmax(150px,1.5fr)_minmax(90px,0.8fr)_52px] items-center gap-2 px-2 min-h-[34px] border-b border-slate-100 text-[12px] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-400 ${
+                  className={`relative ${GRID} items-center gap-2 px-2 min-h-[34px] border-b border-slate-100 text-[12px] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-400 ${
                     isSel ? 'bg-blue-50/70' : hasError ? 'bg-red-50/40' : 'hover:bg-[#F8FAFC]'
                   } ${dropHere === 'into' ? 'outline outline-2 -outline-offset-2 outline-blue-500 bg-blue-50' : ''}`}
                 >
                   {dropHere === 'before' && <span className="absolute left-0 right-0 top-0 h-0.5 bg-blue-500" aria-hidden="true" />}
                   {dropHere === 'after' && <span className="absolute left-0 right-0 bottom-0 h-0.5 bg-blue-500" aria-hidden="true" />}
-                  <input type="checkbox" aria-label={`Select ${row.path || 'item'}`} checked={checked.has(uid)} onChange={() => toggleCheck(uid)} onClick={(e) => e.stopPropagation()} tabIndex={-1} />
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${row.path || 'item'}`}
+                    title="Select (Shift+click selects a range)"
+                    checked={checked.has(uid)}
+                    onChange={() => undefined}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (e.shiftKey) checkRange(uid);
+                      else toggleCheck(uid);
+                    }}
+                    tabIndex={-1}
+                  />
                   <div className="flex items-center gap-1 min-w-0" style={{ paddingLeft: row.depth * 16 }}>
                     <span
                       draggable
@@ -453,7 +556,18 @@ export const BodyTable: React.FC<Props> = ({
                     />
                     {row.parent.type === 'array' && <span className="text-[10px] text-slate-400 font-mono">[{row.index}]</span>}
                   </div>
-                  <div onClick={(e) => e.stopPropagation()}>
+                  <div onClick={(e) => e.stopPropagation()} className="relative">
+                    {field && field.roundDigits !== null && (
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        onClick={() => setRoundFor(field)}
+                        title={`Rounded to ${field.roundDigits} digit(s). Click to change.`}
+                        className="absolute -top-1.5 right-0 z-[1] text-[9px] font-bold px-1 rounded bg-[#EEF5FF] text-[#1D4ED8] border border-[#D2E3FA]"
+                      >
+                        ≈{field.roundDigits}
+                      </button>
+                    )}
                     {field ? (
                       <select
                         value={field.valueType}
@@ -515,9 +629,12 @@ export const BodyTable: React.FC<Props> = ({
                         <span className="truncate font-mono">{val?.text ?? rowErrors[0].message}</span>
                       </span>
                     ) : (
-                      <span className="font-mono text-[11px] text-[#334568] truncate" title={val?.text}>
-                        {container ? '' : val?.text ?? '—'}
-                      </span>
+                      <>
+                        {!container && val?.quality && val.quality !== 'good' && <QualityDot quality={val.quality} reason={val.qualityReason} />}
+                        <span className="font-mono text-[11px] text-[#334568] truncate" title={val?.text}>
+                          {container ? '' : val?.text ?? '—'}
+                        </span>
+                      </>
                     )}
                   </div>
                   <div className="flex items-center justify-end" onClick={(e) => e.stopPropagation()}>
@@ -542,8 +659,68 @@ export const BodyTable: React.FC<Props> = ({
         </div>
       </div>
       <p className="mt-1.5 text-[10px] text-[#94A3B8]">
-        Keyboard: ↑/↓ rows · Alt+↑/↓ move · Alt+←/→ outdent / indent · F2 rename · Enter edit · Space select · Del delete · Ctrl+D duplicate
+        Keyboard: ↑/↓ rows · Alt+↑/↓ move · Alt+←/→ outdent / indent · F2 rename · Enter edit · Space select (Shift: range) · Del delete · Ctrl+D duplicate · Ctrl+Z undo · Esc
+        root
       </p>
+      <RoundDialog field={roundFor} onClose={() => setRoundFor(null)} onApply={(digits) => roundFor && actions.setRound(roundFor.uid, digits)} />
     </div>
+  );
+};
+
+/** Field-level "Round digits" (R4-DM-17): numbers are rounded half away from zero on output. */
+const RoundDialog: React.FC<{ field: FieldNode | null; onClose: () => void; onApply: (digits: number | null) => void }> = ({ field, onClose, onApply }) => {
+  const [text, setText] = useState('');
+  useEffect(() => {
+    if (field) setText(field.roundDigits === null ? '2' : String(field.roundDigits));
+  }, [field]);
+  const n = Number(text);
+  const valid = text.trim() !== '' && Number.isInteger(n) && n >= 0 && n <= ROUND_DIGITS_MAX;
+  const apply = (digits: number | null) => {
+    onApply(digits);
+    onClose();
+  };
+  return (
+    <Dialog
+      open={Boolean(field)}
+      onClose={onClose}
+      width="sm"
+      title="Round digits"
+      subtitle={field ? `Output of “${field.key || 'item'}”. Numbers are rounded half away from zero; text and other values are not changed.` : undefined}
+      footer={
+        <>
+          {field?.roundDigits !== null && (
+            <Button variant="ghost" size="sm" className="mr-auto" onClick={() => apply(null)}>
+              Turn off
+            </Button>
+          )}
+          <Button variant="outline" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="sm" disabled={!valid} onClick={() => apply(n)}>
+            Apply
+          </Button>
+        </>
+      }
+    >
+      <label className="block text-[12px] font-semibold text-[#334568]">
+        Digits after the decimal point (0 – {ROUND_DIGITS_MAX})
+        <input
+          type="number"
+          min={0}
+          max={ROUND_DIGITS_MAX}
+          step={1}
+          value={text}
+          data-autofocus
+          aria-invalid={!valid}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && valid) apply(n);
+          }}
+          className="mt-1 w-28 h-8 px-2 border border-[#D4DFEC] rounded-lg text-[13px] focus:outline-none focus:border-blue-500"
+        />
+      </label>
+      {!valid && <p className="mt-1 text-[11px] text-red-700">Enter a whole number from 0 to {ROUND_DIGITS_MAX}.</p>}
+      <p className="mt-2 text-[11px] text-[#657794]">Calculated numbers are already cleaned of binary noise (e.g. 30.364800000000002 → 30.3648); use this for a fixed precision.</p>
+    </Dialog>
   );
 };

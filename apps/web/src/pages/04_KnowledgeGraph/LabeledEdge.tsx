@@ -19,6 +19,11 @@ const RELATION_VERB_MAP: Record<string, string> = {
   INSTALLED_AT: 'installed at',
 };
 
+/** Human verb of a relation code, e.g. CONTAINS → "contains". */
+export function relationVerb(code: string): string {
+  return RELATION_VERB_MAP[code] || code.toLowerCase().replace(/_/g, ' ');
+}
+
 export const LabeledEdge: React.FC<EdgeProps> = ({
   id,
   sourceX,
@@ -43,7 +48,7 @@ export const LabeledEdge: React.FC<EdgeProps> = ({
   });
 
   const relationCode = String(data?.relation_code || 'CONNECTED_TO');
-  const verb = RELATION_VERB_MAP[relationCode] || relationCode.toLowerCase().replace(/_/g, ' ');
+  const verb = relationVerb(relationCode);
   const sourceLabel = String(data?.sourceLabel || 'Source');
   const targetLabel = String(data?.targetLabel || 'Target');
   const tooltipText = `${sourceLabel} ${verb} ${targetLabel}`;

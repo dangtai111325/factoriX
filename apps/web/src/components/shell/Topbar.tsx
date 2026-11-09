@@ -170,6 +170,27 @@ export const Topbar: React.FC = () => {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  // R4-UI-01: Esc closes the open menu and returns focus to its button.
+  const userMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const siteButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!userMenuOpen && !siteDropdownOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      if (userMenuOpen) {
+        setUserMenuOpen(false);
+        userMenuButtonRef.current?.focus();
+      }
+      if (siteDropdownOpen) {
+        setSiteDropdownOpen(false);
+        siteButtonRef.current?.focus();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [userMenuOpen, siteDropdownOpen]);
+
   // Toast timer
   useEffect(() => {
     if (!toastMessage) return;
@@ -237,6 +258,7 @@ export const Topbar: React.FC = () => {
           {/* Plant / Scope Selector */}
           <div className="relative hidden md:block" ref={siteDropdownRef}>
             <button
+              ref={siteButtonRef}
               type="button"
               onClick={() => setSiteDropdownOpen(!siteDropdownOpen)}
               aria-haspopup="listbox"
@@ -331,15 +353,19 @@ export const Topbar: React.FC = () => {
           <button
             type="button"
             onClick={() => setSearchOpen(true)}
-            aria-label="Search resources, signals and connections (Ctrl+K)"
+            aria-label="Search resources, signals, connections and data models (Ctrl+K)"
             aria-keyshortcuts="Control+K Meta+K"
-            className="w-9 lg:w-[260px] h-[36px] px-0 lg:px-3 rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-center lg:justify-between text-[13px] text-[#94A3B8] hover:border-[#0B2545] hover:text-[#334568] transition-colors shadow-2xs"
+            title="Search resources, signals, connections and data models (Ctrl+K)"
+            className="w-9 lg:w-[200px] xl:w-[260px] 2xl:w-[340px] h-[36px] px-0 lg:px-3 shrink-0 whitespace-nowrap rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-center lg:justify-between gap-2 text-[13px] text-[#94A3B8] hover:border-[#0B2545] hover:text-[#334568] transition-colors shadow-2xs"
           >
-            <div className="flex items-center gap-2">
-              <Search className="w-4 h-4 text-[#657794]" />
-              <span className="hidden lg:inline">Search resources, signals…</span>
+            {/* R4-UI-02: one line at every width; the label names data models too. */}
+            <div className="flex items-center gap-2 min-w-0">
+              <Search className="w-4 h-4 shrink-0 text-[#657794]" />
+              <span className="hidden lg:inline xl:hidden truncate">Search…</span>
+              <span className="hidden xl:inline 2xl:hidden truncate">Search signals, models…</span>
+              <span className="hidden 2xl:inline truncate">Search resources, signals, models…</span>
             </div>
-            <kbd className="hidden lg:inline px-1.5 py-0.5 text-[10px] font-mono bg-[#F1F5FA] border border-[#CBD5E1] rounded text-[#657794]">
+            <kbd className="hidden lg:inline shrink-0 px-1.5 py-0.5 text-[10px] font-mono bg-[#F1F5FA] border border-[#CBD5E1] rounded text-[#657794]">
               Ctrl K
             </kbd>
           </button>
@@ -358,6 +384,7 @@ export const Topbar: React.FC = () => {
           {/* User Menu Dropdown */}
           <div className="relative pl-1 sm:pl-2 border-l border-[#E2E8F0]" ref={userMenuRef}>
             <button
+              ref={userMenuButtonRef}
               type="button"
               onClick={() => setUserMenuOpen(!userMenuOpen)}
               aria-haspopup="menu"

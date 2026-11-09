@@ -19,6 +19,26 @@ export const SAMPLE_PRESETS: Array<{ ms: number; label: string }> = [
 export const KEY_MAX = 128;
 export const DEPTH_MAX = 16;
 export const FIELDS_MAX = 2000;
+/** Field-level "Round digits" range (server: body.MAX_ROUND_DIGITS). */
+export const ROUND_DIGITS_MAX = 12;
+
+/** Data quality of a field's sources (R4-DM-08), worst first. */
+export type FieldQuality = 'missing' | 'bad' | 'disabled' | 'no_data' | 'paused' | 'stale' | 'uncertain' | 'good';
+
+export interface QualitySummary {
+  status: FieldQuality;
+  counts: Partial<Record<FieldQuality, number>>;
+  affectedFields: number;
+  pausedSources: string[];
+  staleSources: string[];
+}
+
+export interface FieldQualityRow {
+  path: string;
+  nodeId?: string;
+  quality: FieldQuality;
+  reason: string | null;
+}
 
 /** Row of GET /data-models. */
 export interface ModelListItem {
@@ -71,6 +91,10 @@ export interface ApiFieldNode {
   ref_info?: ApiRefInfo | null;
   /** A referenced signal / resource was deleted or archived (read only). */
   missing?: boolean;
+  /** Readable explanation of the missing reference, with current names (read only). */
+  missing_reason?: string | null;
+  /** Optional output rounding (0..12 digits, half away from zero). */
+  round_digits?: number | null;
 }
 
 export interface ApiContainerNode {
@@ -116,6 +140,10 @@ export interface FieldNode {
   refTooltip: string;
   /** The server reported a deleted / archived reference. */
   missing: boolean;
+  /** Readable explanation of a missing reference (server). */
+  missingReason: string;
+  /** Output rounding in digits, null = off. */
+  roundDigits: number | null;
 }
 
 export interface ContainerNode {
@@ -190,6 +218,8 @@ export interface PreviewField {
   nodeId?: string;
   value: unknown;
   error: string | null;
+  quality?: FieldQuality;
+  qualityReason?: string | null;
 }
 
 export interface PreviewResult {
@@ -197,6 +227,7 @@ export interface PreviewResult {
   errors: FieldError[];
   sampledAt: string | null;
   fields: PreviewField[];
+  quality: QualitySummary | null;
 }
 
 export interface ValidateResult {
@@ -224,12 +255,18 @@ export interface LatestBody {
   body: string | null;
   sampledAt: string | null;
   errors: FieldError[];
+  /** Per-field source quality (GET /latest, model detail). */
+  fields?: FieldQualityRow[];
+  quality?: QualitySummary | null;
 }
 
 export interface UnmatchedRef {
   path: string;
   ref: string;
   reason: string;
+  /** Every field using this reference (one entry per reference). */
+  paths: string[];
+  count: number;
 }
 
 export interface DuplicateOutcome {
@@ -238,4 +275,8 @@ export interface DuplicateOutcome {
   createdName: string;
   replaced: number;
   unmatched: UnmatchedRef[];
+  /** Fields that would keep reading the source. */
+  unmatchedFields: number;
+  /** Not created because references were unmatched (skip_unmatched). */
+  skipped: boolean;
 }

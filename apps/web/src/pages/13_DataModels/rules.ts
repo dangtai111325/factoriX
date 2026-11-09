@@ -167,6 +167,19 @@ export function parseRef(text: string): { ref: ParsedRef; length: number } | nul
   return { ref: { selectors, key, attrs }, length: m[0].length };
 }
 
+/**
+ * Readable text of a deleted reference `$⚠missing[<last label>]`: "humidity on M1" / "M1"
+ * (R4-DM-12: the internal syntax is never shown in read-only views).
+ */
+export function missingLabel(display: string): string {
+  const m = /^\$⚠missing\[([\s\S]*)\]$/.exec(display.trim());
+  const inner = m ? m[1] : display;
+  const parsed = parseRef(inner) || parseRef(inner.replace(/\\([\\[\]])/g, '$1'));
+  if (!parsed) return inner || 'data point';
+  const name = parsed.ref.selectors[parsed.ref.selectors.length - 1].name;
+  return parsed.ref.key ? `${parsed.ref.key} on ${name}` : name;
+}
+
 export interface RefResolution {
   ok: boolean;
   resource?: CatalogResource;
@@ -356,7 +369,31 @@ export interface Token {
   signalId?: string;
 }
 
-const MISSING_RE = /^\$⚠missing\[[^\]\n]*\](?:\.[^\s()+\-*/%,<>=!]*)?/;
+const MISSING_PREFIX = '$⚠missing[';
+
+/**
+ * Length of a `$⚠missing[<label>](.@attr)*` reference at the start of `text`, else 0. The label is the
+ * server's last known reference text, e.g. `$machine[M1].humidity`: brackets inside are balanced (or
+ * escaped with `\`), so the closing bracket is found by depth, not by the first `]`.
+ */
+function missingRefLength(text: string): number {
+  if (!text.startsWith(MISSING_PREFIX)) return 0;
+  let depth = 1;
+  let i = MISSING_PREFIX.length;
+  while (i < text.length && depth > 0) {
+    const c = text[i];
+    if (c === '\\') i += 2;
+    else {
+      if (c === '[') depth += 1;
+      else if (c === ']') depth -= 1;
+      else if (c === '\n') return 0;
+      i += 1;
+    }
+  }
+  if (depth !== 0) return 0;
+  const attrs = /^(?:\.@[A-Za-z_]\w*)*/.exec(text.slice(i));
+  return i + (attrs ? attrs[0].length : 0);
+}
 
 /** Tokenize a rule expression. With an index, references are resolved and unresolved ones marked broken. */
 export function tokenize(text: string, index?: CatalogIndex | null): Token[] {
@@ -375,9 +412,9 @@ export function tokenize(text: string, index?: CatalogIndex | null): Token[] {
       continue;
     }
     if (ch === '$') {
-      const missing = MISSING_RE.exec(rest);
-      if (missing) {
-        push('broken', missing[0].length, { message: 'This reference points to a deleted or archived signal or resource.' });
+      const missingLen = missingRefLength(rest);
+      if (missingLen) {
+        push('broken', missingLen, { message: 'This reference points to a deleted or archived signal or resource.' });
         continue;
       }
       const parsed = parseRef(rest);

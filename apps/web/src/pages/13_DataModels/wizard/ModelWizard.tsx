@@ -1,6 +1,6 @@
 // Create / Edit wizard of a Data Model: 1 Basics → 2 Body (data tree | body fields | live preview) → 3 Review → Save & run.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRight, Check, ChevronLeft, ChevronRight, Eye, Rocket, Save } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Check, ChevronLeft, ChevronRight, Eye, Rocket, Save, Undo2 } from 'lucide-react';
 import { Button } from '../../../components/common/Button';
 import { ConfirmDialog } from '../../../components/common/ConfirmDialog';
 import { useSubmit } from '../../../lib/useSubmit';
@@ -55,7 +55,7 @@ import {
   isContainer,
 } from '../types';
 import { Banner, JsonBlock, Skeleton, StateChip, fieldCls, labelCls, sampleLabel } from '../ui';
-import { BodyTable, DropPlace, RowActions } from './BodyTable';
+import { BodyTable, DropPlace, LiveCell, RowActions } from './BodyTable';
 import { MapAllDialog, PasteJsonDialog } from './BuilderDialogs';
 import { DataTree } from './DataTree';
 import { PreviewPane } from './PreviewPane';
@@ -102,6 +102,69 @@ interface RuleTarget {
 }
 
 const TEMP_RULE_UID = 'rule-draft';
+/** Undo depth of the body builder (R4-DM-14). */
+const HISTORY_MAX = 50;
+/** A save never shows "Saving…" for longer than this (R4-DM-02). */
+const SAVE_TIMEOUT_MS = 60000;
+const TREE_WIDTH_KEY = 'fx.dm.treeWidth';
+const TREE_WIDTH_MIN = 220;
+const TREE_WIDTH_MAX = 640;
+
+function initialTreeWidth(): number {
+  try {
+    const v = Number(window.localStorage.getItem(TREE_WIDTH_KEY));
+    if (Number.isFinite(v) && v >= TREE_WIDTH_MIN && v <= TREE_WIDTH_MAX) return v;
+  } catch {
+    /* storage unavailable */
+  }
+  return 300;
+}
+
+function isTextTarget(el: EventTarget | null): boolean {
+  const t = el as HTMLElement | null;
+  return Boolean(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable));
+}
+
+/** Drag handle on the right edge of the data tree (R4-DM-07). Keyboard: ←/→ when focused. */
+const PaneResizer: React.FC<{ width: number; min: number; max: number; onChange: (w: number) => void }> = ({ width, min, max, onChange }) => {
+  const clamp = (w: number) => Math.round(Math.min(max, Math.max(min, w)));
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize the data tree"
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuenow={width}
+      tabIndex={0}
+      title="Drag to resize"
+      onPointerDown={(e) => {
+        e.preventDefault();
+        const startX = e.clientX;
+        const startW = width;
+        const el = e.currentTarget;
+        el.setPointerCapture(e.pointerId);
+        const move = (ev: PointerEvent) => onChange(clamp(startW + ev.clientX - startX));
+        const up = () => {
+          el.removeEventListener('pointermove', move);
+          el.removeEventListener('pointerup', up);
+          el.removeEventListener('pointercancel', up);
+        };
+        el.addEventListener('pointermove', move);
+        el.addEventListener('pointerup', up);
+        el.addEventListener('pointercancel', up);
+      }}
+      onDoubleClick={() => onChange(300)}
+      onKeyDown={(e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+          e.preventDefault();
+          onChange(clamp(width + (e.key === 'ArrowRight' ? 24 : -24)));
+        }
+      }}
+      className="hidden lg:block absolute top-3 bottom-3 -right-[11px] w-[6px] rounded-full cursor-col-resize bg-transparent hover:bg-blue-300 focus:bg-blue-400 focus:outline-none z-10"
+    />
+  );
+};
 
 export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSaved }) => {
   const isEdit = Boolean(modelId);
@@ -138,7 +201,11 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
   const [versionConflict, setVersionConflict] = useState(false);
   const [saveIssues, setSaveIssues] = useState<FieldError[]>([]);
   const [confirmLeave, setConfirmLeave] = useState(false);
+  const [history, setHistory] = useState<ContainerNode[]>([]);
+  const [notice, setNotice] = useState<{ text: string; undo: boolean } | null>(null);
+  const [treeWidth, setTreeWidth] = useState<number>(initialTreeWidth);
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const shownStep = useRef(1);
 
   useEffect(() => setPreviewOpen(wide || !lg), [wide, lg]);
 
@@ -159,6 +226,9 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
       setLabels(d.spec.labels);
       setBaseline(JSON.stringify({ n: d.name, d: d.description, s: d.sample_ms, b: specFingerprint(r) }));
       setSaveIssues([]);
+      setSaveError(null);
+      setHistory([]);
+      setNotice(null);
       setVersionConflict(false);
       setLoadState('ready');
       setStep(2);
@@ -173,8 +243,18 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
   }, [load]);
 
   useEffect(() => {
+    // R4-DM-10: on first render the name input keeps its autofocus. Moving focus to the heading
+    // blurred it, which marked the form as touched and showed "Name is required." before any input.
+    if (shownStep.current === step) return;
+    shownStep.current = step;
     headingRef.current?.focus();
   }, [step]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const t = window.setTimeout(() => setNotice(null), 10000);
+    return () => window.clearTimeout(t);
+  }, [notice]);
 
   // ------------------------------------------------------------ derived
   const fingerprint = useMemo(() => JSON.stringify({ n: name, d: description, s: sampleMs, b: specFingerprint(root) }), [name, description, sampleMs, root]);
@@ -185,7 +265,9 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
   const fields = useMemo(() => allFields(root), [root]);
   const fieldCount = fields.length;
   const liveEnabled = loadState === 'ready' && step >= 2 && fieldCount > 0;
-  const preview = usePreviewLoop(liveEnabled ? apiSpec : null, sampleMs, liveEnabled, modelId);
+  // The preview / validation loops stay quiet while a save runs, so the save is not queued behind them.
+  const [saving, setSaving] = useState(false);
+  const preview = usePreviewLoop(liveEnabled && !saving ? apiSpec : null, sampleMs, liveEnabled && !saving, modelId);
   const validation = useValidation(liveEnabled ? apiSpec : null, liveEnabled, modelId);
 
   const local = useMemo(() => localErrors(root), [root]);
@@ -220,7 +302,7 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
   }, [local, validation.result]);
 
   const values = useMemo(() => {
-    const out = new Map<string, { text: string; error: string | null }>();
+    const out = new Map<string, LiveCell>();
     const res = preview.result;
     if (!res) return out;
     const byNode = new Map(res.fields.filter((f) => f.nodeId).map((f) => [f.nodeId!, f]));
@@ -228,7 +310,7 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
     flatten(root).forEach((row) => {
       if (isContainer(row.node)) return;
       const f = byNode.get(row.node.uid);
-      if (f) out.set(row.node.uid, { text: displayValue(f.value), error: f.error });
+      if (f) out.set(row.node.uid, { text: displayValue(f.value), error: f.error, quality: f.quality, qualityReason: f.qualityReason ?? null });
       else if (parsed) {
         const node = nodeAt(parsed, row.segments);
         if (node) out.set(row.node.uid, { text: nodeText(node), error: null });
@@ -263,10 +345,43 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
   };
 
   // ------------------------------------------------------------ edits
-  const change = (next: ContainerNode) => {
+  /** Every body edit goes through here: it is undoable (Ctrl+Z) and clears the errors of a rejected save. */
+  const change = (next: ContainerNode, note?: string) => {
+    if (next === root) return;
+    setHistory((h) => [...h.slice(-(HISTORY_MAX - 1)), root]);
     setRoot(next);
     setSaveIssues([]);
+    setSaveError(null);
+    setNotice(note ? { text: note, undo: true } : null);
   };
+
+  const undo = () => {
+    const prev = history[history.length - 1];
+    if (!prev) return;
+    setHistory((h) => h.slice(0, -1));
+    setRoot(prev);
+    setSaveIssues([]);
+    setSaveError(null);
+    setNotice({ text: 'Undone.', undo: false });
+    setChecked(new Set());
+    if (selected && !locate(prev, selected)) setSelected(null);
+  };
+
+  // Ctrl+Z / Cmd+Z in the body step (text inputs and dialogs keep their own undo).
+  const undoRef = useRef(undo);
+  undoRef.current = undo;
+  const dialogOpen = Boolean(ruleTarget || mapAllFor || pasteOpen || confirmLeave);
+  useEffect(() => {
+    if (step !== 2 || dialogOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && !isTextTarget(e.target)) {
+        e.preventDefault();
+        undoRef.current();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [step, dialogOpen]);
 
   const insert = (nodes: BodyNode[], selectInserted: 'last' | 'keep' | 'firstUnmapped' = 'last') => {
     if (!nodes.length) return;
@@ -327,10 +442,12 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
     convert: (uid) => {
       const hit = locate(root, uid);
       if (!hit || isContainer(hit.node)) return;
-      const patch = convertField(hit.node, index);
-      change(updateNode(root, uid, patch));
+      const { patch, note } = convertField(hit.node, index);
+      change(updateNode(root, uid, patch), note || undefined);
       if (patch.mode === 'calculated') setRuleTarget({ uid, parentUid: null });
+      else setSelected(uid);
     },
+    setRound: (uid, digits) => change(updateNode(root, uid, { roundDigits: digits })),
     toggleContainerType: (uid) => {
       const hit = locate(root, uid);
       if (!hit || !isContainer(hit.node)) return;
@@ -349,7 +466,10 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
     outdent: (uid) => change(outdentNode(root, uid)),
     duplicate: (uid) => change(duplicateNode(root, uid)),
     remove: (uids) => {
-      change(removeNodes(root, uids));
+      if (!uids.length) return;
+      const rows = flatten(root).filter((r) => uids.includes(r.node.uid));
+      const label = rows.length === 1 ? `Deleted “${rows[0].path || 'item'}”.` : `Deleted ${rows.length} rows.`;
+      change(removeNodes(root, uids), label);
       setChecked(new Set(Array.from(checked).filter((u) => !uids.includes(u))));
       if (selected && uids.includes(selected)) setSelected(null);
     },
@@ -393,15 +513,18 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
         initial: { key: f.key, expr: f.exprText, valueType: f.valueType } as RuleDraft,
         siblingKeys: hit.parent.children.filter((c) => c.uid !== f.uid).map((c) => c.key),
         nodeId: f.uid,
+        itemLabel: hit.parent.type === 'array' ? `${hit.parent.key || 'array'}[${hit.index}]` : null,
       };
     }
     const parent = locate(root, ruleTarget.parentUid || '')?.node;
     const container = parent && isContainer(parent) ? parent : root;
+    const at = ruleTarget.index ?? container.children.length;
     return {
       keyed: container.type !== 'array',
       initial: { key: uniqueKey(container, 'rule'), expr: '', valueType: 'auto' as ValueType },
       siblingKeys: container.children.map((c) => c.key),
       nodeId: TEMP_RULE_UID,
+      itemLabel: container.type === 'array' ? `${container.key || 'array'}[${at}]` : null,
     };
   }, [ruleTarget, root]);
 
@@ -444,15 +567,24 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
     setSaveError(null);
     setNameConflict(null);
     setVersionConflict(false);
+    setSaving(true);
+    // R4-DM-02: the button can never stay on "Saving…": the request is aborted after SAVE_TIMEOUT_MS
+    // and every outcome (success, rejection, network error, timeout) ends in `finally`.
+    const ctrl = new AbortController();
+    let timedOut = false;
+    const timer = window.setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, SAVE_TIMEOUT_MS);
     const payload = { name: trimmedName, description: description.trim(), sample_ms: sampleMs, spec: apiSpec };
     try {
       let id = modelId;
       let wasPaused = detail?.state === 'PAUSED';
       if (isEdit && modelId && detail) {
-        const updated = await updateModel(modelId, detail.version, payload);
+        const updated = await updateModel(modelId, detail.version, payload, ctrl.signal);
         wasPaused = updated.state === 'PAUSED';
       } else {
-        const created = await createModel({ ...payload, state: run ? 'RUNNING' : 'PAUSED' });
+        const created = await createModel({ ...payload, state: run ? 'RUNNING' : 'PAUSED' }, ctrl.signal);
         id = created.id;
         wasPaused = created.state === 'PAUSED';
       }
@@ -461,6 +593,10 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
       setBaseline(fingerprint);
       onSaved(id!, isEdit ? `Saved “${trimmedName}”.${run ? ' It is running.' : ''}` : `Created “${trimmedName}”${run ? ' and started sampling' : ''}.`);
     } catch (err) {
+      if (timedOut) {
+        setSaveError('FactoriX did not answer in time. Your changes are kept on this page — retry in a moment.');
+        return;
+      }
       if (isDuplicateName(err)) {
         setNameConflict('Another data model already uses this name.');
         setStep(1);
@@ -474,8 +610,16 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
       if (issues.length) {
         setSaveIssues(issues);
         setStep(2);
+        // Same count as the body status bar ("N row(s) with errors"), not the raw issue count.
+        const rows = errorsByUid(root, issues.filter((e) => e.severity !== 'warning')).size;
+        const first = issues.find((e) => e.severity !== 'warning') || issues[0];
+        setSaveError(`Not saved: ${rows} row${rows === 1 ? '' : 's'} need${rows === 1 ? 's' : ''} fixing. ${first.path ? `${first.path}: ` : ''}${first.message}`);
+        return;
       }
       setSaveError(errorText(err, 'Could not save the model.'));
+    } finally {
+      window.clearTimeout(timer);
+      setSaving(false);
     }
   });
 
@@ -531,7 +675,19 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
         <Button variant="ghost" size="sm" icon={<ArrowLeft className="w-3.5 h-3.5" />} onClick={onCancel}>
           Data models
         </Button>
-        <Banner tone="error" action={<Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>}>
+        <Banner
+          tone="error"
+          action={
+            <div className="flex gap-2">
+              <Button size="sm" variant="outline" onClick={() => void load()}>
+                Retry
+              </Button>
+              <Button size="sm" variant="primary" onClick={onCancel}>
+                Back to catalog
+              </Button>
+            </div>
+          }
+        >
           {loadError}
         </Banner>
       </div>
@@ -694,10 +850,16 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
                 <span className="text-[12px] text-[#657794]">seconds (0.2 – 3600)</span>
               </div>
             )}
-            {sampleError && <p className="mt-1 text-[11px] text-red-700">{sampleError}</p>}
-            <p className="mt-2 text-[12px] text-[#657794] leading-relaxed">
-              Every {Number.isFinite(sampleMs) ? sampleLabel(sampleMs) : 'N seconds'} the model reads the latest value of each data point. Independent of how often the collector reads the source.
-            </p>
+            {sampleError ? (
+              // R4-DM-19: an invalid value shows only the error, never "Every 100 ms …" next to it.
+              <p className="mt-1 text-[11px] text-red-700" role="alert">
+                {sampleError}
+              </p>
+            ) : (
+              <p className="mt-2 text-[12px] text-[#657794] leading-relaxed">
+                Every {sampleLabel(sampleMs)} the model reads the latest value of each data point. Independent of how often the collector reads the source.
+              </p>
+            )}
           </fieldset>
           <div className="flex justify-between pt-3 border-t border-slate-100">
             <Button variant="outline" size="sm" onClick={requestCancel}>
@@ -714,15 +876,29 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
       {step === 2 && (
         <>
           <div
-            className={`grid grid-cols-1 gap-4 ${
+            style={{ ['--tree-w' as string]: `${treeWidth}px` } as React.CSSProperties}
+            className={`grid grid-cols-1 gap-4 min-w-0 ${
               !previewOpen
-                ? 'lg:grid-cols-[minmax(220px,260px)_minmax(0,1fr)_40px]'
+                ? 'lg:grid-cols-[var(--tree-w)_minmax(0,1fr)_40px]'
                 : wide
-                ? 'lg:grid-cols-[280px_minmax(0,1fr)_minmax(300px,380px)]'
-                : 'lg:grid-cols-[minmax(220px,260px)_minmax(0,1fr)]'
+                ? 'lg:grid-cols-[var(--tree-w)_minmax(0,1fr)_minmax(300px,380px)]'
+                : 'lg:grid-cols-[var(--tree-w)_minmax(0,1fr)]'
             }`}
           >
-            <section aria-label="Data tree" className="bg-white border border-[#CBD5E1] rounded-xl p-3 min-h-0 h-[420px] lg:h-[calc(100vh-260px)] lg:min-h-[520px] flex flex-col">
+            <section aria-label="Data tree" className="relative bg-white border border-[#CBD5E1] rounded-xl p-3 min-w-0 min-h-0 h-[420px] lg:h-[calc(100vh-260px)] lg:min-h-[520px] flex flex-col">
+              <PaneResizer
+                width={treeWidth}
+                min={TREE_WIDTH_MIN}
+                max={TREE_WIDTH_MAX}
+                onChange={(w) => {
+                  setTreeWidth(w);
+                  try {
+                    window.localStorage.setItem(TREE_WIDTH_KEY, String(w));
+                  } catch {
+                    /* storage unavailable */
+                  }
+                }}
+              />
               <DataTree
                 index={index}
                 loading={catalog.loading}
@@ -734,12 +910,25 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
                 usedSignalIds={usedSignalIds}
               />
             </section>
-            <section aria-label="Body fields" className="bg-white border border-[#CBD5E1] rounded-xl p-3 min-h-[420px] lg:h-[calc(100vh-260px)] lg:min-h-[520px] flex flex-col">
+            <section aria-label="Body fields" className="bg-white border border-[#CBD5E1] rounded-xl p-3 min-w-0 min-h-[420px] lg:h-[calc(100vh-260px)] lg:min-h-[520px] flex flex-col">
+              {notice && (
+                <div role="status" className="mb-2 flex items-center gap-2 rounded-lg border border-slate-200 bg-[#F8FAFC] px-2.5 py-1.5 text-[12px] text-[#334568]">
+                  <span className="min-w-0 flex-1">{notice.text}</span>
+                  {notice.undo && history.length > 0 && (
+                    <Button size="sm" variant="outline" icon={<Undo2 className="w-3.5 h-3.5" />} onClick={undo}>
+                      Undo
+                    </Button>
+                  )}
+                </div>
+              )}
               <BodyTable
                 root={root}
                 index={index}
                 selected={selected}
                 onSelect={setSelected}
+                targetLabel={target.label}
+                canUndo={history.length > 0}
+                onUndo={undo}
                 checked={checked}
                 onChecked={setChecked}
                 collapsed={collapsed}
@@ -754,7 +943,7 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
               />
             </section>
             {previewOpen ? (
-              <section aria-label="Live preview" className={`bg-white border border-[#CBD5E1] rounded-xl p-3 flex flex-col ${wide ? 'lg:h-[calc(100vh-260px)] lg:min-h-[520px]' : lg ? 'lg:col-span-2 h-[420px]' : 'h-[420px]'}`}>
+              <section aria-label="Live preview" className={`bg-white border border-[#CBD5E1] rounded-xl p-3 min-w-0 flex flex-col ${wide ? 'lg:h-[calc(100vh-260px)] lg:min-h-[520px]' : lg ? 'lg:col-span-2 h-[420px]' : 'h-[420px]'}`}>
                 {lg && !wide && (
                   <div className="flex justify-end -mb-1">
                     <button type="button" onClick={() => setPreviewOpen(false)} className="text-[11px] font-semibold text-[#134074] hover:underline">
@@ -915,6 +1104,7 @@ export const ModelWizard: React.FC<Props> = ({ modelId, models, onCancel, onSave
         <RuleEditorDialog
           open
           keyed={ruleCtx.keyed}
+          itemLabel={ruleCtx.itemLabel}
           initial={ruleCtx.initial}
           index={index}
           exampleRefs={ruleIndexRefs}
