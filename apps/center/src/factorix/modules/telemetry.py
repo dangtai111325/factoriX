@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import collections
 import logging
 import math
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -365,7 +368,12 @@ async def ingest_observations(
     # transaction: its row locks on `connections` are shared with the heartbeat.
     if live_connections:
         await _mark_connections_live(session, tenant_id, edge_id, live_connections, now)
-    return {"results": [row for row in results if row is not None]}
+    stored = [row for row in results if row is not None]
+    committed = sum(1 for row in stored if row.get("status") == "committed")
+    if committed:
+        # Display metric only (Overview "ingestion rate"); the edge-sync handler commits right after.
+        _INGEST_RATE.add(str(tenant_id), committed)
+    return {"results": stored}
 
 
 class _StoreOutcome:
@@ -1097,25 +1105,72 @@ async def aggregate(
     return {"fn": fn, "bucket_ms": bucket_ms, "buckets": rows, "empty_buckets": "omitted", "quality_policy": "GOOD_ONLY"}
 
 
+class _IngestRate:
+    """Rolling one-minute count of committed samples per tenant, kept in memory.
+
+    The Overview polls this every few seconds; counting rows of the (multi-million row)
+    observations table for it saturated the database (R4 performance finding)."""
+
+    def __init__(self, window_s: float = 60.0) -> None:
+        self._window = window_s
+        self._events: dict[str, collections.deque[tuple[float, int]]] = {}
+
+    def add(self, tenant: str, count: int) -> None:
+        now = time.monotonic()
+        events = self._events.setdefault(tenant, collections.deque())
+        events.append((now, count))
+        self._trim(events, now)
+
+    def per_minute(self, tenant: str) -> int:
+        events = self._events.get(tenant)
+        if not events:
+            return 0
+        self._trim(events, time.monotonic())
+        return sum(count for _, count in events)
+
+    def _trim(self, events: "collections.deque[tuple[float, int]]", now: float) -> None:
+        while events and now - events[0][0] > self._window:
+            events.popleft()
+
+
+_INGEST_RATE = _IngestRate()
+_TOTALS_TTL_S = 300.0
+_totals_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_totals_lock = asyncio.Lock()
+
+
+async def _observation_totals(session: AsyncSession, tenant_id: UUID) -> dict[str, Any]:
+    """Size figures of stored history (count, oldest, newest, quarantine, dedup keys), refreshed at
+    most every 5 minutes with a single query in flight; they scan large tables."""
+    key = str(tenant_id)
+    cached = _totals_cache.get(key)
+    if cached and time.monotonic() - cached[0] < _TOTALS_TTL_S:
+        return cached[1]
+    async with _totals_lock:
+        cached = _totals_cache.get(key)
+        if cached and time.monotonic() - cached[0] < _TOTALS_TTL_S:
+            return cached[1]
+        row = await fetch_one(
+            session,
+            """
+            SELECT count(*) AS observations, min(event_time) AS oldest, max(event_time) AS newest
+            FROM observations WHERE tenant_id = :tenant_id
+            """,
+            {"tenant_id": tenant_id},
+        )
+        totals = dict(row) if row else {"observations": 0, "oldest": None, "newest": None}
+        # ingest_dedup holds a key per sample for 7 days: as large as the history itself.
+        quarantine = await fetch_one(session, "SELECT count(*) AS count FROM observation_quarantine WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
+        dedup = await fetch_one(session, "SELECT count(*) AS count FROM ingest_dedup WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
+        totals["quarantine"] = int(quarantine["count"]) if quarantine else 0
+        totals["dedup_keys"] = int(dedup["count"]) if dedup else 0
+        _totals_cache[key] = (time.monotonic(), totals)
+        return totals
+
+
 async def storage_overview(session: AsyncSession, tenant_id: UUID) -> dict[str, Any]:
-    totals = await fetch_one(
-        session,
-        """
-        SELECT count(*) AS observations,
-               min(event_time) AS oldest,
-               max(event_time) AS newest
-        FROM observations WHERE tenant_id = :tenant_id
-        """,
-        {"tenant_id": tenant_id},
-    )
-    recent = await fetch_one(
-        session,
-        """
-        SELECT count(*) AS count FROM observations
-        WHERE tenant_id = :tenant_id AND received_time >= :since
-        """,
-        {"tenant_id": tenant_id, "since": utcnow() - timedelta(minutes=1)},
-    )
+    totals = await _observation_totals(session, tenant_id)
+    recent = {"count": _INGEST_RATE.per_minute(str(tenant_id))}
     quality = await fetch_all(
         session,
         """
@@ -1126,16 +1181,8 @@ async def storage_overview(session: AsyncSession, tenant_id: UUID) -> dict[str, 
         """,
         {"tenant_id": tenant_id},
     )
-    quarantine = await fetch_one(
-        session,
-        "SELECT count(*) AS count FROM observation_quarantine WHERE tenant_id = :tenant_id",
-        {"tenant_id": tenant_id},
-    )
-    dedup = await fetch_one(
-        session,
-        "SELECT count(*) AS count FROM ingest_dedup WHERE tenant_id = :tenant_id",
-        {"tenant_id": tenant_id},
-    )
+    quarantine = {"count": totals.get("quarantine", 0)}
+    dedup = {"count": totals.get("dedup_keys", 0)}
     backlog = await fetch_one(
         session,
         "SELECT COALESCE(sum(outbox_pending), 0) AS pending FROM edge_nodes WHERE tenant_id = :tenant_id",
