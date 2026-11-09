@@ -27,7 +27,7 @@ import {
 import { CommissionResult, runConnectionTest } from '../lib/commissioning'
 import { normalizeQuality } from '../lib/format'
 import { endpointWithScheme } from '../lib/protocols'
-import { connectivityDelay, onConnectivityRestored, useConnectivity } from '../lib/connectivity'
+import { connectivityDelay, onConnectivityRestored, reportApiSuccess, useConnectivity } from '../lib/connectivity'
 
 const EMPTY_PLANT: PlantScope = {
   id: '',
@@ -580,9 +580,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!keep.has(id)) liveRef.current.delete(id)
     }
     setSignalMeta(metas)
-    // Reconcile latest values for ALL signals (chunked), merged by received_time.
-    await fetchLatest(ids)
-
     setLayoutNodes([])
     if (modelList) {
       // GET /data-models answers a plain array (tolerate a {items} page as well).
@@ -652,6 +649,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           lastError: text(row.last_error),
         })),
     )
+    // Reconcile latest values for ALL signals (chunked), merged by received_time.
+    void fetchLatest(ids)
   }, [fetchLatest])
 
   const refresh = useCallback(async () => {
@@ -718,6 +717,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!isStreaming || !signalIdsKey) return
     const ids = signalIdsKey.split(',')
     const onLatest = (msg: LatestMsg) => {
+      reportApiSuccess()
       const id = text(msg.signal_id)
       const current = liveRef.current.get(id)
       const next: LiveState = {
@@ -736,6 +736,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Push: connection / edge health.
   useEffect(() => {
     const onHealth = (msg: HealthMsg) => {
+      reportApiSuccess()
       const id = text(msg.id)
       if (msg.entity === 'connection') {
         setConnections((prev) =>
@@ -921,7 +922,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const archiveResource = async (resourceId: string) => {
     try {
       await api(`/api/v1/resources/${resourceId}/archive`, { method: 'POST' })
-      await refresh()
+      setAllResources((prev) => prev.filter((item) => item.id !== resourceId))
+      void refresh()
       if (selectedResourceId === resourceId) {
         setSelectedResourceId('')
       }

@@ -48,21 +48,36 @@ function useVisibleDocument(): boolean {
 // ------------------------------------------------------------------ list
 
 export function useModelList() {
-  const [models, setModels] = useState<ModelListItem[]>([]);
+  const [models, setModelsState] = useState<ModelListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const visible = useVisibleDocument();
+  const seqRef = useRef(0);
+
+  const setModels = useCallback((val: React.SetStateAction<ModelListItem[]>) => {
+    seqRef.current += 1;
+    setModelsState(val);
+  }, []);
+
   const reload = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
+    const seq = ++seqRef.current;
     try {
-      setModels(await listModels());
-      setError(null);
-      setLoaded(true);
+      const data = await listModels();
+      if (seq === seqRef.current) {
+        setModelsState(data);
+        setError(null);
+        setLoaded(true);
+      }
     } catch (err) {
-      setError(errorText(err, 'Could not load data models.'));
+      if (seq === seqRef.current) {
+        setError(errorText(err, 'Could not load data models.'));
+      }
     } finally {
-      setLoading(false);
+      if (seq === seqRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
   useEffect(() => {

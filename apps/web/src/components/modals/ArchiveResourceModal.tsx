@@ -44,6 +44,7 @@ export const ArchiveResourceModal: React.FC<ArchiveResourceModalProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [impact, setImpact] = useState<ImpactState>({ status: 'loading' });
   const [archiveModels, setArchiveModels] = useState(false);
+  const impactPromiseRef = useRef<Promise<ArchiveImpact | null> | null>(null);
   // In-flight guard: one archive request however often the button is pressed.
   const archive = useSubmit((options: { archiveModels: boolean; models: ImpactModel[] }) => onConfirm(options));
   const submitting = archive.pending;
@@ -55,12 +56,17 @@ export const ArchiveResourceModal: React.FC<ArchiveResourceModalProps> = ({
 
   const loadImpact = useCallback(async (id: string, isActive: () => boolean = () => true) => {
     setImpact({ status: 'loading' });
-    try {
-      const next = await fetchArchiveImpact(id);
-      if (isActive()) setImpact({ status: 'ready', impact: next });
-    } catch (caught) {
-      if (isActive()) setImpact({ status: 'error', message: translateApiError(caught) });
-    }
+    const p = fetchArchiveImpact(id)
+      .then((next) => {
+        if (isActive()) setImpact({ status: 'ready', impact: next });
+        return next;
+      })
+      .catch((caught) => {
+        if (isActive()) setImpact({ status: 'error', message: translateApiError(caught) });
+        return null;
+      });
+    impactPromiseRef.current = p;
+    return p;
   }, []);
 
   useEffect(() => {
@@ -90,10 +96,15 @@ export const ArchiveResourceModal: React.FC<ArchiveResourceModalProps> = ({
   const signalsStopping = impact.status === 'ready' && impact.impact.signalCount != null ? impact.impact.signalCount : signalCount;
 
   const handleConfirm = async () => {
-    if (archive.isRunning() || impact.status === 'loading') return;
+    if (archive.isRunning()) return;
     setError(null);
+    let resolvedModels = models;
+    if (impact.status === 'loading' && impactPromiseRef.current) {
+      const res = await impactPromiseRef.current;
+      if (res) resolvedModels = res.models;
+    }
     try {
-      const result = await archive.run({ archiveModels: archiveModels && models.length > 0, models });
+      const result = await archive.run({ archiveModels: archiveModels && resolvedModels.length > 0, models: resolvedModels });
       if (!result) return;
       if (!result.success) {
         setError(translateApiError(result.error || 'The resource could not be archived.'));
@@ -274,8 +285,7 @@ export const ArchiveResourceModal: React.FC<ArchiveResourceModalProps> = ({
               <button
                 type="button"
                 onClick={() => void handleConfirm()}
-                disabled={submitting || impact.status === 'loading'}
-                title={impact.status === 'loading' ? 'Checking the affected data models…' : undefined}
+                disabled={submitting}
                 className="h-8 px-3 bg-[#DB2028] hover:bg-[#C21A21] text-white rounded-lg text-[12px] font-semibold transition-colors disabled:opacity-50 inline-flex items-center gap-1.5"
               >
                 <Archive className="w-3.5 h-3.5" aria-hidden="true" />

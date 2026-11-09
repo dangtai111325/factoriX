@@ -47,7 +47,7 @@ function resourceContext(byId: Map<string, ResourceNode>, resourceId: string): {
 }
 
 export const SearchModal: React.FC = () => {
-  const { searchOpen, setSearchOpen, searchQuery, setSearchQuery, resources, signals, connections, dataModels } = useApp();
+  const { searchOpen, setSearchOpen, searchQuery, setSearchQuery, resources, signals, connections, dataModels, loadState } = useApp();
   const inputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -196,7 +196,9 @@ export const SearchModal: React.FC = () => {
           {/* Results Body */}
           <div className="max-h-[min(380px,calc(100vh-8rem))] overflow-y-auto p-3 space-y-4">
             {hasQuery && allResults.length === 0 && (
-              <div className="py-8 text-center text-[14px] text-[#657794]">No results for "{searchQuery}"</div>
+              <div className="py-8 text-center text-[14px] text-[#657794]">
+                {loadState === 'loading' ? 'Loading search index…' : `No results for "${searchQuery}"`}
+              </div>
             )}
 
             {sections.map((section) => (

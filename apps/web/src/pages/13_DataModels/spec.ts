@@ -438,7 +438,10 @@ export function errorsByUid(root: ContainerNode, errors: FieldError[]): Map<stri
     if (e.nodeId && uids.has(e.nodeId)) uid = e.nodeId;
     if (!uid && e.path) uid = byPointer.get(e.path) || byDotted.get(e.path.replace(/^\$\.?/, ''));
     const key = uid || root.uid;
-    out.set(key, [...(out.get(key) || []), e]);
+    const list = out.get(key) || [];
+    if (!list.some((item) => item.message === e.message)) {
+      out.set(key, [...list, e]);
+    }
   });
   return out;
 }

@@ -171,20 +171,26 @@ async def audit(
     )
 
 
+_KNOWN_PARTITIONS: set[str] = set()
+
+
 async def create_partitions_for(session: AsyncSession, moment: datetime) -> None:
     from factorix.platform.db import _month_start, _shift_month
 
     months = [_shift_month(moment.date(), -1), _month_start(moment.date()), _shift_month(moment.date(), 1)]
     for start in months:
-        end = _shift_month(start, 1)
         name = f"observations_{start.year}_{start.month:02d}"
+        if name in _KNOWN_PARTITIONS:
+            continue
         if not _PARTITION.fullmatch(name):
             raise RuntimeError("partition")
+        end = _shift_month(start, 1)
         start_s, end_s = start.isoformat(), end.isoformat()
         if not _DAY.fullmatch(start_s) or not _DAY.fullmatch(end_s):
             raise RuntimeError("partition bound")
         exists = await session.execute(text("SELECT to_regclass(:name)"), {"name": f"public.{name}"})
         if exists.scalar() is not None:
+            _KNOWN_PARTITIONS.add(name)
             continue
         await session.execute(
             text(
@@ -192,3 +198,4 @@ async def create_partitions_for(session: AsyncSession, moment: datetime) -> None
                 f"FOR VALUES FROM ('{start_s}') TO ('{end_s}')"
             )
         )
+        _KNOWN_PARTITIONS.add(name)

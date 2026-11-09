@@ -958,12 +958,16 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
         session,
         """
         SELECT l.*, s.key, s.display_name, s.expected_interval_ms,
-               o.provenance_json->>'reason' AS raw_reason,
+               CASE WHEN l.quality <> 'GOOD' THEN (
+                   SELECT o.provenance_json->>'reason'
+                   FROM observations o
+                   WHERE o.event_time = l.event_time AND o.id = l.observation_id
+                   LIMIT 1
+               ) END AS raw_reason,
                COALESCE(nb.nullable, FALSE) AS nullable,
                COALESCE(nb.connection_status = 'PAUSED', FALSE) AS connection_paused
         FROM latest_signal_state l
         JOIN signal_definitions s ON s.id = l.signal_id
-        LEFT JOIN observations o ON o.event_time = l.event_time AND o.id = l.observation_id
         LEFT JOIN LATERAL (
             SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable, c.status AS connection_status
             FROM signal_bindings b

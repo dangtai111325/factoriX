@@ -570,7 +570,9 @@ export const SignalsCatalogPage: React.FC = () => {
         <div className="min-w-0">
           <h1 className="text-[20px] font-bold text-[#111B37]">Signals</h1>
           <p className="text-[13px] text-[#657794]">
-            Signal catalog with live values ({signals.length} signal{signals.length === 1 ? '' : 's'})
+            {loadState !== 'ready' && signals.length === 0
+              ? 'Signal catalog with live values (loading…)'
+              : `Signal catalog with live values (${signals.length} signal${signals.length === 1 ? '' : 's'})`}
           </p>
         </div>
 
@@ -663,7 +665,7 @@ export const SignalsCatalogPage: React.FC = () => {
                     : 'text-slate-500 hover:text-slate-800 bg-slate-100'
                 }`}
               >
-                All ({signals.length})
+                {loadState !== 'ready' && signals.length === 0 ? 'All' : `All (${signals.length})`}
               </button>
             </div>
           </div>
@@ -1014,7 +1016,14 @@ export const SignalsCatalogPage: React.FC = () => {
                         return (
                           <tr
                             key={sig.id}
-                            onClick={() => setSelectedSignal(sig)}
+                            onClick={(e) => {
+                              if (e.shiftKey) {
+                                e.preventDefault();
+                                handleToggleSelect(sig.id, true);
+                                return;
+                              }
+                              setSelectedSignal(sig);
+                            }}
                             className={`hover:bg-slate-50 cursor-pointer transition ${
                               isChecked ? 'bg-blue-50/30' : ''
                             }`}

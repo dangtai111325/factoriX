@@ -117,6 +117,10 @@ export const BulkAddressDialog: React.FC<BulkAddressDialogProps> = ({ isOpen, si
   const invalid = Array.from(bySignal.values()).filter((rows) => rows.some((row) => row.error));
   const unchangedCount = bySignal.size - changed.length - invalid.length;
 
+  // In-flight guard (R3-DM-04 / R5-SG-03): declared unconditionally before the early return so hook
+  // order never changes when `isOpen` toggles from false to true.
+  const applyingRef = useRef(false);
+
   if (!isOpen) return null;
 
   const insertToken = (token: string) => {
@@ -124,8 +128,6 @@ export const BulkAddressDialog: React.FC<BulkAddressDialogProps> = ({ isOpen, si
     else setReplace((prev) => prev + token);
   };
 
-  // In-flight guard (R3-DM-04): one all-or-nothing request per click burst.
-  const applyingRef = useRef(false);
   const handleApply = async () => {
     if (applyingRef.current || !changed.length || invalid.length) return;
     applyingRef.current = true;

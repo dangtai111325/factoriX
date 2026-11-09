@@ -45,11 +45,12 @@ export function useRangeSelection(order: string[], existing?: string[]): RangeSe
   }, [existingKey]);
 
   const toggle = useCallback((id: string, shift: boolean) => {
+    const anchor = anchorRef.current;
+    anchorRef.current = id;
     setSelected((prev) => {
       const next = new Set(prev);
       const on = !prev.has(id);
       const list = orderRef.current;
-      const anchor = anchorRef.current;
       const from = anchor ? list.indexOf(anchor) : -1;
       const to = list.indexOf(id);
       if (shift && from >= 0 && to >= 0) {
@@ -62,7 +63,6 @@ export function useRangeSelection(order: string[], existing?: string[]): RangeSe
       else next.delete(id);
       return next;
     });
-    anchorRef.current = id;
   }, []);
 
   const setMany = useCallback((ids: string[], on: boolean) => {

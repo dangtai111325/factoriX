@@ -20,10 +20,28 @@ const inputCls = 'w-full px-3 py-2 border border-slate-300 rounded text-[13px] f
 
 type RoundMode = 'keep' | 'set' | 'remove';
 
-const NUMERIC = new Set(['int64', 'float64', 'number', 'integer', 'float', 'double']);
+const NUMERIC = new Set([
+  'analog',
+  'float32',
+  'float64',
+  'int16',
+  'uint16',
+  'int32',
+  'uint32',
+  'int64',
+  'uint64',
+  'number',
+  'integer',
+  'int',
+  'float',
+  'double',
+  'decimal',
+]);
 
 function isNumeric(signal: SignalItem): boolean {
-  return NUMERIC.has(String(signal.dataType || signal.data_type || '').toLowerCase());
+  const raw = String(signal.data_type || signal.dataType || '').toLowerCase();
+  const ui = String(signal.dataType || '').toLowerCase();
+  return NUMERIC.has(raw) || NUMERIC.has(ui);
 }
 
 /** The single value all signals share, or null when they differ. */

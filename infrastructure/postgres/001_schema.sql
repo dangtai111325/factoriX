@@ -435,6 +435,8 @@ CREATE TABLE ingest_dedup (
     PRIMARY KEY (tenant_id, edge_id, event_uid)
 );
 
+CREATE INDEX ingest_dedup_first_seen ON ingest_dedup (first_seen_at);
+
 CREATE TABLE latest_signal_state (
     tenant_id UUID NOT NULL,
     signal_id UUID NOT NULL,
@@ -464,6 +466,8 @@ CREATE TABLE observation_quarantine (
     received_time TIMESTAMPTZ NOT NULL,
     payload_redacted JSONB NOT NULL
 );
+
+CREATE INDEX observation_quarantine_received ON observation_quarantine (received_time);
 
 CREATE TABLE dashboards (
     id UUID PRIMARY KEY,
@@ -537,6 +541,9 @@ CREATE TABLE audit_events (
     correlation_id TEXT NOT NULL,
     occurred_at TIMESTAMPTZ NOT NULL
 );
+
+CREATE INDEX audit_events_occurred_at ON audit_events (occurred_at);
+CREATE INDEX audit_events_noise_prune ON audit_events (event_type, occurred_at);
 
 CREATE INDEX audit_tenant_time ON audit_events (tenant_id, occurred_at DESC);
 

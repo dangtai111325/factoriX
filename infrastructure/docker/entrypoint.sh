@@ -10,6 +10,19 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
   su postgres -c "$PG_BIN/initdb -D $PGDATA --locale=C --encoding=UTF8 --auth-local=peer --auth-host=scram-sha-256"
   printf "\nlisten_addresses = '127.0.0.1'\n" >> "$PGDATA/postgresql.conf"
 fi
+if ! grep -q "synchronous_commit = off" "$PGDATA/postgresql.conf"; then
+  cat <<'EOF' >> "$PGDATA/postgresql.conf"
+
+# Performance tuning for high-throughput IIoT ingestion
+shared_buffers = 1024MB
+work_mem = 32MB
+maintenance_work_mem = 256MB
+wal_buffers = 16MB
+max_wal_size = 4GB
+checkpoint_completion_target = 0.9
+synchronous_commit = off
+EOF
+fi
 su postgres -c "$PG_BIN/pg_ctl -D $PGDATA -w -l $PGDATA/postgres.log start"
 python /opt/factorix/infrastructure/docker/bootstrap_db.py
 cd /opt/factorix/apps/center

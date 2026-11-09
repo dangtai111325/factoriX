@@ -101,15 +101,17 @@ export const DataModelsPage: React.FC = () => {
     const { kind, models } = bulkOp;
     const failed: string[] = [];
     let done = 0;
-    for (const m of models) {
-      try {
-        if (kind === 'delete') await once(`dm-del:${m.id}`, () => deleteModel(m.id));
-        else await once(`dm-run:${m.id}`, () => setRunning(m.id, kind === 'resume'));
-        done += 1;
-      } catch (err) {
-        failed.push(`${m.name}: ${errorText(err, 'failed')}`);
-      }
-    }
+    await Promise.all(
+      models.map(async (m) => {
+        try {
+          if (kind === 'delete') await once(`dm-del:${m.id}`, () => deleteModel(m.id));
+          else await once(`dm-run:${m.id}`, () => setRunning(m.id, kind === 'resume'));
+          done += 1;
+        } catch (err) {
+          failed.push(`${m.name}: ${errorText(err, 'failed')}`);
+        }
+      }),
+    );
     const ids = new Set(models.map((m) => m.id));
     if (kind === 'delete') list.setModels((prev) => prev.filter((m) => !ids.has(m.id) || failed.some((f) => f.startsWith(`${m.name}:`))));
     else list.setModels((prev) => prev.map((m) => (ids.has(m.id) && !failed.some((f) => f.startsWith(`${m.name}:`)) ? { ...m, state: kind === 'resume' ? 'RUNNING' : 'PAUSED' } : m)));

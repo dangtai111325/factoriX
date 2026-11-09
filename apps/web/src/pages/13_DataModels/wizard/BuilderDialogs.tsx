@@ -176,7 +176,7 @@ export const PasteJsonDialog: React.FC<{
   const detectedKey = detected ? `${detected.triggers.join(',')}|${detected.snapshots.join(',')}` : '';
   useEffect(() => {
     setEventKeys(detected || { triggers: [], snapshots: [] });
-    if (!detected) setEventOn(false);
+    setEventOn(Boolean(detected));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detectedKey]);
   const toggleEventKey = (kind: keyof EventOption, key: string) =>

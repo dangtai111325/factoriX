@@ -368,12 +368,13 @@ async def list_models(session: AsyncSession, tenant_id: UUID, *, q: str | None =
     return out
 
 
-async def get_model(session: AsyncSession, tenant_id: UUID, model_id: UUID) -> dict[str, Any]:
+async def get_model(session: AsyncSession, tenant_id: UUID, model_id: UUID, *, catalog: R.Catalog | None = None) -> dict[str, Any]:
     row = await _model_row(session, tenant_id, model_id)
-    catalog = await E.load_catalog(session, tenant_id)
-    state_row = await fetch_one(session, "SELECT body_text, sampled_at, errors_json, error_count FROM model_state WHERE group_id = :id", {"id": model_id})
     stored = _spec_of(row)
     signals, _resources = B.spec_refs(stored)
+    if catalog is None:
+        catalog = await E.load_catalog(session, tenant_id, signals)
+    state_row = await fetch_one(session, "SELECT body_text, sampled_at, errors_json, error_count FROM model_state WHERE group_id = :id", {"id": model_id})
     rendered, issues = B.render_spec(stored, catalog, await _signal_meta(session, signals))
     out = _summary(row, catalog, state_row)
     out["spec"] = rendered
@@ -490,7 +491,7 @@ async def create_model(session: AsyncSession, tenant_id: UUID, actor: UUID, body
         correlation_id=correlation_id,
     )
     _changed(session, tenant_id, model_id)
-    return await get_model(session, tenant_id, model_id)
+    return await get_model(session, tenant_id, model_id, catalog=catalog)
 
 
 def _version_conflict(current: int) -> AppError:
@@ -512,6 +513,7 @@ async def patch_model(session: AsyncSession, tenant_id: UUID, actor: UUID, model
     sample_ms = _sample_ms(body.sample_ms) if body.sample_ms is not None else int(current["sample_ms"])
     description = _description(body.description) if body.description is not None else (current.get("description") or "")
     stored = _spec_of(current)
+    catalog: R.Catalog | None = None
     if body.spec is not None:
         catalog = await E.load_catalog(session, tenant_id)
         stored, issues = B.resolve_spec(body.spec, catalog, B.refresh_labels(stored.get("labels") or {}, catalog))
@@ -555,7 +557,7 @@ async def patch_model(session: AsyncSession, tenant_id: UUID, actor: UUID, model
         correlation_id=correlation_id,
     )
     _changed(session, tenant_id, model_id)
-    return await get_model(session, tenant_id, model_id)
+    return await get_model(session, tenant_id, model_id, catalog=catalog)
 
 
 async def _archive(session: AsyncSession, tenant_id: UUID, actor: UUID | None, row: dict[str, Any], correlation_id: str, *, reason: str | None = None) -> None:

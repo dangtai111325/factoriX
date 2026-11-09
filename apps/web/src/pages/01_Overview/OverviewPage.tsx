@@ -323,10 +323,8 @@ export const OverviewPage: React.FC = () => {
     }
   })();
 
-  const lastDataAt =
-    stats?.last_data_at ||
-    signals.reduce<string>((latest, s) => (s.lastUpdated && s.lastUpdated > latest ? s.lastUpdated : latest), '') ||
-    null;
+  const maxSignalAt = signals.reduce<string>((latest, s) => (s.lastUpdated && s.lastUpdated > latest ? s.lastUpdated : latest), '');
+  const lastDataAt = [stats?.last_data_at, maxSignalAt].filter(Boolean).sort().pop() || null;
   const messagesPerMin = stats?.messages_per_min || 0;
 
   const latestSignals = useMemo(

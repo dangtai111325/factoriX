@@ -56,15 +56,17 @@ FLUSH_BUDGET_S = 1.0
 # lane. The latest lane is sent at the start of every cycle, so live values wait for at most one
 # history batch instead of a full second of history (R2-SG-01).
 HISTORY_SLICE_S = 0.25
-PRUNE_CHUNK = 500  # ~0.1 s per step on a 1 GB outbox, then PRUNE_PAUSE_S
-# Pause between prune steps so acquisition, heartbeat and flushing run in between (R3 P1).
-PRUNE_PAUSE_S = 0.02
+PRUNE_CHUNK = 500
+# Pause between prune steps so acquisition, heartbeat and flushing run in between (R3 P1 / R5-ENV-01).
+PRUNE_PAUSE_S = 0.05
+PRUNE_INTERVAL_S = 15.0
+MAX_PRUNE_STEPS_PER_PASS = 40
 SLOW_LOOP_STEP_S = 1.0
 # Connection secret fetch (R4-ENV-01): a Center that is starting up or briefly overloaded must not
 # fail the job. Transient answers (not reachable, timeout, 5xx, 429) are retried after these pauses.
 SECRET_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
 SECRET_TIMEOUT_S = 10.0
-ACKED_RETENTION = timedelta(minutes=10)
+ACKED_RETENTION = timedelta(minutes=2)
 
 
 class CredentialRevoked(Exception):
@@ -757,22 +759,19 @@ class EdgeRuntime:
 
     async def _maintenance_loop(self) -> None:
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(PRUNE_INTERVAL_S)
             cutoff = iso_ms(datetime.now(timezone.utc) - ACKED_RETENTION)
             removed = 0
-            blocked = 0.0
-            while True:
-                started = time.monotonic()
-                chunk, more = self.outbox.prune_step(cutoff, chunk=PRUNE_CHUNK)
-                blocked += time.monotonic() - started
+            steps = 0
+            while steps < MAX_PRUNE_STEPS_PER_PASS:
+                chunk, more = await asyncio.to_thread(self.outbox.prune_step, cutoff, PRUNE_CHUNK)
                 removed += chunk
+                steps += 1
                 if not more:
                     break
-                # A real pause, not sleep(0): acquisition, heartbeat and flushing get the loop between chunks.
+                # Yield between off-loop prune chunks so writers never contend on the outbox lock.
                 await asyncio.sleep(PRUNE_PAUSE_S)
-            if blocked > SLOW_LOOP_STEP_S:
-                logger.warning("Outbox prune blocked the event loop for %.2f s in total (%d rows)", blocked, removed)
-            dropped = self.outbox.enforce_cap(self.max_pending)
+            dropped = await asyncio.to_thread(self.outbox.enforce_cap, self.max_pending)
             if dropped:
                 logger.error("Outbox above %d pending rows: %d oldest rows dropped", self.max_pending, dropped)
             if removed:
