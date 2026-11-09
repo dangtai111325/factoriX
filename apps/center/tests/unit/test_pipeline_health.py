@@ -34,7 +34,7 @@ from factorix.modules.protocols import (
 )
 from factorix.modules.telemetry import RejectionThrottle, latest_stream_payload, select_binding
 from factorix.platform.errors import AppError
-from factorix.transport.hub import Channel, Hub, coalesce_key, origin_allowed
+from factorix.transport.hub import Channel, Hub, coalesce_key, origin_allowed, FLUSH_INTERVAL_S
 
 NOW = datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -349,13 +349,33 @@ def test_channel_sender_is_independent_and_stops_on_failure() -> None:
         channel = Channel(send, "t1")
         task = asyncio.create_task(channel.run())
         channel.offer({"type": "pong"})
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(FLUSH_INTERVAL_S + 0.1)
         channel.offer({"type": "x", "boom": True})
-        await asyncio.wait_for(task, timeout=1)
+        await asyncio.wait_for(task, timeout=2)
         assert channel.closed
 
     asyncio.run(scenario())
     assert sent == [{"type": "pong"}]
+
+
+def test_channel_batches_a_burst_into_one_frame() -> None:
+    sent: list[dict] = []
+
+    async def scenario() -> None:
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        channel = Channel(send, "t1")
+        task = asyncio.create_task(channel.run())
+        for index in range(3):
+            channel.offer({"type": "latest", "signal_id": f"s{index}", "value": index})
+        await asyncio.sleep(FLUSH_INTERVAL_S + 0.1)
+        channel.close()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())
+    assert len(sent) == 1 and sent[0]["type"] == "batch"
+    assert [m["signal_id"] for m in sent[0]["messages"]] == ["s0", "s1", "s2"]
 
 
 def test_origin_check() -> None:

@@ -176,6 +176,12 @@ function scheduleReconnect(): void {
 }
 
 function dispatch(raw: unknown): void {
+  // The server coalesces bursts into one frame: {type: "batch", messages: [...]}.
+  if (raw && typeof raw === 'object' && (raw as { type?: unknown }).type === 'batch') {
+    const messages = (raw as { messages?: unknown }).messages
+    if (Array.isArray(messages)) for (const item of messages) dispatch(item)
+    return
+  }
   if (!raw || typeof raw !== 'object') return
   const msg = raw as { type?: string } & Record<string, unknown>
   switch (msg.type) {

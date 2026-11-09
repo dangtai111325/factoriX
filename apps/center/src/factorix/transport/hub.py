@@ -32,6 +32,7 @@ Sender = Callable[[dict[str, Any]], Awaitable[None]]
 
 DEFAULT_MAX_PENDING = 5000
 SEND_TIMEOUT_S = 10.0
+FLUSH_INTERVAL_S = 0.2
 _ROUTING_KEYS = {"kind", "tenant_id", "payload"}
 
 
@@ -111,8 +112,14 @@ class Channel:
         try:
             while not self.closed:
                 await self._wake.wait()
-                for message in self.drain():
-                    await asyncio.wait_for(self._send(message), timeout=SEND_TIMEOUT_S)
+                # Let a burst accumulate, then send it as one frame: one WebSocket write per
+                # flush instead of one per signal (per-message sends were ~20% of Center CPU).
+                await asyncio.sleep(FLUSH_INTERVAL_S)
+                messages = self.drain()
+                if not messages:
+                    continue
+                frame = messages[0] if len(messages) == 1 else {"type": "batch", "messages": messages}
+                await asyncio.wait_for(self._send(frame), timeout=SEND_TIMEOUT_S)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - any send failure ends this socket only
