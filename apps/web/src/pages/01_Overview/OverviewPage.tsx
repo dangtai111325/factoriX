@@ -735,14 +735,21 @@ export const OverviewPage: React.FC = () => {
             <div className="py-8 text-center text-[#657794] text-[13px]">No values received yet.</div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full text-left text-[12px] mt-2">
+              <table className="w-full table-fixed min-w-[760px] text-left text-[12px] mt-2">
+                <colgroup>
+                  <col className="w-[21%]" />
+                  <col className="w-[25%]" />
+                  <col className="w-[31%]" />
+                  <col className="w-[11%]" />
+                  <col className="w-[12%]" />
+                </colgroup>
                 <thead>
                   <tr className="border-b border-slate-100 text-[#657794] font-semibold">
-                    <th className="py-2.5 px-3">Signal</th>
-                    <th className="py-2.5 px-3">Resource</th>
-                    <th className="py-2.5 px-3">Value</th>
-                    <th className="py-2.5 px-3">Quality</th>
-                    <th className="py-2.5 px-3 text-right">Updated</th>
+                    <th className="py-2.5 px-3 whitespace-nowrap">Signal</th>
+                    <th className="py-2.5 px-3 whitespace-nowrap">Resource</th>
+                    <th className="py-2.5 px-3 whitespace-nowrap">Value</th>
+                    <th className="py-2.5 px-3 whitespace-nowrap">Quality</th>
+                    <th className="py-2.5 px-3 text-right whitespace-nowrap">Updated</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -760,20 +767,20 @@ export const OverviewPage: React.FC = () => {
                         }}
                         className="hover:bg-slate-50 cursor-pointer transition focus:outline-none focus-visible:bg-slate-50"
                       >
-                        <td className="py-2.5 px-3 font-medium text-[#111B37] max-w-[220px] truncate" title={label}>
+                        <td className="py-2.5 px-3 font-medium text-[#111B37] whitespace-nowrap overflow-hidden text-ellipsis" title={label}>
                           {label}
                         </td>
-                        <td className="py-2.5 px-3 text-[#657794] max-w-[200px] truncate" title={resourceName}>
+                        <td className="py-2.5 px-3 text-[#657794] whitespace-nowrap overflow-hidden text-ellipsis" title={resourceName}>
                           {resourceName}
                         </td>
-                        <td className={`py-2.5 px-3 font-semibold tabular-nums font-mono ${connectionLost ? 'text-[#94A3B8]' : 'text-[#111B37]'}`}>
+                        <td className={`py-2.5 px-3 font-semibold tabular-nums font-mono whitespace-nowrap overflow-hidden text-ellipsis ${connectionLost ? 'text-[#94A3B8]' : 'text-[#111B37]'}`}>
                           {formatValue(sig.value)}{' '}
                           {sig.unit ? <span className="font-normal font-sans text-[#657794] text-[11px]">{sig.unit}</span> : null}
                         </td>
-                        <td className="py-2.5 px-3">
+                        <td className="py-2.5 px-3 whitespace-nowrap">
                           <StatusBadge status={normalizeQuality(sig.quality)} />
                         </td>
-                        <td className="py-2.5 px-3 text-right text-[#657794] whitespace-nowrap" title={formatTimestamp(sig.lastUpdated)}>
+                        <td className="py-2.5 px-3 text-right text-[#657794] whitespace-nowrap tabular-nums" title={formatTimestamp(sig.lastUpdated)}>
                           {connectionLost ? clockTime(sig.lastUpdated) : timeAgo(sig.lastUpdated)}
                         </td>
                       </tr>
