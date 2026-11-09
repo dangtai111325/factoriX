@@ -35,6 +35,11 @@ import { DEFAULT_HTTP_RATE_LIMIT, httpPathsOfConnection, rateBudget } from '../0
 import { FieldTable } from './FieldTable';
 import { JsonSampleTree } from './JsonSampleTree';
 import { SimilarResourcesDialog } from './SimilarResourcesDialog';
+import { useLeaveGuard } from './useLeaveGuard';
+import { ResourceTreeNode, buildResourceTree, resourceTreeMatches, resourceTypeGlyph } from '../../components/tree/resourceTree';
+import { isEnterSubmit } from '../08_SignalsCatalog/enterSubmit';
+import { ConfirmDialog } from '../../components/common/ConfirmDialog';
+import { formatInterval, pollIntervalMin, validatePollInterval } from '../05_Connections/pollInterval';
 import {
   JNode,
   JsonParseError,
@@ -63,44 +68,11 @@ import {
   validateRows,
 } from './wizardModel';
 
-interface WizardTreeNode {
-  resource: ResourceNode;
-  children: WizardTreeNode[];
-}
-
-function buildWizardTree(items: ResourceNode[]): WizardTreeNode[] {
-  const map = new Map<string, WizardTreeNode>();
-  items.forEach((r) => map.set(r.id, { resource: r, children: [] }));
-  const roots: WizardTreeNode[] = [];
-  items.forEach((r) => {
-    const node = map.get(r.id)!;
-    if (r.parentId && map.has(r.parentId)) map.get(r.parentId)!.children.push(node);
-    else roots.push(node);
-  });
-  return roots;
-}
-
-function nodeOrDescendantMatches(node: WizardTreeNode, query: string): boolean {
-  if (!query) return true;
-  const q = query.toLowerCase();
-  if ((node.resource.name || '').toLowerCase().includes(q) || (node.resource.code || '').toLowerCase().includes(q)) return true;
-  return node.children.some((child) => nodeOrDescendantMatches(child, query));
-}
-
-const typeIcon = (type: string) => {
-  switch (type.toLowerCase()) {
-    case 'site':
-    case 'plant':
-      return <Network className="w-4 h-4 text-emerald-600 shrink-0" />;
-    case 'area':
-      return <FolderTree className="w-4 h-4 text-amber-600 shrink-0" />;
-    case 'line':
-    case 'machine':
-      return <Cpu className="w-4 h-4 text-slate-600 shrink-0" />;
-    default:
-      return <Layers className="w-4 h-4 text-slate-500 shrink-0" />;
-  }
-};
+// Hierarchy tree helpers are shared with the Data Model builder's data picker (components/tree/resourceTree).
+type WizardTreeNode = ResourceTreeNode<ResourceNode>;
+const buildWizardTree = (items: ResourceNode[]): WizardTreeNode[] => buildResourceTree(items);
+const nodeOrDescendantMatches = (node: WizardTreeNode, query: string): boolean => resourceTreeMatches(node, query);
+const typeIcon = resourceTypeGlyph;
 
 interface ConnDetail {
   id: string;
@@ -247,10 +219,19 @@ export const AddDataWizardPage: React.FC = () => {
   /** Value read from the OPC UA source-time node by the last test (R2-AD-05). */
   const [sourceTimeValue, setSourceTimeValue] = useState<string | null>(null);
 
-  // Restore draft, then apply deep-link parameters.
+  // Restore draft, then apply deep-link parameters. R3-AD-02: a draft started from a deep link
+  // (?resourceId= / ?connectionId=, e.g. "Add data" on a filtered Signals page) is restored too when
+  // the link still points at the same target / connection — F5 keeps the URL, so it used to drop it.
+  const restoredDraftRef = useRef(false);
   useEffect(() => {
     const draft = readDraft();
-    if (draft && !queryResourceId && !queryConnectionId) {
+    const matchesQuery =
+      Boolean(draft) &&
+      (!queryResourceId || draft?.targetId === queryResourceId) &&
+      (!queryConnectionId || draft?.connectionId === queryConnectionId);
+    restoredDraftRef.current = false;
+    if (draft && matchesQuery) {
+      restoredDraftRef.current = true;
       draftConnectionRef.current = draft.connectionId || null;
       if (draft.targetId) setSelectedTargetId(draft.targetId);
       if (draft.connectionId) setSelectedConnectionId(draft.connectionId);
@@ -269,7 +250,7 @@ export const AddDataWizardPage: React.FC = () => {
     if (queryResourceId) setSelectedTargetId(queryResourceId);
     if (queryConnectionId) {
       setSelectedConnectionId(queryConnectionId);
-      setCurrentStep(queryResourceId ? 3 : 1);
+      if (!restoredDraftRef.current) setCurrentStep(queryResourceId ? 3 : 1);
     }
   }, [queryResourceId, queryConnectionId]);
 
@@ -437,10 +418,20 @@ export const AddDataWizardPage: React.FC = () => {
   const step3Valid = (): string | null => {
     if (protocol === 'mqtt') return validateTopicFilter(mqttTopicFilter);
     if (protocol === 'http' && !httpPath.trim().startsWith('/')) return 'Enter the request path, starting with /.';
-    if (isPolling && (!Number.isInteger(intervalMs) || intervalMs < 1000)) return 'Interval must be at least 1000 ms.';
+    if (isPolling && intervalError) return intervalError;
     if (protocol === 'modbus' && (!Number.isInteger(modbusUnitId) || modbusUnitId < 0 || modbusUnitId > 247)) return 'Unit ID must be 0–247.';
     return null;
   };
+
+  // R3-AD-01: the interval belongs to the connection job, so it is validated inline and the change
+  // is spelled out for every machine read through that connection.
+  const intervalError = isPolling ? validatePollInterval(protocol, intervalMs) : null;
+  const currentJobInterval = job?.interval_ms != null ? Number(job.interval_ms) : null;
+  const intervalChanges = isPolling && currentJobInterval !== null && !intervalError && currentJobInterval !== intervalMs;
+  const connectionMachineCount = useMemo(
+    () => new Set(connectionSignals.map((s) => s.resourceId).filter(Boolean)).size,
+    [connectionSignals],
+  );
 
   // ---------------------------------------------------------------- Step 4: JSON protocols
   const activeSample = samples[sampleIndex];
@@ -546,6 +537,24 @@ export const AddDataWizardPage: React.FC = () => {
       });
       return next;
     });
+  };
+
+  /** Unmap captured leaves of the active sample (tree "Clear" / "Clear all"). */
+  const handleClearPaths = (paths: string[]) => {
+    if (!activeSample || !paths.length) return;
+    const drop = new Set(paths);
+    invalidateTest();
+    setFields((prev) => prev.filter((row) => !(row.jsonpath && drop.has(row.jsonpath) && (protocol !== 'mqtt' || row.topic === activeSample.topic))));
+  };
+
+  const [clearFieldsOpen, setClearFieldsOpen] = useState(false);
+
+  /** Step 3 "Next" (also on Enter in a step 3 field). */
+  const goToStep4 = () => {
+    if (!connDetail || (isPolling && intervalError)) return;
+    const error = step3Valid();
+    setAddressError(error);
+    if (!error) setCurrentStep(4);
   };
 
   const siblingTsInfo = useMemo(() => {
@@ -694,8 +703,24 @@ export const AddDataWizardPage: React.FC = () => {
   );
 
   // ---------------------------------------------------------------- Start collecting
+  /** In-flight guard (R3-DM-04): a double click on Start collecting creates the signals once. */
+  const startRunningRef = useRef(false);
   const handleStartCollecting = async () => {
+    if (startRunningRef.current) return;
+    startRunningRef.current = true;
+    try {
+      await startCollecting();
+    } finally {
+      startRunningRef.current = false;
+    }
+  };
+
+  const startCollecting = async () => {
     if (!selectedTargetId || !connDetail || !validateCurrentRows()) return;
+    if (isPolling && intervalError) {
+      setSubmitError(intervalError);
+      return;
+    }
     setSubmitError(null);
     setOutcomes(null);
     const targets: Array<{ resourceId: string; name: string; rows: FieldRow[]; addresses: Array<Record<string, unknown>> }> = [
@@ -769,10 +794,11 @@ export const AddDataWizardPage: React.FC = () => {
       if (results.some((r) => r.ok) && connDetail.edge_id) {
         await api('/api/v1/config-releases/publish', { method: 'POST', body: JSON.stringify({ edge_id: connDetail.edge_id }) });
       }
-      await refresh();
+      await refresh().catch((error) => console.warn('Refresh after Start collecting failed', error));
       setOutcomes(results);
       if (results.every((r) => r.ok)) {
         clearDraft();
+        leaveGuard.allowNext();
         navigate(`/collector/signals?resourceId=${encodeURIComponent(selectedTargetId)}`);
       }
     } catch (error) {
@@ -783,14 +809,23 @@ export const AddDataWizardPage: React.FC = () => {
     }
   };
 
-  // ---------------------------------------------------------------- Cancel
+  // ---------------------------------------------------------------- Cancel / leave (R3-AD-02)
+  const hasUnsavedSettings = !submitting && (currentStep >= 3 || fields.length > 0 || rewrites.length > 0 || Boolean(newConnCreated));
+  const leaveGuard = useLeaveGuard(hasUnsavedSettings);
+
   const handleCancel = () => {
     if (newConnCreated) {
       setConfirmCancelOpen(true);
       return;
     }
-    clearDraft();
+    // With unsaved settings, navigate(-1) is held by the leave guard and its dialog asks first.
+    if (!hasUnsavedSettings) clearDraft();
     navigate(-1);
+  };
+
+  const confirmLeave = () => {
+    clearDraft();
+    leaveGuard.proceed();
   };
 
   const handleDiscardNewConn = async (keep: boolean) => {
@@ -799,7 +834,7 @@ export const AddDataWizardPage: React.FC = () => {
       try {
         await api(`/api/v1/connections/${encodeURIComponent(newConnCreated.id)}/pause`, { method: 'POST' });
         await api(`/api/v1/connections/${encodeURIComponent(newConnCreated.id)}`, { method: 'DELETE' });
-        await refresh();
+        await refresh().catch((refreshError) => console.warn('Refresh after archiving the new connection failed', refreshError));
       } catch (error) {
         setCancelError(`The connection could not be archived: ${error instanceof Error ? error.message : 'request failed'}. Archive it from Connections.`);
         return;
@@ -807,6 +842,7 @@ export const AddDataWizardPage: React.FC = () => {
     }
     clearDraft();
     setConfirmCancelOpen(false);
+    leaveGuard.allowNext();
     navigate(-1);
   };
 
@@ -826,7 +862,7 @@ export const AddDataWizardPage: React.FC = () => {
   }, [currentStep, connDetail]);
 
   const testPassed = Boolean(testResult?.passed);
-  const canStart = fields.length > 0 && (testPassed || acceptUntested) && !submitting;
+  const canStart = fields.length > 0 && (testPassed || acceptUntested) && !submitting && !(isPolling && intervalError);
 
   // ---------------------------------------------------------------- Render
   const stepTitle = ['Choose target resource', 'Select data source', 'Source address', 'Map fields', 'Review & start'][currentStep - 1];
@@ -850,13 +886,13 @@ export const AddDataWizardPage: React.FC = () => {
   return (
     <div className="max-w-6xl mx-auto space-y-6 pb-12">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
-        <div>
+        <div className="min-w-0">
           <div className="text-[12px] font-semibold text-blue-600 flex items-center gap-1.5 flex-wrap">
             <span>Add Data</span>
             {targetPathString && (
               <>
                 <ChevronRight className="w-3 h-3 text-slate-400" />
-                <span className="text-[#111B37] font-mono">{targetPathString}</span>
+                <span className="text-[#111B37] font-mono break-all">{targetPathString}</span>
               </>
             )}
             {selectedConnection && (
@@ -875,14 +911,14 @@ export const AddDataWizardPage: React.FC = () => {
         </Button>
       </div>
 
-      <ol className="grid grid-cols-5 gap-2" aria-label="Wizard steps">
+      <ol className="grid grid-cols-5 gap-1 sm:gap-2" aria-label="Wizard steps">
         {['Target', 'Source', 'Address', 'Fields', 'Review'].map((title, index) => {
           const num = index + 1;
           return (
             <li
               key={title}
               aria-current={currentStep === num ? 'step' : undefined}
-              className={`p-2.5 rounded-lg border text-center transition ${
+              className={`p-1.5 sm:p-2.5 rounded-lg border text-center transition min-w-0 ${
                 currentStep === num
                   ? 'bg-blue-50 border-blue-400 text-blue-700 font-bold'
                   : currentStep > num
@@ -890,8 +926,10 @@ export const AddDataWizardPage: React.FC = () => {
                     : 'bg-white border-slate-200 text-slate-400 font-medium'
               }`}
             >
-              <div className="text-[11px] uppercase tracking-wider">Step {num}</div>
-              <div className="text-[13px]">{title}</div>
+              <div className="text-[10px] sm:text-[11px] uppercase tracking-wider">
+                <span className="hidden sm:inline">Step </span>{num}
+              </div>
+              <div className="text-[11px] sm:text-[13px] truncate">{title}</div>
             </li>
           );
         })}
@@ -1062,6 +1100,14 @@ export const AddDataWizardPage: React.FC = () => {
 
       {/* STEP 3 */}
       {currentStep === 3 && (
+        <div
+          onKeyDown={(event) => {
+            // Enter in a step 3 field = "Next: Map fields".
+            if (!isEnterSubmit(event)) return;
+            event.preventDefault();
+            goToStep4();
+          }}
+        >
         <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
           <div>
             <h3 className="text-[14px] font-bold text-[#111B37]">{PROTOCOL_LABEL[protocol]} address for {targetResource?.name || 'the target'}</h3>
@@ -1176,8 +1222,36 @@ export const AddDataWizardPage: React.FC = () => {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[12px]">
               <div>
                 <label className={labelCls} htmlFor="wiz-interval">{protocol === 'websocket' ? 'Emit interval (ms)' : 'Poll interval (ms)'}</label>
-                <input id="wiz-interval" type="number" min={1000} step={500} value={intervalMs} onChange={(e) => { setIntervalMs(Number(e.target.value)); invalidateTest(); }} className={`${inputCls} font-mono`} />
-                <p className="text-[10px] text-[#657794] mt-1">Applies to the whole connection (current: {job?.interval_ms ?? '—'} ms).</p>
+                <input
+                  id="wiz-interval"
+                  type="number"
+                  min={pollIntervalMin(protocol)}
+                  max={86400000}
+                  step={100}
+                  value={Number.isFinite(intervalMs) ? intervalMs : ''}
+                  onChange={(e) => {
+                    setIntervalMs(e.target.value === '' ? Number.NaN : Number(e.target.value));
+                    invalidateTest();
+                  }}
+                  aria-invalid={Boolean(intervalError)}
+                  aria-describedby="wiz-interval-help"
+                  className={`${inputCls} font-mono ${intervalError ? 'border-red-400 focus:border-red-500' : ''}`}
+                />
+                {intervalError && (
+                  <p role="alert" className="text-[11px] text-red-600 mt-1">{intervalError}</p>
+                )}
+                <p id="wiz-interval-help" className="text-[10px] text-[#657794] mt-1">
+                  This is the interval of the whole connection job, not of this machine only: every machine read through{' '}
+                  <span className="font-semibold">{selectedConnection?.name || 'this connection'}</span>
+                  {connectionMachineCount > 0 ? ` (${connectionMachineCount} machine${connectionMachineCount === 1 ? '' : 's'} today)` : ''} uses it.
+                  {' '}Current: {currentJobInterval !== null ? `${currentJobInterval} ms` : 'not set yet'}. Allowed {pollIntervalMin(protocol)}–86 400 000 ms.
+                </p>
+                {intervalChanges && (
+                  <p role="status" className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-2 py-1 mt-1.5">
+                    Start collecting changes the interval of {selectedConnection?.name || 'the connection'} from {formatInterval(currentJobInterval as number)} to {formatInterval(intervalMs)}
+                    {connectionMachineCount > 0 ? ` for all ${connectionMachineCount} machine${connectionMachineCount === 1 ? '' : 's'} on it` : ''}.
+                  </p>
+                )}
               </div>
               {httpBudget && <HttpBudgetNote budget={httpBudget} />}
             </div>
@@ -1190,18 +1264,15 @@ export const AddDataWizardPage: React.FC = () => {
             <Button
               variant="primary"
               size="sm"
-              disabled={!connDetail}
-              onClick={() => {
-                const error = step3Valid();
-                setAddressError(error);
-                if (!error) setCurrentStep(4);
-              }}
+              disabled={!connDetail || Boolean(isPolling && intervalError)}
+              onClick={goToStep4}
             >
               Next: Map fields <ArrowRight className="w-3.5 h-3.5 ml-1" />
             </Button>
           </div>
           {addressError && protocol !== 'mqtt' && <p className="text-[11px] text-red-600">{addressError}</p>}
         </Card>
+        </div>
       )}
 
       {/* STEP 4 */}
@@ -1262,7 +1333,13 @@ export const AddDataWizardPage: React.FC = () => {
                   <p className="text-[10px] text-amber-700">Pasted sample: enter the exact topic in each row.</p>
                 )}
                 {activeSample && (
-                  <JsonSampleTree root={activeSample.root} selectedPaths={selectedPaths} onPickLeaf={handlePickLeaf} onPickObject={handlePickObject} />
+                  <JsonSampleTree
+                    root={activeSample.root}
+                    selectedPaths={selectedPaths}
+                    onPickLeaf={handlePickLeaf}
+                    onPickObject={handlePickObject}
+                    onClearPaths={handleClearPaths}
+                  />
                 )}
               </div>
             </div>
@@ -1278,7 +1355,7 @@ export const AddDataWizardPage: React.FC = () => {
                   <option value="none">None (use read time only)</option>
                 </select>
                 {timestampMode === 'custom' && (
-                  <input aria-label="Timestamp JSONPath" value={timestampPath} onChange={(e) => { setTimestampPath(e.target.value); invalidateTest(); }} placeholder="$.meta.updated_at" className="px-2 py-1 border border-slate-300 rounded text-[12px] font-mono min-w-[240px]" />
+                  <input aria-label="Timestamp JSONPath" value={timestampPath} onChange={(e) => { setTimestampPath(e.target.value); invalidateTest(); }} placeholder="$.meta.updated_at" className="px-2 py-1 border border-slate-300 rounded text-[12px] font-mono w-full sm:w-auto sm:min-w-[240px]" />
                 )}
               </div>
               <p className="text-[11px] text-[#657794]">
@@ -1325,9 +1402,27 @@ export const AddDataWizardPage: React.FC = () => {
                 {browseNodes && browseNodes.some((node) => node.node_class.toLowerCase().includes('variable')) && (() => {
                   const variables = browseNodes.filter((node) => node.node_class.toLowerCase().includes('variable'));
                   const pending = variables.filter((node) => !fields.some((row) => row.nodeId === node.node_id) && node.node_id !== opcTimestampNodeId);
+                  const addedHere = variables.filter((node) => fields.some((row) => row.nodeId === node.node_id));
+                  const folder = browseStack[browseStack.length - 1]?.label || 'this folder';
                   return (
-                    <div className="flex items-center justify-between gap-2 text-[11px]">
-                      <span className="text-[#657794]">{variables.length} variable(s) in {browseStack[browseStack.length - 1]?.label || 'this folder'}</span>
+                    <div role="toolbar" aria-label={`Variables in ${folder}`} className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                      <span className="text-[#657794]" aria-live="polite">
+                        <span className="font-semibold text-[#111B37]">{addedHere.length}</span> of {variables.length} variable(s) in {folder} selected
+                      </span>
+                      <span className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={addedHere.length === 0}
+                        onClick={() => {
+                          const drop = new Set(addedHere.map((node) => node.node_id));
+                          setFields((prev) => prev.filter((row) => !(row.nodeId && drop.has(row.nodeId))));
+                          invalidateTest();
+                        }}
+                        aria-label={`Clear the ${addedHere.length} selected variables of ${folder}`}
+                        className="font-semibold text-slate-600 hover:underline disabled:text-slate-400 disabled:no-underline"
+                      >
+                        Clear all
+                      </button>
                       <button
                         type="button"
                         disabled={pending.length === 0}
@@ -1353,6 +1448,7 @@ export const AddDataWizardPage: React.FC = () => {
                       >
                         {pending.length === 0 ? 'All added' : `Add all variables (${pending.length})`}
                       </button>
+                      </span>
                     </div>
                   );
                 })()}
@@ -1375,15 +1471,20 @@ export const AddDataWizardPage: React.FC = () => {
                             {node.node_class.toLowerCase().includes('variable') && (
                               <button
                                 type="button"
-                                disabled={added}
+                                aria-pressed={added}
+                                aria-label={`${added ? 'Remove' : 'Add'} variable ${node.display_name || node.browse_name}`}
                                 onClick={() => {
-                                  const key = keyFromRawName(nodeIdField(node.node_id) || node.browse_name);
-                                  setFields((prev) => [...prev, emptyRow('opcua', { key, displayName: node.display_name || key, nodeId: node.node_id })]);
+                                  // Toggle, like the JSON tree: a second click removes the field again.
+                                  if (added) setFields((prev) => prev.filter((row) => row.nodeId !== node.node_id));
+                                  else {
+                                    const key = keyFromRawName(nodeIdField(node.node_id) || node.browse_name);
+                                    setFields((prev) => [...prev, emptyRow('opcua', { key, displayName: node.display_name || key, nodeId: node.node_id })]);
+                                  }
                                   invalidateTest();
                                 }}
-                                className="text-[11px] text-emerald-700 hover:underline disabled:text-slate-400"
+                                className={`text-[11px] hover:underline ${added ? 'text-slate-600' : 'text-emerald-700'}`}
                               >
-                                {added ? 'Added' : 'Add'}
+                                {added ? 'Remove' : 'Add'}
                               </button>
                             )}
                           </div>
@@ -1423,6 +1524,12 @@ export const AddDataWizardPage: React.FC = () => {
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-[12px] font-bold text-[#111B37]">Fields ({fields.length})</span>
+              <span className="flex items-center gap-2">
+              {fields.length > 1 && (
+                <Button size="sm" variant="ghost" className="text-[11px] h-7" onClick={() => setClearFieldsOpen(true)}>
+                  Remove all
+                </Button>
+              )}
               <Button
                 size="sm"
                 variant="outline"
@@ -1441,6 +1548,7 @@ export const AddDataWizardPage: React.FC = () => {
               >
                 <Plus className="w-3.5 h-3.5 mr-1" /> Add field
               </Button>
+              </span>
             </div>
             {fields.length === 0 ? (
               <div className="p-8 text-center text-[#657794] border border-dashed border-slate-300 rounded-lg text-[12px]">
@@ -1484,7 +1592,7 @@ export const AddDataWizardPage: React.FC = () => {
       {pasteOpen && (
         <ModalPortal>
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div role="dialog" aria-modal="true" aria-labelledby="wiz-paste-title" className="bg-white rounded-2xl border border-slate-300 shadow-2xl max-w-lg w-full p-5 space-y-4">
+          <div role="dialog" aria-modal="true" aria-labelledby="wiz-paste-title" className="bg-white rounded-2xl border border-slate-300 shadow-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto p-5 space-y-4">
             <div className="flex items-center justify-between pb-2 border-b border-slate-100">
               <h3 id="wiz-paste-title" className="text-sm font-bold text-[#111B37] flex items-center gap-2">
                 <Braces className="w-4 h-4 text-blue-600" /> Paste a sample payload
@@ -1524,7 +1632,12 @@ export const AddDataWizardPage: React.FC = () => {
               ...(protocol === 'mqtt' ? [['Topic filter', mqttTopicFilter]] : []),
               ...(protocol === 'http' ? [['Path', httpPath]] : []),
               ...(protocol === 'modbus' ? [['Unit ID', String(modbusUnitId)]] : []),
-              ...(isPolling ? [[protocol === 'websocket' ? 'Emit interval' : 'Poll interval', `${intervalMs} ms`]] : []),
+              ...(isPolling
+                ? [[
+                    protocol === 'websocket' ? 'Emit interval (whole connection)' : 'Poll interval (whole connection)',
+                    intervalChanges ? `${intervalMs} ms (changes from ${currentJobInterval} ms)` : `${intervalMs} ms`,
+                  ]]
+                : []),
               ['Fields', `${fields.length}${rewrites.length ? ` (+ ${rewrites.length * fields.length} on ${rewrites.length} similar machine(s))` : ''}`],
             ].map(([label, value]) => (
               <div key={label} className="flex justify-between gap-3 py-1.5">
@@ -1567,8 +1680,8 @@ export const AddDataWizardPage: React.FC = () => {
             </div>
             <TestResultPanel running={testing} runningLabel="The Edge collector is reading the source…" result={testResult} successLabel="All fields were read from the source" />
             {testResult && (
-              <div className="border border-slate-200 rounded-lg overflow-hidden">
-                <table className="w-full text-left text-[11px]">
+              <div className="border border-slate-200 rounded-lg overflow-x-auto">
+                <table className="w-full min-w-[480px] text-left text-[11px]">
                   <thead>
                     <tr className="bg-slate-50 border-b border-slate-200 text-[#657794] font-semibold">
                       <th className="py-2 px-3">Key</th>
@@ -1607,14 +1720,16 @@ export const AddDataWizardPage: React.FC = () => {
             </ul>
           )}
 
-          <div className="flex justify-between pt-3 border-t border-slate-100">
+          <div className="flex flex-wrap justify-between gap-2 pt-3 border-t border-slate-100">
             <Button variant="outline" size="sm" onClick={() => setCurrentStep(4)}>
               <ArrowLeft className="w-3.5 h-3.5 mr-1" /> Back to fields
             </Button>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center justify-end gap-3">
               {!canStart && !submitting && (
                 <span id="wiz-start-hint" className="text-[11px] text-[#657794] text-right">
-                  {testing
+                  {isPolling && intervalError
+                    ? `Fix the interval in step 3: ${intervalError}`
+                    : testing
                     ? 'Waiting for the test result…'
                     : !testResult
                       ? 'Run the test first.'
@@ -1674,10 +1789,42 @@ export const AddDataWizardPage: React.FC = () => {
         }}
       />
 
+      <ConfirmDialog
+        isOpen={clearFieldsOpen}
+        title={`Remove all ${fields.length} fields?`}
+        message="The mapped fields of this wizard are removed. Captured samples stay, so you can select fields again."
+        confirmText="Remove all"
+        variant="warning"
+        onConfirm={() => {
+          setFields([]);
+          invalidateTest();
+          setClearFieldsOpen(false);
+        }}
+        onCancel={() => setClearFieldsOpen(false)}
+      />
+
+      <ConfirmDialog
+        isOpen={Boolean(leaveGuard.pending)}
+        title="Leave Add Data?"
+        message={(() => {
+          const parts = [
+            targetResource ? targetResource.name || targetResource.code : '',
+            selectedConnection?.name || '',
+            fields.length ? `${fields.length} mapped field${fields.length === 1 ? '' : 's'}` : '',
+          ].filter(Boolean);
+          return `The settings of this wizard are not saved yet${parts.length ? ` (${parts.join(', ')})` : ''}. If you leave, they are discarded and nothing is collected.`;
+        })()}
+        confirmText="Leave and discard"
+        cancelText="Stay"
+        variant="warning"
+        onConfirm={confirmLeave}
+        onCancel={leaveGuard.cancel}
+      />
+
       {confirmCancelOpen && (
         <ModalPortal>
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
-          <div role="dialog" aria-modal="true" aria-labelledby="wiz-cancel-title" className="w-full max-w-sm p-5 bg-white border border-slate-300 shadow-xl rounded-xl space-y-4">
+          <div role="dialog" aria-modal="true" aria-labelledby="wiz-cancel-title" className="w-full max-w-sm max-h-[90vh] overflow-y-auto p-5 bg-white border border-slate-300 shadow-xl rounded-xl space-y-4">
             <h3 id="wiz-cancel-title" className="text-[14px] font-bold text-[#111B37]">Keep the new connection "{newConnCreated?.name}"?</h3>
             <p className="text-[12px] text-[#657794]">You created it in step 2. Keep it in Connections or archive it.</p>
             {cancelError && <p role="alert" className="text-[12px] text-red-600">{cancelError}</p>}

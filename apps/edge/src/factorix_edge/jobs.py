@@ -185,7 +185,28 @@ def read_budget_s(spec: JobSpec) -> float:
         paths = {(str(field_address(f).get("method") or "GET"), str(field_address(f).get("path") or spec.config.get("path") or "/")) for f in spec.fields}
         rate = float(spec.config.get("rate_limit_per_min") or 60)
         return min(120.0, len(paths) * (timeout_s + 60.0 / rate) + 1.0)
+    if spec.protocol == "modbus_tcp":
+        return modbus_cycle_budget_s(spec.fields, spec.config, timeout_s)
     return min(30.0, max(2.0, timeout_s * 2 + 1.0))
+
+
+MODBUS_MAX_CYCLE_S = 120.0
+
+
+def modbus_cycle_budget_s(fields: list[dict[str, Any]], config: dict[str, Any], timeout_s: float) -> float:
+    """Time one Modbus read cycle may take: every block read one after the other, each up to
+    ``timeout_s × (retries + 1)``. The former flat ``2 × timeout + 1`` (7 s) let one slow unit
+    (3 s × 2 tries) cancel the whole 6-unit cycle mid-request, marking all 48 signals BAD and
+    leaving a late reply on the session (R3 Modbus P1)."""
+    retries = max(0, int(config.get("retries") or 0))
+    try:
+        items, _bad = modbus_fields(fields, config, key_by=lambda f: str(f.get("id")))
+        gap = int(config.get("merge_gap_registers", DEFAULT_MODBUS_MERGE_GAP))
+        blocks = len(plan_reads([item.span for item in items], allow_gap=max(0, gap))) if items else 1
+    except (ModbusPlanError, KeyError, TypeError, ValueError):
+        blocks = max(1, len(fields))
+    per_request = timeout_s * (retries + 1)
+    return min(MODBUS_MAX_CYCLE_S, max(2.0, blocks * per_request + 1.0))
 
 
 # --------------------------------------------------------------------------- auth helpers

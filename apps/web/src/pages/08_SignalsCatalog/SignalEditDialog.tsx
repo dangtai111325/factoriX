@@ -1,5 +1,6 @@
-import React, { useEffect, useId, useMemo, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { SignalItem } from '../../types';
+import { isEnterSubmit } from './enterSubmit';
 import { Button } from '../../components/common/Button';
 import { Card } from '../../components/common/Card';
 import { ModalPortal } from '../../components/modals/ModalPortal';
@@ -117,7 +118,10 @@ export const SignalEditDialog: React.FC<SignalEditDialogProps> = ({ signal, isOp
     });
   };
 
+  // In-flight guard (R3-DM-04): `saving` only disables the button after the next render.
+  const savingRef = useRef(false);
   const handleSave = async () => {
+    if (savingRef.current) return;
     const interval = Number(intervalMs);
     if (!Number.isInteger(interval) || interval < 100) {
       setError('Expected interval must be a whole number of milliseconds (100 or more).');
@@ -132,6 +136,7 @@ export const SignalEditDialog: React.FC<SignalEditDialogProps> = ({ signal, isOp
       setError('Change the address or move the signal to another connection, not both at once.');
       return;
     }
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     setServerFieldErrors({});
@@ -159,6 +164,7 @@ export const SignalEditDialog: React.FC<SignalEditDialogProps> = ({ signal, isOp
         setError(described.message);
       }
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -253,7 +259,15 @@ export const SignalEditDialog: React.FC<SignalEditDialogProps> = ({ signal, isOp
 
   return (
     <ModalPortal>
-      <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+      <div
+        className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50"
+        onKeyDown={(event) => {
+          // Enter in a field saves (not in textareas); the in-flight guard prevents a double save.
+          if (!isEnterSubmit(event)) return;
+          event.preventDefault();
+          void handleSave();
+        }}
+      >
         <Card className={`w-full ${protocol ? 'max-w-2xl' : 'max-w-md'} max-h-[90vh] overflow-y-auto p-5 bg-white border border-slate-300 shadow-xl space-y-4`}>
           <div role="dialog" aria-modal="true" aria-labelledby={titleId} className="space-y-4">
             <div>

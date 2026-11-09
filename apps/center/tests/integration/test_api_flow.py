@@ -61,7 +61,7 @@ async def _wipe() -> None:
                   hierarchy_templates, hierarchy_views,
                   edge_nodes, edge_enrollment_tokens, secret_store, connections, acquisition_jobs,
                   source_fields, signal_definitions, signal_bindings, mapping_definitions,
-                  formula_definitions, formula_dependencies, output_groups, output_group_members,
+                  formula_definitions, formula_dependencies, output_groups, output_group_members, model_refs, model_snapshots, model_state,
                   configuration_drafts, configuration_releases, deployment_events, commissioning_jobs,
                   observations, ingest_dedup, latest_signal_state, observation_quarantine,
                   dashboards, dashboard_revisions, retention_policies, retention_jobs,
@@ -304,29 +304,24 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
         )
         assert formula.status_code == 201, formula.text
         assert (await client.post(f"/api/v1/formulas/{formula.json()['id']}/publish", headers=headers)).status_code == 200
-        group = await client.post(
-            "/api/v1/output-groups",
+        model = await client.post(
+            "/api/v1/data-models",
             headers=headers,
             json={
-                "resource_id": machine.json()["id"],
-                "key": "state",
-                "display_name": "State",
-                "members": [
-                    {"kind": "system", "alias": "source_timestamp", "field": "source_timestamp"},
-                    {"kind": "system", "alias": "publish_timestamp", "field": "publish_timestamp"},
-                    {"kind": "signal", "signal_id": signal_id, "alias": "temperature"},
-                ],
+                "name": "State",
+                "spec": {"version": 2, "root": {"type": "object", "children": [
+                    {"key": "source_timestamp", "type": "field", "mode": "calculated", "expr": f"latest_ts({{{{sig:{signal_id}}}}})", "value_type": "timestamp"},
+                    {"key": "publish_timestamp", "type": "field", "mode": "calculated", "expr": "now()", "value_type": "timestamp"},
+                    {"key": "temperature", "type": "field", "mode": "mapping", "ref": {"signal_id": signal_id}},
+                ]}},
             },
         )
-        assert group.status_code == 201, group.text
-        preview = await client.get(f"/api/v1/output-groups/{group.json()['id']}/preview")
+        assert model.status_code == 201, model.text
+        preview = await client.post("/api/v1/data-models/preview", headers=headers, json={"spec": model.json()["spec"]})
         assert preview.status_code == 200, preview.text
-        assert preview.json()["values"]["temperature"] == 0
-        assert preview.json()["body"].startswith('{"source_timestamp":')
-        published = await client.post(f"/api/v1/output-groups/{group.json()['id']}/publish", headers=headers, json={"version": 1})
-        assert published.status_code == 200, published.text
-        latest_body = await client.get(f"/api/v1/output-groups/{group.json()['id']}/latest")
-        assert latest_body.status_code == 200 and '"temperature":0' in latest_body.json()["body"]
+        assert preview.json()["body"].startswith('{"source_timestamp":') and '"temperature":0' in preview.json()["body"]
+        usage = await client.get(f"/api/v1/signals/{signal_id}/usage")
+        assert [m["id"] for m in usage.json()["models"]] == [model.json()["id"]]
         dashboard = await client.post("/api/v1/dashboards", headers=headers, json={"name": "Chuyen lap rap", "site_id": site_id})
         assert dashboard.status_code == 201, dashboard.text
         drafted = await client.patch(

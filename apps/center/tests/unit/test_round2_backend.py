@@ -193,7 +193,7 @@ async def test_move_rewrites_descendant_paths_with_typed_exact_prefix() -> None:
     async def execute(_session: Any, sql: str, params: dict[str, Any]) -> None:
         executed.append((" ".join(sql.split()), params))
 
-    fetch_one = AsyncMock(side_effect=[{"hierarchy_mode": "guided"}, None, {"id": uuid4()}])
+    fetch_one = AsyncMock(side_effect=[{"hierarchy_mode": "guided"}, None, None, {"id": uuid4()}])
     with patch.object(resources, "_resource", AsyncMock(side_effect=[current, target])), patch.object(resources, "fetch_one", fetch_one), patch.object(resources, "fetch_all", AsyncMock(return_value=[])), patch.object(resources, "execute", execute), patch.object(resources, "_link", AsyncMock()), patch.object(resources, "audit", AsyncMock()), patch.object(resources, "get_resource", AsyncMock(return_value={"id": str(node)})), patch("factorix.modules.collect.bump_edge_release", AsyncMock()):
         await resources.move_resource(None, tenant, actor, node, resources.MoveIn(version=2, parent_id=str(parent)), "c")
     sql, params = next((sql, params) for sql, params in executed if "SUBSTRING" in sql)

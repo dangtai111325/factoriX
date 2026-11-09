@@ -54,6 +54,10 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
   const [selectedTargetId, setSelectedTargetId] = useState(currentParentId);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // Filter for long candidate lists (dozens of lines / machines).
+  const [filter, setFilter] = useState('');
+  // In-flight guard (R3-DM-04): a double click moves once (state updates only apply after a render).
+  const movingRef = useRef(false);
   const dialogRef = useRef<HTMLDivElement>(null);
 
   useDialogA11y(isOpen, dialogRef, () => {
@@ -67,14 +71,25 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
     setSelectedTargetId(currentParentId);
     setErrorMsg(null);
     setSubmitting(false);
+    setFilter('');
   }, [isOpen, selectedResource.id, currentParentId]);
 
   if (!isOpen) return null;
 
   const currentParent = allResources.find((r) => r.id === selectedResource.parentId);
+  const filterText = filter.trim().toLowerCase();
+  const visibleCandidates = filterText
+    ? candidateParents.filter(
+        (cand) =>
+          cand.id === selectedTargetId ||
+          cand.name.toLowerCase().includes(filterText) ||
+          cand.code.toLowerCase().includes(filterText),
+      )
+    : candidateParents;
   const unchanged = selectedTargetId === currentParentId || !selectedTargetId;
 
   const handleConfirm = async () => {
+    if (movingRef.current) return;
     if (!selectedTargetId) {
       setErrorMsg('Choose the new parent.');
       return;
@@ -83,6 +98,7 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
       setErrorMsg('This is already the current parent.');
       return;
     }
+    movingRef.current = true;
     setSubmitting(true);
     setErrorMsg(null);
     try {
@@ -95,6 +111,7 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
     } catch (caught) {
       setErrorMsg(translateApiError(caught));
     } finally {
+      movingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -113,6 +130,14 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
           aria-modal="true"
           aria-labelledby="move-resource-title"
           tabIndex={-1}
+          onKeyDown={(event) => {
+            // Enter moves (except on buttons, which act themselves). The ref guard prevents a repeat.
+            if (event.key !== 'Enter' || event.shiftKey || event.altKey || event.nativeEvent.isComposing) return;
+            const target = event.target as HTMLElement;
+            if (target.closest('button, a, textarea, select')) return;
+            event.preventDefault();
+            if (!unchanged && candidateParents.length > 0) void handleConfirm();
+          }}
           className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh] outline-none"
         >
           {/* Header */}
@@ -188,8 +213,22 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
                   No other resource in the model can contain a {resourceTypeLabel(selectedResource.type).toLowerCase()}.
                 </p>
               ) : (
+                <>
+                {candidateParents.length > 8 && (
+                  <input
+                    type="search"
+                    value={filter}
+                    onChange={(event) => setFilter(event.target.value)}
+                    placeholder={`Filter ${candidateParents.length} possible parents by name or code`}
+                    aria-label="Filter the possible parents by name or code"
+                    className="mb-2 w-full h-8 px-2.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-[#2A82E7]/20 focus:border-[#2A82E7]"
+                  />
+                )}
                 <div role="radiogroup" aria-labelledby="move-resource-target-label" className="max-h-56 overflow-y-auto space-y-1.5 pr-1">
-                  {candidateParents.map((cand) => (
+                  {visibleCandidates.length === 0 && (
+                    <p className="text-xs text-slate-500 py-3 text-center">No possible parent matches “{filter}”.</p>
+                  )}
+                  {visibleCandidates.map((cand) => (
                     <label
                       key={cand.id}
                       className={`flex items-center justify-between p-2.5 rounded-lg border cursor-pointer transition-all ${
@@ -228,6 +267,7 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
                     </label>
                   ))}
                 </div>
+                </>
               )}
             </div>
 

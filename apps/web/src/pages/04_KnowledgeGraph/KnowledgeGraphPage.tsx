@@ -19,7 +19,8 @@ import { useApp } from '../../store/AppContext';
 import { api } from '../../api/client';
 import { ResourceNode, SignalItem } from '../../types';
 import { resourceTypeLabel } from '../../components/common/ResourceTypeIcon';
-import { formatValue, normalizeQuality, QUALITY_LABEL } from '../../lib/format';
+import { formatValue, normalizeQuality, QUALITY_HINT, QUALITY_LABEL } from '../../lib/format';
+import { qualityLine, summarizeQualities, useValuesReady } from '../01_Overview/signalSummary';
 import { translateApiError } from '../../utils/apiErrors';
 import { ancestorPath, compareResourcesByName, descendantIds } from '../../utils/resourceHierarchy';
 import { LoadStateNotice } from '../../components/common/LoadStateNotice';
@@ -180,6 +181,19 @@ function buildExpansion(
   return { nodes: Array.from(nodes.values()), edges: Array.from(edges.values()), connections, models };
 }
 
+/** Counts shown on a "Signals" node of the graph (see TelemetryGroupNodeComponent). */
+function groupCounts(list: SignalItem[], valuesReady: boolean) {
+  const summary = summarizeQualities(list);
+  return {
+    signalCount: summary.total,
+    goodCount: summary.good,
+    activeCount: summary.active,
+    pausedCount: summary.paused,
+    valuesLoading: !valuesReady,
+    statusUnknown: summary.noConnection > 0,
+  };
+}
+
 export const KnowledgeGraphPage: React.FC = () => {
   const { resources, signals, setSelectedResourceId, loadState } = useApp();
   const navigate = useNavigate();
@@ -255,7 +269,10 @@ export const KnowledgeGraphPage: React.FC = () => {
     return map;
   }, [viewSignals]);
 
-  const goodSignals = useMemo(() => viewSignals.filter((s) => normalizeQuality(s.quality) === 'GOOD').length, [viewSignals]);
+  // R3-KG-01: no "0 of N good" while the first latest values are still loading.
+  const valuesReady = useValuesReady(loadState, signals);
+  const viewSummary = useMemo(() => summarizeQualities(viewSignals), [viewSignals]);
+  const viewLine = qualityLine(viewSummary, valuesReady);
 
   const resourceNames = useMemo(() => new Map(viewResources.map((item) => [item.id, item.name])), [viewResources]);
   const visibleExpansions = useMemo(
@@ -317,8 +334,7 @@ export const KnowledgeGraphPage: React.FC = () => {
               kind: 'telemetryGroup',
               resourceId: resId,
               resourceName: res?.name || '',
-              signalCount: list.length,
-              goodCount: list.filter((s) => normalizeQuality(s.quality) === 'GOOD').length,
+              ...groupCounts(list, valuesReady),
             },
           });
           rawEdges.push(labeledEdge(`${resId}->${groupId}-HAS_SIGNAL`, resId, groupId, 'HAS_SIGNAL', res?.name || '', 'Signals', '#10B981'));
@@ -378,20 +394,21 @@ export const KnowledgeGraphPage: React.FC = () => {
 
   // Live quality counts on data nodes, without re-layout.
   const qualityFingerprint = useMemo(
-    () => viewSignals.map((s) => `${s.id}:${normalizeQuality(s.quality)}`).join(';'),
-    [viewSignals],
+    () => `${valuesReady}#` + viewSignals.map((s) => `${s.id}:${normalizeQuality(s.quality)}`).join(';'),
+    [viewSignals, valuesReady],
   );
   useEffect(() => {
     setNodes((prev) =>
       prev.map((node) => {
         if (node.type !== 'telemetryGroup') return node;
         const list = signalsByResource.get(String(node.data?.resourceId || '')) || [];
-        const goodCount = list.filter((s) => normalizeQuality(s.quality) === 'GOOD').length;
-        if (node.data?.goodCount === goodCount && node.data?.signalCount === list.length) return node;
-        return { ...node, data: { ...node.data, goodCount, signalCount: list.length } };
+        const counts = groupCounts(list, valuesReady);
+        const same = (Object.keys(counts) as Array<keyof typeof counts>).every((key) => node.data?.[key] === counts[key]);
+        if (same) return node;
+        return { ...node, data: { ...node.data, ...counts } };
       }),
     );
-  }, [qualityFingerprint, signalsByResource, setNodes]);
+  }, [qualityFingerprint, signalsByResource, setNodes, valuesReady]);
 
   const handleNodeClick = (_: React.MouseEvent, node: Node) => {
     const data = (node.data || {}) as Record<string, unknown>;
@@ -428,6 +445,19 @@ export const KnowledgeGraphPage: React.FC = () => {
     },
     [resourceNames],
   );
+
+  // Escape closes the details panel (unless a dialog is open or focus is in a text field).
+  useEffect(() => {
+    if (!selected) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || document.querySelector('[aria-modal="true"]')) return;
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+      setSelected(null);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [selected]);
 
   const collapse = (resourceId: string) => {
     setExpansions((prev) => {
@@ -537,16 +567,22 @@ export const KnowledgeGraphPage: React.FC = () => {
 
         <div className="flex items-center gap-2 flex-wrap">
           <div
+            role="status"
+            aria-busy={viewLine.tone === 'loading' || undefined}
             className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-xs font-semibold ${
-              signalTotal === 0
-                ? 'bg-slate-50 border-slate-200 text-slate-600'
-                : goodSignals === signalTotal
-                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                  : 'bg-amber-50 border-amber-200 text-amber-800'
+              viewLine.tone === 'good'
+                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                : viewLine.tone === 'warning'
+                  ? 'bg-amber-50 border-amber-200 text-amber-800'
+                  : 'bg-slate-50 border-slate-200 text-slate-600'
             }`}
           >
-            <Activity className="w-4 h-4" aria-hidden="true" />
-            <span>{signalTotal === 0 ? 'No signals bound yet' : `${goodSignals} of ${signalTotal} signals good`}</span>
+            {viewLine.tone === 'loading' ? (
+              <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <Activity className="w-4 h-4" aria-hidden="true" />
+            )}
+            <span>{viewLine.text}</span>
           </div>
           {focus && (
             <button
@@ -575,7 +611,7 @@ export const KnowledgeGraphPage: React.FC = () => {
         </p>
       )}
 
-      <div className="relative h-[720px] rounded-2xl border border-[#CBD5E1] bg-[#F8FAFC] shadow-sm overflow-hidden flex">
+      <div className="relative h-[560px] md:h-[720px] rounded-2xl border border-[#CBD5E1] bg-[#F8FAFC] shadow-sm overflow-hidden flex">
         <div ref={canvasRef} className="flex-1 h-full relative">
           {isLoading && (
             <div className="absolute inset-0 bg-white/70 backdrop-blur-xs flex items-center justify-center z-10">
@@ -666,7 +702,7 @@ export const KnowledgeGraphPage: React.FC = () => {
         {selected && (
           <aside
             aria-label="Details"
-            className="w-80 md:w-96 bg-white border-l border-[#E2E8F0] h-full flex flex-col p-4 shadow-xl z-20 animate-in slide-in-from-right duration-200 overflow-y-auto"
+            className="absolute inset-0 w-full md:relative md:inset-auto md:w-96 bg-white border-l border-[#E2E8F0] h-full flex flex-col p-4 shadow-xl z-20 animate-in slide-in-from-right duration-200 overflow-y-auto"
           >
             <div className="flex items-start justify-between gap-2 pb-3 border-b border-[#E2E8F0]">
               <div className="min-w-0">
@@ -727,10 +763,10 @@ export const KnowledgeGraphPage: React.FC = () => {
                 </div>
                 <button
                   type="button"
-                  onClick={() => navigate('/models')}
+                  onClick={() => navigate(selected.id ? `/models?model=${encodeURIComponent(selected.id)}` : '/models')}
                   className="w-full h-8 rounded-lg border border-[#CBD5E1] bg-white hover:bg-slate-50 text-xs font-semibold text-[#0B2545]"
                 >
-                  Open Model Catalog
+                  Open data model
                 </button>
               </div>
             )}
@@ -842,12 +878,17 @@ export const KnowledgeGraphPage: React.FC = () => {
                                 {sig.unit ? <span className="font-sans font-normal text-[10px] text-slate-500 ml-1">{sig.unit}</span> : null}
                               </div>
                               <div
+                                title={QUALITY_HINT[quality]}
                                 className={`text-[10px] font-semibold ${
                                   quality === 'GOOD'
                                     ? 'text-emerald-600'
                                     : quality === 'UNCERTAIN'
                                       ? 'text-amber-600'
-                                      : quality === 'NO_DATA' || quality === 'DISABLED'
+                                      : quality === 'NO_DATA' ||
+                                          quality === 'DISABLED' ||
+                                          quality === 'PAUSED' ||
+                                          quality === 'NO_CONNECTION' ||
+                                          quality === 'STALE'
                                         ? 'text-slate-500'
                                         : 'text-red-600'
                                 }`}

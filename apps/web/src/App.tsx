@@ -20,8 +20,9 @@ import { KnowledgeGraphPage } from './pages/04_KnowledgeGraph/KnowledgeGraphPage
 import { ConnectionsPage } from './pages/05_Connections/ConnectionsPage';
 import { AddDataWizardPage } from './pages/06_AddDataWizard/AddDataWizardPage';
 import { SignalsCatalogPage } from './pages/08_SignalsCatalog/SignalsCatalogPage';
-import { OutputGroupsPage } from './pages/13_OutputGroups/OutputGroupsPage';
+import { DataModelsPage } from './pages/13_DataModels/DataModelsPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
+import { NotFoundPage } from './pages/NotFound/NotFoundPage';
 
 // Query-preserving redirect helper (TC-UI-NAV-06)
 const RedirectWithQuery: React.FC<{ to: string; extraParams?: Record<string, string> }> = ({
@@ -60,7 +61,7 @@ const PageTitleUpdater: React.FC = () => {
   const location = useLocation();
   React.useEffect(() => {
     const matchedPath = Object.keys(ROUTE_TITLES).find((path) => location.pathname.startsWith(path));
-    const title = matchedPath ? ROUTE_TITLES[matchedPath] : 'FactoriX';
+    const title = matchedPath ? ROUTE_TITLES[matchedPath] : 'Page not found';
     document.title = `${title} · FactoriX`;
   }, [location.pathname]);
   return null;
@@ -72,8 +73,11 @@ const ProtectedAppShell: React.FC = () => (
     <div className="fx-app-shell">
       <Sidebar />
       <div className="flex-1 min-w-0">
+        <a href="#fx-main-content" className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[70] focus:bg-white focus:px-3 focus:py-2 focus:rounded-lg focus:shadow-lg focus:text-[13px] focus:font-semibold focus:text-[#111B37]">
+          Skip to content
+        </a>
         <Topbar />
-        <main className="fx-main">
+        <main id="fx-main-content" tabIndex={-1} className="fx-main outline-none">
           <div className="fx-content">
             <Routes>
               {/* Canonical Routes */}
@@ -84,7 +88,7 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/collector/connections" element={<ConnectionsPage />} />
               <Route path="/collector/signals" element={<SignalsCatalogPage />} />
               <Route path="/collector/add-data" element={<AddDataWizardPage />} />
-              <Route path="/models" element={<OutputGroupsPage />} />
+              <Route path="/models" element={<DataModelsPage />} />
 
               {/* Safe Redirects for Removed Product Features (Review 4 S5.4 / S5.8) */}
               <Route path="/factory/layout" element={<Navigate to="/factory/structure" replace />} />
@@ -124,7 +128,8 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/signals/calculated" element={<RedirectWithQuery to="/models" extraParams={{ tab: 'calculations' }} />} />
               <Route path="/storage" element={<RedirectWithQuery to="/historian" />} />
 
-              <Route path="*" element={<Navigate to="/overview" replace />} />
+              {/* R3-NAV-01: unknown routes get a real Not Found page instead of a silent redirect. */}
+              <Route path="*" element={<NotFoundPage />} />
             </Routes>
           </div>
         </main>

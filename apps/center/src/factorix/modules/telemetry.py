@@ -19,7 +19,6 @@ from factorix.domain.health import NO_DATA_PREFIX, effective_connection_health
 from factorix.domain.observation import EDGE_CLOCK_FUTURE, Observation, ObservationError, Quality, resolve_times
 from factorix.domain.quality import Origin
 from factorix.domain.signal_state import evaluate_signal_state
-from factorix.modules import models_engine
 from factorix.modules.common import (
     as_uuid,
     audit,
@@ -294,7 +293,6 @@ async def ingest_observations(
     context = await _batch_context(session, tenant_id, edge_id, items)
     checked_partitions: set[str] = set()
     live_connections: set[UUID] = set()
-    touched: set[UUID] = set()
     accepted: list[tuple[int, Observation, dict[str, Any]]] = []
     for item in items:
         event_uid = str(item.get("event_uid", ""))[:256]
@@ -361,12 +359,12 @@ async def ingest_observations(
         for index, status in outcome.statuses.items():
             results[index] = {"event_uid": uid_at[index], "status": status}
         live_connections |= outcome.live_connections
-        touched |= outcome.touched
 
+    # Data models are sampled by their own scheduler (models_engine), not per ingest batch, so
+    # ingest never waits for model composition. Connection liveness stays at the end of the
+    # transaction: its row locks on `connections` are shared with the heartbeat.
     if live_connections:
         await _mark_connections_live(session, tenant_id, edge_id, live_connections, now)
-    if touched:
-        await _notify_models(session, tenant_id, touched)
     return {"results": [row for row in results if row is not None]}
 
 
@@ -521,7 +519,9 @@ async def _store_batch(
         },
     )
 
-    candidates = list(newest_per_signal(new_rows).values())
+    # Sorted by signal id: every writer of latest_signal_state locks its rows in the same order, so
+    # two concurrent ingest transactions cannot deadlock on it (seen 2026-11-06 07:26).
+    candidates = sorted(newest_per_signal(new_rows).values(), key=lambda row: str(row[1].signal_id))
     goods = [(o.quality.value == "GOOD" and o.value is not None) for _oid, o, _w in candidates]
     replaced_rows = await fetch_all(
         session,
@@ -722,6 +722,7 @@ async def _mark_connections_live(
             SELECT id, health AS old_health
             FROM connections
             WHERE id = ANY(:ids) AND tenant_id = :tenant_id AND edge_id = :edge_id AND status = 'ACTIVE'
+            ORDER BY id
             FOR UPDATE
         )
         UPDATE connections c
@@ -777,23 +778,6 @@ def connection_health_payload(*, connection_id: Any, health: str, effective_heal
         "last_error": last_error,
         "last_success_at": iso_ms(last_success_at),
     }
-
-
-async def _notify_models(session: AsyncSession, tenant_id: UUID, signal_ids: set[UUID]) -> None:
-    """One call per ingest batch into the data-model engine. A model failure never loses telemetry."""
-    # A raw SAVEPOINT (not session.begin_nested) so the batch survives even when the engine catches
-    # a database error itself and leaves the transaction aborted: RELEASE then fails and we roll back
-    # to the savepoint instead of losing the whole telemetry batch.
-    events_mark = len(session.info.get("fx_events", []))
-    await session.execute(text("SAVEPOINT fx_models"))
-    try:
-        await models_engine.on_signals_changed(session, tenant_id, signal_ids)
-        await session.execute(text("RELEASE SAVEPOINT fx_models"))
-    except Exception:  # noqa: BLE001 - the model engine must not block or fail telemetry ingest
-        _truncate_events(session, events_mark)
-        logger.exception("Data model update failed for %d changed signal(s); telemetry was stored.", len(signal_ids))
-        await session.execute(text("ROLLBACK TO SAVEPOINT fx_models"))
-        await session.execute(text("RELEASE SAVEPOINT fx_models"))
 
 
 async def _quarantine(
@@ -967,14 +951,17 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
         """
         SELECT l.*, s.key, s.display_name, s.expected_interval_ms,
                o.provenance_json->>'reason' AS raw_reason,
-               COALESCE(nb.nullable, FALSE) AS nullable
+               COALESCE(nb.nullable, FALSE) AS nullable,
+               COALESCE(nb.connection_status = 'PAUSED', FALSE) AS connection_paused
         FROM latest_signal_state l
         JOIN signal_definitions s ON s.id = l.signal_id
         LEFT JOIN observations o ON o.event_time = l.event_time AND o.id = l.observation_id
         LEFT JOIN LATERAL (
-            SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable
+            SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable, c.status AS connection_status
             FROM signal_bindings b
             JOIN source_fields f ON f.id = b.source_field_id
+            LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+            LEFT JOIN connections c ON c.id = j.connection_id
             WHERE b.signal_id = l.signal_id AND b.enabled = TRUE AND b.valid_to IS NULL
             LIMIT 1
         ) nb ON TRUE
@@ -1002,6 +989,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
             last_good_time=row.get("last_good_event_time"),
             raw_reason_code=row.pop("raw_reason", None),
             null_allowed=bool(row.get("nullable")),
+            connection_paused=bool(row.pop("connection_paused", False)),
             now=now,
         )
         row["source_quality"] = eval_result.source_quality

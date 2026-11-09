@@ -16,7 +16,7 @@ import {
 import { SignalItem } from '../../types';
 import { Button } from '../../components/common/Button';
 import { StatusBadge } from '../../components/common/StatusBadge';
-import { QUALITY_LABEL, formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { QUALITY_HINT, QUALITY_LABEL, formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
 
 interface SignalInspectorProps {
   signal: SignalItem | null;
@@ -25,6 +25,8 @@ interface SignalInspectorProps {
   onEdit: (signal: SignalItem) => void;
   onToggleEnabled: (signal: SignalItem) => void;
   onDelete: (signal: SignalItem) => void;
+  /** True while an enable / disable request runs (the button is disabled). */
+  togglePending?: boolean;
   resourceName?: string;
   connectionName?: string;
   edgeName?: string;
@@ -37,6 +39,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
   onEdit,
   onToggleEnabled,
   onDelete,
+  togglePending = false,
   resourceName,
   connectionName,
   edgeName,
@@ -112,6 +115,8 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
               ? 'The last read failed or could not be decoded.'
               : quality === 'DISABLED'
               ? 'Collection is disabled for this signal.'
+              : quality === 'PAUSED' || quality === 'NO_CONNECTION'
+              ? QUALITY_HINT[quality]
               : 'No sample received yet.'}
           </div>
         </div>
@@ -191,8 +196,9 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
             variant="outline"
             size="sm"
             onClick={() => onToggleEnabled(signal)}
+            disabled={togglePending}
           >
-            {isEnabled ? 'Disable' : 'Enable'}
+            {togglePending ? (isEnabled ? 'Disabling…' : 'Enabling…') : isEnabled ? 'Disable…' : 'Enable'}
           </Button>
 
           <Button

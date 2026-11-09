@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { X, FolderPlus, AlertCircle } from 'lucide-react';
+import { X, FolderPlus, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { ApiError, api } from '../../api/client';
 import { ResourceNode } from '../../types';
 import { translateApiError } from '../../utils/apiErrors';
@@ -8,6 +8,7 @@ import { allowedChildTypes, buildResourceTree, HierarchyTreeNode } from '../../u
 import { resourceTypeLabel } from '../common/ResourceTypeIcon';
 import { useDialogA11y } from './useDialogA11y';
 import { ModalPortal } from './ModalPortal';
+import { useSubmit } from '../../lib/useSubmit';
 
 export interface NewResourceInput {
   name: string;
@@ -91,6 +92,63 @@ export function resourceCodeProblem(value: string): string {
 }
 const FORBIDDEN_NAME = /[/#+$\x00-\x1F\x7F]/;
 
+function normalizedName(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+}
+
+/**
+ * R3-HS-02: a sibling (same parent) that already uses this name, case-insensitive. Two lines named
+ * alike under one zone cannot be told apart in the tree, the graph or the data models.
+ */
+export function duplicateSiblingName(
+  resources: Array<{ id: string; name: string; parentId?: string }>,
+  parentId: string | null | undefined,
+  name: string,
+  excludeId?: string,
+): string {
+  const wanted = normalizedName(name);
+  if (!wanted) return '';
+  const parent = parentId || undefined;
+  const clash = resources.find(
+    (item) => item.id !== excludeId && (item.parentId || undefined) === parent && normalizedName(item.name) === wanted,
+  );
+  return clash ? `Another resource here is already named "${clash.name}". Use a different name.` : '';
+}
+
+/**
+ * Field of a resource create / update error: the server's `field_errors[].path` first, then the
+ * error code. Duplicate names (409 DUPLICATE_NAME) belong to Name, duplicate codes to Code.
+ */
+export function resourceErrorField(caught: unknown): 'name' | 'code' | null {
+  if (!(caught instanceof ApiError)) return null;
+  const paths = caught.fieldErrors.map((item) => String(item.path || '').split('.').pop());
+  if (paths.includes('name')) return 'name';
+  if (paths.includes('code')) return 'code';
+  const code = caught.code;
+  if (code === 'DUPLICATE_NAME' || code === 'NAME_CHARS' || code === 'NAME_LENGTH') return 'name';
+  if (code === 'DUPLICATE' || code === 'DUPLICATE_CODE' || code === 'INVALID_CODE') return 'code';
+  return null;
+}
+
+/** "Add another" choice, remembered for the browser session. */
+const ADD_ANOTHER_KEY = 'fx.addResource.addAnother';
+
+function readAddAnother(): boolean {
+  try {
+    return sessionStorage.getItem(ADD_ANOTHER_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function writeAddAnother(value: boolean): void {
+  try {
+    sessionStorage.setItem(ADD_ANOTHER_KEY, String(value));
+  } catch {
+    // Storage unavailable (private mode): the choice lasts while the dialog is open.
+  }
+}
+
 function flattenTree(nodes: HierarchyTreeNode[], depth = 0, out: Array<{ resource: ResourceNode; depth: number }> = []) {
   for (const node of nodes) {
     out.push({ resource: node.resource, depth });
@@ -117,7 +175,12 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
   const [error, setError] = useState('');
   const [nameError, setNameError] = useState('');
   const [codeError, setCodeError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
+  // Bulk entry: keep the dialog open after a create, with the same parent and type.
+  const [addAnother, setAddAnother] = useState<boolean>(readAddAnother);
+  const [addedNames, setAddedNames] = useState<string[]>([]);
+  // In-flight guard (R3-DM-04): a double Enter / double click creates the resource once.
+  const create = useSubmit((input: NewResourceInput) => onAddResource(input));
+  const submitting = create.pending;
 
   useDialogA11y(isOpen, dialogRef, () => {
     if (!submitting) onClose();
@@ -138,7 +201,7 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
     setError('');
     setNameError('');
     setCodeError('');
-    setSubmitting(false);
+    setAddedNames([]);
     let active = true;
     api<{ items?: Array<{ key: string; name?: string }> }>('/api/v1/resource-types')
       .then((res) => {
@@ -196,8 +259,12 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
     if (!valid) setType(recommended[0]?.key || others[0]?.key || '');
   }, [isOpen, recommended, others, type]);
 
+  // The suggested code follows the name. A new suggestion replaces the value, so an error about the
+  // previous value is stale (R3-HS-04); it is checked again on submit.
   useEffect(() => {
-    if (!codeUserEdited) setCode(slugifyResourceCode(name));
+    if (codeUserEdited) return;
+    setCode(slugifyResourceCode(name));
+    setCodeError('');
   }, [name, codeUserEdited]);
 
   if (!isOpen) return null;
@@ -210,7 +277,8 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
 
     const trimmedName = name.trim();
     const trimmedCode = code.trim();
-    const nameIssue = resourceNameProblem(name);
+    if (create.isRunning()) return;
+    const nameIssue = resourceNameProblem(name) || duplicateSiblingName(resources, parent?.id, name);
     const codeIssue = resourceCodeProblem(code);
     setNameError(nameIssue);
     setCodeError(codeIssue);
@@ -223,27 +291,40 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
       return;
     }
 
-    setSubmitting(true);
     try {
-      await onAddResource({
+      await create.run({
         name: trimmedName,
         code: trimmedCode,
         type,
         parent_id: parent ? parent.id : null,
         description: description.trim(),
       });
-      onClose();
+      if (!addAnother) {
+        onClose();
+        return;
+      }
+      // "Add another": keep parent and type, clear the per-resource fields, back to Name.
+      setAddedNames((prev) => [...prev, trimmedName]);
+      setName('');
+      setCode('');
+      setCodeUserEdited(false);
+      setDescription('');
+      setNameError('');
+      setCodeError('');
+      setError('');
+      window.setTimeout(() => document.getElementById('add-resource-name')?.focus(), 0);
     } catch (caught) {
-      const codeKey = caught instanceof ApiError ? caught.code : '';
-      if (codeKey === 'DUPLICATE' || codeKey === 'INVALID_CODE') {
+      // R3-HS-02: the server's duplicate-name / duplicate-code error is shown on its field.
+      const field = resourceErrorField(caught);
+      if (field === 'code') {
         setCodeError(translateApiError(caught));
-      } else if (codeKey === 'NAME_CHARS' || codeKey === 'NAME_LENGTH') {
+        document.getElementById('add-resource-code')?.focus();
+      } else if (field === 'name') {
         setNameError(translateApiError(caught));
+        document.getElementById('add-resource-name')?.focus();
       } else {
         setError(translateApiError(caught));
       }
-    } finally {
-      setSubmitting(false);
     }
   };
 
@@ -293,6 +374,18 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
           </div>
 
           <form onSubmit={handleSubmit} noValidate className="p-6 space-y-4 overflow-y-auto flex-1 text-sm">
+            {addedNames.length > 0 && (
+              <div
+                role="status"
+                className="p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center gap-2 text-emerald-800 text-xs"
+              >
+                <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
+                <span className="min-w-0 break-words">
+                  Added “{addedNames[addedNames.length - 1]}”
+                  {addedNames.length > 1 ? ` (${addedNames.length} added in this dialog)` : ''}. Enter the next one.
+                </span>
+              </div>
+            )}
             {error && (
               <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-red-700 text-xs">
                 <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
@@ -308,7 +401,13 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                 <select
                   id="add-resource-parent"
                   value={parentId}
-                  onChange={(event) => setParentId(event.target.value)}
+                  onChange={(event) => {
+                    setParentId(event.target.value);
+                    // Duplicate name / code are checked per parent: errors about the old parent are stale.
+                    setNameError('');
+                    setCodeError('');
+                    setError('');
+                  }}
                   className={`${FIELD_BASE} ${FIELD_OK}`}
                 >
                   <option value={TOP_LEVEL}>Top level (no parent)</option>
@@ -377,12 +476,13 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                   aria-describedby="add-resource-name-hint"
                   onChange={(event) => {
                     setName(event.target.value);
-                    // Clear as soon as the input is valid again; new errors appear on blur or submit.
-                    if (nameError && !resourceNameProblem(event.target.value)) setNameError('');
+                    // R3-HS-04: an error is about the previous value; it is checked again on blur or submit.
+                    if (nameError) setNameError('');
+                    if (error) setError('');
                   }}
                   onBlur={() => {
                     // Validate what was typed; an untouched empty field is only reported on submit.
-                    if (name) setNameError(resourceNameProblem(name));
+                    if (name) setNameError(resourceNameProblem(name) || duplicateSiblingName(resources, parent?.id, name));
                   }}
                   placeholder={examples.name}
                   className={`${FIELD_BASE} ${nameError ? FIELD_ERROR : FIELD_OK}`}
@@ -415,7 +515,8 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                   onChange={(event) => {
                     setCode(event.target.value);
                     setCodeUserEdited(true);
-                    if (codeError && !resourceCodeProblem(event.target.value)) setCodeError('');
+                    if (codeError) setCodeError('');
+                    if (error) setError('');
                   }}
                   onBlur={() => {
                     if (codeUserEdited) setCodeError(resourceCodeProblem(code));
@@ -455,14 +556,29 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
               <span className="font-semibold text-slate-700">{parentLabel}</span>.
             </p>
 
-            <div className="pt-2 flex items-center justify-end gap-3">
+            <div className="pt-2 flex flex-wrap items-center justify-end gap-3">
+              <label
+                className="mr-auto flex items-center gap-2 text-xs text-slate-600 cursor-pointer select-none"
+                title="Keep this dialog open after creating, with the same parent and type"
+              >
+                <input
+                  type="checkbox"
+                  checked={addAnother}
+                  onChange={(event) => {
+                    setAddAnother(event.target.checked);
+                    writeAddAnother(event.target.checked);
+                  }}
+                  className="rounded border-slate-300 text-[#EF1B24] focus:ring-[#EF1B24]/30"
+                />
+                Add another
+              </label>
               <button
                 type="button"
                 onClick={onClose}
                 disabled={submitting}
                 className="px-4 py-2 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
               >
-                Cancel
+                {addedNames.length ? 'Done' : 'Cancel'}
               </button>
               <button
                 type="submit"

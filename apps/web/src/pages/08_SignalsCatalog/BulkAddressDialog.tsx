@@ -1,6 +1,7 @@
-import React, { useEffect, useId, useMemo, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, X } from 'lucide-react';
 import { ProtocolType, ResourceNode, SignalItem } from '../../types';
+import { isEnterSubmit } from './enterSubmit';
 import { Button } from '../../components/common/Button';
 import { ModalPortal } from '../../components/modals/ModalPortal';
 import { PROTOCOL_LABEL } from '../../lib/protocols';
@@ -123,8 +124,11 @@ export const BulkAddressDialog: React.FC<BulkAddressDialogProps> = ({ isOpen, si
     else setReplace((prev) => prev + token);
   };
 
+  // In-flight guard (R3-DM-04): one all-or-nothing request per click burst.
+  const applyingRef = useRef(false);
   const handleApply = async () => {
-    if (!changed.length || invalid.length) return;
+    if (applyingRef.current || !changed.length || invalid.length) return;
+    applyingRef.current = true;
     setApplying(true);
     setError(null);
     setItemErrors({});
@@ -139,6 +143,7 @@ export const BulkAddressDialog: React.FC<BulkAddressDialogProps> = ({ isOpen, si
       setItemErrors(described.items);
       setError(described.message);
     } finally {
+      applyingRef.current = false;
       setApplying(false);
     }
   };
@@ -149,7 +154,15 @@ export const BulkAddressDialog: React.FC<BulkAddressDialogProps> = ({ isOpen, si
 
   return (
     <ModalPortal>
-      <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
+      <div
+        className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50"
+        onKeyDown={(event) => {
+          // Enter in a field applies (guarded; disabled conditions are checked inside handleApply).
+          if (!isEnterSubmit(event)) return;
+          event.preventDefault();
+          void handleApply();
+        }}
+      >
         <div role="dialog" aria-modal="true" aria-labelledby={titleId} className="w-full max-w-5xl max-h-[90vh] bg-white border border-slate-300 shadow-xl rounded-xl flex flex-col overflow-hidden">
           <div className="p-4 border-b border-slate-200 flex items-start justify-between gap-3">
             <div>
@@ -298,7 +311,7 @@ export const BulkAddressDialog: React.FC<BulkAddressDialogProps> = ({ isOpen, si
                     {invalid.length > 0 && <span className="text-red-700 font-semibold">{invalid.length} invalid</span>}
                   </div>
                   <div className="max-h-[42vh] overflow-auto">
-                    <table className="w-full text-[11px]">
+                    <table className="w-full min-w-[640px] text-[11px]">
                       <thead className="bg-white sticky top-0 text-[10px] uppercase text-[#657794]">
                         <tr className="border-b border-slate-200">
                           <th className="px-2 py-1.5 text-left">Signal</th>

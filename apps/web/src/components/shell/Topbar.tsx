@@ -10,12 +10,15 @@ import {
   Info,
   LogOut,
   AlertCircle,
+  Menu,
 } from 'lucide-react';
 import { useApp } from '../../store/AppContext';
 import { useAuth } from '../../features/auth';
 import { CollectorState, useCollectorHealth } from './collectorHealth';
 import { ChangePasswordModal } from '../modals/ChangePasswordModal';
 import { AboutFactorixModal } from '../modals/AboutFactorixModal';
+import { ConnectivityBanner } from './ConnectivityBanner';
+import { toggleSidebar, useSidebarOpen } from './sidebarState';
 
 const ROUTE_BREADCRUMBS: Record<string, { group?: string; title: string }> = {
   '/overview': { title: 'Overview' },
@@ -39,6 +42,25 @@ export const Topbar: React.FC = () => {
   const { setSearchOpen, resources } = useApp();
   const collector = useCollectorHealth();
   const { state, signOut } = useAuth();
+  const navOpen = useSidebarOpen();
+  const bannerRef = useRef<HTMLDivElement>(null);
+
+  // Banners sit in a fixed stack under the top bar; their height pushes the page content down
+  // (--fx-banner-height is read by .fx-main) instead of covering it.
+  useEffect(() => {
+    const el = bannerRef.current;
+    if (!el) return;
+    const root = document.documentElement;
+    const apply = () => root.style.setProperty('--fx-banner-height', `${el.offsetHeight}px`);
+    apply();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(apply);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      root.style.setProperty('--fx-banner-height', '0px');
+    };
+  }, []);
 
   const [siteDropdownOpen, setSiteDropdownOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
@@ -131,6 +153,7 @@ export const Topbar: React.FC = () => {
     online: 'bg-[#10B981]',
     degraded: 'bg-[#F59E0B]',
     offline: 'bg-[#EF1B24]',
+    unknown: 'bg-[#CBD5E1]',
   };
 
   // Close dropdowns on click outside
@@ -156,10 +179,13 @@ export const Topbar: React.FC = () => {
 
   return (
     <>
+      <div ref={bannerRef} className="fx-banner-stack">
+      {/* R3-OV-01: browser offline / appliance unreachable / live stream interrupted. */}
+      <ConnectivityBanner />
       {/* Offline banner if an enrolled edge is offline */}
       {offlineEdge && (
-        <div className="bg-[#EF1B24] text-white text-[12px] font-semibold px-4 py-1.5 flex items-center justify-between shadow-xs">
-          <div className="flex items-center gap-2">
+        <div className="bg-[#EF1B24] text-white text-[12px] font-semibold px-4 py-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 shadow-xs">
+          <div className="flex items-center gap-2 min-w-0">
             <AlertCircle className="w-4 h-4 shrink-0" />
             <span>
               Data collection for{' '}
@@ -179,25 +205,37 @@ export const Topbar: React.FC = () => {
           </button>
         </div>
       )}
+      </div>
 
       <header className="fx-topbar select-none relative z-30">
         {/* Left: Breadcrumbs & Plant Selector */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 md:gap-3 min-w-0">
+          {/* R3-UI-01: hamburger for the off-canvas navigation below 768 px. */}
+          <button
+            type="button"
+            onClick={toggleSidebar}
+            className="md:hidden -ml-1 p-2 rounded-lg text-[#334568] hover:bg-[#F1F5FA] shrink-0"
+            aria-label={navOpen ? 'Close navigation' : 'Open navigation'}
+            aria-controls="fx-main-navigation"
+            aria-expanded={navOpen}
+          >
+            <Menu className="w-5 h-5" aria-hidden="true" />
+          </button>
           {/* Breadcrumbs */}
-          <div className="flex items-center gap-2 text-[13px] text-[#657794]">
+          <div className="flex items-center gap-2 text-[13px] text-[#657794] min-w-0">
             {breadcrumb.group && (
               <>
-                <span className="font-medium text-[#475569]">{breadcrumb.group}</span>
-                <span className="text-[#CBD5E1]">›</span>
+                <span className="hidden md:inline font-medium text-[#475569] whitespace-nowrap">{breadcrumb.group}</span>
+                <span className="hidden md:inline text-[#CBD5E1]">›</span>
               </>
             )}
-            <span className="font-bold text-[#111B37]">{breadcrumb.title}</span>
+            <span className="font-bold text-[#111B37] truncate">{breadcrumb.title}</span>
           </div>
 
-          <span className="text-[#CBD5E1] mx-1">|</span>
+          <span className="hidden md:inline text-[#CBD5E1] mx-1">|</span>
 
           {/* Plant / Scope Selector */}
-          <div className="relative" ref={siteDropdownRef}>
+          <div className="relative hidden md:block" ref={siteDropdownRef}>
             <button
               type="button"
               onClick={() => setSiteDropdownOpen(!siteDropdownOpen)}
@@ -273,7 +311,7 @@ export const Topbar: React.FC = () => {
           <button
             type="button"
             onClick={() => navigate('/collector/connections')}
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide border border-[#D4DFEC] bg-white hover:bg-[#F8FAFC] transition-colors whitespace-nowrap"
+            className="inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide border border-[#D4DFEC] bg-white hover:bg-[#F8FAFC] transition-colors whitespace-nowrap shrink-0"
             title={`${collector.detail} Open Connections.`}
             aria-label={`Collector: ${collector.label}. ${collector.detail} Open Connections.`}
           >
@@ -281,24 +319,27 @@ export const Topbar: React.FC = () => {
               aria-hidden="true"
               className={`w-2 h-2 rounded-full ${pillDot[collector.state]}`}
             />
-            <span className="text-[#334568]">Collector: {collector.state === 'waiting' ? 'waiting' : collector.label.toLowerCase()}</span>
+            <span className="hidden sm:inline text-[#334568]">
+              Collector: {collector.state === 'waiting' ? 'waiting' : collector.state === 'unknown' ? 'unknown (no connection to appliance)' : collector.label.toLowerCase()}
+            </span>
           </button>
         </div>
 
         {/* Right Controls */}
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-1.5 sm:gap-3 shrink-0">
           {/* Global Search Bar (Ctrl+K) */}
           <button
             type="button"
             onClick={() => setSearchOpen(true)}
-            aria-label="Search the model and signals (Ctrl+K)"
-            className="w-[260px] h-[36px] px-3 rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-between text-[13px] text-[#94A3B8] hover:border-[#0B2545] hover:text-[#334568] transition-colors shadow-2xs"
+            aria-label="Search resources, signals and connections (Ctrl+K)"
+            aria-keyshortcuts="Control+K Meta+K"
+            className="w-9 lg:w-[260px] h-[36px] px-0 lg:px-3 rounded-lg border border-[#D4DFEC] bg-white flex items-center justify-center lg:justify-between text-[13px] text-[#94A3B8] hover:border-[#0B2545] hover:text-[#334568] transition-colors shadow-2xs"
           >
             <div className="flex items-center gap-2">
               <Search className="w-4 h-4 text-[#657794]" />
-              <span>Search model, signals…</span>
+              <span className="hidden lg:inline">Search resources, signals…</span>
             </div>
-            <kbd className="px-1.5 py-0.5 text-[10px] font-mono bg-[#F1F5FA] border border-[#CBD5E1] rounded text-[#657794]">
+            <kbd className="hidden lg:inline px-1.5 py-0.5 text-[10px] font-mono bg-[#F1F5FA] border border-[#CBD5E1] rounded text-[#657794]">
               Ctrl K
             </kbd>
           </button>
@@ -315,7 +356,7 @@ export const Topbar: React.FC = () => {
           </button>
 
           {/* User Menu Dropdown */}
-          <div className="relative pl-2 border-l border-[#E2E8F0]" ref={userMenuRef}>
+          <div className="relative pl-1 sm:pl-2 border-l border-[#E2E8F0]" ref={userMenuRef}>
             <button
               type="button"
               onClick={() => setUserMenuOpen(!userMenuOpen)}
@@ -327,13 +368,13 @@ export const Topbar: React.FC = () => {
               <div className="w-8 h-8 rounded-full bg-[#0B2545] text-white flex items-center justify-center text-[12px] font-bold">
                 <UserRound className="w-4 h-4" />
               </div>
-              <div className="flex flex-col text-left">
+              <div className="hidden md:flex flex-col text-left">
                 <span className="text-[12px] font-bold text-[#111B37] leading-tight">
                   {operatorName}
                 </span>
                 <span className="text-[10px] text-[#657794]">Administrator</span>
               </div>
-              <ChevronDown className="w-3.5 h-3.5 text-[#64748B]" />
+              <ChevronDown className="hidden sm:block w-3.5 h-3.5 text-[#64748B]" />
             </button>
 
             {userMenuOpen && (

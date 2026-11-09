@@ -13,6 +13,10 @@ export interface StatusPresentation {
 /** Presentation of a connection's display state (computed in AppContext from `effective_health`). */
 export function connectionStatus(conn: ConnectionItem): StatusPresentation {
   const lastError = conn.lastError || '';
+  if (conn.noConnection) {
+    // R3-OV-01: the browser cannot reach the appliance, so the last state is not current.
+    return { label: 'Unknown', dot: 'bg-slate-300', text: 'text-[#475569]', detail: 'No connection to appliance', detailTone: 'muted' };
+  }
   switch (conn.status) {
     case 'connected':
       return lastError

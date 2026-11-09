@@ -7,6 +7,7 @@ import { useApp } from '../../store/AppContext';
 import { ModalPortal } from '../../components/modals/ModalPortal';
 import { TestResultPanel } from './TestResultPanel';
 import { httpPathsOfConnection, rateBudget } from './httpRate';
+import { pollIntervalMin, validatePollInterval } from './pollInterval';
 
 export interface SavedConnection {
   id: string;
@@ -269,6 +270,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
       setHttpHeaders(headersToRows(cfg.headers));
       setHttpTimeout(num(cfg.timeout_ms, 5000));
       setHttpRateLimit(num(cfg.rate_limit_per_min, 60));
+      setHttpTestPath(typeof cfg.path === 'string' && cfg.path !== '/' ? cfg.path : '');
     } else if (proto === 'websocket') {
       setWsUrl(String(cfg.url || ''));
       setWsHeaders(headersToRows(cfg.headers));
@@ -398,7 +400,8 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
     }
     if (needsSecret && !secret && !(isEdit && secretConfigured)) errors.secret = `${secretLabel} is required.`;
     if (INTERVAL_PROTOCOLS.includes(protocol)) {
-      if (!Number.isInteger(intervalMs) || intervalMs < 1000) errors.intervalMs = 'Interval must be at least 1000 ms.';
+      const intervalError = validatePollInterval(protocol, intervalMs);
+      if (intervalError) errors.intervalMs = intervalError;
     }
     return errors;
   };
@@ -449,6 +452,8 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
         headers: rowsToHeaders(httpHeaders),
         timeout_ms: httpTimeout,
         rate_limit_per_min: httpRateLimit,
+        // Stored so every later test (list, drawer, "Test all") can prove the credentials.
+        path: httpTestPath || '/',
       };
     }
     return { ...base, url: wsUrl.trim(), headers: rowsToHeaders(wsHeaders), timeout_ms: wsTimeout };
@@ -456,9 +461,13 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
 
   const describeError = (err: unknown): string => {
     if (err instanceof ApiError) {
-      if (err.code === 'DUPLICATE') {
-        setFieldErrors((prev) => ({ ...prev, name: err.message }));
-        return err.message;
+      // R3-HS-02: a duplicate sibling name is shown on the Name field (409 DUPLICATE / DUPLICATE_NAME,
+      // or a field error on `name`).
+      const nameError = err.fieldErrors.find((fe) => fe.path === 'name' || fe.path.endsWith('.name'));
+      if (err.code === 'DUPLICATE' || err.code === 'DUPLICATE_NAME' || nameError) {
+        const message = err.message || nameError?.message || 'Another connection already uses this name.';
+        setFieldErrors((prev) => ({ ...prev, name: message }));
+        return message;
       }
       if (err.code === 'RESOURCE_VERSION_CONFLICT') {
         return 'This connection was changed elsewhere. Close the dialog and open it again to load the latest version.';
@@ -527,33 +536,54 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
     }
   };
 
+  // In-flight guard shared by Save and Test (R3-DM-04): a double click or Enter + click runs once.
+  const actionRunningRef = useRef(false);
+
   const handleSave = async (event: React.FormEvent) => {
     event.preventDefault();
-    const id = await save();
-    if (id) onClose();
+    if (actionRunningRef.current) return;
+    actionRunningRef.current = true;
+    try {
+      const id = await save();
+      if (id) onClose();
+    } finally {
+      actionRunningRef.current = false;
+    }
   };
 
   const handleTest = async () => {
-    // Unsaved edits of an existing connection are tested as a draft (nothing is stored);
-    // a new connection, or a changed secret, has to be saved first.
-    if (isEdit && savedId && dirty && !secret) {
-      const errors = validate();
-      setFieldErrors(errors);
-      if (Object.keys(errors).length) return;
+    if (actionRunningRef.current) return;
+    actionRunningRef.current = true;
+    try {
+      // Unsaved edits of an existing connection are tested as a draft (nothing is stored);
+      // a new connection, or a changed secret, has to be saved first.
+      if (isEdit && savedId && dirty && !secret) {
+        const errors = validate();
+        setFieldErrors(errors);
+        if (Object.keys(errors).length) return;
+        setIsTesting(true);
+        setTestResult(null);
+        try {
+          const result = await runConnectionTest(savedId, { mode: 'CONNECTIVITY', config: buildConfig(), testPath: protocol === 'http' ? httpTestPath : undefined });
+          setTestResult(result);
+        } finally {
+          setIsTesting(false);
+        }
+        return;
+      }
+      const id = await save();
+      if (!id) return;
       setIsTesting(true);
       setTestResult(null);
-      const result = await runConnectionTest(savedId, { mode: 'CONNECTIVITY', config: buildConfig(), testPath: protocol === 'http' ? httpTestPath : undefined });
-      setTestResult(result);
-      setIsTesting(false);
-      return;
+      try {
+        const result = await runConnectionTest(id, { mode: 'CONNECTIVITY', testPath: protocol === 'http' ? httpTestPath : undefined });
+        setTestResult(result);
+      } finally {
+        setIsTesting(false);
+      }
+    } finally {
+      actionRunningRef.current = false;
     }
-    const id = await save();
-    if (!id) return;
-    setIsTesting(true);
-    setTestResult(null);
-    const result = await runConnectionTest(id, { mode: 'CONNECTIVITY', testPath: protocol === 'http' ? httpTestPath : undefined });
-    setTestResult(result);
-    setIsTesting(false);
   };
 
   if (!isOpen) return null;
@@ -653,12 +683,13 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
   const httpPaths = protocol === 'http' && savedId ? httpPathsOfConnection(signals, savedId) : new Set<string>();
   const httpBudget = protocol === 'http' && httpPaths.size > 0 && intervalMs > 0 ? rateBudget(httpPaths.size, intervalMs, httpRateLimit || 1) : null;
 
-  const intervalHint =
+  const intervalHint = `${
     protocol === 'http'
       ? 'Each distinct path is requested once per interval. Keep requests per minute under the source rate limit (5000 ms recommended).'
       : protocol === 'websocket'
         ? 'Latest values are emitted at most once per interval, only when a frame arrived.'
-        : 'How often the collector reads the source.';
+        : 'How often the collector reads the source.'
+  } Applies to the whole connection job: every machine read through this connection. ${pollIntervalMin(protocol)}–86 400 000 ms.`;
 
   return (
     <ModalPortal>
@@ -732,7 +763,10 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
                 onChange={(e) => {
                   setName(e.target.value);
                   markDirty();
+                  // A stale error (required / duplicate) no longer applies once the name changes.
+                  if (fieldErrors.name) setFieldErrors(({ name: _stale, ...rest }) => rest);
                 }}
+                aria-invalid={Boolean(fieldErrors.name)}
                 placeholder="e.g. Line PLC gateway"
                 className={inputCls.replace('font-mono', 'font-semibold')}
               />
@@ -1021,12 +1055,13 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
                   onChange={(e) => {
                     setHttpTestPath(e.target.value.trim());
                     setTestResult(null);
+                    markDirty();
                   }}
                   placeholder="/api/v1/machines/<machine>/status"
                   className={`${inputCls} font-mono`}
                 />
                 <p className="text-[10px] text-[#64748B] mt-0.5">
-                  A data path that requires the credentials. The test requests it to prove authentication; without it, Authenticate is reported as not verified. Not stored.
+                  A data path that requires the credentials. The test requests it to prove authentication; without it, Authenticate is reported as not verified. Saved with the connection and used by every test.
                 </p>
               </div>
             </div>
@@ -1052,17 +1087,35 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
           )}
 
           {INTERVAL_PROTOCOLS.includes(protocol) && (
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <label className={labelCls}>{protocol === 'websocket' ? 'Emit interval (ms)' : 'Poll interval (ms)'}</label>
-                <input type="number" min={1000} step={500} value={intervalMs} onChange={(e) => { setIntervalMs(Number(e.target.value)); markDirty(); }} className={inputCls} />
+                <label className={labelCls} htmlFor={`${titleId}-interval`}>{protocol === 'websocket' ? 'Emit interval (ms)' : 'Poll interval (ms)'}</label>
+                <input
+                  id={`${titleId}-interval`}
+                  type="number"
+                  min={pollIntervalMin(protocol)}
+                  max={86400000}
+                  step={100}
+                  value={Number.isFinite(intervalMs) ? intervalMs : ''}
+                  onChange={(e) => {
+                    const next = e.target.value === '' ? Number.NaN : Number(e.target.value);
+                    setIntervalMs(next);
+                    markDirty();
+                    // R3-AD-01: validate inline while typing; the stale message never outlives the value.
+                    const message = validatePollInterval(protocol, next);
+                    setFieldErrors(({ intervalMs: _old, ...rest }) => (message ? { ...rest, intervalMs: message } : rest));
+                  }}
+                  aria-invalid={Boolean(fieldErrors.intervalMs)}
+                  aria-describedby={`${titleId}-interval-hint`}
+                  className={inputCls}
+                />
                 {err('intervalMs')}
               </div>
-              <p className="text-[10px] text-[#64748B] self-end pb-1">{intervalHint}</p>
+              <p id={`${titleId}-interval-hint`} className="text-[10px] text-[#64748B] self-end pb-1">{intervalHint}</p>
               {httpBudget && (
                 <p
                   role={httpBudget.over ? 'alert' : undefined}
-                  className={`col-span-2 p-2.5 rounded-lg border text-[11px] ${httpBudget.over ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-white border-[#E2E8F0] text-[#64748B]'}`}
+                  className={`sm:col-span-2 p-2.5 rounded-lg border text-[11px] ${httpBudget.over ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-white border-[#E2E8F0] text-[#64748B]'}`}
                 >
                   {httpBudget.message}
                 </p>
@@ -1077,7 +1130,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
             successLabel="The Edge collector reached the endpoint"
           />
 
-          <div className="pt-3 border-t border-[#E2E8F0] flex items-center justify-between">
+          <div className="pt-3 border-t border-[#E2E8F0] flex flex-wrap items-center justify-between gap-2">
             <button
               type="button"
               disabled={busy}

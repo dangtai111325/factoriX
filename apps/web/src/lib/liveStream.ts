@@ -43,9 +43,14 @@ export interface HealthMsg {
 
 export interface ModelBodyMsg {
   type: 'model_body'
+  /** Data model id. */
   group_id: string
-  /** Exact ordered JSON text as published. Never re-serialise it if key order matters. */
+  /** Exact ordered JSON text of the sample. Never re-serialise it if key order matters. */
   body: string
+  /** Sample time (ISO ms Z); pushed every sample_ms while the model runs. */
+  sampled_at?: string | null
+  /** Runtime errors of this sample: [{path, node_id?, code, message}]. */
+  errors?: Array<{ path?: string; node_id?: string; code?: string; message?: string }>
 }
 
 export interface ModelEventMsg {
@@ -300,6 +305,25 @@ function subscribeStatus(listener: () => void): () => void {
   return () => {
     statusListeners.delete(listener)
   }
+}
+
+/** Listen for stream status changes (used by the connectivity store). */
+export function onStreamStatusChange(listener: () => void): () => void {
+  return subscribeStatus(listener)
+}
+
+/**
+ * Reconnect now instead of waiting for the backoff timer (e.g. the browser came back online).
+ * No-op while the socket is open or nobody is subscribed.
+ */
+export function reconnectStreamNow(): void {
+  if (socket || !hasSubscribers()) return
+  if (reconnectTimer !== null) {
+    window.clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  backoffMs = 1000
+  connect()
 }
 
 export function useStreamStatus(): StreamStatus {

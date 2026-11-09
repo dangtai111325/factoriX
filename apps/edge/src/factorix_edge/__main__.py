@@ -129,6 +129,9 @@ async def obtain_credential(client: httpx.AsyncClient, credential_path: Path) ->
         return credential
 
 
+CENTER_KEEPALIVE_S = 2.0
+
+
 async def main() -> None:
     center = os.environ.get("FACTORIX_CENTER_URL", "http://127.0.0.1:8000").rstrip("/")
     allow = [item.strip() for item in os.environ.get("FACTORIX_OT_ALLOWLIST", "").split(",") if item.strip()]
@@ -137,7 +140,11 @@ async def main() -> None:
     snapshot_path = Path(os.environ.get("FACTORIX_CONFIG_PATH", str(outbox_path.parent / "active-config.json")))
     health_path = Path(os.environ.get("FACTORIX_EDGE_HEALTH", str(outbox_path.parent / "edge-health.json")))
     outbox_path.parent.mkdir(parents=True, exist_ok=True)
-    async with httpx.AsyncClient(base_url=center, timeout=20) as client:
+    # Idle pooled connections expire before uvicorn's 5 s keep-alive closes them: with equal
+    # timeouts the edge reused sockets the server had just closed ("Server disconnected without
+    # sending a response", ReadError on flush; R3 P1).
+    limits = httpx.Limits(keepalive_expiry=CENTER_KEEPALIVE_S)
+    async with httpx.AsyncClient(base_url=center, timeout=20, limits=limits) as client:
         while True:
             credential = await obtain_credential(client, credential_path)
             # Reopen per enrollment: a reset may have removed the files under /data.

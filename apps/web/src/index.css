@@ -118,7 +118,8 @@ html:has([aria-modal='true']) {
 
 .fx-main {
   margin-left: var(--fx-sidebar-width);
-  padding-top: var(--fx-topbar-height);
+  /* Global banners (connectivity, collector offline) sit under the top bar and push the page down. */
+  padding-top: calc(var(--fx-topbar-height) + var(--fx-banner-height, 0px));
   min-height: 100vh;
   width: calc(100% - var(--fx-sidebar-width));
   background: var(--fx-app-bg);
@@ -296,4 +297,86 @@ button:disabled[class*='bg-blue-6'] {
   box-shadow: none !important;
   opacity: 1 !important;
   cursor: not-allowed;
+}
+
+/* Global banners under the fixed top bar (R3-OV-01). Empty when nothing is wrong. */
+.fx-banner-stack {
+  position: fixed;
+  z-index: 29;
+  top: var(--fx-topbar-height);
+  left: var(--fx-sidebar-width);
+  right: 0;
+}
+
+.fx-sidebar-backdrop {
+  display: none;
+}
+
+/*
+ * R3-UI-01: narrow screens (< 768 px). The sidebar becomes an off-canvas drawer opened from the
+ * hamburger in the top bar, the content uses the full width, and the page itself never scrolls
+ * sideways (wide tables scroll inside their own container). Desktop layout is unchanged.
+ */
+@media (max-width: 767.98px) {
+  :root {
+    --fx-sidebar-width: 0px;
+    --fx-content-padding: 12px;
+    --fx-topbar-height: 56px;
+  }
+  .fx-sidebar {
+    width: min(296px, 86vw);
+    transform: translateX(-100%);
+    transition: transform 200ms ease;
+    box-shadow: none;
+    z-index: 45;
+  }
+  .fx-sidebar[data-open='true'] {
+    transform: translateX(0);
+    box-shadow: 0 10px 40px rgba(17, 27, 55, 0.25);
+  }
+  .fx-sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 44;
+    background: rgba(15, 23, 42, 0.45);
+  }
+  .fx-topbar {
+    padding: 0 12px;
+    gap: 8px;
+  }
+  .fx-main {
+    width: 100%;
+    overflow-x: hidden;
+    overflow-x: clip;
+  }
+  .fx-content {
+    padding: 12px var(--fx-content-padding) 28px;
+    min-width: 0;
+  }
+  .fx-page-title {
+    font-size: 22px;
+  }
+  /* Safety net: media and preformatted text never widen the page. */
+  .fx-content img,
+  .fx-content video,
+  .fx-content canvas {
+    max-width: 100%;
+  }
+  .fx-content pre {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  /* A table that is not inside a scroll container scrolls by itself instead of widening the page. */
+  .fx-content table:not(.overflow-x-auto table):not(.overflow-auto table):not(.overflow-x-scroll table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fx-sidebar {
+    transition: none;
+  }
 }

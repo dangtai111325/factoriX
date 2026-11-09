@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import {
   House,
@@ -13,10 +13,12 @@ import {
   ChevronDown,
   RotateCcw,
   LogOut,
+  X,
 } from 'lucide-react';
 import { useAuth } from '../../features/auth';
 import { RevertToZeroModal } from '../modals/RevertToZeroModal';
 import factorixLogo from '../../assets/factorix_brand_logo.png';
+import { MOBILE_QUERY, setSidebarOpen, useSidebarOpen } from './sidebarState';
 
 interface NavChild {
   label: string;
@@ -150,6 +152,47 @@ export const Sidebar: React.FC = () => {
   const location = useLocation();
   const { signOut } = useAuth();
   const [revertModalOpen, setRevertModalOpen] = useState(false);
+  // R3-UI-01: below 768 px the sidebar is an off-canvas drawer opened from the top bar.
+  const drawerOpen = useSidebarOpen();
+  const asideRef = useRef<HTMLElement>(null);
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia(MOBILE_QUERY).matches : false,
+  );
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const query = window.matchMedia(MOBILE_QUERY);
+    const onChange = () => {
+      setIsMobile(query.matches);
+      if (!query.matches) setSidebarOpen(false);
+    };
+    query.addEventListener('change', onChange);
+    return () => query.removeEventListener('change', onChange);
+  }, []);
+
+  // Navigating closes the drawer.
+  useEffect(() => {
+    setSidebarOpen(false);
+  }, [location.pathname, location.search]);
+
+  // Drawer open: Escape closes it, focus moves into it and returns to the hamburger afterwards.
+  useEffect(() => {
+    if (!drawerOpen || !isMobile) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusTimer = window.setTimeout(() => asideRef.current?.querySelector<HTMLElement>('a, button')?.focus(), 0);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setSidebarOpen(false);
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      window.clearTimeout(focusTimer);
+      document.removeEventListener('keydown', onKey);
+      if (opener && document.contains(opener)) opener.focus();
+    };
+  }, [drawerOpen, isMobile]);
 
   // Group open state persistence
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() => {
@@ -288,11 +331,32 @@ export const Sidebar: React.FC = () => {
 
   return (
     <>
-      <aside className="fx-sidebar select-none flex flex-col" aria-label="Main navigation">
+      {isMobile && drawerOpen && (
+        <div className="fx-sidebar-backdrop" aria-hidden="true" onClick={() => setSidebarOpen(false)} />
+      )}
+      <aside
+        ref={asideRef}
+        id="fx-main-navigation"
+        className="fx-sidebar select-none flex flex-col"
+        data-open={drawerOpen ? 'true' : 'false'}
+        aria-label="Main navigation"
+        // Off-canvas and closed on a phone: keep it out of the tab order and the accessibility tree.
+        {...(isMobile && !drawerOpen ? { 'aria-hidden': true, inert: '' } : {})}
+      >
         {/* Brand Header: Logo only in red/white tone per user request */}
         <div className="flex-1 min-h-0 flex flex-col">
-          <div className="h-[62px] px-5 flex items-center border-b border-[#E3EAF3] shrink-0">
+          <div className="h-[62px] px-5 flex items-center justify-between border-b border-[#E3EAF3] shrink-0">
             <img src={factorixLogo} alt="FactoriX" className="h-8 w-auto object-contain" />
+            {isMobile && (
+              <button
+                type="button"
+                onClick={() => setSidebarOpen(false)}
+                className="p-2 -mr-2 rounded-lg text-[#657794] hover:bg-[#F1F5FA] hover:text-[#111B37]"
+                aria-label="Close navigation"
+              >
+                <X className="w-5 h-5" aria-hidden="true" />
+              </button>
+            )}
           </div>
 
           {/* Navigation Links: scroll inside, never under the footer */}

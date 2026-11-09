@@ -39,6 +39,12 @@ import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { api } from '../../api/client';
 import { PROTOCOL_LABEL } from '../../lib/protocols';
 import { formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { fetchSignalUsage, fetchSignalsUsage } from '../../lib/impactApi';
+import { indeterminateRef, useRangeSelection } from './useRangeSelection';
+import { useSubmit } from '../../lib/useSubmit';
+import { ActionToast, useActionToast } from '../../components/common/ActionToast';
+import { translateApiError } from '../../utils/apiErrors';
+import { ModelUsageList, useModelUsage } from './ModelUsageList';
 
 interface CatalogTreeNodeProps {
   node: { resource: ResourceNode; children: any[] };
@@ -220,7 +226,7 @@ export const SignalsCatalogPage: React.FC = () => {
   // Local Filter States
   const [searchTerm, setSearchTerm] = useState('');
   const [typeFilter, setTypeFilter] = useState<'all' | 'number' | 'integer' | 'boolean' | 'text'>('all');
-  const [qualityFilter, setQualityFilter] = useState<'all' | 'good' | 'uncertain' | 'bad' | 'stale' | 'no_data' | 'disabled'>('all');
+  const [qualityFilter, setQualityFilter] = useState<'all' | 'good' | 'uncertain' | 'bad' | 'stale' | 'paused' | 'no_data' | 'disabled'>('all');
   const [selectedFilter, setSelectedFilter] = useState<string>('all');
   const [expandedTreeNodes, setExpandedTreeNodes] = useState<Record<string, boolean>>({});
 
@@ -232,27 +238,27 @@ export const SignalsCatalogPage: React.FC = () => {
     [selectedSignalId, signals]
   );
   const setSelectedSignal = (sig: SignalItem | null) => setSelectedSignalIdState(sig ? sig.id : null);
-  const [deleting, setDeleting] = useState(false);
   const [editTarget, setEditTarget] = useState<SignalItem | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SignalItem | null>(null);
+  // R3-DM-02: disabling asks for confirmation too; both dialogs list the data models that use the signal.
+  const [disableTarget, setDisableTarget] = useState<SignalItem | null>(null);
+  const [dialogError, setDialogError] = useState<string | null>(null);
+  const impactTarget = deleteTarget || disableTarget;
+  // Bumped on every open so the usage is re-read each time a dialog opens.
+  const [impactSeq, setImpactSeq] = useState(0);
+  const [usage, retryUsage] = useModelUsage(impactTarget ? `${impactTarget.id}:${impactSeq}` : null, () =>
+    impactTarget ? fetchSignalUsage(impactTarget.id) : Promise.resolve([]),
+  );
 
   // Bulk Selection
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  // Bulk selection with Shift+click ranges over the visible (filtered) order; see below.
+  const allSignalIds = useMemo(() => signals.map((s) => s.id), [signals]);
   const [trendSignals, setTrendSignals] = useState<SignalItem[]>([]);
   const [timeframe, setTimeframe] = useState<'15m' | '1h' | '6h'>('15m');
 
-  // Toast / Feedback
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [undoAction, setUndoAction] = useState<(() => void) | null>(null);
-
-  const showToast = (msg: string, undo?: () => void) => {
-    setToastMessage(msg);
-    setUndoAction(undo ? () => undo : null);
-    setTimeout(() => {
-      setToastMessage(null);
-      setUndoAction(null);
-    }, 4000);
-  };
+  // Toast / Feedback (shared toast: pauses on hover / focus, keyboard reachable).
+  const { toast, show: showActionToast, dismiss: dismissToast } = useActionToast();
+  const showToast = (msg: string, tone: 'info' | 'error' = 'info') => showActionToast({ message: msg, tone });
 
   // Open initial signal inspector from URL (TC-UI-SG-19)
   useEffect(() => {
@@ -392,19 +398,60 @@ export const SignalsCatalogPage: React.FC = () => {
     getResourceSubtree,
   ]);
 
-  // Bulk Selection Handlers
-  const handleToggleSelectAll = () => {
-    if (selectedIds.length === filteredSignals.length) {
-      setSelectedIds([]);
-    } else {
-      setSelectedIds(filteredSignals.map((s) => s.id));
-    }
+  // Bulk Selection: Shift+click selects a range in the visible order; the header checkbox selects or
+  // clears every visible (filtered) signal and leaves hidden selections alone.
+  const visibleIds = useMemo(() => filteredSignals.map((s) => s.id), [filteredSignals]);
+  const selection = useRangeSelection(visibleIds, allSignalIds);
+  const selectedIds = useMemo(() => Array.from(selection.selected), [selection.selected]);
+  const visibleSelectionState = selection.stateOf(visibleIds);
+  const hiddenSelected = selectedIds.length - visibleIds.filter((id) => selection.selected.has(id)).length;
+  const setSelectedIds = (next: string[] | ((prev: string[]) => string[])) => {
+    const list = typeof next === 'function' ? next(selectedIds) : next;
+    selection.clear();
+    selection.setMany(list, true);
   };
 
-  const handleToggleSelect = (id: string) => {
-    setSelectedIds((prev) =>
-      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
-    );
+  const handleToggleSelectAll = () => {
+    selection.setMany(visibleIds, visibleSelectionState !== 'all');
+  };
+
+  const handleToggleSelect = (id: string, shift = false) => selection.toggle(id, shift);
+
+  // Bulk enable / disable / delete of the selected signals (POST /signals/bulk-action), confirmed with
+  // the data models that use them.
+  const [bulkAction, setBulkAction] = useState<'enable' | 'disable' | 'delete' | null>(null);
+  const [bulkSeq, setBulkSeq] = useState(0);
+  const bulkIdsRef = React.useRef<string[]>([]);
+  bulkIdsRef.current = selectedIds;
+  const [bulkUsage, retryBulkUsage] = useModelUsage(bulkAction && bulkAction !== 'enable' ? `bulk:${bulkSeq}` : null, () =>
+    fetchSignalsUsage(bulkIdsRef.current),
+  );
+  const openBulk = (action: 'enable' | 'disable' | 'delete') => {
+    setDialogError(null);
+    setBulkSeq((n) => n + 1);
+    setBulkAction(action);
+  };
+  const runBulk = async () => {
+    const action = bulkAction;
+    if (!action) return;
+    const ids = selectedIds;
+    try {
+      const result = await api<{ affected?: number }>('/api/v1/signals/bulk-action', {
+        method: 'POST',
+        body: JSON.stringify({ signal_ids: ids, action }),
+      });
+      setBulkAction(null);
+      if (action === 'delete') {
+        if (selectedSignalId && ids.includes(selectedSignalId)) setSelectedSignal(null);
+        setTrendSignals((prev) => prev.filter((s) => !ids.includes(s.id)));
+        selection.clear();
+      }
+      await refresh().catch((error) => console.warn('Refresh after the bulk action failed', error));
+      const n = result?.affected ?? ids.length;
+      showToast(`${n} signal${n === 1 ? '' : 's'} ${action === 'enable' ? 'enabled' : action === 'disable' ? 'disabled' : 'deleted'}`);
+    } catch (error) {
+      setDialogError(`Could not ${action} the selected signals: ${translateApiError(error)}`);
+    }
   };
 
   // Trend Chart Toggle
@@ -420,40 +467,61 @@ export const SignalsCatalogPage: React.FC = () => {
     });
   };
 
-  const handleToggleEnabled = async (sig: SignalItem) => {
-    const nextEnabled = sig.enabled === false;
+  /** PATCH enabled; in-flight guarded so a double click sends one request (R3-DM-04). */
+  const setEnabled = useSubmit(async (sig: SignalItem, nextEnabled: boolean): Promise<boolean> => {
     try {
       await api(`/api/v1/signals/${encodeURIComponent(sig.id)}`, {
         method: 'PATCH',
         body: JSON.stringify({ version: sig.version ?? 1, enabled: nextEnabled }),
       });
-      await refresh();
+      await refresh().catch((error) => console.warn('Refresh after the signal update failed', error));
       showToast(`Signal ${sig.key || sig.name} ${nextEnabled ? 'enabled' : 'disabled'}`);
+      return true;
     } catch (error) {
-      showToast(`Could not update ${sig.key || sig.name}: ${error instanceof Error ? error.message : 'request failed'}`);
-      await refresh().catch(() => undefined);
+      await refresh().catch((refreshError) => console.warn('Refresh after a failed signal update failed', refreshError));
+      const message = `Could not ${nextEnabled ? 'enable' : 'disable'} ${sig.key || sig.name}: ${translateApiError(error)}`;
+      if (nextEnabled) showToast(message, 'error');
+      else setDialogError(message);
+      return false;
     }
+  });
+
+  const handleToggleEnabled = (sig: SignalItem) => {
+    if (sig.enabled === false) {
+      void setEnabled.run(sig, true);
+      return;
+    }
+    setDialogError(null);
+    setImpactSeq((n) => n + 1);
+    setDisableTarget(sig);
+  };
+
+  const handleDisable = async () => {
+    const sig = disableTarget;
+    if (!sig) return;
+    const ok = await setEnabled.run(sig, false);
+    if (ok) setDisableTarget(null);
   };
 
   const handleDelete = async () => {
     const sig = deleteTarget;
     if (!sig) return;
-    setDeleting(true);
+    setDialogError(null);
     try {
       await api(`/api/v1/signals/${encodeURIComponent(sig.id)}`, { method: 'DELETE' });
       setDeleteTarget(null);
       if (selectedSignalId === sig.id) setSelectedSignal(null);
       setTrendSignals((prev) => prev.filter((s) => s.id !== sig.id));
       setSelectedIds((prev) => prev.filter((id) => id !== sig.id));
-      await refresh();
+      await refresh().catch((error) => console.warn('Refresh after the signal delete failed', error));
       showToast(`Signal ${sig.key || sig.name} deleted`);
     } catch (error) {
-      setDeleteTarget(null);
-      showToast(`Could not delete ${sig.key || sig.name}: ${error instanceof Error ? error.message : 'request failed'}`);
-    } finally {
-      setDeleting(false);
+      setDialogError(`Could not delete ${sig.key || sig.name}: ${translateApiError(error)}`);
     }
   };
+
+  const usageModels = usage.status === 'ready' ? usage.models : [];
+  const runningUsage = usageModels.filter((m) => m.status === 'RUNNING').length;
 
   const handleExportCsv = () => {
     const listToExport =
@@ -497,14 +565,14 @@ export const SignalsCatalogPage: React.FC = () => {
     <div className="space-y-4">
       {/* Top Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
+        <div className="min-w-0">
           <h1 className="text-[20px] font-bold text-[#111B37]">Signals</h1>
           <p className="text-[13px] text-[#657794]">
             Signal catalog with live values ({signals.length} signal{signals.length === 1 ? '' : 's'})
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {/* View Mode Toggle */}
           <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
             <button
@@ -559,7 +627,7 @@ export const SignalsCatalogPage: React.FC = () => {
       {/* 2-Column Layout: Hierarchy Tree Filter on Left, Signals on Right */}
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 items-start">
         {/* Left Column: Hierarchy Tree Filter */}
-        <Card className="p-3 border border-[#CBD5E1] bg-white lg:col-span-1 space-y-2.5 sticky top-3">
+        <Card className="p-3 border border-[#CBD5E1] bg-white lg:col-span-1 space-y-2.5 lg:sticky lg:top-3 min-w-0">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100">
             <div className="flex items-center gap-1 text-xs font-bold text-[#0B2545]">
               <Layers className="w-3.5 h-3.5 text-[#134074]" />
@@ -598,7 +666,7 @@ export const SignalsCatalogPage: React.FC = () => {
             </div>
           </div>
 
-          <div role="tree" aria-label="Filter signals by resource" className="h-[calc(100vh-260px)] min-h-[550px] overflow-y-auto space-y-1 pr-1">
+          <div role="tree" aria-label="Filter signals by resource" className="max-h-[40vh] lg:max-h-none lg:h-[calc(100vh-260px)] lg:min-h-[550px] overflow-y-auto space-y-1 pr-1">
             {(() => {
               // Build tree roots
               const map = new Map<string, any>();
@@ -636,7 +704,7 @@ export const SignalsCatalogPage: React.FC = () => {
         </Card>
 
         {/* Right Column: Filter Bar & Signals Content */}
-        <div className="lg:col-span-3 space-y-3">
+        <div className="lg:col-span-3 space-y-3 min-w-0">
           {/* Active Hierarchy Filter Banner */}
           {selectedFilter !== 'all' && (
             <div className="flex items-center justify-between px-3 py-1.5 rounded-xl bg-blue-50/80 border border-blue-200 text-xs text-[#0B2545]">
@@ -722,7 +790,7 @@ export const SignalsCatalogPage: React.FC = () => {
             {/* Filter Pills: Type & Quality */}
             <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 text-[12px]">
               {/* Data Type Pills */}
-              <div className="flex items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 <span className="text-[#657794] mr-1 text-[11px] font-semibold uppercase">Type:</span>
                 {(['all', 'number', 'integer', 'boolean', 'text'] as const).map((t) => (
                   <button
@@ -740,9 +808,9 @@ export const SignalsCatalogPage: React.FC = () => {
               </div>
 
               {/* Quality Pills */}
-              <div className="flex items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 <span className="text-[#657794] mr-1 text-[11px] font-semibold uppercase">Quality:</span>
-                {(['all', 'good', 'uncertain', 'bad', 'stale', 'no_data', 'disabled'] as const).map((q) => (
+                {(['all', 'good', 'uncertain', 'bad', 'stale', 'paused', 'no_data', 'disabled'] as const).map((q) => (
                   <button
                     key={q}
                     onClick={() => setQualityFilter(q)}
@@ -762,7 +830,24 @@ export const SignalsCatalogPage: React.FC = () => {
           {/* Bulk actions for the selected signals */}
           {selectedIds.length > 0 && (
             <div role="toolbar" aria-label="Selected signals" className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-xl border border-blue-200 bg-blue-50/70 text-[12px] text-[#0B2545]">
-              <span className="font-bold">{selectedIds.length} selected</span>
+              <span className="font-bold">
+                {selectedIds.length} selected
+                {hiddenSelected > 0 && <span className="font-normal text-[#657794]"> ({hiddenSelected} hidden by filters)</span>}
+              </span>
+              {visibleSelectionState !== 'all' && visibleIds.length > 0 && (
+                <Button variant="ghost" size="sm" onClick={() => selection.setMany(visibleIds, true)}>
+                  Select all {visibleIds.length} shown
+                </Button>
+              )}
+              <Button variant="outline" size="sm" onClick={() => openBulk('enable')}>
+                Enable
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => openBulk('disable')}>
+                Disable…
+              </Button>
+              <Button variant="danger" size="sm" onClick={() => openBulk('delete')}>
+                <Trash2 className="w-3.5 h-3.5" /> Delete…
+              </Button>
               <Button variant="outline" size="sm" onClick={() => setBulkAddressOpen(true)}>
                 <Pencil className="w-3.5 h-3.5" /> Edit source address…
               </Button>
@@ -892,18 +977,17 @@ export const SignalsCatalogPage: React.FC = () => {
                 </div>
               ) : (
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left text-[12px]">
+                  <table className="w-full min-w-[760px] text-left text-[12px]">
                     <thead className="bg-[#F8FAFC] border-b border-[#CBD5E1] text-[#657794] font-semibold uppercase text-[10px] tracking-wider">
                       <tr>
                         <th className="py-2.5 px-3 w-8">
                           <input
                             type="checkbox"
-                            checked={
-                              selectedIds.length > 0 &&
-                              selectedIds.length === filteredSignals.length
-                            }
+                            ref={indeterminateRef(visibleSelectionState === 'some')}
+                            checked={visibleSelectionState === 'all'}
                             onChange={handleToggleSelectAll}
-                            aria-label="Select all shown signals"
+                            aria-label={`Select all ${visibleIds.length} shown signals`}
+                            title="Select all shown signals (respects the filters). Shift+click a row checkbox to select a range."
                             className="rounded border-slate-300 text-blue-600 focus:ring-0"
                           />
                         </th>
@@ -919,7 +1003,7 @@ export const SignalsCatalogPage: React.FC = () => {
                     <tbody className="divide-y divide-slate-100">
                       {filteredSignals.map((sig) => {
                         const res = resources.find((r) => r.id === sig.resourceId);
-                        const isChecked = selectedIds.includes(sig.id);
+                        const isChecked = selection.isSelected(sig.id);
                         const formattedVal = formatValue(sig.value);
 
                         return (
@@ -934,14 +1018,19 @@ export const SignalsCatalogPage: React.FC = () => {
                               className="py-2.5 px-3 w-8"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                handleToggleSelect(sig.id);
+                                // A click on the cell padding acts like a click on the checkbox.
+                                if (e.target === e.currentTarget) handleToggleSelect(sig.id, e.shiftKey);
                               }}
                             >
                               <input
                                 type="checkbox"
                                 checked={isChecked}
-                                onChange={() => handleToggleSelect(sig.id)}
-                                onClick={(e) => e.stopPropagation()}
+                                // Toggled in onClick so Shift (range) is known; Space fires a click too.
+                                onChange={() => undefined}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleToggleSelect(sig.id, e.shiftKey);
+                                }}
                                 aria-label={`Select ${sig.key || sig.name}`}
                                 className="rounded border-slate-300 text-blue-600 focus:ring-0"
                               />
@@ -1007,8 +1096,13 @@ export const SignalsCatalogPage: React.FC = () => {
         edgeName={selectedSignal?.edgeName}
         onClose={() => setSelectedSignal(null)}
         onEdit={(sig) => setEditTarget(sig)}
-        onToggleEnabled={(sig) => void handleToggleEnabled(sig)}
-        onDelete={(sig) => setDeleteTarget(sig)}
+        onToggleEnabled={handleToggleEnabled}
+        togglePending={setEnabled.pending}
+        onDelete={(sig) => {
+          setDialogError(null);
+          setImpactSeq((n) => n + 1);
+          setDeleteTarget(sig);
+        }}
       />
 
       {/* Signal Edit / Reassign Dialog */}
@@ -1036,30 +1130,93 @@ export const SignalsCatalogPage: React.FC = () => {
       />
 
       <ConfirmDialog
+        isOpen={Boolean(disableTarget)}
+        title={`Disable signal "${disableTarget?.key || disableTarget?.name || ''}"?`}
+        message="Collection of this signal stops until you enable it again. Its history stays in storage."
+        confirmText="Disable signal"
+        busyLabel="Disabling…"
+        cancelText="Cancel"
+        variant="warning"
+        wide
+        confirmDisabled={usage.status === 'loading'}
+        error={dialogError}
+        onConfirm={handleDisable}
+        onCancel={() => setDisableTarget(null)}
+      >
+        <ModelUsageList
+          state={usage}
+          onRetry={retryUsage}
+          onNavigate={() => setDisableTarget(null)}
+          heading={(count) =>
+            `Used in ${count} data model${count === 1 ? '' : 's'}. ${
+              runningUsage
+                ? 'Running data models keep sampling, but fields mapped to this signal output null until it is enabled again.'
+                : 'This field stops receiving new values and is marked "Signal disabled".'
+            }`
+          }
+        />
+      </ConfirmDialog>
+
+      <ConfirmDialog
         isOpen={Boolean(deleteTarget)}
         title={`Delete signal "${deleteTarget?.key || deleteTarget?.name || ''}"?`}
         message="Collection stops and the signal is removed from the catalog. Its history stays in storage."
-        confirmText={deleting ? 'Deleting…' : 'Delete signal'}
+        confirmText="Delete signal"
+        busyLabel="Deleting…"
         cancelText="Cancel"
         variant="danger"
-        onConfirm={() => void handleDelete()}
+        wide
+        confirmDisabled={usage.status === 'loading'}
+        error={dialogError}
+        onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
-      />
+      >
+        <ModelUsageList
+          state={usage}
+          onRetry={retryUsage}
+          onNavigate={() => setDeleteTarget(null)}
+          heading={(count) =>
+            `Used in ${count} data model${count === 1 ? '' : 's'}. ${
+              count === 1 ? 'That model loses' : 'These models lose'
+            } this field: it is marked "Signal deleted" until you remove or replace it.`
+          }
+        />
+      </ConfirmDialog>
 
-      {/* Toast Notification */}
-      {toastMessage && (
-        <div className="fixed bottom-4 right-4 z-50 flex items-center gap-2 bg-[#0B2545] text-white text-xs px-4 py-2.5 rounded-xl shadow-xl animate-in fade-in slide-in-from-bottom duration-200">
-          <span>{toastMessage}</span>
-          {undoAction && (
-            <button
-              onClick={() => undoAction()}
-              className="ml-2 underline font-bold text-blue-300 hover:text-white"
-            >
-              Undo
-            </button>
-          )}
-        </div>
-      )}
+      <ConfirmDialog
+        isOpen={Boolean(bulkAction)}
+        title={`${bulkAction === 'enable' ? 'Enable' : bulkAction === 'disable' ? 'Disable' : 'Delete'} ${selectedIds.length} signal${selectedIds.length === 1 ? '' : 's'}?`}
+        message={
+          bulkAction === 'enable'
+            ? 'Collection starts again for the selected signals. The collector receives the new configuration.'
+            : bulkAction === 'disable'
+              ? 'Collection of the selected signals stops until you enable them again. Their history stays in storage.'
+              : 'Collection stops and the selected signals are removed from the catalog. Their history stays in storage.'
+        }
+        confirmText={bulkAction === 'enable' ? 'Enable signals' : bulkAction === 'disable' ? 'Disable signals' : 'Delete signals'}
+        busyLabel={bulkAction === 'enable' ? 'Enabling…' : bulkAction === 'disable' ? 'Disabling…' : 'Deleting…'}
+        variant={bulkAction === 'delete' ? 'danger' : bulkAction === 'disable' ? 'warning' : 'primary'}
+        wide
+        confirmDisabled={bulkAction !== 'enable' && bulkUsage.status === 'loading'}
+        error={dialogError}
+        onConfirm={runBulk}
+        onCancel={() => setBulkAction(null)}
+      >
+        {bulkAction && bulkAction !== 'enable' && (
+          <ModelUsageList
+            state={bulkUsage}
+            onRetry={retryBulkUsage}
+            onNavigate={() => setBulkAction(null)}
+            heading={(count) =>
+              `Used in ${count} data model${count === 1 ? '' : 's'}: ${
+                bulkAction === 'delete' ? 'their fields are marked "Signal deleted".' : 'their fields stop receiving new values ("Signal disabled").'
+              }`
+            }
+          />
+        )}
+      </ConfirmDialog>
+
+      <ActionToast toast={toast} onDismiss={dismissToast} />
     </div>
   );
 };

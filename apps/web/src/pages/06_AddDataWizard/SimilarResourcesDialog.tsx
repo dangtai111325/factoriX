@@ -212,8 +212,8 @@ export const SimilarResourcesDialog: React.FC<SimilarResourcesDialogProps> = ({
                       </span>
                     )}
                   </div>
-                  <div className="max-h-56 overflow-y-auto">
-                    <table className="w-full text-[11px] font-mono">
+                  <div className="max-h-56 overflow-auto">
+                    <table className="w-full min-w-[560px] text-[11px] font-mono">
                       <thead className="bg-white sticky top-0 text-[10px] font-sans font-semibold uppercase text-[#657794]">
                         <tr className="border-b border-slate-200">
                           <th className="px-2 py-1 text-left w-36">Field</th>

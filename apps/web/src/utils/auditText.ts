@@ -69,6 +69,13 @@ const EVENTS: Record<string, Verb> = {
   EDGE_ENROLL_TOKEN: { verb: 'issued an enrollment token for collector', noun: '' },
   EDGE_OFFLINE: { verb: 'lost contact with collector', noun: '', system: true, tone: 'error' },
   EDGE_ONLINE: { verb: 'reconnected to collector', noun: '', system: true, tone: 'success' },
+  DATA_MODEL_CREATED: { verb: 'created data model', noun: '' },
+  DATA_MODEL_UPDATED: { verb: 'updated data model', noun: '' },
+  DATA_MODEL_DELETED: { verb: 'deleted data model', noun: '', tone: 'warning' },
+  DATA_MODEL_PAUSED: { verb: 'paused data model', noun: '' },
+  DATA_MODEL_RESUMED: { verb: 'resumed data model', noun: '', tone: 'success' },
+  DATA_MODEL_DUPLICATED: { verb: 'duplicated a data model as', noun: '' },
+  // Data Model v1 events, kept so older activity rows still read well.
   OUTPUT_GROUP_DRAFT: { verb: 'created data model', noun: '' },
   OUTPUT_GROUP_UPDATE: { verb: 'updated data model', noun: '' },
   OUTPUT_GROUP_DELETE: { verb: 'archived data model', noun: '', tone: 'warning' },

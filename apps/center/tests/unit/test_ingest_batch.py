@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from sqlalchemy.exc import DBAPIError
@@ -117,8 +116,7 @@ def _item(uid: str, signal, resource, connection, received: datetime, value: obj
 
 
 def _run(session: _IngestSession, items: list[dict]) -> dict:
-    with patch.object(telemetry.models_engine, "on_signals_changed", AsyncMock()):
-        return asyncio.run(telemetry.ingest_observations(session, tenant_id=uuid4(), edge_id=uuid4(), items=items))
+    return asyncio.run(telemetry.ingest_observations(session, tenant_id=uuid4(), edge_id=uuid4(), items=items))
 
 
 def test_batch_uses_one_statement_per_table_and_newest_latest_per_signal() -> None:

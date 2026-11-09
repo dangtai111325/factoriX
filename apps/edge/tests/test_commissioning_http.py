@@ -133,3 +133,48 @@ def test_overall_status_never_contradicts_the_stages() -> None:
     broken = Stages(["REACH"])
     broken.set("REACH", "FAILED", "down")
     assert overall_status(True, broken, "")[0] is False
+
+
+# R3-CN-01: the stored connection config carries the form default "path": "/". The test path the
+# user typed must still be the one requested, so a wrong key fails Authenticate.
+STORED_CONFIG = {**CONFIG, "path": "/", "method": "GET", "rate_limit_per_min": 100, "timeout_ms": 5000}
+
+
+async def _run_stored(monkeypatch: pytest.MonkeyPatch, job: dict[str, Any], key: str) -> dict[str, Any]:
+    monkeypatch.setattr(commissioning, "HttpPullConnector", FakeHttp)
+    FakeHttp.calls = []
+    commissioner, reports = _commissioner(key)
+    await commissioner.run({"id": "j", "protocol": "http", "secret_ref": "s1", "config_json": STORED_CONFIG, **job})
+    return reports.items["j"]
+
+
+@pytest.mark.asyncio
+async def test_test_path_wins_over_the_stored_root_path_wrong_key_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    job = {"mode": "CONNECTIVITY", "fields": [], "test_path": "/api/v1/machines/AA10-01/operator-program"}
+    report = await _run_stored(monkeypatch, job, key="wrong_key_123")
+    assert FakeHttp.calls[0][0] == "/api/v1/machines/AA10-01/operator-program"
+    assert report["status"] == "FAILED"
+    auth = _stage(report, "AUTH")
+    assert auth["status"] == "FAILED" and "401" in auth["detail"]
+
+
+@pytest.mark.asyncio
+async def test_test_path_wins_over_the_stored_root_path_right_key_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    job = {"mode": "CONNECTIVITY", "fields": [], "test_path": "/api/v1/machines/AA10-01/operator-program"}
+    report = await _run_stored(monkeypatch, job, key=GOOD_KEY)
+    assert report["status"] == "PASSED"
+    assert _stage(report, "AUTH")["status"] == "PASSED"
+
+
+@pytest.mark.asyncio
+async def test_stored_root_path_alone_is_not_a_proof_of_authentication(monkeypatch: pytest.MonkeyPatch) -> None:
+    report = await _run_stored(monkeypatch, {"mode": "CONNECTIVITY", "fields": []}, key=GOOD_KEY)
+    assert report["status"] == "PASSED"
+    assert _stage(report, "AUTH")["status"] == "SKIPPED"
+
+
+def test_auth_probe_path_precedence() -> None:
+    assert commissioning.auth_probe_path("/api/x", "/api/y") == "/api/x"
+    assert commissioning.auth_probe_path(None, "/api/y") == "/api/y"
+    assert commissioning.auth_probe_path("  ", "/") == ""
+    assert commissioning.auth_probe_path(None, None) == ""

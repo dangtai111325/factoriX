@@ -6,8 +6,8 @@ import {
   ConnectionItem,
   DiagnosticItem,
   EdgeItem,
+  DataModelSummary,
   LayoutMachineNode,
-  OutputGroup,
   PlantScope,
   ProtocolType,
   ResourceNode,
@@ -27,6 +27,7 @@ import {
 import { CommissionResult, runConnectionTest } from '../lib/commissioning'
 import { normalizeQuality } from '../lib/format'
 import { endpointWithScheme } from '../lib/protocols'
+import { connectivityDelay, onConnectivityRestored, useConnectivity } from '../lib/connectivity'
 
 const EMPTY_PLANT: PlantScope = {
   id: '',
@@ -106,7 +107,8 @@ interface AppContextType {
   edges: EdgeItem[]
   signals: SignalItem[]
   layoutNodes: LayoutMachineNode[]
-  outputGroups: OutputGroup[]
+  /** Data models (GET /api/v1/data-models), for counts and search. */
+  dataModels: DataModelSummary[]
   activities: ActivityEvent[]
   diagnostics: DiagnosticItem[]
   scopedResources: ResourceNode[]
@@ -141,9 +143,7 @@ interface AppContextType {
   queueApplianceEnroll: (edgeId: string) => Promise<{ status: string }>
   addSignal: (signal: Partial<SignalItem>) => void
   bulkDeleteSignals: (signalIds: string[]) => { count: number; undo: () => void }
-  bulkAssignOutputGroup: (signalIds: string[], groupId: string) => void
   saveCalculatedSignal: (signal: Partial<SignalItem>) => void
-  saveOutputGroup: (group: OutputGroup) => void
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined)
@@ -351,7 +351,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [edges, setEdges] = useState<EdgeItem[]>([])
   const [signalMeta, setSignalMeta] = useState<SignalMeta[]>([])
   const [layoutNodes, setLayoutNodes] = useState<LayoutMachineNode[]>([])
-  const [outputGroups, setOutputGroups] = useState<OutputGroup[]>([])
+  const [dataModels, setDataModels] = useState<DataModelSummary[]>([])
   const [activities, setActivities] = useState<ActivityEvent[]>([])
   const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([])
   const [plants, setPlants] = useState<PlantScope[]>([])
@@ -367,6 +367,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [loadError, setLoadError] = useState<string | null>(null)
   const loadedOnceRef = useRef(false)
   const streamStatus = useStreamStatus()
+  // R3-OV-01: while the appliance cannot be reached nothing on screen is current. Statuses read
+  // "Unknown (no connection to appliance)" instead of the last value or a client-side Stale.
+  const { lost: connectivityLost } = useConnectivity()
 
   // Live values live outside the metadata so a metadata refresh never wipes them.
   const liveRef = useRef<Map<string, LiveState>>(new Map())
@@ -442,25 +445,56 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   )
   const resourceIds = useMemo(() => new Set(resources.map((item) => item.id)), [resources])
   const scopedConnections = useMemo(() => {
-    if (!currentPlant.id) return connections
-    const plant = allResources.find((item) => item.id === currentPlant.id)
+    const plant = currentPlant.id ? allResources.find((item) => item.id === currentPlant.id) : undefined
     const siteId = plant?.attributes?.siteId
-    if (!siteId) return connections
-    return connections.filter((item) => !item.plantId || item.plantId === siteId)
-  }, [allResources, connections, currentPlant.id])
+    const scoped = siteId ? connections.filter((item) => !item.plantId || item.plantId === siteId) : connections
+    if (!connectivityLost) return scoped
+    return scoped.map((item) => ({ ...item, status: 'unknown', noConnection: true }))
+  }, [allResources, connections, currentPlant.id, connectivityLost])
 
   const signals = useMemo<SignalItem[]>(() => {
     void liveTick
     void clockTick
     const now = Date.now()
+    // R3-CN-02: signals of a paused connection read "Paused" (neutral), not Stale, on every page.
+    const pausedConnections = new Set(
+      connections.filter((conn) => conn.lifecycleStatus === 'PAUSED').map((conn) => conn.id),
+    )
     return signalMeta.map((meta) => {
       const live = liveRef.current.get(meta.id)
+      if (connectivityLost && meta.enabled) {
+        // Last known value stays visible, but its status is unknown: never a client-side Stale.
+        return {
+          ...meta,
+          value: live?.value == null ? null : (live.value as SignalItem['value']),
+          currentValue: live?.value == null ? '—' : (live.value as SignalItem['currentValue']),
+          quality: 'NO_CONNECTION',
+          reasonCode: 'NO_CONNECTION',
+          qualityReason: 'NO_CONNECTION',
+          lastUpdated: live?.receivedTime || '',
+          receivedTime: live?.receivedTime || '',
+          sourceTime: live?.sourceTime || '',
+        }
+      }
       if (!meta.enabled) {
         return {
           ...meta,
           quality: 'DISABLED',
           value: live?.value === undefined ? null : (live.value as SignalItem['value']),
           currentValue: live?.value == null ? '—' : (live.value as SignalItem['currentValue']),
+          lastUpdated: live?.receivedTime || '',
+          receivedTime: live?.receivedTime || '',
+          sourceTime: live?.sourceTime || '',
+        }
+      }
+      if (meta.enabled && meta.connectionId && pausedConnections.has(meta.connectionId)) {
+        return {
+          ...meta,
+          value: live?.value == null ? null : (live.value as SignalItem['value']),
+          currentValue: live?.value == null ? '—' : (live.value as SignalItem['currentValue']),
+          quality: 'PAUSED',
+          reasonCode: 'CONNECTION_PAUSED',
+          qualityReason: 'CONNECTION_PAUSED',
           lastUpdated: live?.receivedTime || '',
           receivedTime: live?.receivedTime || '',
           sourceTime: live?.sourceTime || '',
@@ -485,7 +519,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         sourceTime: live.sourceTime,
       }
     })
-  }, [signalMeta, liveTick, clockTick])
+  }, [signalMeta, liveTick, clockTick, connectivityLost, connections])
 
   const scopedSignals = useMemo(
     () => signals.filter((item) => !currentPlant.id || resourceIds.has(item.resourceId)),
@@ -500,11 +534,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         console.warn(`Optional list ${path} could not be loaded`, error)
         return null
       })
-    const [resourcePage, connectionPage, signalPage, groupPage, auditPage, edgePage] = await Promise.all([
+    const [resourcePage, connectionPage, signalPage, modelList, auditPage, edgePage] = await Promise.all([
       api<Page>('/api/v1/resources?view=all&limit=200'),
       api<Page>('/api/v1/connections'),
       api<Page>('/api/v1/signals?limit=1000'),
-      optional('/api/v1/output-groups'),
+      optional('/api/v1/data-models'),
       optional('/api/v1/audit-events?limit=50'),
       api<Page>('/api/v1/edges'),
     ])
@@ -550,18 +584,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     await fetchLatest(ids)
 
     setLayoutNodes([])
-    if (groupPage) setOutputGroups(
-      (groupPage.items || []).map((row) => ({
-        id: text(row.id),
-        name: text(row.display_name || row.key),
-        topicTemplate: text(row.topic_template),
-        enabled: true,
-        publishIntervalMs: 1000,
-        assignedSignals: [],
-        lastPublished: '',
-        samplePayload: '',
-      })),
-    )
+    if (modelList) {
+      // GET /data-models answers a plain array (tolerate a {items} page as well).
+      const rows: Array<Record<string, unknown>> = Array.isArray(modelList) ? modelList : modelList.items || []
+      setDataModels(
+        rows.map((row) => ({
+          id: text(row.id),
+          name: text(row.name || row.display_name),
+          description: text(row.description),
+          state: text(row.state).toUpperCase() === 'PAUSED' ? 'PAUSED' : 'RUNNING',
+          machines: Array.isArray(row.machines) ? row.machines.map(text) : [],
+          machineIds: Array.isArray(row.machine_ids) ? row.machine_ids.map(text) : [],
+          sampleMs: Number(row.sample_ms) || 1000,
+          fieldCount: Number(row.field_count) || 0,
+          errorCount: Number(row.error_count) || 0,
+        })),
+      )
+    }
     if (auditPage) setActivities(
       (auditPage.items || []).map((row) => ({
         id: text(row.id),
@@ -643,14 +682,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     void refresh().catch((error) => console.warn('Initial refresh failed', error))
   }, [refresh])
 
-  // Metadata refresh: 30 s while push is available, 10 s otherwise. Never wipes live values.
+  // Metadata refresh: 30 s while push is available, 10 s otherwise, backing off (max 30 s) while the
+  // appliance is unreachable; immediately once it answers again. Never wipes live values.
   useEffect(() => {
     if (!isStreaming) return
     const period = streamStatus === 'open' ? META_REFRESH_OPEN_MS : META_REFRESH_CLOSED_MS
-    const timer = window.setInterval(() => {
-      void refresh().catch((error) => console.warn('Metadata refresh failed', error))
-    }, period)
-    return () => window.clearInterval(timer)
+    let active = true
+    let timer: number | null = null
+    const schedule = (delay: number) => {
+      if (!active) return
+      if (timer !== null) window.clearTimeout(timer)
+      timer = window.setTimeout(tick, delay)
+    }
+    const tick = async () => {
+      timer = null
+      try {
+        await refresh()
+      } catch (error) {
+        console.warn('Metadata refresh failed', error)
+      }
+      schedule(connectivityDelay(period))
+    }
+    schedule(connectivityDelay(period))
+    const offRestored = onConnectivityRestored(() => schedule(0))
+    return () => {
+      active = false
+      offRestored()
+      if (timer !== null) window.clearTimeout(timer)
+    }
   }, [isStreaming, refresh, streamStatus])
 
   // Push: subscribe to latest values of every known signal.
@@ -745,15 +804,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       } finally {
         inFlight = false
       }
-      schedule(pushed.size ? POLL_PARTIAL_MS : POLL_STREAM_DOWN_MS)
+      schedule(connectivityDelay(pushed.size ? POLL_PARTIAL_MS : POLL_STREAM_DOWN_MS))
     }
     schedule(POLL_STREAM_DOWN_MS)
     const offCoverage = onPushCoverageChange(() => {
       if (!inFlight && timer === null) schedule(0)
     })
+    const offRestored = onConnectivityRestored(() => {
+      if (!inFlight) schedule(0)
+    })
     return () => {
       active = false
       offCoverage()
+      offRestored()
       if (timer !== null) window.clearTimeout(timer)
     }
   }, [fetchLatest, isStreaming])
@@ -769,7 +832,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSignalMeta([])
     liveRef.current.clear()
     setLayoutNodes([])
-    setOutputGroups([])
+    setDataModels([])
     setActivities([])
     setDiagnostics([])
     setPlants([])
@@ -1029,7 +1092,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     edges,
     signals: scopedSignals,
     layoutNodes,
-    outputGroups,
+    dataModels,
     activities,
     diagnostics,
     scopedResources: resources,
@@ -1069,21 +1132,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       count: 0,
       undo: () => undefined,
     }),
-    bulkAssignOutputGroup: () => undefined,
     saveCalculatedSignal: () => undefined,
-    saveOutputGroup: (group) => {
-      void api('/api/v1/output-groups', {
-        method: 'POST',
-        body: JSON.stringify({
-          resource_id: resources[0]?.id,
-          key: codeFrom(group.name),
-          display_name: group.name,
-          topic_template: group.topicTemplate,
-          members: [],
-          projection_policy: { mode: 'rich', missing: 'null' },
-        }),
-      }).then(() => refresh())
-    },
   }
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>

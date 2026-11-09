@@ -35,6 +35,8 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({ isOpen, on
   const dialogRef = useRef<HTMLDivElement>(null);
   const [topicsText, setTopicsText] = useState('');
   const [loading, setLoading] = useState<'preview' | 'import' | null>(null);
+  // In-flight guard: one preview / import request at a time, even on a double click.
+  const busyRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ created: PreviewRow[]; existing: number; conflicts: number } | null>(null);
 
@@ -65,6 +67,8 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({ isOpen, on
     });
 
   const handlePreview = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setError(null);
     setLoading('preview');
     try {
@@ -82,11 +86,14 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({ isOpen, on
     } catch (caught) {
       setError(translateApiError(caught));
     } finally {
+      busyRef.current = false;
       setLoading(null);
     }
   };
 
   const handleImport = async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setError(null);
     setLoading('import');
     try {
@@ -96,6 +103,7 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({ isOpen, on
     } catch (caught) {
       setError(translateApiError(caught));
     } finally {
+      busyRef.current = false;
       setLoading(null);
     }
   };
@@ -114,6 +122,16 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({ isOpen, on
           aria-modal="true"
           aria-labelledby="import-topics-title"
           tabIndex={-1}
+          onKeyDown={(event) => {
+            // Enter (Ctrl/Cmd+Enter inside the topic list): Preview first, then Import.
+            if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
+            const target = event.target as HTMLElement;
+            if (target.closest('button, a, select')) return;
+            if (target.tagName === 'TEXTAREA' && !(event.ctrlKey || event.metaKey)) return;
+            event.preventDefault();
+            if (loading || lines.length === 0) return;
+            void (preview ? handleImport() : handlePreview());
+          }}
           className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh] outline-none"
         >
           <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
@@ -163,7 +181,7 @@ export const ImportTopicsModal: React.FC<ImportTopicsModalProps> = ({ isOpen, on
                 placeholder={EXAMPLE}
               />
               <p className="mt-1.5 text-[11px] text-slate-500 leading-relaxed">
-                The first level (for example <span className="font-mono">uns</span>) and the last level (the data
+                Press Ctrl+Enter to preview, then again to import. The first level (for example <span className="font-mono">uns</span>) and the last level (the data
                 group, for example <span className="font-mono">state</span>) are skipped. The remaining levels become
                 enterprise, site, area, zone, line and machine, in that order. Resources that already exist are kept.
               </p>

@@ -27,8 +27,33 @@ _EXCEPTION_NAMES = {
 }
 
 
+_endpoint_locks: dict[tuple[int, str, int], asyncio.Lock] = {}
+
+
+def endpoint_lock(host: str, port: int) -> asyncio.Lock:
+    """One request at a time per Modbus device endpoint, across every connector of this process
+    (the acquisition job and commissioning tests open separate TCP sessions to the same gateway).
+    Keyed by event loop too, because an asyncio.Lock belongs to one loop."""
+    key = (id(asyncio.get_running_loop()), host.lower(), int(port))
+    lock = _endpoint_locks.get(key)
+    if lock is None:
+        lock = _endpoint_locks[key] = asyncio.Lock()
+    return lock
+
+
+def request_budget_s(timeout_s: float, retries: int) -> float:
+    """Worst case of one request: pymodbus waits ``timeout_s`` per try and tries ``retries + 1`` times."""
+    return float(timeout_s) * (max(0, int(retries)) + 1)
+
+
 class ModbusConnector:
-    """One persistent TCP session. Requests on the session are serialised."""
+    """One persistent TCP session. Requests are serialised per device endpoint.
+
+    A request that is abandoned while in flight (its job was cancelled or ran out of budget)
+    closes the TCP session: otherwise its reply arrives later on the same session, pymodbus
+    discards it as "request ask for id=13 but got id=15" / "received pdu without a corresponding
+    request", and the next request waits for an answer that already went by (R3 Modbus P1).
+    """
 
     can_write = False
 
@@ -36,9 +61,13 @@ class ModbusConnector:
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
+        self.retries = max(0, int(retries))
         # reconnect_delay=0: no background reconnect; the job loop reconnects with backoff.
-        self.client = AsyncModbusTcpClient(host, port=port, timeout=timeout_s, retries=max(0, int(retries)), reconnect_delay=0)
-        self._lock = asyncio.Lock()
+        self.client = AsyncModbusTcpClient(host, port=port, timeout=timeout_s, retries=self.retries, reconnect_delay=0)
+
+    @property
+    def request_budget_s(self) -> float:
+        return request_budget_s(self.timeout_s, self.retries)
 
     @property
     def connected(self) -> bool:
@@ -58,7 +87,7 @@ class ModbusConnector:
 
     async def read_raw(self, block: ReadBlock) -> list[int] | list[bool]:
         """Execute one read request. Library and device errors become ConnectorError."""
-        async with self._lock:
+        async with endpoint_lock(self.host, self.port):
             await self.ensure_connected()
             try:
                 if block.area == "holding":
@@ -83,6 +112,11 @@ class ModbusConnector:
             except OSError as exc:
                 self.client.close()
                 raise ConnectorError("NETWORK", f"Modbus TCP {self.host}:{self.port} connection failed.") from exc
+            except asyncio.CancelledError:
+                # Abandoned mid-request: drop the session so the late reply cannot reach the next request.
+                logger.info("Modbus request to unit %s on %s:%s abandoned; closing the session", block.unit_id, self.host, self.port)
+                self.client.close()
+                raise
         if response.isError():
             code = int(getattr(response, "exception_code", 0) or 0)
             name = _EXCEPTION_NAMES.get(code, "UNKNOWN")

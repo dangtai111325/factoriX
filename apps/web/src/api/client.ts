@@ -1,3 +1,5 @@
+import { isUnreachableStatus, reportApiFailure, reportApiSuccess } from '../lib/connectivity'
+
 export interface ApiFieldError {
   path: string
   code: string
@@ -48,7 +50,16 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const method = (init.method || 'GET').toUpperCase()
   if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   if (method !== 'GET' && method !== 'HEAD') headers.set('X-CSRF-Token', csrfToken())
-  const response = await fetch(path, { ...init, method, headers, credentials: 'same-origin' })
+  let response: Response
+  try {
+    response = await fetch(path, { ...init, method, headers, credentials: 'same-origin' })
+  } catch (error) {
+    // Network-level failure (browser offline, appliance unreachable). Aborts are the caller's choice.
+    if (!(error instanceof DOMException && error.name === 'AbortError')) reportApiFailure()
+    throw error
+  }
+  if (isUnreachableStatus(response.status)) reportApiFailure()
+  else reportApiSuccess()
   if (response.status === 204) return undefined as T
   const body = await response.json().catch(() => null)
   if (!response.ok) {

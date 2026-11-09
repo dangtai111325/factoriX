@@ -32,6 +32,8 @@ class Outbox:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
+        # Index pages of a ~1 GB outbox stay cached: deletes/updates by event_uid touch random pages (R3 P1).
+        self.connection.execute("PRAGMA cache_size=-32768")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS outbox (
@@ -164,19 +166,65 @@ class Outbox:
         removed = 0
         chunks = 0
         while True:
-            with self.connection:
-                cursor = self.connection.execute(
-                    """
-                    DELETE FROM outbox WHERE seq IN (
-                        SELECT seq FROM outbox WHERE state IN ('ACKED', 'QUARANTINED', 'DEAD') AND created_at < ? ORDER BY seq LIMIT ?
-                    )
-                    """,
-                    (acked_before, chunk),
-                )
-            removed += cursor.rowcount
+            count, more = self.prune_step(acked_before, chunk)
+            removed += count
             chunks += 1
-            if cursor.rowcount < chunk or (max_chunks is not None and chunks >= max_chunks):
+            if not more or (max_chunks is not None and chunks >= max_chunks):
                 return removed
+
+    def prune_step(self, acked_before: str, chunk: int = 5000) -> tuple[int, bool]:
+        """Delete the terminal rows of one primary-key range of ``chunk`` seqs. Returns ``(removed, more)``.
+
+        Every lookup is an index seek, so one step costs O(chunk) whatever the table size. The
+        former ``WHERE state IN (...) AND created_at < ? ORDER BY seq LIMIT ?`` could not use the
+        ``(state, seq)`` index for a seq order across three states: each 2000-row chunk read and
+        sorted every terminal row, 1.1 s (p50) to 4.7 s per chunk on a 175k-row outbox, on the
+        event loop, about 10 chunks a minute (R3 P1: the edge stalled, every source read, heartbeat
+        and Center call timed out at once).
+
+        The range runs from the oldest terminal row to the first row created at or after
+        ``acked_before``. ``created_at`` follows ``seq`` because this process is the only writer;
+        if the wall clock stepped back, a row is pruned at most one clock step early or late, and
+        only terminal rows are ever deleted.
+        """
+        low = self._oldest_terminal_seq()
+        if low is None:
+            return 0, False
+        high = self._first_seq_created_at_or_after(acked_before)
+        if low >= high:
+            return 0, False
+        end = min(low + max(1, chunk), high)
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM outbox WHERE seq >= ? AND seq < ? AND state IN ('ACKED', 'QUARANTINED', 'DEAD')",
+                (low, end),
+            )
+        return max(0, cursor.rowcount), end < high
+
+    def _oldest_terminal_seq(self) -> int | None:
+        seqs = [
+            row[0]
+            for state in sorted(TERMINAL_STATES)
+            for row in self.connection.execute("SELECT min(seq) FROM outbox WHERE state = ?", (state,))
+            if row[0] is not None
+        ]
+        return min(seqs) if seqs else None
+
+    def _first_seq_created_at_or_after(self, moment: str) -> int:
+        """Smallest seq whose row was created at or after ``moment`` (max seq + 1 if none); binary
+        search over primary-key seeks."""
+        bounds = self.connection.execute("SELECT min(seq), max(seq) FROM outbox").fetchone()
+        if bounds is None or bounds[0] is None:
+            return 0
+        low, high = int(bounds[0]), int(bounds[1]) + 1
+        while low < high:
+            middle = (low + high) // 2
+            row = self.connection.execute("SELECT seq, created_at FROM outbox WHERE seq >= ? ORDER BY seq LIMIT 1", (middle,)).fetchone()
+            if row is None or str(row[1]) >= moment:
+                high = middle
+            else:
+                low = int(row[0]) + 1
+        return low
 
     def enforce_cap(self, max_pending: int) -> int:
         """Keep at most ``max_pending`` pending rows; the oldest beyond the cap become DEAD."""

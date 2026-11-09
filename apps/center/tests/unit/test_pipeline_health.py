@@ -491,7 +491,6 @@ class _FakeSession:
 
 
 def test_ingest_batch_flow_with_frozen_source_time() -> None:
-    from unittest.mock import AsyncMock, patch
     from uuid import uuid4
 
     from factorix.modules import telemetry
@@ -532,18 +531,15 @@ def test_ingest_batch_flow_with_frozen_source_time() -> None:
         "quality": "GOOD",
         "config_revision": 4,
     }
-    hook = AsyncMock()
-    with patch.object(telemetry.models_engine, "on_signals_changed", hook):
-        result = asyncio.run(telemetry.ingest_observations(session, tenant_id=tenant, edge_id=edge, items=[item, {**item, "event_uid": ""}]))
+    result = asyncio.run(telemetry.ingest_observations(session, tenant_id=tenant, edge_id=edge, items=[item, {**item, "event_uid": ""}]))
     assert [r["status"] for r in result["results"]] == ["committed", "quarantined"]
-    hook.assert_awaited_once()
-    assert hook.await_args.args[2] == {signal}
     kinds = [event["kind"] for event in session.info["fx_events"]]
     assert kinds == ["latest", "health"]
     latest = session.info["fx_events"][0]["payload"]
     assert latest["effective_status"] == "GOOD" and latest["source_time"] == "2026-01-01T00:00:00.000Z"
     assert not any("output_deliveries" in sql for sql in session.statements)
-    assert any("SAVEPOINT fx_models" in sql for sql in session.statements)
+    # Data Model v2: ingest never composes models (no per-ingest hook, no savepoint).
+    assert not any("SAVEPOINT fx_models" in sql or "model_state" in sql for sql in session.statements)
 
 
 def test_heartbeat_applies_connection_states_and_emits_health() -> None:

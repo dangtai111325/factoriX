@@ -35,7 +35,10 @@ import { ImportTopicsModal } from '../../components/modals/ImportTopicsModal';
 import { ArchiveResourceModal } from '../../components/modals/ArchiveResourceModal';
 import { translateApiError } from '../../utils/apiErrors';
 import { AuditRow, describeAudit } from '../../utils/auditText';
-import { formatTimestamp, formatValue, normalizeQuality, QUALITY_LABEL, timeAgo } from '../../lib/format';
+import { formatTimestamp, formatValue, normalizeQuality, QUALITY_HINT, QUALITY_LABEL, timeAgo } from '../../lib/format';
+import { ActionToast, ToastSpec, useActionToast } from '../../components/common/ActionToast';
+import { ImpactModel, archiveResourceWithModels } from '../../lib/impactApi';
+import { useConnectivity } from '../../lib/connectivity';
 import {
   allowedChildTypes,
   ancestorPath,
@@ -46,17 +49,43 @@ import {
   HierarchyTreeNode,
 } from '../../utils/resourceHierarchy';
 
-/** Summary of the data bound directly to a resource, from the live signal qualities. */
+/**
+ * Summary of the data bound directly to a resource, from the live signal qualities.
+ * Paused (connection paused) and disabled signals are neutral: they are not problems (R3-CN-02).
+ * While the appliance cannot be reached the status is unknown, not "no good data" (R3-OV-01).
+ */
 function dataStatus(signals: SignalItem[]): { label: string; variant: BadgeVariant } {
   const total = signals.length;
   if (total === 0) return { label: 'No data bound', variant: 'neutral' };
-  const good = signals.filter((s) => normalizeQuality(s.quality) === 'GOOD').length;
-  const reporting = signals.filter((s) => Boolean(s.lastUpdated)).length;
+  const qualities = signals.map((s) => normalizeQuality(s.quality));
   const noun = total === 1 ? 'signal' : 'signals';
-  if (good === total) return { label: `Receiving data · ${total} ${noun}`, variant: 'good' };
-  if (good > 0) return { label: `${good} of ${total} ${noun} good`, variant: 'warning' };
-  if (reporting === 0) return { label: `Waiting for data · ${total} ${noun}`, variant: 'neutral' };
-  return { label: `No good data · ${total} ${noun}`, variant: 'error' };
+  if (qualities.some((q) => q === 'NO_CONNECTION')) {
+    return { label: `Unknown · no connection to appliance · ${total} ${noun}`, variant: 'neutral' };
+  }
+  const paused = qualities.filter((q) => q === 'PAUSED').length;
+  const disabled = qualities.filter((q) => q === 'DISABLED').length;
+  const active = total - paused - disabled;
+  const good = qualities.filter((q) => q === 'GOOD').length;
+  const reporting = signals.filter((s, i) => Boolean(s.lastUpdated) && qualities[i] !== 'PAUSED' && qualities[i] !== 'DISABLED').length;
+  const inactive = [paused ? `${paused} paused` : '', disabled ? `${disabled} disabled` : ''].filter(Boolean).join(', ');
+  const suffix = inactive ? ` · ${inactive}` : '';
+  if (active === 0) return { label: paused ? `Paused · ${total} ${noun}` : `Disabled · ${total} ${noun}`, variant: 'neutral' };
+  const activeNoun = active === 1 ? 'signal' : 'signals';
+  if (good === active) return { label: `Receiving data · ${active} ${activeNoun}${suffix}`, variant: 'good' };
+  if (good > 0) return { label: `${good} of ${active} ${activeNoun} good${suffix}`, variant: 'warning' };
+  if (reporting === 0) return { label: `Waiting for data · ${active} ${activeNoun}${suffix}`, variant: 'neutral' };
+  return { label: `No good data · ${active} ${activeNoun}${suffix}`, variant: 'error' };
+}
+
+/** Quality chip colours: neutral gray for states that are not data problems. */
+function qualityChipClass(quality: ReturnType<typeof normalizeQuality>): string {
+  if (quality === 'GOOD') return 'bg-emerald-50 text-emerald-700';
+  if (quality === 'UNCERTAIN') return 'bg-amber-50 text-amber-700';
+  if (quality === 'NO_DATA' || quality === 'DISABLED' || quality === 'PAUSED' || quality === 'NO_CONNECTION') {
+    return 'bg-slate-100 text-slate-600';
+  }
+  if (quality === 'STALE') return 'bg-slate-100 text-slate-700';
+  return 'bg-red-50 text-red-700';
 }
 
 /** Fill missing childrenCount / signalsCount from the loaded lists. */
@@ -109,13 +138,6 @@ async function fetchArchivedResources(): Promise<ResourceNode[]> {
 interface ResourceDetail {
   description?: string | null;
   properties_json?: Record<string, unknown> | null;
-}
-
-interface ToastState {
-  id: number;
-  message: string;
-  tone: 'info' | 'error';
-  action?: { label: string; run: () => void };
 }
 
 interface TreeRowProps {
@@ -183,7 +205,7 @@ const TreeRow: React.FC<TreeRowProps> = ({
           if (!archived) onKeyNavigate(event, node);
         }}
       >
-        <div className="flex items-center gap-1.5 min-w-0">
+        <div className="flex items-center gap-1.5 min-w-0 flex-1">
           {hasKids ? (
             <button
               type="button"
@@ -200,19 +222,19 @@ const TreeRow: React.FC<TreeRowProps> = ({
           ) : (
             <span className="w-[18px] flex-shrink-0" />
           )}
-          <span className={isSelected ? 'text-current' : 'text-[#7A8AA3]'}>
-            <ResourceTypeIcon type={resource.type} />
+          <span className={isSelected ? 'text-current' : archived ? 'text-[#B6C2D3]' : 'text-[#7A8AA3]'}>
+            {archived ? <Archive className="w-3.5 h-3.5" aria-hidden="true" /> : <ResourceTypeIcon type={resource.type} />}
           </span>
+          {/* R3-HS-03: an archived row keeps its name (muted, italic); the tooltip says it is archived. */}
           <span
-            className={`truncate ${archived ? 'line-through decoration-[#CBD5E1]' : ''}`}
-            title={archived ? `${resource.name} (archived)` : resource.name}
+            className={`truncate ${archived ? 'italic text-[#8A9AB2] min-w-[3rem]' : ''}`}
+            title={archived ? `${resource.name} (${typeLabel.toLowerCase()}, archived${resource.code ? ` · ${resource.code}` : ''})` : resource.name}
           >
             {resource.name}
           </span>
         </div>
         {archived ? (
           <span className="flex items-center gap-1.5 ml-2 flex-shrink-0">
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-[#94A3B8]" aria-hidden="true">Archived</span>
             <button
               type="button"
               onClick={(event) => {
@@ -324,8 +346,10 @@ export const FactoryStructurePage: React.FC = () => {
   const [archivedResources, setArchivedResources] = useState<ResourceNode[]>([]);
   const [restoringId, setRestoringId] = useState<string | null>(null);
 
-  const [toast, setToast] = useState<ToastState | null>(null);
-  const toastTimer = useRef<number | null>(null);
+  // R3-HS-01: shared toast. An Undo toast stays at least 15 s, pauses on hover / focus, and its
+  // action is a keyboard-reachable button (also Ctrl+Z).
+  // Dismissal is per toast id: an Undo that shows a result toast keeps that toast.
+  const { toast, show: showToastSpec, dismiss: dismissToast } = useActionToast();
 
   const [auditRows, setAuditRows] = useState<AuditRow[]>([]);
   const [auditState, setAuditState] = useState<'idle' | 'loading' | 'error'>('idle');
@@ -334,19 +358,9 @@ export const FactoryStructurePage: React.FC = () => {
 
   const resources = useMemo(() => enrichResourceCounts(rawResources, signals), [rawResources, signals]);
 
-  const showToast = useCallback((next: Omit<ToastState, 'id'>) => {
-    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
-    const id = Date.now();
-    setToast({ ...next, id });
-    toastTimer.current = window.setTimeout(() => setToast((current) => (current?.id === id ? null : current)), 8000);
-  }, []);
-
-  useEffect(
-    () => () => {
-      if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
-    },
-    [],
-  );
+  const showToast = useCallback((next: ToastSpec) => showToastSpec(next), [showToastSpec]);
+  // One restore at a time per resource (in-flight guard for the Restore buttons and Undo).
+  const restoringRef = useRef(new Set<string>());
 
   const reloadArchived = useCallback(async () => {
     try {
@@ -574,14 +588,13 @@ export const FactoryStructurePage: React.FC = () => {
       action: oldParentId
         ? {
             label: 'Undo',
-            run: () => {
-              void moveResource(moved.id, oldParentId).then((undo) => {
-                if (undo.success) {
-                  showToast({ message: `Moved "${moved.name}" back`, tone: 'info' });
-                } else {
-                  showToast({ message: `Undo failed: ${translateApiError(undo.error || 'Move failed')}`, tone: 'error' });
-                }
-              });
+            run: async () => {
+              const undo = await moveResource(moved.id, oldParentId);
+              if (undo.success) {
+                showToast({ message: `Moved "${moved.name}" back`, tone: 'info' });
+              } else {
+                showToast({ message: `Undo failed: ${translateApiError(undo.error || 'Move failed')}`, tone: 'error' });
+              }
             },
           }
         : undefined,
@@ -590,7 +603,9 @@ export const FactoryStructurePage: React.FC = () => {
   };
 
   const restoreResource = useCallback(
-    async (target: ResourceNode) => {
+    async (target: ResourceNode, archivedModels: ImpactModel[] = []) => {
+      if (restoringRef.current.has(target.id)) return;
+      restoringRef.current.add(target.id);
       setRestoringId(target.id);
       try {
         await api(`/api/v1/resources/${encodeURIComponent(target.id)}/restore`, { method: 'POST' });
@@ -598,7 +613,14 @@ export const FactoryStructurePage: React.FC = () => {
         if (showArchived) await reloadArchived();
         setSelectedResourceId(target.id);
         setHistoryTick((value) => value + 1);
-        showToast({ message: `Restored "${target.name}"`, tone: 'info' });
+        // The Center has no restore for data models: models archived together stay archived.
+        const kept = archivedModels.length;
+        showToast({
+          message: kept
+            ? `Restored "${target.name}". ${kept === 1 ? 'The data model archived with it stays' : `The ${kept} data models archived with it stay`} archived.`
+            : `Restored "${target.name}"`,
+          tone: 'info',
+        });
       } catch (caught) {
         let message = translateApiError(caught);
         if (caught instanceof ApiError && caught.code === 'ARCHIVED_PARENT') {
@@ -609,22 +631,25 @@ export const FactoryStructurePage: React.FC = () => {
         }
         showToast({ message: `Could not restore "${target.name}". ${message}`, tone: 'error' });
       } finally {
+        restoringRef.current.delete(target.id);
         setRestoringId(null);
       }
     },
     [archivedResources, reloadArchived, safeRefresh, setSelectedResourceId, showArchived, showToast],
   );
 
-  const confirmArchive = async (): Promise<{ success: boolean; error?: string }> => {
+  const confirmArchive = async (options: {
+    archiveModels: boolean;
+    models: ImpactModel[];
+  }): Promise<{ success: boolean; error?: string }> => {
     const target = archiveTarget;
     if (!target) return { success: false, error: 'No resource selected.' };
-    let affected = 0;
+    const affected = signals.filter((s) => s.resourceId === target.id).length;
+    let archivedModels: ImpactModel[] = [];
     try {
-      const res = await api<{ affected_signals?: number }>(
-        `/api/v1/resources/${encodeURIComponent(target.id)}/archive`,
-        { method: 'POST' },
-      );
-      affected = Number(res?.affected_signals || 0);
+      const result = await archiveResourceWithModels(target.id, options.archiveModels, options.models);
+      const ids = new Set(result.archivedModelIds);
+      archivedModels = options.models.filter((model) => ids.has(model.id));
     } catch (caught) {
       return { success: false, error: translateApiError(caught) };
     }
@@ -633,10 +658,16 @@ export const FactoryStructurePage: React.FC = () => {
     // Keep the user in context: select the parent of the archived resource.
     setSelectedResourceId(target.parentId || '');
     setPageError(null);
+    const keptModels = options.models.length - archivedModels.length;
+    const parts = [
+      affected ? `${affected} ${affected === 1 ? 'signal' : 'signals'} stopped` : '',
+      archivedModels.length ? `${archivedModels.length} data ${archivedModels.length === 1 ? 'model' : 'models'} archived` : '',
+      keptModels > 0 ? `${keptModels} data ${keptModels === 1 ? 'model receives' : 'models receive'} no new values` : '',
+    ].filter(Boolean);
     showToast({
-      message: `Archived "${target.name}"${affected ? ` · ${affected} ${affected === 1 ? 'signal' : 'signals'} stopped` : ''}`,
+      message: `Archived "${target.name}"${parts.length ? ` · ${parts.join(' · ')}` : ''}`,
       tone: 'info',
-      action: { label: 'Undo', run: () => void restoreResource(target) },
+      action: { label: 'Undo', run: () => restoreResource(target, archivedModels) },
     });
     return { success: true };
   };
@@ -680,47 +711,67 @@ export const FactoryStructurePage: React.FC = () => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
         setSelectedResourceId(resource.id);
+        return;
+      }
+      // Shortcuts (WAI-ARIA tree pattern + actions on the focused resource).
+      if (event.key === 'Home' || event.key === 'End') {
+        event.preventDefault();
+        const target = event.key === 'Home' ? flatVisibleOrder[0] : flatVisibleOrder[flatVisibleOrder.length - 1];
+        if (target) focusRow(target.resource.id);
+        return;
+      }
+      if (event.key === '*') {
+        // Expand every sibling on this level that has children.
+        event.preventDefault();
+        const siblings = treeSource.filter((item) => (item.parentId || '') === (resource.parentId || '') && !archivedIds.has(item.id));
+        setExpandedNodes((prev) => {
+          const next = { ...prev };
+          for (const item of siblings) if (hasChildren(treeSource, item.id)) next[item.id] = true;
+          return next;
+        });
+        return;
+      }
+      if (event.key === 'F2') {
+        event.preventDefault();
+        setSelectedResourceId(resource.id);
+        setIsEditModalOpen(true);
+        return;
+      }
+      if (event.key === 'Delete') {
+        // Opens the confirmation dialog; nothing is archived without it.
+        event.preventDefault();
+        setSelectedResourceId(resource.id);
+        setArchiveTarget(resource);
+        return;
+      }
+      if (event.key === 'Insert' || (event.key.toLowerCase() === 'n' && event.altKey)) {
+        event.preventDefault();
+        setSelectedResourceId(resource.id);
+        setIsAddModalOpen(true);
+        return;
+      }
+      // Type-ahead: a letter or digit moves to the next visible resource whose name starts with it.
+      if (event.key.length === 1 && /\S/.test(event.key) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        const char = event.key.toLocaleLowerCase();
+        const count = flatVisibleOrder.length;
+        for (let step = 1; step <= count; step += 1) {
+          const candidate = flatVisibleOrder[(index + step) % count];
+          if (candidate.resource.name.trim().toLocaleLowerCase().startsWith(char)) {
+            event.preventDefault();
+            focusRow(candidate.resource.id);
+            return;
+          }
+        }
       }
     },
-    [expandedNodes, flatVisibleOrder, setSelectedResourceId, toggleExpand],
+    [archivedIds, expandedNodes, flatVisibleOrder, setSelectedResourceId, toggleExpand, treeSource],
   );
 
   const goToAddData = () => {
     if (selectedResource) navigate(`/collector/add-data?resourceId=${encodeURIComponent(selectedResource.id)}`);
   };
 
-  const toastView = toast && (
-    <div
-      role={toast.tone === 'error' ? 'alert' : 'status'}
-      aria-live={toast.tone === 'error' ? 'assertive' : 'polite'}
-      className={`fixed bottom-6 right-6 z-50 max-w-md flex items-center gap-3 pl-4 pr-2 py-2.5 rounded-xl text-white shadow-2xl border animate-in slide-in-from-bottom-4 duration-200 ${
-        toast.tone === 'error' ? 'bg-[#7F1D1D] border-[#991B1B]' : 'bg-slate-900 border-slate-700'
-      }`}
-    >
-      <span className="text-xs font-semibold leading-snug">{toast.message}</span>
-      {toast.action && (
-        <button
-          type="button"
-          onClick={() => {
-            const action = toast.action;
-            setToast(null);
-            action?.run();
-          }}
-          className="text-xs font-bold text-amber-300 hover:text-amber-200 px-2 py-1 rounded-md hover:bg-white/10 shrink-0"
-        >
-          {toast.action.label}
-        </button>
-      )}
-      <button
-        type="button"
-        onClick={() => setToast(null)}
-        aria-label="Dismiss notification"
-        className="p-1 rounded-md text-white/60 hover:text-white hover:bg-white/10 shrink-0"
-      >
-        <X className="w-3.5 h-3.5" />
-      </button>
-    </div>
-  );
+  const toastView = <ActionToast toast={toast} onDismiss={dismissToast} />;
 
   if (!selectedResource && loadState !== 'ready') {
     // Never show the "empty" onboarding while the model is loading or could not be loaded.
@@ -795,8 +846,8 @@ export const FactoryStructurePage: React.FC = () => {
           <h1 className="fx-page-title">Hierarchy Structure</h1>
           <p className="fx-page-subtitle">Sites, areas, lines and machines of the factory, and the data bound to them.</p>
         </div>
-        <div className="flex items-center gap-2 flex-nowrap">
-          <div className="relative w-56">
+        <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap w-full sm:w-auto">
+          <div className="relative w-full sm:w-56">
             <Search className="w-4 h-4 absolute left-3 top-2.5 text-[#94A3B8]" aria-hidden="true" />
             <input
               type="search"
@@ -853,8 +904,8 @@ export const FactoryStructurePage: React.FC = () => {
 
       <div className="grid grid-cols-12 gap-3.5">
         {/* Hierarchy tree */}
-        <div className="col-span-12 lg:col-span-3">
-          <Card className="h-[calc(100vh-210px)] min-h-[620px] flex flex-col p-0">
+        <div className="col-span-12 lg:col-span-3 min-w-0">
+          <Card className="h-[420px] lg:h-[calc(100vh-210px)] lg:min-h-[620px] flex flex-col p-0">
             <div className="px-3 py-2 border-b border-[#E3EAF3] flex items-center justify-between gap-2 bg-[#F9FAFD]">
               <span className="text-[12px] font-bold text-[#111B37] uppercase tracking-wider">Hierarchy</span>
               <div className="flex items-center gap-0.5">
@@ -881,7 +932,12 @@ export const FactoryStructurePage: React.FC = () => {
                 </span>
               </div>
             </div>
-            <div className="p-2 overflow-y-auto flex-1 min-h-0" role="tree" aria-label="Factory hierarchy">
+            <div
+              className="p-2 overflow-y-auto flex-1 min-h-0"
+              role="tree"
+              aria-label="Factory hierarchy"
+              aria-describedby="hierarchy-tree-keys"
+            >
               {tree.length === 0 ? (
                 <div className="text-center py-8 text-[#94A3B8] text-[13px]">No resource matches “{searchTerm}”.</div>
               ) : (
@@ -910,7 +966,14 @@ export const FactoryStructurePage: React.FC = () => {
                 ))
               )}
             </div>
-            <div className="px-3 py-2 border-t border-[#E3EAF3] bg-[#F9FAFD] flex items-center justify-between">
+            <p
+              id="hierarchy-tree-keys"
+              className="px-3 pt-1.5 text-[10px] leading-snug text-[#94A3B8] border-t border-[#E3EAF3] bg-[#F9FAFD]"
+              title="Keyboard: arrows move and expand, Home / End jump, * expands the level, a letter jumps to a name, F2 edits, Insert adds under it, Delete asks to archive."
+            >
+              Keys: ↑↓←→ · * expand level · F2 edit · Ins add · Del archive
+            </p>
+            <div className="px-3 py-2 bg-[#F9FAFD] flex items-center justify-between">
               <label className="flex items-center gap-2 text-[12px] text-[#475569] cursor-pointer select-none">
                 <input
                   type="checkbox"
@@ -930,8 +993,8 @@ export const FactoryStructurePage: React.FC = () => {
         </div>
 
         {/* Contents of the selected resource: sub-units or signals */}
-        <div className="col-span-12 lg:col-span-4">
-          <Card className="h-[calc(100vh-210px)] min-h-[620px] flex flex-col p-0">
+        <div className="col-span-12 lg:col-span-4 min-w-0">
+          <Card className="h-[460px] lg:h-[calc(100vh-210px)] lg:min-h-[620px] flex flex-col p-0">
             <div className="px-3 py-2 border-b border-[#E3EAF3] flex items-center justify-between gap-2 bg-[#F9FAFD]">
               <div className="flex items-center gap-1 bg-slate-200/70 p-0.5 rounded-lg" role="tablist" aria-label="Contents">
                 <button
@@ -998,15 +1061,8 @@ export const FactoryStructurePage: React.FC = () => {
                               {label}
                             </span>
                             <span
-                              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded shrink-0 ${
-                                quality === 'GOOD'
-                                  ? 'bg-emerald-50 text-emerald-700'
-                                  : quality === 'UNCERTAIN'
-                                    ? 'bg-amber-50 text-amber-700'
-                                    : quality === 'NO_DATA' || quality === 'DISABLED'
-                                      ? 'bg-slate-100 text-slate-500'
-                                      : 'bg-red-50 text-red-700'
-                              }`}
+                              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded shrink-0 ${qualityChipClass(quality)}`}
+                              title={QUALITY_HINT[quality]}
                             >
                               {QUALITY_LABEL[quality]}
                             </span>
@@ -1032,6 +1088,17 @@ export const FactoryStructurePage: React.FC = () => {
                 <div className="text-center py-12 px-4 space-y-1.5">
                   <p className="text-[13px] font-semibold text-[#334568]">Nothing under {selectedResource.name} yet</p>
                   <p className="text-[12px] text-[#94A3B8]">Use Add resource to add an area, line or machine here.</p>
+                  {allowedChildTypes(selectedResource.type).length > 0 && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="mt-2"
+                      icon={<Plus className="w-3.5 h-3.5" />}
+                      onClick={() => setIsAddModalOpen(true)}
+                    >
+                      Add under {selectedResource.name}
+                    </Button>
+                  )}
                 </div>
               ) : (
                 childResources.map((child) => {
@@ -1071,7 +1138,7 @@ export const FactoryStructurePage: React.FC = () => {
         </div>
 
         {/* Inspector */}
-        <div className="col-span-12 lg:col-span-5 space-y-3.5 h-[calc(100vh-210px)] min-h-[620px] overflow-y-auto pr-1">
+        <div className="col-span-12 lg:col-span-5 min-w-0 space-y-3.5 lg:h-[calc(100vh-210px)] lg:min-h-[620px] lg:overflow-y-auto lg:pr-1">
           <section className="fx-card p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
@@ -1092,7 +1159,7 @@ export const FactoryStructurePage: React.FC = () => {
                   </Badge>
                 </div>
               </div>
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center gap-2 shrink-0 flex-wrap">
                 <Button size="sm" variant="primary" icon={<Plus className="w-3.5 h-3.5" />} onClick={goToAddData}>
                   Add data
                 </Button>
@@ -1253,6 +1320,7 @@ export const FactoryStructurePage: React.FC = () => {
         isOpen={isEditModalOpen}
         onClose={() => setIsEditModalOpen(false)}
         resource={selectedResource}
+        resources={resources}
         onSuccess={async (updated) => {
           await safeRefresh();
           setHistoryTick((value) => value + 1);

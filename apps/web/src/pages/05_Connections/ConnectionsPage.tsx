@@ -29,6 +29,9 @@ import { CommissionResult, runConnectionTest } from '../../lib/commissioning';
 import { timeAgo } from '../../lib/format';
 import { PROTOCOL_LABEL } from '../../lib/protocols';
 import { LoadStateNotice } from '../../components/common/LoadStateNotice';
+import { useSubmit } from '../../lib/useSubmit';
+import { translateApiError } from '../../utils/apiErrors';
+import { PauseConnectionDialog } from './PauseConnectionDialog';
 
 type KpiFilter = 'all' | 'connected' | 'idle' | 'degraded' | 'paused';
 
@@ -64,6 +67,9 @@ export const ConnectionsPage: React.FC = () => {
   const [archivingConn, setArchivingConn] = useState<ConnectionItem | null>(null);
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // R3-CN-02: pausing is confirmed in a dialog that states the impact.
+  const [pausingConn, setPausingConn] = useState<ConnectionItem | null>(null);
+  const [dialogError, setDialogError] = useState<string | null>(null);
 
   // Real Edge test results, per connection.
   const [testing, setTesting] = useState<Record<string, boolean>>({});
@@ -87,6 +93,8 @@ export const ConnectionsPage: React.FC = () => {
   const counts = useMemo(() => {
     const out: Record<KpiFilter, number> = { all: connections.length, connected: 0, idle: 0, degraded: 0, paused: 0 };
     connections.forEach((c) => {
+      // R3-OV-01: while the appliance cannot be reached the state is unknown, not a problem to count.
+      if (c.noConnection) return;
       if (c.status === 'connected') out.connected += 1;
       else if (c.status === 'idle') out.idle += 1;
       else if (c.status === 'paused') out.paused += 1;
@@ -102,7 +110,7 @@ export const ConnectionsPage: React.FC = () => {
       if (kpiFilter === 'connected' && conn.status !== 'connected') return false;
       if (kpiFilter === 'idle' && conn.status !== 'idle') return false;
       if (kpiFilter === 'paused' && conn.status !== 'paused') return false;
-      if (kpiFilter === 'degraded' && !(conn.status === 'degraded' || conn.status === 'unknown')) return false;
+      if (kpiFilter === 'degraded' && (conn.noConnection || !(conn.status === 'degraded' || conn.status === 'unknown'))) return false;
       if (q) {
         return conn.name.toLowerCase().includes(q) || conn.endpoint.toLowerCase().includes(q) || conn.protocol.toLowerCase().includes(q);
       }
@@ -113,22 +121,70 @@ export const ConnectionsPage: React.FC = () => {
   const edgeName = (conn: ConnectionItem) => conn.edgeName || edges.find((e) => e.id === conn.edgeId)?.name || '—';
 
   const handleTest = async (id: string) => {
+    // In-flight guard per connection: a second click while the test runs is ignored.
+    if (testing[id]) return;
     setTestPanelId(id);
     setTesting((prev) => ({ ...prev, [id]: true }));
-    const result = await runConnectionTest(id, { mode: 'CONNECTIVITY' });
-    setTestResults((prev) => ({ ...prev, [id]: result }));
-    setTesting((prev) => ({ ...prev, [id]: false }));
+    try {
+      const result = await runConnectionTest(id, { mode: 'CONNECTIVITY' });
+      setTestResults((prev) => ({ ...prev, [id]: result }));
+    } finally {
+      setTesting((prev) => ({ ...prev, [id]: false }));
+    }
   };
 
-  const handlePauseResume = async (conn: ConnectionItem) => {
-    const action = conn.lifecycleStatus === 'PAUSED' ? 'resume' : 'pause';
-    setActionError(null);
+  /**
+   * "Test all shown": tests every connection the filters show, two at a time, instead of opening the
+   * menu of each one. Results land in the same per-connection result store (drawer / panel).
+   */
+  const testAll = useSubmit(async (ids: string[]) => {
+    const queue = ids.filter((id) => !testing[id]);
+    setTestPanelId(null);
+    setTesting((prev) => ({ ...prev, ...Object.fromEntries(queue.map((id) => [id, true])) }));
+    let next = 0;
+    const worker = async () => {
+      while (next < queue.length) {
+        const id = queue[next++];
+        try {
+          const result = await runConnectionTest(id, { mode: 'CONNECTIVITY' });
+          setTestResults((prev) => ({ ...prev, [id]: result }));
+        } finally {
+          setTesting((prev) => ({ ...prev, [id]: false }));
+        }
+      }
+    };
+    await Promise.all([worker(), worker()]);
+  });
+  const testedShown = filteredConnections.filter((c) => testResults[c.id] && !testing[c.id]);
+  const failedShown = testedShown.filter((c) => !testResults[c.id].passed);
+
+  /** Pause / resume, guarded so a double click sends one request. */
+  const lifecycle = useSubmit(async (conn: ConnectionItem, action: 'pause' | 'resume'): Promise<boolean> => {
     try {
       await api(`/api/v1/connections/${encodeURIComponent(conn.id)}/${action}`, { method: 'POST' });
-      await refresh();
+      await refresh().catch((error) => console.warn(`Refresh after ${action} failed`, error));
+      return true;
     } catch (error) {
-      setActionError(`Could not ${action} "${conn.name}": ${error instanceof Error ? error.message : 'request failed'}`);
+      const message = `Could not ${action} "${conn.name}": ${translateApiError(error)}`;
+      if (action === 'pause') setDialogError(message);
+      else setActionError(message);
+      return false;
     }
+  });
+
+  const handlePauseResume = (conn: ConnectionItem) => {
+    setActionError(null);
+    if (conn.lifecycleStatus === 'PAUSED') {
+      void lifecycle.run(conn, 'resume');
+      return;
+    }
+    setDialogError(null);
+    setPausingConn(conn);
+  };
+
+  const confirmPause = async (conn: ConnectionItem) => {
+    const ok = await lifecycle.run(conn, 'pause');
+    if (ok) setPausingConn(null);
   };
 
   const handleArchive = async () => {
@@ -145,12 +201,12 @@ export const ConnectionsPage: React.FC = () => {
         setSelectedConnId(null);
         setSearchParams({});
       }
-      await refresh();
+      await refresh().catch((error) => console.warn('Refresh after archive failed', error));
     } catch (error) {
       setArchivingConn(null);
-      const message = error instanceof ApiError || error instanceof Error ? error.message : 'request failed';
+      const message = error instanceof ApiError || error instanceof Error ? translateApiError(error) : 'request failed';
       setActionError(`Could not archive "${conn.name}": ${message}`);
-      await refresh().catch(() => undefined);
+      await refresh().catch((refreshError) => console.warn('Refresh after a failed archive failed', refreshError));
     }
   };
 
@@ -217,7 +273,7 @@ export const ConnectionsPage: React.FC = () => {
       </div>
 
       <div className="flex flex-col sm:flex-row sm:items-center gap-2">
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-[#CBD5E1] bg-white text-xs shadow-sm w-64">
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-[#CBD5E1] bg-white text-xs shadow-sm w-full sm:w-64">
           <Search className="w-3.5 h-3.5 text-[#64748B]" />
           <input
             type="text"
@@ -228,6 +284,16 @@ export const ConnectionsPage: React.FC = () => {
             className="w-full text-xs font-medium text-[#0B2545] outline-none placeholder:text-[#94A3B8]"
           />
         </div>
+        <button
+          type="button"
+          disabled={testAll.pending || filteredConnections.length === 0}
+          onClick={() => void testAll.run(filteredConnections.map((c) => c.id))}
+          title="Test reachability and authentication of every connection shown"
+          className="sm:order-last sm:ml-auto py-1.5 px-3 rounded-xl border border-[#CBD5E1] bg-white text-xs font-bold text-[#134074] flex items-center justify-center gap-1.5 shadow-sm hover:border-[#134074] disabled:opacity-50"
+        >
+          <Activity className="w-3.5 h-3.5" />
+          {testAll.pending ? 'Testing…' : `Test all shown (${filteredConnections.length})`}
+        </button>
         <div className="flex items-center gap-1 bg-[#F1F5F9] p-1 rounded-xl border border-[#E2E8F0] text-xs flex-wrap">
           {(['all', 'mqtt', 'modbus', 'opcua', 'http', 'websocket'] as const).map((proto) => (
             <button
@@ -244,6 +310,27 @@ export const ConnectionsPage: React.FC = () => {
           ))}
         </div>
       </div>
+
+      {!testAll.pending && testedShown.length > 1 && !panelConn && (
+        <div role="status" className={`p-3 rounded-xl border text-xs ${failedShown.length ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-emerald-50 border-emerald-200 text-emerald-900'}`}>
+          <span className="font-bold">
+            {testedShown.length - failedShown.length} of {testedShown.length} connections passed the test.
+          </span>
+          {failedShown.length > 0 && (
+            <span>
+              {' '}Failed:{' '}
+              {failedShown.map((c, index) => (
+                <React.Fragment key={c.id}>
+                  {index > 0 && ', '}
+                  <button type="button" onClick={() => setTestPanelId(c.id)} className="font-semibold underline hover:no-underline">
+                    {c.name}
+                  </button>
+                </React.Fragment>
+              ))}
+            </span>
+          )}
+        </div>
+      )}
 
       {panelConn && (testing[panelConn.id] || testResults[panelConn.id]) && (
         <div className="bg-white rounded-2xl border border-[#E2E8F0] shadow-sm p-3 space-y-2">
@@ -277,7 +364,7 @@ export const ConnectionsPage: React.FC = () => {
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs border-collapse">
+            <table className="w-full min-w-[820px] text-left text-xs border-collapse">
               <thead>
                 <tr className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-[11px] font-bold text-[#475569] uppercase tracking-wider">
                   <th className="py-3 px-4">Name & Protocol</th>
@@ -348,9 +435,9 @@ export const ConnectionsPage: React.FC = () => {
                               <Edit2 className="w-3.5 h-3.5 text-[#64748B]" />
                               <span>Edit</span>
                             </button>
-                            <button type="button" role="menuitem" onClick={() => { setActiveMenuId(null); void handlePauseResume(conn); }} className="w-full px-3 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-[#0B2545] flex items-center gap-2">
+                            <button type="button" role="menuitem" disabled={lifecycle.pending} onClick={() => { setActiveMenuId(null); handlePauseResume(conn); }} className="w-full px-3 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-[#0B2545] flex items-center gap-2 disabled:opacity-50">
                               {conn.lifecycleStatus === 'PAUSED' ? <Play className="w-3.5 h-3.5 text-[#10B981]" /> : <Pause className="w-3.5 h-3.5 text-[#64748B]" />}
-                              <span>{conn.lifecycleStatus === 'PAUSED' ? 'Resume' : 'Pause'}</span>
+                              <span>{conn.lifecycleStatus === 'PAUSED' ? 'Resume' : 'Pause…'}</span>
                             </button>
                             <div className="h-px bg-[#F1F5F9] my-1" />
                             <button type="button" role="menuitem" onClick={() => { setActiveMenuId(null); setArchivingConn(conn); }} className="w-full px-3 py-1.5 rounded-lg hover:bg-red-50 text-red-600 flex items-center gap-2">
@@ -382,7 +469,8 @@ export const ConnectionsPage: React.FC = () => {
             setSearchParams({});
           }}
           onTest={(id) => void handleTest(id)}
-          onPauseResume={(conn) => void handlePauseResume(conn)}
+          onPauseResume={handlePauseResume}
+          pauseBusy={lifecycle.pending}
           onEdit={openEdit}
         />
       )}
@@ -400,10 +488,19 @@ export const ConnectionsPage: React.FC = () => {
         title={`Archive "${archivingConn?.name}"?`}
         message={`The connection is paused first. Its ${archivingConn?.signalsCount ?? 0} signal(s) stop collecting.`}
         confirmText="Pause and archive"
+        busyLabel="Archiving…"
         cancelText="Cancel"
         variant="danger"
         onConfirm={handleArchive}
         onCancel={() => setArchivingConn(null)}
+      />
+
+      <PauseConnectionDialog
+        connection={pausingConn}
+        signals={signals}
+        error={dialogError}
+        onConfirm={confirmPause}
+        onCancel={() => setPausingConn(null)}
       />
     </div>
   );

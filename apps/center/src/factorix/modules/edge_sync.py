@@ -178,6 +178,7 @@ async def _apply_connection_reports(
         SELECT id, status, health, last_error, last_success_at
         FROM connections
         WHERE tenant_id = :tenant_id AND edge_id = :edge_id AND id = ANY(:ids)
+        ORDER BY id
         FOR UPDATE
         """,
         {"tenant_id": tenant_id, "edge_id": edge_id, "ids": list(by_id)},

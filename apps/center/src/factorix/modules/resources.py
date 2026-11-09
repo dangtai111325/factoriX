@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from factorix.domain.catalog import HIERARCHY_PRESETS
 from factorix.domain.resources import ResourceInvariantError, assert_no_cycle, validate_code
 from factorix.modules.common import as_uuid, audit, execute, execute_rowcount, fetch_all, fetch_one, jsonb, parse_uuid, utcnow
+from factorix.modules import usage
 from factorix.platform.errors import AppError
 
 MAX_PAGE = 200
@@ -175,6 +176,43 @@ async def _type_by_key(session: AsyncSession, tenant_id: UUID, key: str) -> dict
     return row
 
 
+def sibling_name_key(name: str) -> str:
+    """Comparison key of a resource name among its siblings: trimmed, case-insensitive (R3-HS-02)."""
+    return str(name or "").strip().lower()
+
+
+async def assert_unique_sibling_name(
+    session: AsyncSession, tenant_id: UUID, parent_id: Any, name: str, *, exclude_id: Any = None, parent_name: str | None = None
+) -> None:
+    """409 DUPLICATE_NAME when an active sibling (same parent, or both roots) has the same name.
+    Two lines named alike under one zone cannot be told apart in the tree, graph or models."""
+    duplicate = await fetch_one(
+        session,
+        """
+        SELECT id, code FROM resources
+        WHERE tenant_id = :tenant_id AND archived_at IS NULL
+          AND parent_id IS NOT DISTINCT FROM CAST(:parent_id AS uuid)
+          AND lower(btrim(name)) = :name_key
+          AND (CAST(:exclude_id AS uuid) IS NULL OR id <> CAST(:exclude_id AS uuid))
+        LIMIT 1
+        """,
+        {
+            "tenant_id": tenant_id,
+            "parent_id": as_uuid(parent_id) if parent_id else None,
+            "name_key": sibling_name_key(name),
+            "exclude_id": as_uuid(exclude_id) if exclude_id else None,
+        },
+    )
+    if duplicate:
+        where = f"under {parent_name}" if parent_name else "at the top level"
+        raise AppError(
+            409,
+            "DUPLICATE_NAME",
+            f'Another resource {where} is already named "{name.strip()}" (code {duplicate["code"]}). Use a different name.',
+            field_errors=[{"path": "name", "code": "DUPLICATE_NAME"}],
+        )
+
+
 async def create_resource(
     session: AsyncSession,
     tenant_id: UUID,
@@ -242,6 +280,7 @@ async def create_resource(
     if duplicate:
         parent_name = parent["name"] if parent else "root"
         raise AppError(409, "DUPLICATE", f'Another resource under {parent_name} already uses the code "{code}".', field_errors=[{"path": "code", "code": "DUPLICATE"}])
+    await assert_unique_sibling_name(session, tenant_id, parent_id_val, body.name, parent_name=parent["name"] if parent else None)
 
     if parent is not None:
         parent_path = parent.get("path_code") or parent["code"]
@@ -552,6 +591,11 @@ async def patch_resource(
             raise AppError(422, "NAME_LENGTH", "Name must be at most 200 characters.", field_errors=[{"path": "name", "code": "NAME_LENGTH"}])
         if FORBIDDEN_NAME.search(name):
             raise AppError(422, "NAME_CHARS", "Names cannot contain / # + $ or control characters.", field_errors=[{"path": "name", "code": "NAME_CHARS"}])
+        if sibling_name_key(name) != sibling_name_key(current["name"]):
+            parent_row = await fetch_one(session, "SELECT name FROM resources WHERE id = :id", {"id": current["parent_id"]}) if current.get("parent_id") else None
+            await assert_unique_sibling_name(
+                session, tenant_id, current.get("parent_id"), name, exclude_id=resource_id, parent_name=parent_row["name"] if parent_row else None
+            )
     description = body.description if body.description is not None else current["description"]
     code = current["code"]
     old_path_code = current.get("path_code") or current["code"]
@@ -659,6 +703,7 @@ async def move_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, res
     )
     if dup:
         raise AppError(409, "DUPLICATE", f'Another resource under {parent["name"]} already uses the code "{current["code"]}".', field_errors=[{"path": "code", "code": "DUPLICATE"}])
+    await assert_unique_sibling_name(session, tenant_id, parent["id"], current["name"], exclude_id=resource_id, parent_name=parent["name"])
 
     old_path_code = current.get("path_code") or current["code"]
     new_path_code = f"{parent_path}/{current['code']}"
@@ -764,19 +809,61 @@ async def move_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, res
     return await get_resource(session, tenant_id, resource_id)
 
 
-async def archive_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID, correlation_id: str) -> dict[str, Any]:
+class ArchiveIn(BaseModel):
+    # Archive the data models that read this resource's signals together with it (R3-HS-01).
+    # Without it, a resource whose signals feed active models is not archived (409 RESOURCE_HAS_MODELS).
+    archive_models: bool = False
+
+
+async def _active_children(session: AsyncSession, tenant_id: UUID, resource_id: UUID) -> int:
+    row = await fetch_one(
+        session,
+        "SELECT count(*) AS count FROM resources WHERE tenant_id = :tenant_id AND parent_id = :id AND archived_at IS NULL",
+        {"tenant_id": tenant_id, "id": resource_id},
+    )
+    return int(row["count"]) if row else 0
+
+
+async def archive_impact(session: AsyncSession, tenant_id: UUID, resource_id: UUID) -> dict[str, Any]:
+    """What archiving the resource affects, shown by the archive dialog before it is confirmed.
+
+    ``signals`` are the active signals of the resource (they stop collecting); ``models`` are the
+    active data models that read any of them (``usage.models_using_signals``).
+    """
     current = await _resource(session, tenant_id, resource_id)
-    children = await fetch_one(
+    children = await _active_children(session, tenant_id, resource_id)
+    signals = await fetch_all(
         session,
         """
-        SELECT count(*) AS count FROM resources
-        WHERE tenant_id = :tenant_id AND parent_id = :id AND archived_at IS NULL
+        SELECT sd.id, sd.key, sd.display_name,
+               EXISTS (SELECT 1 FROM signal_bindings b WHERE b.signal_id = sd.id AND b.valid_to IS NULL AND b.enabled) AS collecting
+        FROM signal_definitions sd
+        WHERE sd.tenant_id = :tenant_id AND sd.resource_id = :id AND sd.status = 'ACTIVE'
+        ORDER BY sd.key
         """,
         {"tenant_id": tenant_id, "id": resource_id},
     )
-    if children and int(children["count"]) > 0:
+    # Signals of the resource and resource attributes (e.g. ``.@zone.@name``) both count (Data Model v2).
+    models = await usage.models_using_resource(session, tenant_id, resource_id)
+    return {
+        "resource_id": str(resource_id),
+        "resource_name": current.get("name"),
+        "child_count": children,
+        "can_archive": children == 0,
+        "signal_count": len(signals),
+        "collecting_signal_count": sum(1 for row in signals if row.get("collecting")),
+        "signals": [{"id": str(row["id"]), "key": row["key"], "display_name": row["display_name"]} for row in signals[:200]],
+        "models": models,
+    }
+
+
+async def archive_resource(
+    session: AsyncSession, tenant_id: UUID, actor: UUID, resource_id: UUID, correlation_id: str, *, archive_models: bool = False
+) -> dict[str, Any]:
+    current = await _resource(session, tenant_id, resource_id)
+    if await _active_children(session, tenant_id, resource_id) > 0:
         raise AppError(409, "HAS_CHILDREN", "Archive child resources first.")
-    
+
     now = utcnow()
     sig_rows = await fetch_all(
         session,
@@ -791,6 +878,18 @@ async def archive_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
     affected_count = len(sig_rows)
     active_sig_ids = [as_uuid(r["id"]) for r in sig_rows if r["id"]]
     enabled_binding_sig_ids = [as_uuid(r["id"]) for r in sig_rows if r.get("enabled")]
+
+    # R3-HS-01: archiving must not leave models publishing frozen values from archived signals.
+    models = await usage.models_using_resource(session, tenant_id, resource_id)
+    if models and not archive_models:
+        names = ", ".join(str(m.get("display_name") or m["id"]) for m in models[:5])
+        raise AppError(
+            409,
+            "RESOURCE_HAS_MODELS",
+            f"{len(models)} data model(s) use signals of this resource ({names}). Archive them too or change them first.",
+            extra={"models": models},
+        )
+    archived_models = await usage.archive_models(session, tenant_id, actor, models, correlation_id) if models else []
 
     if active_sig_ids:
         await execute(
@@ -821,9 +920,10 @@ async def archive_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         """,
         {"now": now, "props": jsonb(props), "id": resource_id, "tenant_id": tenant_id},
     )
-    await audit(session, tenant_id=tenant_id, event_type="RESOURCE_ARCHIVE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"status": current["status"], "affected_signals": 0}, after={"status": "ARCHIVED", "affected_signals": affected_count}, correlation_id=correlation_id)
+    await audit(session, tenant_id=tenant_id, event_type="RESOURCE_ARCHIVE", actor_id=actor, entity_type="resource", entity_id=resource_id, before={"status": current["status"], "affected_signals": 0}, after={"status": "ARCHIVED", "affected_signals": affected_count, "archived_models": [str(m["id"]) for m in archived_models]}, correlation_id=correlation_id)
     res = await get_resource(session, tenant_id, resource_id)
     res["affected_signals"] = affected_count
+    res["archived_models"] = archived_models
     return res
 
 
@@ -848,6 +948,7 @@ async def restore_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         if dup:
             pname = parent["name"] if parent else "parent"
             raise AppError(409, "DUPLICATE", f'Another resource under {pname} already uses the code "{current["code"]}".')
+        await assert_unique_sibling_name(session, tenant_id, current["parent_id"], current["name"], exclude_id=resource_id, parent_name=parent["name"] if parent else None)
     else:
         dup = await fetch_one(
             session,
@@ -856,6 +957,7 @@ async def restore_resource(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         )
         if dup:
             raise AppError(409, "DUPLICATE", f'A root resource already uses the code "{current["code"]}".')
+        await assert_unique_sibling_name(session, tenant_id, None, current["name"], exclude_id=resource_id)
             
     now = utcnow()
     props = dict(current.get("properties_json") or {})
@@ -1186,10 +1288,10 @@ async def neighbors(
                     models = await fetch_all(
                         session,
                         """
-                        SELECT m.signal_id, og.id AS model_id, og.display_name AS model_name, og.status
-                        FROM output_group_members m
-                        JOIN output_groups og ON og.id = m.output_group_id
-                        WHERE m.signal_id = ANY(:sig_ids) AND og.status != 'ARCHIVED'
+                        SELECT m.ref_id AS signal_id, og.id AS model_id, og.display_name AS model_name, og.state AS status
+                        FROM model_refs m
+                        JOIN output_groups og ON og.id = m.model_id
+                        WHERE m.ref_kind = 'signal' AND m.ref_id = ANY(:sig_ids) AND og.status <> 'ARCHIVED'
                         """,
                         {"sig_ids": sig_ids},
                     )

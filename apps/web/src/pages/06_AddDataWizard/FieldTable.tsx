@@ -1,5 +1,6 @@
-import React from 'react';
-import { Trash2 } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { Trash2, X } from 'lucide-react';
+import { indeterminateRef, useRangeSelection } from '../08_SignalsCatalog/useRangeSelection';
 import { ProtocolType } from '../../types';
 import {
   DATA_TYPE_LABEL,
@@ -32,11 +33,130 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
   const remove = (id: string) => onChange(rows.filter((row) => row.id !== id));
   const json = protocol === 'mqtt' || protocol === 'http' || protocol === 'websocket';
 
+  // Bulk edit: select rows (Shift+click = range), then set one value on every selected row.
+  const ids = useMemo(() => rows.map((row) => row.id), [rows]);
+  const selection = useRangeSelection(ids);
+  const headerState = selection.stateOf(ids);
+  const [bulkUnit, setBulkUnit] = useState('');
+  const [bulkRound, setBulkRound] = useState('');
+  const applyToSelected = (patch: Partial<FieldRow>) => {
+    onChange(rows.map((row) => (selection.selected.has(row.id) ? { ...row, ...patch, error: undefined } : row)));
+  };
+  const removeSelected = () => {
+    onChange(rows.filter((row) => !selection.selected.has(row.id)));
+    selection.clear();
+  };
+  const bulkSelect = 'px-1.5 py-1 border border-slate-300 rounded text-[11px] bg-white';
+  const onEnter = (run: () => void) => (event: React.KeyboardEvent) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      event.stopPropagation();
+      run();
+    }
+  };
+
   return (
+    <div className="space-y-1.5">
+    {selection.count > 0 && (
+      <div role="toolbar" aria-label="Edit the selected fields" className="flex flex-wrap items-center gap-2 px-2.5 py-1.5 rounded-lg border border-blue-200 bg-blue-50/70 text-[11px] text-[#0B2545]">
+        <span className="font-bold">{selection.count} of {rows.length} selected</span>
+        <select
+          aria-label="Set the signal type of the selected fields"
+          value=""
+          onChange={(e) => e.target.value && applyToSelected({ dataType: e.target.value as SignalDataType })}
+          className={bulkSelect}
+        >
+          <option value="">Set type…</option>
+          {(Object.keys(DATA_TYPE_LABEL) as SignalDataType[]).map((t) => (
+            <option key={t} value={t}>{DATA_TYPE_LABEL[t]}</option>
+          ))}
+        </select>
+        <span className="inline-flex items-center gap-1">
+          <input
+            aria-label="Unit for the selected fields"
+            value={bulkUnit}
+            placeholder="Unit"
+            onChange={(e) => setBulkUnit(e.target.value)}
+            onKeyDown={onEnter(() => applyToSelected({ unit: bulkUnit.trim() }))}
+            className={`${bulkSelect} w-20`}
+          />
+          <button type="button" onClick={() => applyToSelected({ unit: bulkUnit.trim() })} className="font-semibold text-blue-700 hover:underline">
+            Set unit
+          </button>
+        </span>
+        <select
+          aria-label="Set nullable on the selected fields"
+          value=""
+          onChange={(e) => e.target.value && applyToSelected({ nullable: e.target.value === 'yes' })}
+          className={bulkSelect}
+        >
+          <option value="">Nullable…</option>
+          <option value="yes">Nullable: yes</option>
+          <option value="no">Nullable: no</option>
+        </select>
+        <span className="inline-flex items-center gap-1">
+          <input
+            aria-label="Round digits for the selected fields (empty = no rounding)"
+            type="number"
+            min={0}
+            max={12}
+            value={bulkRound}
+            placeholder="Round"
+            onChange={(e) => setBulkRound(e.target.value)}
+            onKeyDown={onEnter(() => applyToSelected({ roundDigits: bulkRound }))}
+            className={`${bulkSelect} w-16 font-mono`}
+          />
+          <button type="button" onClick={() => applyToSelected({ roundDigits: bulkRound })} className="font-semibold text-blue-700 hover:underline">
+            Set round
+          </button>
+        </span>
+        {protocol === 'modbus' && (
+          <>
+            <select
+              aria-label="Set the register area of the selected fields"
+              value=""
+              onChange={(e) => e.target.value && applyToSelected({ registerArea: e.target.value as RegisterArea })}
+              className={bulkSelect}
+            >
+              <option value="">Area…</option>
+              {REGISTER_AREAS.map((a) => (
+                <option key={a} value={a}>{a}</option>
+              ))}
+            </select>
+            <select
+              aria-label="Set the word order of the selected fields"
+              value=""
+              onChange={(e) => e.target.value && applyToSelected({ wordOrder: e.target.value as 'big' | 'little' })}
+              className={bulkSelect}
+            >
+              <option value="">Word order…</option>
+              <option value="big">big (high word first)</option>
+              <option value="little">little</option>
+            </select>
+          </>
+        )}
+        <button type="button" onClick={removeSelected} className="inline-flex items-center gap-1 font-semibold text-red-700 hover:underline">
+          <Trash2 className="w-3 h-3" aria-hidden="true" /> Remove selected
+        </button>
+        <button type="button" onClick={selection.clear} className="inline-flex items-center gap-1 text-[#657794] hover:text-[#111B37]">
+          <X className="w-3 h-3" aria-hidden="true" /> Clear selection
+        </button>
+      </div>
+    )}
     <div className="overflow-x-auto border border-slate-200 rounded-lg">
       <table className={`w-full text-left text-[11px] ${protocol === 'modbus' ? 'min-w-[1240px]' : 'min-w-[960px]'}`}>
         <thead>
           <tr className="border-b border-slate-200 bg-slate-50 text-[#657794] font-semibold text-[10px] uppercase tracking-wide">
+            <th className={`${cell} w-6`}>
+              <input
+                type="checkbox"
+                ref={indeterminateRef(headerState === 'some')}
+                checked={headerState === 'all'}
+                onChange={() => selection.setMany(ids, headerState !== 'all')}
+                aria-label={`Select all ${rows.length} fields`}
+                title="Select all fields. Shift+click a row checkbox to select a range."
+              />
+            </th>
             <th className={cell}>Key</th>
             <th className={cell}>Display name</th>
             {protocol === 'mqtt' && <th className={cell}>Topic</th>}
@@ -67,7 +187,16 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
             const fixedCount = registersFor(type);
             const live = liveValues?.[row.id];
             return (
-              <tr key={row.id} className={row.error ? 'bg-red-50/40' : 'hover:bg-slate-50'}>
+              <tr key={row.id} className={row.error ? 'bg-red-50/40' : selection.isSelected(row.id) ? 'bg-blue-50/40' : 'hover:bg-slate-50'}>
+                <td className={`${cell} w-6`}>
+                  <input
+                    type="checkbox"
+                    checked={selection.isSelected(row.id)}
+                    onChange={() => undefined}
+                    onClick={(e) => selection.toggle(row.id, e.shiftKey)}
+                    aria-label={`Select field ${row.key || 'without key'}`}
+                  />
+                </td>
                 <td className={cell}>
                   <input aria-label="Signal key" value={row.key} onChange={(e) => update(row.id, { key: e.target.value })} className={`${mono} min-w-[110px]`} />
                   {row.error && <p className="text-[10px] text-red-600 mt-0.5 max-w-[220px]">{row.error}</p>}
@@ -197,6 +326,7 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
           })}
         </tbody>
       </table>
+    </div>
     </div>
   );
 };

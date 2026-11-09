@@ -4,8 +4,18 @@ import { ApiError, api } from '../../api/client';
 import { Button } from '../common/Button';
 import { translateApiError } from '../../utils/apiErrors';
 import { useDialogA11y } from './useDialogA11y';
-import { FIELD_BASE, FIELD_ERROR, FIELD_OK, resourceCodeProblem, resourceExamples, resourceNameProblem } from './AddResourceModal';
+import {
+  FIELD_BASE,
+  FIELD_ERROR,
+  FIELD_OK,
+  duplicateSiblingName,
+  resourceCodeProblem,
+  resourceErrorField,
+  resourceExamples,
+  resourceNameProblem,
+} from './AddResourceModal';
 import { ModalPortal } from './ModalPortal';
+import { useSubmit } from '../../lib/useSubmit';
 
 export interface EditResourceModalProps {
   isOpen: boolean;
@@ -15,8 +25,11 @@ export interface EditResourceModalProps {
     name: string;
     code: string;
     type?: string;
+    parentId?: string;
     attributes?: Record<string, unknown>;
   } | null;
+  /** Active resources, used to warn about a duplicate name under the same parent (R3-HS-02). */
+  resources?: Array<{ id: string; name: string; parentId?: string }>;
   onSuccess?: (updated: { name: string; code: string }) => void | Promise<void>;
 }
 
@@ -34,7 +47,7 @@ function isInternalKey(key: string): boolean {
   return key.startsWith('_');
 }
 
-export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, onClose, resource, onSuccess }) => {
+export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, onClose, resource, resources = [], onSuccess }) => {
   const dialogRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(false);
   const [detail, setDetail] = useState<ResourceDetail | null>(null);
@@ -45,7 +58,11 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
   const [error, setError] = useState<string | null>(null);
   const [nameError, setNameError] = useState<string | null>(null);
   const [codeError, setCodeError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+  // In-flight guard (R3-DM-04): one PATCH per Save, however often it is clicked.
+  const save = useSubmit((id: string, body: Record<string, unknown>) =>
+    api(`/api/v1/resources/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  );
+  const submitting = save.pending;
 
   useDialogA11y(isOpen && Boolean(resource), dialogRef, () => {
     if (!submitting) onClose();
@@ -66,7 +83,6 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
     setError(null);
     setNameError(null);
     setCodeError(null);
-    setSubmitting(false);
     setLoading(true);
 
     let active = true;
@@ -104,8 +120,12 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
   const originalCode = detail?.code ?? resource.code ?? '';
   const isCodeChanged = code.trim().toLowerCase() !== originalCode.toLowerCase();
 
+  const nameDuplicate = (value: string) =>
+    resource ? duplicateSiblingName(resources, resource.parentId, value, resource.id) : '';
+
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (save.isRunning()) return;
     setError(null);
     setNameError(null);
     setCodeError(null);
@@ -116,7 +136,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
 
     const trimmedName = name.trim();
     const trimmedCode = code.trim();
-    const nameIssue = resourceNameProblem(name);
+    const nameIssue = resourceNameProblem(name) || nameDuplicate(name);
     const codeIssue = resourceCodeProblem(code);
     setNameError(nameIssue || null);
     setCodeError(codeIssue || null);
@@ -152,33 +172,35 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
       nextProperties[key] = unchanged ? original : item.value.trim();
     }
 
-    setSubmitting(true);
     try {
-      await api(`/api/v1/resources/${encodeURIComponent(resource.id)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          version: Number(detail.version || resource.attributes?.version || 1),
-          name: trimmedName,
-          code: trimmedCode,
-          description: description.trim(),
-          properties: nextProperties,
-        }),
+      await save.run(resource.id, {
+        version: Number(detail.version || resource.attributes?.version || 1),
+        name: trimmedName,
+        code: trimmedCode,
+        description: description.trim(),
+        properties: nextProperties,
       });
-      await onSuccess?.({ name: trimmedName, code: trimmedCode });
-      onClose();
     } catch (caught) {
       const errCode = caught instanceof ApiError ? caught.code : '';
+      const field = resourceErrorField(caught);
       if (errCode === 'RESOURCE_VERSION_CONFLICT') {
         setError('Someone else changed this resource after you opened it. Close this dialog and open it again to edit the latest version.');
-      } else if (errCode === 'DUPLICATE' || errCode === 'INVALID_CODE') {
+      } else if (field === 'code') {
         setCodeError(translateApiError(caught));
-      } else if (errCode === 'NAME_CHARS' || errCode === 'NAME_LENGTH') {
+        document.getElementById('edit-resource-code')?.focus();
+      } else if (field === 'name') {
+        // R3-HS-02: the server's duplicate-name error is shown on the Name field.
         setNameError(translateApiError(caught));
+        document.getElementById('edit-resource-name')?.focus();
       } else {
         setError(translateApiError(caught));
       }
+      return;
+    }
+    try {
+      await onSuccess?.({ name: trimmedName, code: trimmedCode });
     } finally {
-      setSubmitting(false);
+      onClose();
     }
   };
 
@@ -244,9 +266,10 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
                   aria-describedby="edit-resource-name-hint"
                   onChange={(event) => {
                     setName(event.target.value);
-                    if (nameError && !resourceNameProblem(event.target.value)) setNameError(null);
+                    // R3-HS-04: an error is about the previous value; it is checked again on blur or submit.
+                    if (nameError) setNameError(null);
                   }}
-                  onBlur={() => setNameError(resourceNameProblem(name) || null)}
+                  onBlur={() => setNameError(resourceNameProblem(name) || nameDuplicate(name) || null)}
                   placeholder={resourceExamples(resource.type || '').name}
                   className={`${FIELD_BASE} ${nameError ? FIELD_ERROR : FIELD_OK}`}
                 />
@@ -277,7 +300,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
                   aria-describedby={codeError ? 'edit-resource-code-error' : undefined}
                   onChange={(event) => {
                     setCode(event.target.value);
-                    if (codeError && !resourceCodeProblem(event.target.value)) setCodeError(null);
+                    if (codeError) setCodeError(null);
                   }}
                   onBlur={() => setCodeError(resourceCodeProblem(code) || null)}
                   placeholder={resourceExamples(resource.type || '').code}

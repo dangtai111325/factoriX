@@ -56,7 +56,10 @@ FLUSH_BUDGET_S = 1.0
 # lane. The latest lane is sent at the start of every cycle, so live values wait for at most one
 # history batch instead of a full second of history (R2-SG-01).
 HISTORY_SLICE_S = 0.25
-PRUNE_CHUNK = 2000
+PRUNE_CHUNK = 500  # ~0.1 s per step on a 1 GB outbox, then PRUNE_PAUSE_S
+# Pause between prune steps so acquisition, heartbeat and flushing run in between (R3 P1).
+PRUNE_PAUSE_S = 0.02
+SLOW_LOOP_STEP_S = 1.0
 ACKED_RETENTION = timedelta(minutes=10)
 
 
@@ -715,12 +718,18 @@ class EdgeRuntime:
             await asyncio.sleep(60)
             cutoff = iso_ms(datetime.now(timezone.utc) - ACKED_RETENTION)
             removed = 0
+            blocked = 0.0
             while True:
-                chunk = self.outbox.prune(cutoff, chunk=PRUNE_CHUNK, max_chunks=1)
+                started = time.monotonic()
+                chunk, more = self.outbox.prune_step(cutoff, chunk=PRUNE_CHUNK)
+                blocked += time.monotonic() - started
                 removed += chunk
-                if chunk < PRUNE_CHUNK:
+                if not more:
                     break
-                await asyncio.sleep(0)  # let acquisition, heartbeat and flushing run between chunks
+                # A real pause, not sleep(0): acquisition, heartbeat and flushing get the loop between chunks.
+                await asyncio.sleep(PRUNE_PAUSE_S)
+            if blocked > SLOW_LOOP_STEP_S:
+                logger.warning("Outbox prune blocked the event loop for %.2f s in total (%d rows)", blocked, removed)
             dropped = self.outbox.enforce_cap(self.max_pending)
             if dropped:
                 logger.error("Outbox above %d pending rows: %d oldest rows dropped", self.max_pending, dropped)

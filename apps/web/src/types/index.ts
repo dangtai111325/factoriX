@@ -40,7 +40,7 @@ export type StoredProtocol = 'modbus_tcp' | 'opcua' | 'mqtt' | 'http' | 'websock
 export type ConnectionDisplayState = 'connected' | 'idle' | 'degraded' | 'paused' | 'unknown';
 
 /** Effective signal status as computed by the Center (`latest_signal_state` evaluation). */
-export type SignalQuality = 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE' | 'NO_DATA' | 'DISABLED';
+export type SignalQuality = 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE' | 'NO_DATA' | 'DISABLED' | 'PAUSED' | 'NO_CONNECTION';
 
 export type DemoScenario = 'healthy' | 'degraded_modbus' | 'timeout_opcua' | 'auth_fail_mqtt' | 'offline';
 
@@ -71,6 +71,8 @@ export interface ConnectionItem {
   endpoint: string;
   /** Display state (see ConnectionDisplayState). */
   status: ConnectionDisplayState | string;
+  /** R3-OV-01: the browser cannot reach the appliance; `status` is 'unknown' until it can again. */
+  noConnection?: boolean;
   /** Raw lifecycle status from the API: ACTIVE | PAUSED | DRAFT | ARCHIVED. */
   lifecycleStatus?: string;
   /** Server-computed effective health (HEALTHY | DEGRADED | IDLE | PAUSED | UNKNOWN …); falls back to `health`. */
@@ -188,15 +190,18 @@ export interface LayoutMachineNode {
   power?: number;
 }
 
-export interface OutputGroup {
+/** Data model summary (GET /api/v1/data-models), used for counts and search. */
+export interface DataModelSummary {
   id: string;
   name: string;
-  topicTemplate: string;
-  enabled: boolean;
-  publishIntervalMs: number;
-  assignedSignals: string[];
-  lastPublished: string;
-  samplePayload: string;
+  description: string;
+  state: 'RUNNING' | 'PAUSED';
+  /** Names of the resources the model reads from. */
+  machines: string[];
+  machineIds: string[];
+  sampleMs: number;
+  fieldCount: number;
+  errorCount: number;
 }
 
 export interface DiagnosticItem {

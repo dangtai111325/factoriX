@@ -9,9 +9,11 @@
 import { useSyncExternalStore } from 'react';
 import { api } from '../../api/client';
 import { HealthMsg, subscribeHealth } from '../../lib/liveStream';
+import { connectivityDelay, getConnectivity, onConnectivityChange, onConnectivityRestored } from '../../lib/connectivity';
 
 export type EdgeState = 'online' | 'degraded' | 'offline' | 'waiting';
-export type CollectorState = 'loading' | 'not_configured' | 'waiting' | 'online' | 'degraded' | 'offline';
+/** 'unknown': the browser cannot reach the appliance, so the collector state is not known (R3-OV-01). */
+export type CollectorState = 'loading' | 'not_configured' | 'waiting' | 'online' | 'degraded' | 'offline' | 'unknown';
 
 export interface EdgeHealthRow {
   id: string;
@@ -70,7 +72,21 @@ function toRow(raw: Record<string, unknown>): EdgeHealthRow {
   return { ...base, state: classifyEdge(base) };
 }
 
-export function summarize(edges: EdgeHealthRow[] | null): CollectorHealth {
+export const NO_CONNECTION_LABEL = 'Unknown (no connection to appliance)';
+
+export function summarize(edges: EdgeHealthRow[] | null, connectionLost = false): CollectorHealth {
+  if (connectionLost) {
+    const known = edges || [];
+    return {
+      state: 'unknown',
+      label: NO_CONNECTION_LABEL,
+      detail: 'This browser cannot reach the FactoriX appliance, so the collector status is not known.',
+      edges: known,
+      online: 0,
+      total: known.length,
+      offlineEdges: [],
+    };
+  }
   if (edges === null) {
     return { state: 'loading', label: 'Checking…', detail: 'Reading collector status.', edges: [], online: 0, total: 0, offlineEdges: [] };
   }
@@ -131,9 +147,9 @@ let timer: number | null = null;
 let unsubscribeStream: (() => void) | null = null;
 let inflight = false;
 
-function publish(next: EdgeHealthRow[]): void {
+function publish(next: EdgeHealthRow[] | null): void {
   rows = next;
-  snapshot = summarize(next);
+  snapshot = summarize(next, getConnectivity().lost);
   listeners.forEach((listener) => listener());
 }
 
@@ -167,17 +183,40 @@ function onHealth(msg: HealthMsg): void {
   publish(next);
 }
 
+let unsubscribeConnectivity: (() => void) | null = null;
+let unsubscribeRestored: (() => void) | null = null;
+let running = false;
+
+/** Self-scheduled poll: every 5 s, backing off while the appliance is unreachable (R3-OV-01). */
+function scheduleNext(delay: number): void {
+  if (!running) return;
+  if (timer !== null) window.clearTimeout(timer);
+  timer = window.setTimeout(() => {
+    timer = null;
+    void poll().finally(() => scheduleNext(connectivityDelay(POLL_MS)));
+  }, delay);
+}
+
 function start(): void {
+  running = true;
   void poll();
-  timer = window.setInterval(() => void poll(), POLL_MS);
+  scheduleNext(POLL_MS);
   unsubscribeStream = subscribeHealth(onHealth);
+  // Re-derive the pill (Unknown while lost) without waiting for the next poll.
+  unsubscribeConnectivity = onConnectivityChange(() => publish(rows));
+  unsubscribeRestored = onConnectivityRestored(() => scheduleNext(0));
 }
 
 function stop(): void {
-  if (timer !== null) window.clearInterval(timer);
+  running = false;
+  if (timer !== null) window.clearTimeout(timer);
   timer = null;
   unsubscribeStream?.();
   unsubscribeStream = null;
+  unsubscribeConnectivity?.();
+  unsubscribeConnectivity = null;
+  unsubscribeRestored?.();
+  unsubscribeRestored = null;
 }
 
 function subscribe(listener: () => void): () => void {

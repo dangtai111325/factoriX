@@ -29,6 +29,10 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, label, classNa
     dotColor = '#64748B';
     bgClasses = 'bg-slate-100 text-slate-700 border-slate-200';
     if (!label) defaultLabel = norm === 'STALE' ? 'Stale' : 'Paused';
+  } else if (norm === 'NO_CONNECTION' || norm === 'UNKNOWN') {
+    dotColor = '#CBD5E1';
+    bgClasses = 'bg-slate-50 text-slate-600 border-slate-200';
+    if (!label) defaultLabel = norm === 'NO_CONNECTION' ? 'Unknown (no connection to appliance)' : 'Unknown';
   } else if (norm === 'DISABLED') {
     dotColor = '#94A3B8';
     bgClasses = 'bg-slate-100 text-slate-500 border-slate-200';

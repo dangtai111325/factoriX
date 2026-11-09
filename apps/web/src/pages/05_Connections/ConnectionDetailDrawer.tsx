@@ -19,6 +19,8 @@ interface ConnectionDetailDrawerProps {
   onClose: () => void;
   onTest: (id: string) => void;
   onPauseResume: (conn: ConnectionItem) => void;
+  /** True while a pause / resume request runs. */
+  pauseBusy?: boolean;
   onEdit: (conn: ConnectionItem) => void;
 }
 
@@ -32,6 +34,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
   onClose,
   onTest,
   onPauseResume,
+  pauseBusy = false,
   onEdit,
 }) => {
   const navigate = useNavigate();
@@ -46,7 +49,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  const connSignals = signals.filter((s) => s.sourceConnectionId === connection.id);
+  const connSignals = signals.filter((s) => (s.sourceConnectionId || s.connectionId) === connection.id);
   const signalsByResource = new Map<string, SignalItem[]>();
   connSignals.forEach((sig) => {
     const list = signalsByResource.get(sig.resourceId) || [];
@@ -87,9 +90,9 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
           <Edit2 className="w-3.5 h-3.5" />
           <span>Edit</span>
         </button>
-        <button type="button" onClick={() => onPauseResume(connection)} className="py-1.5 px-2 rounded-lg bg-white border border-[#CBD5E1] hover:border-[#134074] text-xs font-semibold text-[#0B2545] flex items-center justify-center gap-1.5 shadow-sm">
+        <button type="button" disabled={pauseBusy} onClick={() => onPauseResume(connection)} className="py-1.5 px-2 rounded-lg bg-white border border-[#CBD5E1] hover:border-[#134074] text-xs font-semibold text-[#0B2545] flex items-center justify-center gap-1.5 shadow-sm disabled:opacity-50">
           {paused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
-          <span>{paused ? 'Resume' : 'Pause'}</span>
+          <span>{pauseBusy ? (paused ? 'Resuming…' : 'Pausing…') : paused ? 'Resume' : 'Pause…'}</span>
         </button>
         <button type="button" onClick={() => navigate(`/collector/add-data?connectionId=${encodeURIComponent(connection.id)}`)} className="py-1.5 px-2 rounded-lg bg-[#0B2545] hover:bg-[#134074] text-xs font-semibold text-white flex items-center justify-center gap-1.5 shadow-sm">
           <PlusCircle className="w-3.5 h-3.5" />

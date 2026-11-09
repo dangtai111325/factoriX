@@ -401,8 +401,8 @@ class Commissioner:
             await connector.close()
 
     async def _probe_http(self, job: dict[str, Any], config: dict[str, Any], fields: list[dict[str, Any]], stages: Stages, mode: str, allow: list[AllowedEndpoint]) -> tuple[bool, dict[str, Any]]:
-        """REACH and AUTH use a real data path: the first field's path, else the connection's
-        ``path``, else the test's ``test_path``. Without any path the host is only reached and
+        """REACH and AUTH use a real data path: the first field's path, else the test's
+        ``test_path``, else the connection's ``path`` (see :func:`auth_probe_path`). Without any path the host is only reached and
         AUTH is SKIPPED ("Not verified"), never PASSED: a public root URL proves nothing about
         the credential (R2-CN-01). A 401/403 always fails AUTH.
         """
@@ -424,7 +424,7 @@ class Commissioner:
         for item in fields:
             paths.setdefault(str(field_address(item).get("path") or config.get("path") or "/"), []).append(item)
         if not paths:
-            probe = str(config.get("path") or job.get("test_path") or "").strip()
+            probe = auth_probe_path(job.get("test_path"), config.get("path"))
             if probe:
                 paths[probe] = []
         try:
@@ -610,6 +610,20 @@ class Commissioner:
             channel = urlparse(connector.url).path or "/"
             return group_samples([(channel, frame.document, frame.received_time, frame.raw) for frame in frames]), []
         raise ConnectorError("PROTOCOL", "Capture is not supported for this protocol.")
+
+
+def auth_probe_path(test_path: Any, connection_path: Any) -> str:
+    """Data path that proves the HTTP credential when the test has no fields (R3-CN-01).
+
+    The test's own ``test_path`` wins: the user typed it for this test. The connection ``path``
+    is used only when it is a real data path; the form stores ``"/"`` as the default, and a
+    public root page proves nothing about the key. ``""`` means "no data path".
+    """
+    for candidate in (test_path, connection_path):
+        text = str(candidate or "").strip()
+        if text and text != "/":
+            return text
+    return ""
 
 
 def auth_label(auth: str) -> str:

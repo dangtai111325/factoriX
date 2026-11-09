@@ -66,6 +66,7 @@ async def test_cross_site_move_with_active_bindings_raises_409() -> None:
          patch("factorix.modules.resources.fetch_one", AsyncMock(side_effect=[
              {"hierarchy_mode": "guided"},  # tenant hierarchy_mode
              None,  # duplicate code check
+             None,  # duplicate sibling name check (R3-HS-02)
          ])), \
          patch("factorix.modules.resources.fetch_all", AsyncMock(side_effect=[
              [active_binding],  # active bindings query
@@ -109,6 +110,7 @@ async def test_archive_resource_stores_prior_archive_state() -> None:
          patch("factorix.modules.resources.execute", AsyncMock()) as mock_exec, \
          patch("factorix.modules.resources.audit", AsyncMock()), \
          patch("factorix.modules.resources.get_resource", AsyncMock(return_value={"id": str(resource_id), "status": "ARCHIVED"})), \
+         patch("factorix.modules.usage.models_using_resource", AsyncMock(return_value=[])), \
          patch("factorix.modules.collect.bump_edge_release", AsyncMock()):
 
         res = await archive_resource(session, tenant_id, actor_id, resource_id, "corr-1")

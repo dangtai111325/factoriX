@@ -21,6 +21,8 @@ import { refreshCollectorHealth, useCollectorHealth } from '../../components/she
 import { api } from '../../api/client';
 import { ACCOUNT_EVENTS, AuditRow, describeAudit } from '../../utils/auditText';
 import { formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { connectivityDelay, onConnectivityRestored, useConnectivity } from '../../lib/connectivity';
+import { qualityLine, summarizeQualities, useValuesReady } from './signalSummary';
 
 interface OverviewStats {
   resources: number;
@@ -28,19 +30,92 @@ interface OverviewStats {
   active_connections: number;
   connections_online: number;
   connections_total: number;
+  /** Connections without bound signals (never counted as offline, R3-CN-03). */
+  connections_idle?: number;
+  connections_degraded?: number;
+  /** Server verdict over effective connection health: NOT_CONFIGURED | PAUSED | IDLE | DEGRADED | PENDING | HEALTHY. */
+  data_collection_status?: string;
+  connection_health?: Array<{ health: string; count: number }>;
   last_data_at: string | null;
   ingest_per_minute: number;
   messages_per_min: number;
 }
 
 const CHECKLIST_KEY = 'fx.getStarted.hidden';
+/** Set once every step was done: a transient outage must not bring the card back (R3-OV-01). */
+const CHECKLIST_DONE_KEY = 'fx.getStarted.completed';
 
-function readChecklistHidden(): boolean {
+function readFlag(key: string): boolean {
   try {
-    return localStorage.getItem(CHECKLIST_KEY) === 'true';
+    return localStorage.getItem(key) === 'true';
   } catch {
     return false;
   }
+}
+
+function writeFlag(key: string): void {
+  try {
+    localStorage.setItem(key, 'true');
+  } catch {
+    // Storage unavailable: remembered for this page view only.
+  }
+}
+
+interface ConnectionCounts {
+  total: number;
+  online: number;
+  idle: number;
+  paused: number;
+  degraded: number;
+  /** Connections expected to deliver data: not idle, not paused. */
+  working: number;
+  /** Same verdict as the Center's `data_collection_status`. */
+  status: string;
+}
+
+/**
+ * Connection counts and the overall verdict. The Center's `/overview` values are used when present
+ * (idle connections never count as offline, R3-CN-03); the client fallback applies the same rule
+ * (domain/health.py `data_collection_status`) to the connection list.
+ */
+function connectionCounts(stats: OverviewStats | null, connections: Array<{ status: string }>): ConnectionCounts {
+  if (stats) {
+    const byHealth = new Map((stats.connection_health || []).map((row) => [String(row.health).toUpperCase(), Number(row.count) || 0]));
+    const total = stats.connections_total;
+    const idle = stats.connections_idle ?? byHealth.get('IDLE') ?? 0;
+    const paused = byHealth.get('PAUSED') ?? 0;
+    const archived = byHealth.get('ARCHIVED') ?? 0;
+    const degraded = stats.connections_degraded ?? byHealth.get('DEGRADED') ?? 0;
+    const working = Math.max(0, total - idle - paused - archived);
+    const status =
+      stats.data_collection_status ||
+      (total - archived === 0 ? 'NOT_CONFIGURED' : working === 0 ? (paused ? 'PAUSED' : 'IDLE') : degraded ? 'DEGRADED' : stats.connections_online >= working ? 'HEALTHY' : 'PENDING');
+    return { total, online: stats.connections_online, idle, paused, degraded, working, status: status.toUpperCase() };
+  }
+  const states = connections.map((c) => String(c.status || '').toLowerCase());
+  const total = states.length;
+  const online = states.filter((s) => s === 'connected').length;
+  const idle = states.filter((s) => s === 'idle').length;
+  const paused = states.filter((s) => s === 'paused').length;
+  const degraded = states.filter((s) => s === 'degraded').length;
+  const working = total - idle - paused;
+  const status =
+    total === 0
+      ? 'NOT_CONFIGURED'
+      : total === paused
+        ? 'PAUSED'
+        : working === 0
+          ? 'IDLE'
+          : degraded > 0
+            ? 'DEGRADED'
+            : online < working
+              ? 'PENDING'
+              : 'HEALTHY';
+  return { total, online, idle, paused, degraded, working, status };
+}
+
+function countText(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`;
 }
 
 type Tone = 'good' | 'warning' | 'error' | 'neutral';
@@ -62,13 +137,17 @@ interface ChecklistStep {
 
 export const OverviewPage: React.FC = () => {
   const navigate = useNavigate();
-  const { resources, connections, signals, outputGroups, currentPlant, refresh, loadState } = useApp();
+  const { resources, connections, signals, dataModels, currentPlant, refresh, loadState } = useApp();
   const { state: authState } = useAuth();
   const collector = useCollectorHealth();
+  // R3-OV-01: nothing on this page is current while the appliance cannot be reached.
+  const { lost: connectionLost } = useConnectivity();
+  const valuesReady = useValuesReady(loadState, signals);
 
   const [stats, setStats] = useState<OverviewStats | null>(null);
   const [auditRows, setAuditRows] = useState<AuditRow[] | null>(null);
-  const [checklistDismissed, setChecklistDismissed] = useState<boolean>(readChecklistHidden);
+  const [checklistDismissed, setChecklistDismissed] = useState<boolean>(() => readFlag(CHECKLIST_KEY));
+  const [checklistCompleted, setChecklistCompleted] = useState<boolean>(() => readFlag(CHECKLIST_DONE_KEY));
   // Names of resources that are no longer in the live model (e.g. archived), resolved on demand.
   const [extraNames, setExtraNames] = useState<Record<string, string>>({});
   const requestedNames = useRef(new Set<string>());
@@ -84,31 +163,36 @@ export const OverviewPage: React.FC = () => {
     else console.warn('Recent activity could not be loaded', audit.reason);
   }, []);
 
+  // Every 10 s; backs off while the appliance is unreachable and reloads at once when it is back.
   useEffect(() => {
-    void loadOverview();
-    const timer = window.setInterval(() => void loadOverview(), 10000);
-    return () => window.clearInterval(timer);
+    let active = true;
+    let timer: number | null = null;
+    const schedule = (delay: number) => {
+      if (!active) return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(async () => {
+        timer = null;
+        await loadOverview();
+        schedule(connectivityDelay(10000));
+      }, delay);
+    };
+    void loadOverview().finally(() => schedule(connectivityDelay(10000)));
+    const offRestored = onConnectivityRestored(() => schedule(0));
+    return () => {
+      active = false;
+      offRestored();
+      if (timer !== null) window.clearTimeout(timer);
+    };
   }, [loadOverview]);
 
-  // ---- quality ----
-  const qualityCounts = useMemo(() => {
-    const counts = { good: 0, uncertain: 0, bad: 0, stale: 0, nodata: 0, total: signals.length };
-    for (const s of signals) {
-      const q = normalizeQuality(s.quality);
-      if (q === 'GOOD') counts.good++;
-      else if (q === 'UNCERTAIN') counts.uncertain++;
-      else if (q === 'BAD') counts.bad++;
-      else if (q === 'STALE') counts.stale++;
-      else counts.nodata++;
-    }
-    return counts;
-  }, [signals]);
+  // ---- quality (paused / disabled signals are neutral, not problems) ----
+  const qualityCounts = useMemo(() => summarizeQualities(signals), [signals]);
+  const signalLine = qualityLine(qualityCounts, valuesReady);
 
-  // ---- connections ----
-  const totalConnections = stats ? stats.connections_total : connections.length;
-  const onlineConnections = stats
-    ? stats.connections_online
-    : connections.filter((c) => (c.status || '').toLowerCase() === 'connected').length;
+  // ---- connections (server verdict; idle connections are not "offline") ----
+  const conn = connectionCounts(stats, connections);
+  const totalConnections = conn.total;
+  const onlineConnections = conn.online;
 
   // ---- getting started (real progress, in the order the product works) ----
   const modelDone = resources.some((r) => r.type === 'machine' || r.type === 'line');
@@ -154,9 +238,40 @@ export const OverviewPage: React.FC = () => {
   const doneCount = steps.filter((step) => step.done).length;
   const nextStep = steps.find((step) => !step.done);
   const allStepsComplete = doneCount === steps.length;
+  useEffect(() => {
+    if (allStepsComplete && !checklistCompleted) {
+      writeFlag(CHECKLIST_DONE_KEY);
+      setChecklistCompleted(true);
+    }
+  }, [allStepsComplete, checklistCompleted]);
+  // Shown for a new installation only: never while the state is unknown or still loading, and not
+  // again once every step was done (an outage or a paused connection must not "undo" onboarding).
+  const showChecklist =
+    loadState === 'ready' &&
+    !checklistDismissed &&
+    !allStepsComplete &&
+    (!checklistCompleted || resources.length === 0) &&
+    !connectionLost &&
+    valuesReady &&
+    collector.state !== 'loading';
 
   // ---- data collection status ----
+  const inactiveNote = [
+    conn.idle ? `${countText(conn.idle, 'idle connection', 'idle connections')} without signals` : '',
+    conn.paused ? `${countText(conn.paused, 'connection', 'connections')} paused` : '',
+  ]
+    .filter(Boolean)
+    .join(', ');
+  const withInactive = (hint: string) => (inactiveNote ? `${hint} (${inactiveNote}.)` : hint);
+
   const collection: { tone: Tone; label: string; hint: string } = (() => {
+    if (connectionLost || collector.state === 'unknown') {
+      return {
+        tone: 'neutral',
+        label: 'Unknown — no connection to appliance',
+        hint: 'This browser cannot reach the FactoriX appliance. The status updates when the connection is back.',
+      };
+    }
     if (totalConnections === 0 && collector.total === 0) {
       return { tone: 'neutral', label: 'Not configured', hint: 'Add a data connection to start collecting.' };
     }
@@ -169,20 +284,27 @@ export const OverviewPage: React.FC = () => {
     if (collector.state === 'offline') {
       return { tone: 'error', label: 'Collector offline', hint: collector.detail };
     }
-    if (totalConnections === 0) {
-      return { tone: 'neutral', label: 'No connections', hint: 'The collector is online. Add a data connection.' };
+    switch (conn.status) {
+      case 'NOT_CONFIGURED':
+        return { tone: 'neutral', label: 'No connections', hint: 'The collector is online. Add a data connection.' };
+      case 'PAUSED':
+        return { tone: 'neutral', label: 'Collection paused', hint: 'Every connection is paused. Resume one in Connections.' };
+      case 'IDLE':
+        return { tone: 'neutral', label: 'No signals collected', hint: 'No connection has signals bound yet. Use Add data to bind fields.' };
+      case 'DEGRADED':
+        return {
+          tone: 'warning',
+          label: 'Attention needed',
+          hint: withInactive(
+            `${conn.degraded || conn.working - conn.online} of ${countText(conn.working, 'active connection reports', 'active connections report')} a problem.`,
+          ),
+        };
+      case 'PENDING':
+        return { tone: 'neutral', label: 'Waiting for first data', hint: withInactive('Waiting for the first report from the connections.') };
+      default:
+        if (collector.state === 'degraded') return { tone: 'warning', label: 'Attention needed', hint: collector.detail };
+        return { tone: 'good', label: 'Collecting normally', hint: withInactive('All active connections are delivering data.') };
     }
-    if (collector.state === 'online' && onlineConnections >= totalConnections) {
-      return { tone: 'good', label: 'Collecting normally', hint: 'All connections are delivering data.' };
-    }
-    return {
-      tone: 'warning',
-      label: 'Attention needed',
-      hint:
-        collector.state === 'degraded'
-          ? collector.detail
-          : `${onlineConnections} of ${totalConnections} connections online.`,
-    };
   })();
 
   const lastDataAt =
@@ -206,13 +328,13 @@ export const OverviewPage: React.FC = () => {
     resources.forEach((r) => map.set(r.id, r.name));
     connections.forEach((c) => map.set(c.id, c.name));
     signals.forEach((s) => map.set(s.id, s.displayName || s.key || s.name));
-    outputGroups.forEach((g) => map.set(g.id, g.name));
+    dataModels.forEach((m) => map.set(m.id, m.name));
     collector.edges.forEach((e) => map.set(e.id, e.name));
     Object.entries(extraNames).forEach(([id, name]) => {
       if (!map.has(id)) map.set(id, name);
     });
     return map;
-  }, [resources, connections, signals, outputGroups, collector.edges, extraNames]);
+  }, [resources, connections, signals, dataModels, collector.edges, extraNames]);
   const currentActorId = authState.status === 'authenticated' ? authState.user.admin_id : undefined;
   const recentActivities = useMemo(
     () =>
@@ -229,22 +351,6 @@ export const OverviewPage: React.FC = () => {
       .filter((row) => row.entity_type === 'resource' && row.entity_id && !names.has(String(row.entity_id)))
       .map((row) => String(row.entity_id))
       .filter((id) => !requestedNames.current.has(id));
-    // Template names for "created N data models from template X" (model templates are not in AppContext).
-    const needsTemplates = recentActivities.some(
-      ({ row }) => row.entity_type === 'model_template' && row.entity_id && !names.has(String(row.entity_id)),
-    );
-    if (needsTemplates && !requestedNames.current.has('model-templates')) {
-      requestedNames.current.add('model-templates');
-      api<{ items?: Array<{ id: string; display_name?: string; key?: string }> }>('/api/v1/model-templates')
-        .then((page) => {
-          const found: Record<string, string> = {};
-          (page.items || []).forEach((item) => {
-            if (item.id) found[String(item.id)] = item.display_name || item.key || '';
-          });
-          if (Object.keys(found).length) setExtraNames((prev) => ({ ...prev, ...found }));
-        })
-        .catch((error) => console.warn('Template names could not be loaded', error));
-    }
     if (missing.length === 0) return;
     missing.forEach((id) => requestedNames.current.add(id));
     void Promise.allSettled(
@@ -279,7 +385,7 @@ export const OverviewPage: React.FC = () => {
             {currentPlant?.name && currentPlant.id ? `Showing ${currentPlant.name}` : 'Showing all sites'}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <Button
             variant="outline"
             size="sm"
@@ -304,7 +410,7 @@ export const OverviewPage: React.FC = () => {
         </section>
       )}
 
-      {loadState === 'ready' && !checklistDismissed && !allStepsComplete && (
+      {showChecklist && (
         <section className="fx-card border border-[#CBD5E1] bg-gradient-to-r from-blue-50/50 to-indigo-50/30 p-5">
           <div className="flex items-start justify-between gap-4">
             <div>
@@ -395,14 +501,35 @@ export const OverviewPage: React.FC = () => {
             <span className="text-[12px] font-semibold uppercase tracking-wider">Signals</span>
             <Radio className="w-4 h-4 text-emerald-600" aria-hidden="true" />
           </div>
-          <div className="text-[26px] font-extrabold text-[#111B37] mt-2 tabular-nums">
-            {qualityCounts.total === 0 ? '0' : `${qualityCounts.good} of ${qualityCounts.total} good`}
+          <div
+            className="text-[26px] font-extrabold text-[#111B37] mt-2 tabular-nums"
+            aria-busy={signalLine.tone === 'loading' || undefined}
+          >
+            {qualityCounts.total === 0 ? (
+              '0'
+            ) : signalLine.tone === 'loading' ? (
+              <span className="inline-block h-7 w-36 max-w-full rounded-md bg-slate-200 animate-pulse align-middle" aria-label="Loading" />
+            ) : signalLine.tone === 'unknown' ? (
+              <span className="text-[20px] text-[#657794]">Unknown</span>
+            ) : qualityCounts.active === 0 ? (
+              `${qualityCounts.total}`
+            ) : (
+              `${qualityCounts.good} of ${qualityCounts.active} good`
+            )}
           </div>
-          <div className="text-[12px] text-[#657794] mt-1 flex items-center justify-between">
-            <span>
-              {qualityCounts.total > 0
-                ? `${Math.round((qualityCounts.good / qualityCounts.total) * 100)}% good quality`
-                : 'No signals yet'}
+          <div className="text-[12px] text-[#657794] mt-1 flex items-center justify-between gap-2">
+            <span className="min-w-0">
+              {qualityCounts.total === 0
+                ? 'No signals yet'
+                : signalLine.tone === 'loading'
+                  ? 'Loading signal values…'
+                  : signalLine.tone === 'unknown'
+                    ? 'No connection to appliance'
+                    : qualityCounts.active === 0
+                      ? signalLine.text
+                      : `${Math.round((qualityCounts.good / qualityCounts.active) * 100)}% good quality${
+                          qualityCounts.paused ? ` · ${qualityCounts.paused} paused` : ''
+                        }${qualityCounts.disabled ? ` · ${qualityCounts.disabled} disabled` : ''}`}
             </span>
             <span className="text-blue-600 text-[11px] font-medium flex items-center">
               View signals <ArrowRight className="w-3 h-3 ml-0.5" aria-hidden="true" />
@@ -416,10 +543,20 @@ export const OverviewPage: React.FC = () => {
             <Network className="w-4 h-4 text-indigo-600" aria-hidden="true" />
           </div>
           <div className="text-[26px] font-extrabold text-[#111B37] mt-2 tabular-nums">
-            {totalConnections === 0 ? '0' : `${onlineConnections} online`}
+            {totalConnections === 0 ? (
+              '0'
+            ) : connectionLost ? (
+              <span className="text-[20px] text-[#657794]">Unknown</span>
+            ) : (
+              `${onlineConnections} online`
+            )}
           </div>
-          <div className="text-[12px] text-[#657794] mt-1 flex items-center justify-between">
-            <span>{totalConnections} configured</span>
+          <div className="text-[12px] text-[#657794] mt-1 flex items-center justify-between gap-2">
+            <span className="min-w-0">
+              {totalConnections} configured
+              {conn.idle ? ` · ${conn.idle} idle` : ''}
+              {conn.paused ? ` · ${conn.paused} paused` : ''}
+            </span>
             <span className="text-blue-600 text-[11px] font-medium flex items-center">
               Manage <ArrowRight className="w-3 h-3 ml-0.5" aria-hidden="true" />
             </span>
@@ -431,9 +568,12 @@ export const OverviewPage: React.FC = () => {
             <span className="text-[12px] font-semibold uppercase tracking-wider">Data models</span>
             <Database className="w-4 h-4 text-purple-600" aria-hidden="true" />
           </div>
-          <div className="text-[26px] font-extrabold text-[#111B37] mt-2 tabular-nums">{outputGroups.length}</div>
+          <div className="text-[26px] font-extrabold text-[#111B37] mt-2 tabular-nums">{dataModels.length}</div>
           <div className="text-[12px] text-[#657794] mt-1 flex items-center justify-between">
-            <span>{outputGroups.length === 1 ? 'Model defined' : 'Models defined'}</span>
+            <span>
+              {dataModels.length === 1 ? 'Model defined' : 'Models defined'}
+              {dataModels.length > 0 && ` · ${dataModels.filter((m) => m.state === 'RUNNING').length} running`}
+            </span>
             <span className="text-blue-600 text-[11px] font-medium flex items-center">
               Model catalog <ArrowRight className="w-3 h-3 ml-0.5" aria-hidden="true" />
             </span>
@@ -443,7 +583,7 @@ export const OverviewPage: React.FC = () => {
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <section className="fx-card lg:col-span-2 p-5 border border-[#CBD5E1] bg-white">
-          <div className="flex items-center justify-between gap-3 pb-3 border-b border-slate-100">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100">
             <div>
               <h3 className="text-[14px] font-bold text-[#111B37]">Data collection</h3>
               <p className="text-[12px] text-[#657794]">Collector and connection status</p>
@@ -458,14 +598,26 @@ export const OverviewPage: React.FC = () => {
             <div className="p-3 bg-slate-50/70 rounded-lg border border-slate-100">
               <div className="text-[11px] text-[#657794] uppercase font-semibold">Collectors online</div>
               <div className="text-[20px] font-bold text-[#111B37] mt-1 tabular-nums">
-                {collector.total === 0 ? '—' : `${collector.online}/${collector.total}`}
+                {collector.total === 0 || collector.state === 'unknown' ? '—' : `${collector.online}/${collector.total}`}
               </div>
             </div>
             <div className="p-3 bg-slate-50/70 rounded-lg border border-slate-100">
               <div className="text-[11px] text-[#657794] uppercase font-semibold">Connections online</div>
-              <div className="text-[20px] font-bold text-[#111B37] mt-1 tabular-nums">
-                {totalConnections === 0 ? '—' : `${onlineConnections}/${totalConnections}`}
+              <div
+                className="text-[20px] font-bold text-[#111B37] mt-1 tabular-nums"
+                title={inactiveNote ? `Idle and paused connections are not counted: ${inactiveNote}.` : undefined}
+              >
+                {totalConnections === 0 || connectionLost
+                  ? '—'
+                  : conn.working === 0
+                    ? '0/0'
+                    : `${onlineConnections}/${conn.working}`}
               </div>
+              {!connectionLost && (conn.idle > 0 || conn.paused > 0) && (
+                <div className="text-[10px] text-[#657794] mt-0.5">
+                  {[conn.idle ? `${conn.idle} idle` : '', conn.paused ? `${conn.paused} paused` : ''].filter(Boolean).join(' · ')}
+                </div>
+              )}
             </div>
             <div className="p-3 bg-slate-50/70 rounded-lg border border-slate-100">
               <div className="text-[11px] text-[#657794] uppercase font-semibold">Last data received</div>
@@ -481,7 +633,7 @@ export const OverviewPage: React.FC = () => {
             </div>
           </div>
 
-          <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between gap-3 text-[12px]">
+          <div className="mt-4 pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 text-[12px]">
             <span className="text-[#657794]">{collection.hint}</span>
             <Button size="sm" variant="outline" className="h-7 text-[11px] shrink-0" onClick={() => navigate('/collector/connections')}>
               View connections
@@ -500,6 +652,18 @@ export const OverviewPage: React.FC = () => {
               <p className="text-[13px] font-medium text-[#111B37]">No signals yet</p>
               <p className="text-[12px] text-[#657794] mt-1">Quality appears here once signals are bound to the model.</p>
             </div>
+          ) : signalLine.tone === 'loading' ? (
+            <div className="py-8 my-auto flex flex-col items-center gap-3" aria-busy="true">
+              <div className="w-32 h-32 rounded-full border-[14px] border-slate-100 animate-pulse" aria-hidden="true" />
+              <p className="text-[12px] text-[#657794]">Loading signal values…</p>
+            </div>
+          ) : signalLine.tone === 'unknown' ? (
+            <div className="py-8 text-center my-auto">
+              <p className="text-[13px] font-medium text-[#111B37]">Unknown</p>
+              <p className="text-[12px] text-[#657794] mt-1">
+                No connection to the appliance. The quality is shown again when the connection is back.
+              </p>
+            </div>
           ) : (
             <DonutChart
               title=""
@@ -511,6 +675,8 @@ export const OverviewPage: React.FC = () => {
                 { label: 'Bad', value: qualityCounts.bad, color: '#EF4444' },
                 { label: 'Stale', value: qualityCounts.stale, color: '#64748B' },
                 { label: 'No data', value: qualityCounts.nodata, color: '#94A3B8' },
+                { label: 'Paused', value: qualityCounts.paused, color: '#A5B4C8' },
+                { label: 'Disabled', value: qualityCounts.disabled, color: '#CBD5E1' },
               ].filter((s) => s.value > 0)}
             />
           )}

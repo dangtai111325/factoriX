@@ -1,6 +1,10 @@
 /** Display helpers for live values, qualities and timestamps (no rounding of received values). */
 
-export const QUALITY_CODES = ['GOOD', 'UNCERTAIN', 'BAD', 'STALE', 'NO_DATA', 'DISABLED'] as const
+/**
+ * PAUSED: the signal's connection is paused (server effective_status, R3-CN-02) — neutral, not an error.
+ * NO_CONNECTION: client-side only, the browser cannot reach the appliance (R3-OV-01) — status unknown.
+ */
+export const QUALITY_CODES = ['GOOD', 'UNCERTAIN', 'BAD', 'STALE', 'NO_DATA', 'DISABLED', 'PAUSED', 'NO_CONNECTION'] as const
 export type QualityCode = (typeof QUALITY_CODES)[number]
 
 /** Normalise an effective status from the API into one of QUALITY_CODES. */
@@ -19,6 +23,20 @@ export const QUALITY_LABEL: Record<QualityCode, string> = {
   STALE: 'Stale',
   NO_DATA: 'No data',
   DISABLED: 'Disabled',
+  PAUSED: 'Paused',
+  NO_CONNECTION: 'Unknown',
+}
+
+/** Tooltip / helper text for the two neutral states that are not data problems. */
+export const QUALITY_HINT: Partial<Record<QualityCode, string>> = {
+  PAUSED: 'The connection of this signal is paused. Resume it to collect again.',
+  NO_CONNECTION: 'Unknown: no connection to the appliance. The last known value is shown.',
+  DISABLED: 'This signal is disabled and does not collect.',
+}
+
+/** Neutral states: shown gray, never counted as problems. */
+export function isNeutralQuality(code: string): boolean {
+  return code === 'PAUSED' || code === 'NO_CONNECTION' || code === 'DISABLED'
 }
 
 /**

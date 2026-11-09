@@ -268,6 +268,22 @@ export function collectLeaves(node: JNode, basePath = '$'): Leaf[] {
   return out;
 }
 
+/**
+ * Mappable leaves under a container node (for "Select all leaves under this node"): every scalar in
+ * document order, keys named like the tree shows them (array items `<parent>_<index>`), without the
+ * group `source_timestamp` (it is the source time, not a signal).
+ */
+export function leavesUnder(node: JNode, path: string, key: string): Leaf[] {
+  const out: Leaf[] = [];
+  const walk = (n: JNode, p: string, k: string) => {
+    if (n.kind === 'object') n.entries.forEach(([ck, v]) => walk(v, childPath(p, ck), ck));
+    else if (n.kind === 'array') n.items.forEach((v, idx) => walk(v, childPath(p, idx), `${k}_${idx}`));
+    else if (k !== 'source_timestamp') out.push({ path: p, key: k, node: n });
+  };
+  walk(node, path, key === '$' ? 'item' : key);
+  return out;
+}
+
 /** Signal data type suggested from a sample node. */
 export function inferDataType(node: JNode | undefined): { dataType: 'float64' | 'int64' | 'bool' | 'string'; warning?: string } {
   if (!node) return { dataType: 'float64' };

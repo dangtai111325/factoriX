@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import collect, edge_sync, identity, resources, telemetry
 from factorix.modules import models_engine
+from factorix.transport import data_models_api
+from factorix.modules import usage
 from factorix.modules.collect import (
     CaptureIn,
     ConnectionIn,
@@ -29,8 +32,6 @@ from factorix.modules.collect import (
     EdgePatch,
     FormulaIn,
     MappingPreviewIn,
-    OutputGroupIn,
-    OutputGroupPatch,
     PreviewIn,
     ReleaseIn,
     SignalBulkActionIn,
@@ -158,11 +159,15 @@ AUDIT_NOISE_TYPES = ["INGEST_REJECTED", "CONNECTION_DEGRADED", "CONNECTION_RECOV
 
 async def _run_step(name: str, step: Any) -> None:
     """Run one background step in its own session; failures are logged and never stop the loop."""
+    started = time.monotonic()
     try:
         async with session_factory()() as session:
             await step(session)
             await session.commit()
             await _flush_events(session)
+        elapsed = time.monotonic() - started
+        if elapsed > SLOW_REQUEST_S:
+            logger.warning("Background step %s took %.2f s", name, elapsed)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - one failing step must not stop the others
@@ -229,6 +234,7 @@ async def _evaluate_connections(session: AsyncSession) -> None:
             WHERE j.connection_id = c.id AND b.enabled = TRUE AND b.valid_to IS NULL AND s.status = 'ACTIVE'
         ) bnd ON TRUE
         WHERE c.status = 'ACTIVE' AND c.health <> 'DEGRADED'
+        ORDER BY c.id
         """,
         {},
     )
@@ -488,24 +494,6 @@ async def _background_health_loop() -> None:
             break
 
 
-async def _models_background_loop() -> None:
-    """Data models: re-publish STATE bodies (republish_ms), finalise PENDING events, prune events (every 60 s)."""
-    log = logging.getLogger("factorix.models_loop")
-    tick = 0
-    while True:
-        try:
-            await asyncio.sleep(1)
-            tick += 1
-            async with session_factory()() as session:
-                await models_engine.run_maintenance(session, prune=tick % 60 == 0)
-                await session.commit()
-                await flush(session)
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            log.exception("Data model maintenance tick failed")
-
-
 async def _stop(task: asyncio.Task[Any]) -> None:
     task.cancel()
     try:
@@ -519,14 +507,15 @@ async def _stop(task: asyncio.Task[Any]) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     task = asyncio.create_task(_background_health_loop(), name="health-loop")
-    models_task = asyncio.create_task(_models_background_loop(), name="models-loop")
     enroll_task = asyncio.create_task(_appliance_auto_enroll(), name="appliance-enroll")
-    app.state.background_tasks = (task, models_task, enroll_task)
+    # Data Model v2: one sampling scheduler, the only writer of model_state / model_snapshots.
+    models_engine.ENGINE.start()
+    app.state.background_tasks = (task, enroll_task)
     try:
         yield
     finally:
         await _stop(enroll_task)
-        await _stop(models_task)
+        await models_engine.ENGINE.stop()
         await _stop(task)
 
 
@@ -540,10 +529,18 @@ app.add_middleware(
 )
 
 
+SLOW_REQUEST_S = 1.0
+
+
 @app.middleware("http")
 async def request_context(request: Request, call_next):  # type: ignore[no-untyped-def]
     request.state.correlation_id = request.headers.get("x-correlation-id") or uuid.uuid4().hex
+    started = time.monotonic()
     response = await call_next(request)
+    elapsed = time.monotonic() - started
+    if elapsed > SLOW_REQUEST_S:
+        # Responsiveness evidence (R3 P1): edge sync calls share this single event loop with the UI.
+        logger.warning("Slow request %s %s: %.2f s (status %s)", request.method, request.url.path, elapsed, response.status_code)
     response.headers["X-Correlation-Id"] = request.state.correlation_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -783,10 +780,18 @@ async def patch_resource(resource_id: str, body: ResourcePatch, request: Request
     return await resources.patch_resource(session, tenant_id, actor, parse_uuid(resource_id), body, correlation_id(request))
 
 
+@app.get("/api/v1/resources/{resource_id}/archive-impact")
+async def resource_archive_impact(resource_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    tenant_id, _actor = _ids(principal)
+    return await resources.archive_impact(session, tenant_id, parse_uuid(resource_id))
+
+
 @app.post("/api/v1/resources/{resource_id}/archive")
-async def archive_resource(resource_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+async def archive_resource(resource_id: str, request: Request, body: resources.ArchiveIn | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
-    return await resources.archive_resource(session, tenant_id, actor, parse_uuid(resource_id), correlation_id(request))
+    return await resources.archive_resource(
+        session, tenant_id, actor, parse_uuid(resource_id), correlation_id(request), archive_models=bool(body and body.archive_models)
+    )
 
 
 @app.post("/api/v1/resources/{resource_id}/restore")
@@ -1047,6 +1052,16 @@ async def delete_signal(signal_id: str, request: Request, principal: dict[str, A
     return await collect.delete_signal(session, tenant_id, actor, parse_uuid(signal_id), correlation_id(request))
 
 
+@app.get("/api/v1/signals/{signal_id}/usage")
+async def signal_usage(signal_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
+    """Data models that read the signal; asked before disable, delete or pause (R3-DM-02)."""
+    tenant_id, _actor = _ids(principal)
+    signal = parse_uuid(signal_id)
+    if await fetch_one(session, "SELECT id FROM signal_definitions WHERE id = :id AND tenant_id = :tenant_id", {"id": signal, "tenant_id": tenant_id}) is None:
+        raise AppError(404, "NOT_FOUND", "Signal not found.")
+    return {"signal_id": str(signal), "models": await usage.models_using_signal(session, tenant_id, signal)}
+
+
 @app.post("/api/v1/signals/bulk-address")
 async def signal_bulk_address(body: collect.SignalBulkAddressIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
@@ -1103,96 +1118,6 @@ async def evaluate_formula(body: PreviewIn, principal: dict[str, Any] = Depends(
 async def publish_formula(formula_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await collect.publish_formula(session, tenant_id, actor, parse_uuid(formula_id), correlation_id(request))
-
-
-@app.post("/api/v1/output-groups", status_code=201)
-async def create_group(body: OutputGroupIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.create_output_group(session, tenant_id, actor, body, correlation_id(request))
-
-
-@app.get("/api/v1/output-groups/{group_id}")
-async def output_group_detail(group_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, _actor = _ids(principal)
-    return await collect.get_output_group(session, tenant_id, parse_uuid(group_id))
-
-
-@app.patch("/api/v1/output-groups/{group_id}")
-async def patch_output_group(group_id: str, body: OutputGroupPatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.patch_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
-
-
-@app.delete("/api/v1/output-groups/{group_id}")
-async def delete_output_group(group_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.delete_output_group(session, tenant_id, actor, parse_uuid(group_id), correlation_id(request))
-
-
-@app.get("/api/v1/output-groups/{group_id}/preview")
-async def group_preview(group_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, _actor = _ids(principal)
-    return await collect.preview_output_group(session, tenant_id, parse_uuid(group_id))
-
-
-@app.get("/api/v1/output-groups/{group_id}/latest")
-async def group_latest(group_id: str, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, _actor = _ids(principal)
-    return await collect.latest_output_group(session, tenant_id, parse_uuid(group_id))
-
-
-@app.get("/api/v1/output-groups/{group_id}/events")
-async def group_events(group_id: str, limit: int = 50, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> list[dict[str, Any]]:
-    tenant_id, _actor = _ids(principal)
-    return await collect.output_group_events(session, tenant_id, parse_uuid(group_id), limit=limit)
-
-
-@app.post("/api/v1/output-groups/{group_id}/publish")
-async def publish_group(group_id: str, request: Request, body: collect.OutputGroupPublishIn | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.publish_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
-
-
-@app.post("/api/v1/output-groups/{group_id}/unpublish")
-async def unpublish_group(group_id: str, request: Request, body: collect.OutputGroupPublishIn | None = None, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.unpublish_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
-
-
-@app.post("/api/v1/output-groups/{group_id}/duplicate")
-async def duplicate_group(group_id: str, body: collect.OutputGroupDuplicateIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.duplicate_output_group(session, tenant_id, actor, parse_uuid(group_id), body, correlation_id(request))
-
-
-@app.get("/api/v1/model-templates")
-async def model_templates(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, _actor = _ids(principal)
-    return await collect.list_model_templates(session, tenant_id)
-
-
-@app.post("/api/v1/model-templates", status_code=201)
-async def create_model_template(body: collect.ModelTemplateIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.create_model_template(session, tenant_id, actor, body, correlation_id(request))
-
-
-@app.patch("/api/v1/model-templates/{template_id}")
-async def patch_model_template(template_id: str, body: collect.ModelTemplatePatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.patch_model_template(session, tenant_id, actor, parse_uuid(template_id), body, correlation_id(request))
-
-
-@app.delete("/api/v1/model-templates/{template_id}")
-async def delete_model_template(template_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.delete_model_template(session, tenant_id, actor, parse_uuid(template_id), correlation_id(request))
-
-
-@app.post("/api/v1/model-templates/{template_id}/apply")
-async def apply_model_template(template_id: str, body: collect.TemplateApplyIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, actor = _ids(principal)
-    return await collect.apply_model_template(session, tenant_id, actor, parse_uuid(template_id), body, correlation_id(request))
 
 
 @app.post("/api/v1/edges", status_code=201)
@@ -1407,12 +1332,6 @@ async def formulas(principal: dict[str, Any] = Depends(admin), session: AsyncSes
     return {"items": items}
 
 
-@app.get("/api/v1/output-groups")
-async def output_groups(resource_id: str | None = None, include_archived: bool = False, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    tenant_id, _actor = _ids(principal)
-    return await collect.list_output_groups(session, tenant_id, resource_id=resource_id, include_archived=include_archived)
-
-
 @app.get("/api/v1/commissioning")
 async def commissioning(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
@@ -1571,6 +1490,10 @@ async def overview(principal: dict[str, Any] = Depends(admin), session: AsyncSes
         "connections_online": health_counts.get("HEALTHY", 0),
         "connections_idle": health_counts.get("IDLE", 0),
         "connections_degraded": health_counts.get("DEGRADED", 0),
+        "connections_paused": health_counts.get("PAUSED", 0),
+        # Connections expected to deliver data: idle (no signals) and paused ones never make the
+        # overview "Attention needed" (R3-CN-03); data_collection_status applies the same rule.
+        "connections_working": sum(count for state, count in health_counts.items() if state not in {"IDLE", "PAUSED", "ARCHIVED"}),
         "connections_total": len(connection_items),
         "healthy_edges": online_edges,
         "edges_online": online_edges,
@@ -1822,6 +1745,7 @@ def _mount_spa() -> None:
         return FileResponse(index, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
+app.include_router(data_models_api.build_router(admin, db_session))
 _mount_spa()
 
 

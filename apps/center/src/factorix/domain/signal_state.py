@@ -31,6 +31,7 @@ class EffectiveStatus(StrEnum):
     STALE = "STALE"
     NO_DATA = "NO_DATA"
     DISABLED = "DISABLED"
+    PAUSED = "PAUSED"
 
 
 class ReasonCode(StrEnum):
@@ -41,6 +42,7 @@ class ReasonCode(StrEnum):
     RAW_SOURCE_UNCERTAIN = "RAW_SOURCE_UNCERTAIN"
     NO_FRESH_ACQUISITION = "NO_FRESH_ACQUISITION"
     CONNECTION_OFFLINE = "CONNECTION_OFFLINE"
+    CONNECTION_PAUSED = "CONNECTION_PAUSED"
     NULL_VALUE = "NULL_VALUE"
     FIELD_MISSING = "FIELD_MISSING"
     SOURCE_CLOCK_SKEW = "SOURCE_CLOCK_SKEW"
@@ -76,6 +78,7 @@ def evaluate_signal_state(
     raw_reason_code: str | None = None,
     acquisition_mode: str = "POLL",
     null_allowed: bool = False,
+    connection_paused: bool = False,
 ) -> SignalEvaluationResult:
     """Canonical single-source-of-truth evaluator for effective signal status across FactoriX."""
     eval_now = now or datetime.now(timezone.utc)
@@ -103,6 +106,19 @@ def evaluate_signal_state(
             freshness=str(Freshness.UNKNOWN),
             effective_status=str(EffectiveStatus.DISABLED),
             reason_code=str(ReasonCode.DISABLED),
+            evaluated_at=eval_now_iso,
+            stale_after_ms=stale_after_ms,
+            last_good=last_good_payload,
+        )
+
+    # 1b. The source connection is paused by the operator: no acquisition is expected, so the
+    # signal is PAUSED, not STALE (R3-CN-02). The last value is kept and still reported.
+    if connection_paused:
+        return SignalEvaluationResult(
+            source_quality=str(raw_quality or SourceQuality.BAD),
+            freshness=str(Freshness.UNKNOWN),
+            effective_status=str(EffectiveStatus.PAUSED),
+            reason_code=str(ReasonCode.CONNECTION_PAUSED),
             evaluated_at=eval_now_iso,
             stale_after_ms=stale_after_ms,
             last_good=last_good_payload,

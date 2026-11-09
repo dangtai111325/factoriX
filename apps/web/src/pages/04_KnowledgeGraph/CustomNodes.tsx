@@ -160,9 +160,29 @@ export const ModelNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
 export const TelemetryGroupNodeComponent: React.FC<NodeProps> = ({ data, selected }) => {
   const signalCount = Number(data?.signalCount || 0);
   const goodCount = Number(data?.goodCount || 0);
+  // Paused / disabled signals are not expected to deliver: "good" is counted over the active ones.
+  const activeCount = data?.activeCount === undefined ? signalCount : Number(data.activeCount) || 0;
+  const pausedCount = Number(data?.pausedCount || 0);
+  const loading = Boolean(data?.valuesLoading);
+  const unknown = Boolean(data?.statusUnknown);
   const resourceName = String(data?.resourceName || '');
   const tone =
-    signalCount === 0 ? 'bg-[#94A3B8]' : goodCount === signalCount ? 'bg-emerald-500' : goodCount > 0 ? 'bg-amber-500' : 'bg-[#94A3B8]';
+    loading || unknown || activeCount === 0
+      ? 'bg-[#94A3B8]'
+      : goodCount === activeCount
+        ? 'bg-emerald-500'
+        : goodCount > 0
+          ? 'bg-amber-500'
+          : 'bg-[#94A3B8]';
+  const statusText = loading
+    ? 'Loading values…'
+    : unknown
+      ? 'Unknown (no connection)'
+      : activeCount === 0
+        ? pausedCount
+          ? 'Paused'
+          : 'Disabled'
+        : `${goodCount} of ${activeCount} good${pausedCount ? ` · ${pausedCount} paused` : ''}`;
 
   return (
     <div
@@ -185,9 +205,7 @@ export const TelemetryGroupNodeComponent: React.FC<NodeProps> = ({ data, selecte
       </div>
       <div className="mt-1 flex items-center gap-1.5 text-[11px] text-emerald-800">
         <span className={`w-1.5 h-1.5 rounded-full ${tone}`} aria-hidden="true" />
-        <span>
-          {goodCount} of {signalCount} good
-        </span>
+        <span>{statusText}</span>
       </div>
       <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-emerald-600" />
     </div>

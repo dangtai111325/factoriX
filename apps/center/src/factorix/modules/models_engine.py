@@ -1,89 +1,59 @@
-"""Data Model evaluation engine.
+"""Data Model v2 engine: one background scheduler, the only writer of model state.
 
-Telemetry calls :func:`on_signals_changed` once per ingest batch. The engine recomposes every
-PUBLISHED STATE model that contains one of the changed signals (rebuild matrix of data_clean.md
-for free: only bodies that hold a changed signal are touched), stores the ordered body in
-``model_state`` when its content changed, and emits EVENT model rows when a trigger signal reports
-a new instant. Outgoing bodies leave the process through the after-commit queue only:
+Every RUNNING model is sampled every ``sample_ms`` (independent of the collectors). A sample:
 
-* ``{"kind": "model_body", "tenant_id", "group_id", "body", "payload": {"type": "model_body", ...}}``
-* ``{"kind": "model_event", "tenant_id", "group_id", "event_id", "body", "payload": {"type": "model_event", ...}}``
+1. reads the latest **valid** value (GOOD/UNCERTAIN) of every referenced signal with one query
+   per tenant and tick; a signal whose latest row is BAD falls back to its last good value (the
+   source time of that value is looked up once in ``observations`` and cached);
+2. evaluates the body (:func:`factorix.domain.body.evaluate_detailed`); ``value_at`` lookups use
+   the ``observations (tenant_id, signal_id, source_time DESC)`` index and are cached;
+3. stores the ordered JSON text in ``model_state`` and appends it to the ``model_snapshots`` ring
+   (last :data:`SNAPSHOT_KEEP` per model, pruned continuously);
+4. pushes ``{"type": "model_body", group_id, body, sampled_at, errors}`` to ``/stream``
+   subscribers through the after-commit queue.
 
-The background loop (:func:`run_maintenance`) re-publishes STATE bodies per ``emit_policy.republish_ms``
-(new ``publish_timestamp``, same ``source_timestamp``), finalises PENDING events after
-``snapshot_grace_ms`` and prunes each EVENT model to ``max_events``.
-
-EVENT baseline rule (R2-DM-04, decided): an EVENT model emits only completions whose trigger
-``source_time`` is strictly after the moment the model was first published. When it is first
-published (:func:`set_event_baseline`) the current trigger state becomes the baseline and nothing
-is emitted for it; the baseline is stored in ``model_state`` (``content_hash`` ``baseline:...``,
-``source_ts`` = newest trigger ``source_time`` at publish, ``body_text`` empty) and is kept across
-unpublish/publish, so a re-publish never replays the completion that existed before the first
-publish. Afterwards the watermark is the newest emitted event (deduplicated by trigger instant).
-Production counts summed from the events therefore start at the first publish.
+A body is produced every period even when nothing changed (live heartbeat). The engine yields to
+the event loop between models and caps the work per cycle (:data:`CYCLE_BUDGET_S`); models that
+did not fit are sampled in the next cycle. Stateful filter state is kept in memory per model and
+field; it resets when the server restarts or the model is edited.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
-from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from collections import OrderedDict
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factorix.domain.body import (
-    DEFAULT_EMIT_POLICY,
-    Member,
-    as_utc,
-    compose_body,
-    event_dedupe_key,
-    new_trigger_times,
-    publish_aliases_of,
-    republish_body,
-    resolve_context,
-    row_at,
-)
-from factorix.modules.common import execute, fetch_all, fetch_one, utcnow
-from factorix.platform.after_commit import queue
+from factorix.domain import rules as R
+from factorix.domain.body import BodyContext, CompiledSpec, EvalResult, compile_spec, evaluate_detailed
+from factorix.modules.common import execute, fetch_all, queue_stream_event, utcnow
+from factorix.platform import after_commit
 
 log = logging.getLogger(__name__)
 
-_CONTEXT_TTL_S = 15.0
-_context_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
-_EVENT_BATCH = 50
-_GROUP_COLUMNS = "g.id, g.tenant_id, g.resource_id, g.key, g.kind, g.status, g.projection_policy_json, g.emit_policy_json"
-BASELINE_PREFIX = "baseline:"
-# A baseline without any trigger data yet: every later completion is new.
-_NO_TRIGGER_DATA = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-
-@dataclass(frozen=True)
-class Composition:
-    body_text: str
-    body: dict[str, Any]
-    source_ts: datetime | None
-    ts_from_alias: str | None
-    content_hash: str
-
-
-# --------------------------------------------------------------------------------------------
-# Loading helpers
-# --------------------------------------------------------------------------------------------
-
-
-def _uuid_list(values: Iterable[Any]) -> list[UUID]:
-    out: list[UUID] = []
-    for value in values:
-        try:
-            out.append(value if isinstance(value, UUID) else UUID(str(value)))
-        except (TypeError, ValueError):
-            log.warning("Ignoring invalid signal id %r", value)
-    return sorted(set(out), key=str)
+SNAPSHOT_KEEP = 100
+PRUNE_EVERY = 10
+CYCLE_BUDGET_S = 0.25
+MODELS_PER_TX = 64
+RELOAD_EVERY_S = 5.0
+CATALOG_TTL_S = 5.0
+MIN_SLEEP_S = 0.05
+MAX_SLEEP_S = 1.0
+LOOKUP_ROUNDS = 2
+VALID_QUALITIES = ("GOOD", "UNCERTAIN")
+CHANGE_EVENT = "data_model_changed"
+MIN_SAMPLE_MS = 200
+MAX_SAMPLE_MS = 3_600_000
+DEFAULT_SAMPLE_MS = 1000
 
 
 def _json(value: Any) -> Any:
@@ -95,561 +65,603 @@ def _json(value: Any) -> Any:
     return value
 
 
-def _policy(group: dict[str, Any]) -> dict[str, Any]:
-    raw = _json(group.get("emit_policy_json")) or {}
-    policy = dict(DEFAULT_EMIT_POLICY)
-    if isinstance(raw, dict):
-        policy.update({key: raw[key] for key in DEFAULT_EMIT_POLICY if key in raw})
-    return policy
+def _uuids(values: Iterable[Any]) -> list[UUID]:
+    out: set[UUID] = set()
+    for value in values:
+        try:
+            out.add(value if isinstance(value, UUID) else UUID(str(value)))
+        except (TypeError, ValueError):
+            log.warning("Ignoring invalid id %r", value)
+    return sorted(out, key=str)
 
 
-def member_from_row(row: dict[str, Any]) -> Member:
-    constant = _json(row.get("constant_json"))
-    return Member(
-        kind=str(row.get("member_kind") or "SIGNAL").lower(),
-        alias=str(row["output_alias"]),
-        signal_id=str(row["signal_id"]) if row.get("signal_id") else None,
-        signal_key=row.get("signal_key"),
-        context_ref=row.get("context_ref"),
-        value=constant.get("v") if isinstance(constant, dict) else None,
-        field=row.get("system_field"),
-        contributes_ts=bool(row.get("contributes_ts")),
-        is_trigger=bool(row.get("is_trigger")),
-    )
+# ============================================================================================
+# Caches
+# ============================================================================================
 
 
-async def load_members(session: AsyncSession, group_ids: list[UUID]) -> dict[str, list[Member]]:
-    if not group_ids:
-        return {}
-    rows = await fetch_all(
+class _Lru:
+    """Small LRU with optional per-entry expiry (monotonic seconds)."""
+
+    MISS = object()
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self._data: OrderedDict[Any, tuple[float | None, Any]] = OrderedDict()
+
+    def get(self, key: Any) -> Any:
+        item = self._data.get(key)
+        if item is None:
+            return self.MISS
+        expires, value = item
+        if expires is not None and time.monotonic() >= expires:
+            self._data.pop(key, None)
+            return self.MISS
+        self._data.move_to_end(key)
+        return value
+
+    def put(self, key: Any, value: Any, ttl_s: float | None = None) -> None:
+        self._data[key] = (None if ttl_s is None else time.monotonic() + ttl_s, value)
+        self._data.move_to_end(key)
+        while len(self._data) > self.size:
+            self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+
+_value_at_cache = _Lru(4096)
+_fallback_source_cache = _Lru(8192)
+
+
+def _value_at_ttl(at: datetime, now: datetime, found: bool) -> float | None:
+    """Past values are immutable except very recent ones (late samples) and misses."""
+    if now - at < timedelta(minutes=2):
+        return 2.0
+    return None if found else 30.0
+
+
+# ============================================================================================
+# Data access (module-level so tests can replace them)
+# ============================================================================================
+
+
+async def load_catalog(session: AsyncSession, tenant_id: UUID, signal_ids: Iterable[Any] | None = None) -> R.Catalog:
+    """Resources (all, with type keys) and signals (all, or only ``signal_ids``) of a tenant."""
+    resources = await fetch_all(
         session,
         """
-        SELECT output_group_id, member_kind, output_alias, signal_id, signal_key, context_ref,
-               constant_json, system_field, contributes_ts, is_trigger, ordinal
-        FROM output_group_members
-        WHERE output_group_id = ANY(:ids)
-        ORDER BY output_group_id, ordinal
+        SELECT r.id, r.parent_id, r.name, r.code, r.status, r.archived_at, t.key AS type_key
+        FROM resources r JOIN resource_types t ON t.id = r.type_id
+        WHERE r.tenant_id = :tenant_id
         """,
-        {"ids": group_ids},
+        {"tenant_id": tenant_id},
     )
-    members: dict[str, list[Member]] = {str(gid): [] for gid in group_ids}
-    for row in rows:
-        members.setdefault(str(row["output_group_id"]), []).append(member_from_row(row))
-    return members
-
-
-def _latest_row(row: dict[str, Any]) -> dict[str, Any]:
-    value_json = _json(row.get("value_json"))
-    return {
-        "value": value_json.get("v") if isinstance(value_json, dict) else None,
-        "quality": row.get("quality"),
-        "unit": row.get("unit"),
-        "source_time": row.get("source_time"),
-        "received_time": row.get("received_time"),
-        "event_time": row.get("event_time"),
-    }
-
-
-async def load_latest(session: AsyncSession, tenant_id: UUID, signal_ids: list[UUID]) -> dict[str, dict[str, Any]]:
-    if not signal_ids:
-        return {}
-    rows = await fetch_all(
-        session,
-        """
-        SELECT signal_id, value_json, quality, unit, source_time, received_time, event_time
-        FROM latest_signal_state
-        WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids)
-        """,
-        {"tenant_id": tenant_id, "ids": signal_ids},
-    )
-    return {str(row["signal_id"]): _latest_row(row) for row in rows}
-
-
-async def resource_chain(session: AsyncSession, tenant_id: UUID, resource_id: UUID) -> list[dict[str, Any]]:
-    """The model's resource first, then its CONTAINS ancestors up to the root, with type keys."""
-    return await fetch_all(
-        session,
-        """
-        WITH RECURSIVE chain (id, depth) AS (
-            SELECT CAST(:resource_id AS uuid), 0
-            UNION ALL
-            SELECT rr.from_id, chain.depth + 1
-            FROM chain
-            JOIN resource_relations rr
-              ON rr.to_id = chain.id AND rr.tenant_id = :tenant_id AND rr.valid_to IS NULL
-            JOIN relation_types rt ON rt.id = rr.relation_type_id AND rt.code = 'CONTAINS'
-            WHERE chain.depth < 32
+    types = await fetch_all(session, "SELECT key FROM resource_types WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
+    if signal_ids is None:
+        signals = await fetch_all(
+            session,
+            "SELECT id, resource_id, key, display_name, data_type, unit, status FROM signal_definitions WHERE tenant_id = :tenant_id",
+            {"tenant_id": tenant_id},
         )
-        SELECT chain.depth, r.id, r.code, r.name, t.key AS type_key
-        FROM chain
-        JOIN resources r ON r.id = chain.id AND r.tenant_id = :tenant_id
-        JOIN resource_types t ON t.id = r.type_id
-        ORDER BY chain.depth
-        """,
-        {"tenant_id": tenant_id, "resource_id": resource_id},
-    )
-
-
-async def resource_context(session: AsyncSession, tenant_id: UUID, resource_id: UUID, *, use_cache: bool = True) -> dict[str, Any]:
-    cache_key = (str(tenant_id), str(resource_id))
-    now = time.monotonic()
-    if use_cache:
-        cached = _context_cache.get(cache_key)
-        if cached and now - cached[0] < _CONTEXT_TTL_S:
-            return cached[1]
-    context = resolve_context(await resource_chain(session, tenant_id, resource_id))
-    _context_cache[cache_key] = (now, context)
-    return context
-
-
-async def row_at_instant(session: AsyncSession, tenant_id: UUID, signal_id: UUID, at: datetime) -> dict[str, Any] | None:
-    """Observation of ``signal_id`` active at ``at`` (source_time, else received/event time, at or before ``at``)."""
-    rows = await fetch_all(
-        session,
-        """
-        SELECT value_json, quality, unit, source_time, received_time, event_time
-        FROM observations
-        WHERE tenant_id = :tenant_id AND signal_id = :signal_id
-          AND source_time IS NOT NULL AND source_time <= :at
-        ORDER BY source_time DESC, received_time DESC
-        LIMIT 1
-        """,
-        {"tenant_id": tenant_id, "signal_id": signal_id, "at": at},
-    )
-    if not rows:
-        # Sources without a group timestamp: event_time equals received_time (indexed).
-        rows = await fetch_all(
+    else:
+        ids = _uuids(signal_ids)
+        signals = await fetch_all(
             session,
             """
-            SELECT value_json, quality, unit, source_time, received_time, event_time
-            FROM observations
-            WHERE tenant_id = :tenant_id AND signal_id = :signal_id
-              AND source_time IS NULL AND event_time <= :at
-            ORDER BY event_time DESC, received_time DESC
-            LIMIT 1
+            SELECT id, resource_id, key, display_name, data_type, unit, status FROM signal_definitions
+            WHERE tenant_id = :tenant_id AND id = ANY(:ids)
             """,
-            {"tenant_id": tenant_id, "signal_id": signal_id, "at": at},
-        )
-    return row_at([_latest_row(row) for row in rows], at)
-
-
-# --------------------------------------------------------------------------------------------
-# Composition
-# --------------------------------------------------------------------------------------------
-
-
-def compose(
-    group: dict[str, Any],
-    members: list[Member],
-    latest: dict[str, dict[str, Any]],
-    context: dict[str, Any],
-    now: datetime,
-    snapshot: dict[str, Any] | None = None,
-) -> Composition:
-    projection = _json(group.get("projection_policy_json")) or None
-    body_text, body, source_ts, ts_alias, digest = compose_body(
-        members, latest, context, now, snapshot, projection=projection if isinstance(projection, dict) else None
+            {"tenant_id": tenant_id, "ids": ids},
+        ) if ids else []
+    return R.Catalog(
+        [
+            {
+                "id": row["id"],
+                "parent_id": row.get("parent_id"),
+                "name": row.get("name"),
+                "code": row.get("code"),
+                "type_key": row.get("type_key"),
+                "active": row.get("status") == "ACTIVE" and row.get("archived_at") is None,
+            }
+            for row in resources
+        ],
+        [
+            {
+                "id": row["id"],
+                "resource_id": row["resource_id"],
+                "key": row.get("key"),
+                "name": row.get("display_name"),
+                "data_type": row.get("data_type"),
+                "unit": row.get("unit"),
+                "active": row.get("status") == "ACTIVE",
+            }
+            for row in signals
+        ],
+        types=[str(row["key"]) for row in types],
     )
-    return Composition(body_text, body, source_ts, ts_alias, digest)
 
 
-async def snapshot_at(
-    session: AsyncSession, tenant_id: UUID, members: list[Member], at: datetime
-) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """Rows of every signal member and values of every snapshot member as they were at ``at``."""
-    rows: dict[str, dict[str, Any]] = {}
-    snapshot: dict[str, Any] = {}
-    cache: dict[str, dict[str, Any] | None] = {}
-    for member in members:
-        if member.kind not in ("signal", "snapshot") or not member.signal_id:
-            continue
-        if member.signal_id not in cache:
-            cache[member.signal_id] = await row_at_instant(session, tenant_id, UUID(member.signal_id), at)
-        found = cache[member.signal_id]
-        if member.kind == "signal" and found is not None:
-            rows[member.signal_id] = found
-        if member.kind == "snapshot":
-            snapshot[member.signal_id] = None if found is None else found.get("value")
-    return rows, snapshot
+def sample_from_latest(row: Mapping[str, Any]) -> tuple[R.Sample | None, datetime | None]:
+    """Latest valid sample of a ``latest_signal_state`` row (pure).
 
-
-def _body_event(tenant_id: Any, group_id: Any, body_text: str) -> dict[str, Any]:
-    return {
-        "kind": "model_body",
-        "tenant_id": str(tenant_id),
-        "group_id": str(group_id),
-        "body": body_text,
-        "payload": {"type": "model_body", "group_id": str(group_id), "body": body_text},
-    }
-
-
-def _event_event(tenant_id: Any, group_id: Any, event_id: Any, body_text: str) -> dict[str, Any]:
-    return {
-        "kind": "model_event",
-        "tenant_id": str(tenant_id),
-        "group_id": str(group_id),
-        "event_id": str(event_id),
-        "body": body_text,
-        "payload": {"type": "model_event", "group_id": str(group_id), "event_id": str(event_id), "body": body_text},
-    }
-
-
-async def _store_state(
-    session: AsyncSession, group: dict[str, Any], result: Composition, existing_hash: str | None, now: datetime, *, force: bool
-) -> list[dict[str, Any]]:
-    if not force and existing_hash == result.content_hash:
-        return []
-    await execute(
-        session,
-        """
-        INSERT INTO model_state (group_id, tenant_id, body_text, content_hash, source_ts, last_publish_ts, updated_at)
-        VALUES (:group_id, :tenant_id, :body, :hash, :source_ts, :now, :now)
-        ON CONFLICT (group_id) DO UPDATE SET
-            body_text = EXCLUDED.body_text,
-            content_hash = EXCLUDED.content_hash,
-            source_ts = EXCLUDED.source_ts,
-            last_publish_ts = EXCLUDED.last_publish_ts,
-            updated_at = EXCLUDED.updated_at
-        """,
-        {
-            "group_id": group["id"],
-            "tenant_id": group["tenant_id"],
-            "body": result.body_text,
-            "hash": result.content_hash,
-            "source_ts": result.source_ts,
-            "now": now,
-        },
-    )
-    return [_body_event(group["tenant_id"], group["id"], result.body_text)]
-
-
-def baseline_from_triggers(rows: list[dict[str, Any] | None]) -> tuple[datetime | None, str]:
-    """Baseline of an EVENT model from the latest rows of its trigger signals (pure).
-
-    Returns ``(instant, dedupe)``: the newest trigger ``source_time`` (``_NO_TRIGGER_DATA`` when no
-    trigger has data yet) and the value key used by triggers without a source timestamp.
+    Returns ``(sample, fallback_at)``. When the latest row is not valid (BAD) the last good value
+    is used and ``fallback_at`` is its event time (its source time must be looked up).
     """
-    present = [row for row in rows if row is not None]
-    instants = [ts for ts in (as_utc(row.get("source_time")) for row in present) if ts is not None]
-    instant = max(instants) if instants else (_NO_TRIGGER_DATA if not present else None)
-    dedupe = event_dedupe_key(None, [row.get("value") for row in present]) if present and len(present) == len(rows) else ""
-    return instant, dedupe
-
-
-def event_watermark(last_event: dict[str, Any] | None, baseline: dict[str, Any] | None) -> tuple[datetime | None, str | None]:
-    """Newest of the last emitted event and the publish baseline: ``(instant, dedupe_key)``."""
-    last_ts = as_utc(last_event.get("source_ts")) if last_event else None
-    base_ts = as_utc(baseline.get("source_ts")) if baseline else None
-    if last_ts is not None and (base_ts is None or last_ts >= base_ts):
-        return last_ts, last_event.get("dedupe_key") if last_event else None
-    if baseline is not None:
-        return base_ts, str(baseline.get("content_hash") or "")[len(BASELINE_PREFIX):] or None
+    quality = str(row.get("quality") or "")
+    if quality in VALID_QUALITIES:
+        value_json = _json(row.get("value_json"))
+        return (
+            R.Sample(
+                value=value_json.get("v") if isinstance(value_json, dict) else None,
+                quality=quality,
+                source_time=R.as_utc(row.get("source_time")),
+                received_time=R.as_utc(row.get("received_time")),
+            ),
+            None,
+        )
+    good = _json(row.get("last_good_value_json"))
+    good_at = R.as_utc(row.get("last_good_event_time"))
+    if isinstance(good, dict) and good.get("v") is not None and good_at is not None:
+        # event_time == received_time (time model); source_time is filled from observations.
+        return R.Sample(value=good.get("v"), quality="GOOD", source_time=None, received_time=good_at), good_at
     return None, None
 
 
-async def _load_baseline(session: AsyncSession, group_id: Any) -> dict[str, Any] | None:
-    row = await fetch_one(session, "SELECT source_ts, content_hash FROM model_state WHERE group_id = :id", {"id": group_id})
-    if row is None or not str(row.get("content_hash") or "").startswith(BASELINE_PREFIX):
-        return None
-    return row
-
-
-async def set_event_baseline(session: AsyncSession, group: dict[str, Any], members: list[Member], now: datetime) -> None:
-    """Record the trigger state at the first publish of an EVENT model without emitting it.
-
-    Kept when the row exists (re-publish after unpublish keeps the first-publish baseline).
-    """
-    triggers = [m for m in members if m.is_trigger and m.signal_id]
-    if not triggers:
-        return
-    tenant_id = UUID(str(group["tenant_id"]))
-    latest = await load_latest(session, tenant_id, _uuid_list(m.signal_id for m in triggers))
-    instant, dedupe = baseline_from_triggers([latest.get(m.signal_id or "") for m in triggers])
-    await execute(
-        session,
-        """
-        INSERT INTO model_state (group_id, tenant_id, body_text, content_hash, source_ts, last_publish_ts, updated_at)
-        VALUES (:group_id, :tenant_id, '', :hash, :source_ts, :now, :now)
-        ON CONFLICT (group_id) DO NOTHING
-        """,
-        {"group_id": group["id"], "tenant_id": tenant_id, "hash": f"{BASELINE_PREFIX}{dedupe}", "source_ts": instant, "now": now},
-    )
-
-
-async def _evaluate_events(
-    session: AsyncSession, group: dict[str, Any], members: list[Member], context: dict[str, Any], now: datetime
-) -> list[dict[str, Any]]:
-    tenant_id = group["tenant_id"]
-    triggers = [m for m in members if m.is_trigger and m.signal_id]
-    if not triggers:
-        return []
-    trigger_ids = _uuid_list(m.signal_id for m in triggers)
-    last = await fetch_one(
-        session,
-        """
-        SELECT source_ts, dedupe_key FROM model_events
-        WHERE tenant_id = :tenant_id AND group_id = :group_id
-        ORDER BY source_ts DESC, created_at DESC
-        LIMIT 1
-        """,
-        {"tenant_id": tenant_id, "group_id": group["id"]},
-    )
-    baseline = await _load_baseline(session, group["id"])
-    if last is None and baseline is None:
-        # Published before baselines existed, or the baseline was reset by an edit: the current
-        # trigger state becomes the baseline and is not emitted (R2-DM-04).
-        await set_event_baseline(session, group, members, now)
-        return []
-    last_ts, last_dedupe = event_watermark(last, baseline)
-    candidates = await fetch_all(
-        session,
-        """
-        SELECT DISTINCT source_time FROM observations
-        WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids) AND source_time > :last_ts
-        ORDER BY source_time ASC
-        LIMIT :limit
-        """,
-        {"tenant_id": tenant_id, "ids": trigger_ids, "last_ts": last_ts or _NO_TRIGGER_DATA, "limit": _EVENT_BATCH},
-    )
-    instants = new_trigger_times((row["source_time"] for row in candidates), last_ts or _NO_TRIGGER_DATA, limit=_EVENT_BATCH)
-
-    policy = _policy(group)
-    status = "PENDING" if int(policy.get("snapshot_grace_ms") or 0) > 0 else "FINAL"
-    emitted: list[dict[str, Any]] = []
-
-    if not instants:
-        # Fallback for triggers whose source reports no group timestamp: a change of the trigger
-        # values is the event, stamped with the latest received time.
-        latest = await load_latest(session, tenant_id, trigger_ids)
-        rows = [latest.get(m.signal_id or "") for m in triggers]
-        if not rows or any(r is None for r in rows) or any(as_utc(r.get("source_time")) is not None for r in rows if r):
-            return []
-        values = [r.get("value") for r in rows if r]
-        dedupe = event_dedupe_key(None, values)
-        if last_dedupe == dedupe:
-            return []
-        received = [as_utc(r.get("received_time")) for r in rows if r]
-        at = max((ts for ts in received if ts is not None), default=None)
-        if at is None:
-            return []
-        pairs = [(at, dedupe)]
-    else:
-        pairs = [(at, event_dedupe_key(at)) for at in instants]
-
-    for at, dedupe in pairs:
-        rows_at, snapshot = await snapshot_at(session, tenant_id, members, at)
-        result = compose(group, members, rows_at, context, now, snapshot)
-        event_id = uuid4()
-        inserted = await fetch_one(
-            session,
-            """
-            INSERT INTO model_events (id, tenant_id, group_id, dedupe_key, source_ts, body_text, status, created_at)
-            VALUES (:id, :tenant_id, :group_id, :dedupe, :source_ts, :body, :status, :now)
-            ON CONFLICT (group_id, dedupe_key) DO NOTHING
-            RETURNING id
-            """,
-            {
-                "id": event_id,
-                "tenant_id": tenant_id,
-                "group_id": group["id"],
-                "dedupe": dedupe,
-                "source_ts": at,
-                "body": result.body_text,
-                "status": status,
-                "now": now,
-            },
-        )
-        if inserted is not None and status == "FINAL":
-            emitted.append(_event_event(tenant_id, group["id"], event_id, result.body_text))
-    return emitted
-
-
-async def _process_groups(
-    session: AsyncSession, tenant_id: UUID, groups: list[dict[str, Any]], now: datetime, *, force: bool, use_cache: bool
-) -> list[dict[str, Any]]:
-    if not groups:
-        return []
-    group_ids = _uuid_list(g["id"] for g in groups)
-    members_by_group = await load_members(session, group_ids)
-    state_groups = [g for g in groups if g["kind"] == "STATE"]
-    signal_ids = _uuid_list(
-        m.signal_id for g in state_groups for m in members_by_group.get(str(g["id"]), []) if m.signal_id
-    )
-    latest = await load_latest(session, tenant_id, signal_ids)
-    hashes = {
-        str(row["group_id"]): row["content_hash"]
-        for row in await fetch_all(
-            session,
-            "SELECT group_id, content_hash FROM model_state WHERE group_id = ANY(:ids)",
-            {"ids": _uuid_list(g["id"] for g in state_groups)},
-        )
-    } if state_groups else {}
-
-    events: list[dict[str, Any]] = []
-    for group in groups:
-        members = members_by_group.get(str(group["id"]), [])
-        if not members:
-            continue
-        context = await resource_context(session, tenant_id, UUID(str(group["resource_id"])), use_cache=use_cache)
-        if group["kind"] == "STATE":
-            result = compose(group, members, latest, context, now)
-            events.extend(await _store_state(session, group, result, hashes.get(str(group["id"])), now, force=force))
-        else:
-            events.extend(await _evaluate_events(session, group, members, context, now))
-    return events
-
-
-# --------------------------------------------------------------------------------------------
-# Entry points
-# --------------------------------------------------------------------------------------------
-
-
-async def on_signals_changed(session: AsyncSession, tenant_id: UUID, signal_ids: set[UUID | str]) -> None:
-    """Recompose published models touched by one ingest batch.
-
-    Runs in a savepoint: a model that cannot be composed is logged and skipped, it never rolls
-    back the raw observations of the batch.
-    """
-    ids = _uuid_list(signal_ids)
+async def load_samples(
+    session: AsyncSession, tenant_id: UUID, signal_ids: Iterable[Any]
+) -> tuple[dict[str, R.Sample | None], dict[str, str | None]]:
+    """Latest valid sample and actual latest quality of each signal: one query (+ one for BAD fallbacks)."""
+    ids = _uuids(signal_ids)
     if not ids:
-        return
-    now = utcnow()
-    try:
-        async with session.begin_nested():
-            groups = await fetch_all(
-                session,
-                f"""
-                SELECT {_GROUP_COLUMNS}
-                FROM output_groups g
-                WHERE g.tenant_id = :tenant_id AND g.status = 'PUBLISHED'
-                  AND EXISTS (
-                      SELECT 1 FROM output_group_members m
-                      WHERE m.output_group_id = g.id AND m.signal_id = ANY(:ids)
-                        AND (
-                            (g.kind = 'STATE' AND m.member_kind = 'SIGNAL')
-                            OR (g.kind = 'EVENT' AND m.member_kind = 'SIGNAL' AND m.is_trigger)
-                        )
-                  )
-                """,
-                {"tenant_id": tenant_id, "ids": ids},
-            )
-            events = await _process_groups(session, tenant_id, groups, now, force=False, use_cache=True)
-    except Exception:  # noqa: BLE001 - composition must not lose the raw batch; the error is logged
-        log.exception("Data model composition failed for tenant %s (%d signals)", tenant_id, len(ids))
-        return
-    for event in events:
-        queue(session, event)
-
-
-async def refresh_groups(session: AsyncSession, tenant_id: UUID, group_ids: Iterable[UUID], *, force: bool = True) -> int:
-    """Compose the given PUBLISHED models now (publish, patch). Returns the number of queued messages."""
-    ids = _uuid_list(group_ids)
-    if not ids:
-        return 0
-    groups = await fetch_all(
+        return {}, {}
+    rows = await fetch_all(
         session,
-        f"SELECT {_GROUP_COLUMNS} FROM output_groups g WHERE g.tenant_id = :tenant_id AND g.id = ANY(:ids) AND g.status = 'PUBLISHED'",
+        """
+        SELECT signal_id, value_json, quality, source_time, received_time, last_good_value_json, last_good_event_time
+        FROM latest_signal_state
+        WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids)
+        """,
         {"tenant_id": tenant_id, "ids": ids},
     )
-    events = await _process_groups(session, tenant_id, groups, utcnow(), force=force, use_cache=False)
-    for event in events:
-        queue(session, event)
-    return len(events)
+    samples: dict[str, R.Sample | None] = {}
+    qualities: dict[str, str | None] = {}
+    fallbacks: dict[str, datetime] = {}
+    for row in rows:
+        sid = str(row["signal_id"]).lower()
+        sample, fallback_at = sample_from_latest(row)
+        samples[sid] = sample
+        qualities[sid] = row.get("quality")
+        if fallback_at is not None:
+            fallbacks[sid] = fallback_at
+    missing = []
+    for sid, at in fallbacks.items():
+        cached = _fallback_source_cache.get((str(tenant_id), sid, at))
+        if cached is _Lru.MISS:
+            missing.append((sid, at))
+        elif cached is not None:
+            samples[sid] = _with_source(samples[sid], cached)
+    if missing:
+        found = await fetch_all(
+            session,
+            """
+            SELECT q.signal_id, o.source_time
+            FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[])) AS q(signal_id, at)
+            LEFT JOIN LATERAL (
+                SELECT source_time FROM observations o
+                WHERE o.tenant_id = :tenant_id AND o.signal_id = q.signal_id AND o.event_time = q.at
+                ORDER BY o.received_time DESC
+                LIMIT 1
+            ) o ON TRUE
+            """,
+            {"tenant_id": tenant_id, "ids": [UUID(sid) for sid, _ in missing], "ats": [at for _, at in missing]},
+        )
+        by_id = {str(row["signal_id"]).lower(): R.as_utc(row.get("source_time")) for row in found}
+        for sid, at in missing:
+            source = by_id.get(sid)
+            _fallback_source_cache.put((str(tenant_id), sid, at), source)
+            if source is not None:
+                samples[sid] = _with_source(samples[sid], source)
+    return samples, qualities
 
 
-async def republish_due(session: AsyncSession, now: datetime) -> list[dict[str, Any]]:
+def _with_source(sample: R.Sample | None, source: datetime) -> R.Sample | None:
+    if sample is None:
+        return None
+    return R.Sample(sample.value, sample.quality, source, sample.received_time)
+
+
+async def fetch_value_at(
+    session: AsyncSession, tenant_id: UUID, requests: list[tuple[str, datetime, str]]
+) -> dict[tuple[str, datetime], R.Sample | None]:
+    """Value of each signal as of an instant: ``requests`` = ``[(signal_id, at, mode)]``.
+
+    ``mode`` ``"s"`` searches by source_time (index ``observations_signal_source``); ``"e"`` by
+    event_time for sources without a group timestamp (index ``observations_signal_time``).
+    """
+    if not requests:
+        return {}
     rows = await fetch_all(
         session,
         """
-        SELECT s.group_id, s.tenant_id, s.body_text
-        FROM model_state s
-        JOIN output_groups g ON g.id = s.group_id
-        WHERE g.status = 'PUBLISHED' AND g.kind = 'STATE'
-          AND jsonb_typeof(g.emit_policy_json -> 'republish_ms') = 'number'
-          AND s.last_publish_ts <= CAST(:now AS timestamptz)
-              - make_interval(secs => (g.emit_policy_json ->> 'republish_ms')::double precision / 1000.0)
-        ORDER BY s.last_publish_ts
-        LIMIT 500
+        SELECT q.idx, o.value_json, o.quality, o.source_time, o.received_time
+        FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[]), CAST(:modes AS text[]), CAST(:idx AS integer[]))
+             AS q(signal_id, at, mode, idx)
+        LEFT JOIN LATERAL (
+            SELECT * FROM (
+                (SELECT o.value_json, o.quality, o.source_time, o.received_time
+                 FROM observations o
+                 WHERE q.mode = 's' AND o.tenant_id = :tenant_id AND o.signal_id = q.signal_id
+                   AND o.source_time <= q.at AND o.quality IN ('GOOD', 'UNCERTAIN')
+                 ORDER BY o.source_time DESC, o.received_time DESC
+                 LIMIT 1)
+                UNION ALL
+                (SELECT o.value_json, o.quality, o.source_time, o.received_time
+                 FROM observations o
+                 WHERE q.mode = 'e' AND o.tenant_id = :tenant_id AND o.signal_id = q.signal_id
+                   AND o.event_time <= q.at AND o.quality IN ('GOOD', 'UNCERTAIN')
+                 ORDER BY o.event_time DESC
+                 LIMIT 1)
+            ) found
+            LIMIT 1
+        ) o ON TRUE
         """,
-        {"now": now},
+        {
+            "tenant_id": tenant_id,
+            "ids": [UUID(sid) for sid, _at, _mode in requests],
+            "ats": [at for _sid, at, _mode in requests],
+            "modes": [mode for _sid, _at, mode in requests],
+            "idx": list(range(len(requests))),
+        },
     )
-    if not rows:
-        return []
-    members = await load_members(session, _uuid_list(row["group_id"] for row in rows))
-    events: list[dict[str, Any]] = []
+    out: dict[tuple[str, datetime], R.Sample | None] = {(sid, at): None for sid, at, _mode in requests}
     for row in rows:
-        body_text = republish_body(row["body_text"], publish_aliases_of(members.get(str(row["group_id"]), [])), now)
-        await execute(
-            session,
-            "UPDATE model_state SET body_text = :body, last_publish_ts = :now WHERE group_id = :group_id",
-            {"body": body_text, "now": now, "group_id": row["group_id"]},
+        sid, at, _mode = requests[int(row["idx"])]
+        if row.get("quality") is None:
+            continue
+        value_json = _json(row.get("value_json"))
+        out[(sid, at)] = R.Sample(
+            value=value_json.get("v") if isinstance(value_json, dict) else None,
+            quality=row.get("quality"),
+            source_time=R.as_utc(row.get("source_time")),
+            received_time=R.as_utc(row.get("received_time")),
         )
-        events.append(_body_event(row["tenant_id"], row["group_id"], body_text))
-    return events
+    return out
 
 
-async def finalize_pending(session: AsyncSession, now: datetime) -> list[dict[str, Any]]:
-    rows = await fetch_all(
-        session,
-        f"""
-        SELECT e.id AS event_id, e.source_ts, {_GROUP_COLUMNS}
-        FROM model_events e
-        JOIN output_groups g ON g.id = e.group_id
-        WHERE e.status = 'PENDING'
-          AND e.created_at <= CAST(:now AS timestamptz) - make_interval(
-              secs => COALESCE((g.emit_policy_json ->> 'snapshot_grace_ms')::double precision, 0) / 1000.0)
-        ORDER BY e.created_at
-        LIMIT 200
-        """,
-        {"now": now},
-    )
+async def evaluate_once(
+    session: AsyncSession,
+    tenant_id: UUID,
+    compiled: CompiledSpec,
+    catalog: R.Catalog,
+    now: datetime,
+    state: R.FilterState,
+    samples: Mapping[str, R.Sample | None] | None = None,
+    qualities: Mapping[str, str | None] | None = None,
+) -> EvalResult:
+    """Evaluate a compiled body against current data, resolving ``value_at`` lookups in rounds."""
+    if samples is None:
+        samples, qualities = await load_samples(session, tenant_id, compiled.signal_ids)
+    qualities = qualities or {}
+    tenant_key = str(tenant_id)
+
+    def lookup(signal_id: str, at: datetime) -> R.Sample | None:
+        hit = _value_at_cache.get((tenant_key, signal_id, at))
+        if hit is _Lru.MISS:
+            raise R.LookupPending(signal_id, at)
+        return hit
+
+    def lookup_final(signal_id: str, at: datetime) -> R.Sample | None:
+        hit = _value_at_cache.get((tenant_key, signal_id, at))
+        return None if hit is _Lru.MISS else hit
+
+    result: EvalResult | None = None
+    for round_no in range(LOOKUP_ROUNDS + 1):
+        final = round_no == LOOKUP_ROUNDS
+        context = BodyContext(catalog=catalog, lookup=lookup_final if final else lookup, qualities=qualities)
+        result = evaluate_detailed(compiled, samples, context, now, state)
+        if not result.pending:
+            return result
+        requests: list[tuple[str, datetime, str]] = []
+        for signal_id, at in dict.fromkeys(result.pending):
+            current = samples.get(signal_id)
+            mode = "s" if current is None or current.source_time is not None else "e"
+            requests.append((signal_id, at, mode))
+        fetched = await fetch_value_at(session, tenant_id, requests)
+        for (signal_id, at), sample in fetched.items():
+            _value_at_cache.put((tenant_key, signal_id, at), sample, _value_at_ttl(at, now, sample is not None))
+    assert result is not None
+    return result
+
+
+async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> None:
+    """Upsert ``model_state`` and append ``model_snapshots`` for one batch (two statements)."""
     if not rows:
-        return []
-    members = await load_members(session, _uuid_list(row["id"] for row in rows))
-    events: list[dict[str, Any]] = []
-    for row in rows:
-        group_members = members.get(str(row["id"]), [])
-        tenant_id = UUID(str(row["tenant_id"]))
-        context = await resource_context(session, tenant_id, UUID(str(row["resource_id"])))
-        rows_at, snapshot = await snapshot_at(session, tenant_id, group_members, row["source_ts"])
-        result = compose(row, group_members, rows_at, context, now, snapshot)
-        await execute(
-            session,
-            "UPDATE model_events SET body_text = :body, status = 'FINAL' WHERE id = :id AND status = 'PENDING'",
-            {"body": result.body_text, "id": row["event_id"]},
-        )
-        events.append(_event_event(tenant_id, row["id"], row["event_id"], result.body_text))
-    return events
-
-
-async def prune_events(session: AsyncSession) -> None:
+        return
+    rows = sorted(rows, key=lambda row: str(row["group_id"]))
+    params = {
+        "ids": [row["group_id"] for row in rows],
+        "tenants": [row["tenant_id"] for row in rows],
+        "bodies": [row["body"] for row in rows],
+        "ats": [row["sampled_at"] for row in rows],
+        "errors": [row["errors_json"] for row in rows],
+        "counts": [row["error_count"] for row in rows],
+    }
     await execute(
         session,
         """
-        DELETE FROM model_events e
+        INSERT INTO model_state (group_id, tenant_id, body_text, sampled_at, errors_json, error_count, updated_at)
+        SELECT t.group_id, t.tenant_id, t.body, t.at, CAST(t.errors AS jsonb), t.n, t.at
+        FROM unnest(CAST(:ids AS uuid[]), CAST(:tenants AS uuid[]), CAST(:bodies AS text[]),
+                    CAST(:ats AS timestamptz[]), CAST(:errors AS text[]), CAST(:counts AS integer[]))
+             AS t(group_id, tenant_id, body, at, errors, n)
+        ON CONFLICT (group_id) DO UPDATE SET
+            body_text = EXCLUDED.body_text,
+            sampled_at = EXCLUDED.sampled_at,
+            errors_json = EXCLUDED.errors_json,
+            error_count = EXCLUDED.error_count,
+            updated_at = EXCLUDED.updated_at
+        """,
+        params,
+    )
+    await execute(
+        session,
+        """
+        INSERT INTO model_snapshots (group_id, tenant_id, sampled_at, body_text, errors_json, error_count)
+        SELECT t.group_id, t.tenant_id, t.at, t.body, CAST(t.errors AS jsonb), t.n
+        FROM unnest(CAST(:ids AS uuid[]), CAST(:tenants AS uuid[]), CAST(:bodies AS text[]),
+                    CAST(:ats AS timestamptz[]), CAST(:errors AS text[]), CAST(:counts AS integer[]))
+             AS t(group_id, tenant_id, body, at, errors, n)
+        """,
+        params,
+    )
+
+
+async def prune_snapshots(session: AsyncSession, group_ids: list[Any], keep: int = SNAPSHOT_KEEP) -> None:
+    ids = _uuids(group_ids)
+    if not ids:
+        return
+    await execute(
+        session,
+        """
+        DELETE FROM model_snapshots s
         USING (
-            SELECT ranked.id FROM (
-                SELECT me.id,
-                       row_number() OVER (PARTITION BY me.group_id ORDER BY me.source_ts DESC, me.created_at DESC) AS rn,
-                       COALESCE((g.emit_policy_json ->> 'max_events')::integer, 1000) AS keep
-                FROM model_events me
-                JOIN output_groups g ON g.id = me.group_id
-            ) ranked
-            WHERE ranked.rn > ranked.keep
-        ) doomed
-        WHERE e.id = doomed.id
+            SELECT g.id AS group_id,
+                   (SELECT x.id FROM model_snapshots x WHERE x.group_id = g.id ORDER BY x.id DESC OFFSET :keep LIMIT 1) AS cutoff
+            FROM unnest(CAST(:ids AS uuid[])) AS g(id)
+        ) c
+        WHERE s.group_id = c.group_id AND c.cutoff IS NOT NULL AND s.id <= c.cutoff
+        """,
+        {"ids": ids, "keep": keep - 1},
+    )
+
+
+async def load_model_rows(session: AsyncSession) -> list[dict[str, Any]]:
+    return await fetch_all(
+        session,
+        """
+        SELECT id, tenant_id, display_name, version, sample_ms, state, spec_json
+        FROM output_groups
+        WHERE status = 'ACTIVE' AND spec_json IS NOT NULL
+        ORDER BY id
         """,
         {},
     )
 
 
-async def run_maintenance(session: AsyncSession, *, prune: bool) -> int:
-    """One background tick. Queues outgoing messages on ``session``; the caller commits and flushes."""
-    now = utcnow()
-    events = await republish_due(session, now)
-    events.extend(await finalize_pending(session, now))
-    if prune:
-        await prune_events(session)
-    for event in events:
-        queue(session, event)
-    return len(events)
+# ============================================================================================
+# Scheduler
+# ============================================================================================
+
+
+def clamp_sample_ms(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SAMPLE_MS
+    return min(max(number, MIN_SAMPLE_MS), MAX_SAMPLE_MS)
+
+
+@dataclass
+class ModelDef:
+    id: str
+    tenant_id: str
+    name: str
+    version: int
+    sample_ms: int
+    state: str
+    compiled: CompiledSpec
+    filter_state: R.FilterState = field(default_factory=R.FilterState)
+    last_sample: datetime | None = None
+    samples_since_prune: int = 0
+
+
+def body_message(model_id: Any, body: str, sampled_at: datetime, errors: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"type": "model_body", "group_id": str(model_id), "body": body, "sampled_at": R.fmt_ts(sampled_at), "errors": errors}
+
+
+class ModelEngine:
+    """Single-writer scheduler. ``session_factory`` returns an async session context manager."""
+
+    def __init__(self, session_factory: Any = None) -> None:
+        self._session_factory = session_factory
+        self.models: dict[str, ModelDef] = {}
+        self._catalogs: dict[str, tuple[float, R.Catalog]] = {}
+        self._reload_at = 0.0
+        self._task: asyncio.Task[Any] | None = None
+
+    # ---- lifecycle -----------------------------------------------------------------------------
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop(), name="data-model-engine")
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 - shutdown continues; the error is logged
+            log.exception("Data model engine failed during shutdown")
+
+    def invalidate(self) -> None:
+        """Reload model definitions (and catalogs) at the next cycle."""
+        self._reload_at = 0.0
+        self._catalogs.clear()
+
+    async def _on_events(self, events: list[dict[str, Any]]) -> None:
+        if any(event.get("kind") == CHANGE_EVENT for event in events):
+            self.invalidate()
+
+    def _session(self) -> Any:
+        if self._session_factory is None:
+            from factorix.platform.db import session_factory
+
+            self._session_factory = session_factory()
+        return self._session_factory()
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                delay = await self.cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one failing cycle must not stop the engine
+                log.exception("Data model engine cycle failed")
+                self.invalidate()
+                delay = MAX_SLEEP_S
+            await asyncio.sleep(delay)
+
+    # ---- one cycle -----------------------------------------------------------------------------
+
+    def apply_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Replace the model set; unchanged models keep their filter state and schedule."""
+        fresh: dict[str, ModelDef] = {}
+        for row in rows:
+            model_id = str(row["id"])
+            version = int(row.get("version") or 1)
+            current = self.models.get(model_id)
+            state = str(row.get("state") or "RUNNING")
+            sample_ms = clamp_sample_ms(row.get("sample_ms"))
+            if current is not None and current.version == version:
+                current.state, current.sample_ms, current.name = state, sample_ms, str(row.get("display_name") or "")
+                if state != "RUNNING":
+                    current.last_sample = None
+                fresh[model_id] = current
+                continue
+            spec = _json(row.get("spec_json")) or {}
+            fresh[model_id] = ModelDef(
+                id=model_id,
+                tenant_id=str(row["tenant_id"]),
+                name=str(row.get("display_name") or ""),
+                version=version,
+                sample_ms=sample_ms,
+                state=state,
+                compiled=compile_spec(spec if isinstance(spec, dict) else {}),
+            )
+        self.models = fresh
+
+    def due(self, now: datetime) -> list[ModelDef]:
+        due = [
+            m
+            for m in self.models.values()
+            if m.state == "RUNNING" and (m.last_sample is None or now >= m.last_sample + timedelta(milliseconds=m.sample_ms))
+        ]
+        return sorted(due, key=lambda m: (m.last_sample or datetime.min.replace(tzinfo=now.tzinfo), m.id))
+
+    def next_delay(self, now: datetime) -> float:
+        waits = [
+            (m.last_sample + timedelta(milliseconds=m.sample_ms) - now).total_seconds()
+            for m in self.models.values()
+            if m.state == "RUNNING" and m.last_sample is not None
+        ]
+        if any(m.state == "RUNNING" and m.last_sample is None for m in self.models.values()):
+            waits.append(0.0)
+        if not waits:
+            return MAX_SLEEP_S
+        return min(max(min(waits), MIN_SLEEP_S), MAX_SLEEP_S)
+
+    async def cycle(self) -> float:
+        if time.monotonic() >= self._reload_at:
+            async with self._session() as session:
+                self.apply_rows(await load_model_rows(session))
+            self._reload_at = time.monotonic() + RELOAD_EVERY_S
+        started = time.monotonic()
+        due = self.due(utcnow())
+        while due and time.monotonic() - started < CYCLE_BUDGET_S:
+            batch, due = due[:MODELS_PER_TX], due[MODELS_PER_TX:]
+            async with self._session() as session:
+                await self.process(session, batch, utcnow())
+                await session.commit()
+                await after_commit.flush(session)
+        return self.next_delay(utcnow())
+
+    async def _catalog(self, session: AsyncSession, tenant_id: str) -> R.Catalog:
+        cached = self._catalogs.get(tenant_id)
+        if cached is not None and time.monotonic() - cached[0] < CATALOG_TTL_S:
+            return cached[1]
+        signal_ids: set[str] = set()
+        for model in self.models.values():
+            if model.tenant_id == tenant_id:
+                signal_ids |= model.compiled.signal_ids
+        catalog = await load_catalog(session, UUID(tenant_id), signal_ids)
+        self._catalogs[tenant_id] = (time.monotonic(), catalog)
+        return catalog
+
+    async def process(self, session: AsyncSession, models: list[ModelDef], now: datetime) -> int:
+        """Sample ``models`` now: one latest query per tenant, one write batch. Returns the count."""
+        by_tenant: dict[str, list[ModelDef]] = {}
+        for model in models:
+            model.last_sample = now  # also on failure: a broken model must not spin the loop
+            by_tenant.setdefault(model.tenant_id, []).append(model)
+        rows: list[dict[str, Any]] = []
+        prune: list[str] = []
+        for tenant_id, group in by_tenant.items():
+            tenant = UUID(tenant_id)
+            catalog = await self._catalog(session, tenant_id)
+            signal_ids: set[str] = set()
+            for model in group:
+                signal_ids |= model.compiled.signal_ids
+            samples, qualities = await load_samples(session, tenant, signal_ids)
+            for model in group:
+                try:
+                    result = await evaluate_once(session, tenant, model.compiled, catalog, now, model.filter_state, samples, qualities)
+                except Exception:  # noqa: BLE001 - one model never stops the others; logged
+                    log.exception("Data model %s (%s) could not be evaluated", model.name, model.id)
+                    continue
+                errors = result.errors
+                rows.append(
+                    {
+                        "group_id": UUID(model.id),
+                        "tenant_id": tenant,
+                        "body": result.text,
+                        "sampled_at": now,
+                        "errors_json": json.dumps(errors, ensure_ascii=False),
+                        "error_count": len(errors),
+                    }
+                )
+                queue_stream_event(session, "model_body", tenant_id, body_message(model.id, result.text, now, errors), group_id=model.id)
+                model.samples_since_prune += 1
+                if model.samples_since_prune >= PRUNE_EVERY:
+                    model.samples_since_prune = 0
+                    prune.append(model.id)
+                await asyncio.sleep(0)  # yield between models
+        await write_samples(session, rows)
+        if prune:
+            await prune_snapshots(session, prune)
+        return len(rows)
+
+
+ENGINE = ModelEngine()
+after_commit.listen(ENGINE._on_events)  # model edits (after commit) reload the definitions
+
+
+def notify_changed(session: AsyncSession, tenant_id: Any, model_id: Any) -> None:
+    """Tell the engine (after commit) that a model definition or state changed."""
+    from factorix.platform.after_commit import queue
+
+    queue(session, {"kind": CHANGE_EVENT, "tenant_id": str(tenant_id), "model_id": str(model_id)})
