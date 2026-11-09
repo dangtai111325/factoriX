@@ -142,7 +142,7 @@ class HttpPullConnector:
             self._client = httpx.AsyncClient(
                 timeout=self.timeout_s,
                 follow_redirects=False,
-                limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
+                limits=httpx.Limits(max_connections=16, max_keepalive_connections=16),
             )
         return self._client
 
@@ -180,16 +180,22 @@ class HttpPullConnector:
         await self.bucket.acquire(self.timeout_s if max_wait_s is None else max_wait_s)
         merged = {**self.headers, **(headers or {})}
         params = self.query or None
-        try:
-            if m == "POST":
-                content = body if isinstance(body, (str, bytes)) else None
-                response = await self._http().post(url, headers=merged, params=params, json=None if content is not None else body, content=content)
-            else:
-                response = await self._http().get(url, headers=merged, params=params)
-        except httpx.TimeoutException as exc:
-            raise ConnectorError("TIMEOUT", f"HTTP {urlparse(url).path} did not answer within {self.timeout_s:g} s.") from exc
-        except httpx.HTTPError as exc:
-            raise ConnectorError("NETWORK", "Cannot connect to HTTP endpoint.") from exc
+        for attempt in range(2):
+            try:
+                if m == "POST":
+                    content = body if isinstance(body, (str, bytes)) else None
+                    response = await self._http().post(url, headers=merged, params=params, json=None if content is not None else body, content=content)
+                else:
+                    response = await self._http().get(url, headers=merged, params=params)
+                break
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                if attempt == 0:
+                    continue
+                raise ConnectorError("NETWORK", "Cannot connect to HTTP endpoint.")
+            except httpx.TimeoutException as exc:
+                raise ConnectorError("TIMEOUT", f"HTTP {urlparse(url).path} did not answer within {self.timeout_s:g} s.") from exc
+            except httpx.HTTPError as exc:
+                raise ConnectorError("NETWORK", "Cannot connect to HTTP endpoint.") from exc
         status = response.status_code
         if 300 <= status < 400:
             raise ConnectorError("REDIRECT", "HTTP redirect was rejected.")
