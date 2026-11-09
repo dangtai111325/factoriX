@@ -167,7 +167,16 @@ class EdgeRuntime:
         kwargs: dict[str, Any] = {"headers": self.headers, "json": body, "params": params}
         if timeout is not None:
             kwargs["timeout"] = timeout
-        response = await self.client.request(method, path, **kwargs)
+        for attempt in range(2):
+            try:
+                response = await self.client.request(method, path, **kwargs)
+                break
+            except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+                if attempt == 0:
+                    logger.debug("Edge client transport retry on %s %s (%r)", method, path, exc)
+                    await asyncio.sleep(0.05)
+                    continue
+                raise
         if response.status_code == 401:
             self._revoked.set()
             raise CredentialRevoked("Center rejected the edge credential.")

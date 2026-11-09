@@ -552,17 +552,24 @@ class JobRunner:
         samples: list[Sample] = []
         errors: list[ConnectorError] = []
         deadline = time.monotonic() + read_budget_s(spec) - 0.5
-        for (method, path), path_fields in by_path.items():
+        async def _fetch_path(method: str, path: str, path_fields: list[dict[str, Any]]) -> tuple[list[Sample], ConnectorError | None]:
             try:
                 document = await connector.request_json(
                     method, path, headers, body=spec.config.get("body") if method == "POST" else None, max_wait_s=max(0.0, deadline - time.monotonic())
                 )
+                return project_json(path_fields, document, now_iso()), None
             except ConnectorError as exc:
-                errors.append(exc)
+                bad_samples = []
                 if exc.code != "RATE_LIMITED":
-                    samples.extend(Sample(str(f["id"]), None, "BAD", None, exc.code, now_iso()) for f in path_fields)
-                continue
-            samples.extend(project_json(path_fields, document, now_iso()))
+                    bad_samples = [Sample(str(f["id"]), None, "BAD", None, exc.code, now_iso()) for f in path_fields]
+                return bad_samples, exc
+
+        tasks = [_fetch_path(m, p, pf) for (m, p), pf in by_path.items()]
+        results = await asyncio.gather(*tasks)
+        for path_samples, path_err in results:
+            if path_err is not None:
+                errors.append(path_err)
+            samples.extend(path_samples)
         if errors and len(errors) == len(by_path):
             raise errors[0]
         self.partial_error = next((exc for exc in errors if exc.code == "RATE_LIMITED"), None)
