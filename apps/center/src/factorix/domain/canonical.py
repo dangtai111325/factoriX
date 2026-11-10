@@ -337,6 +337,7 @@ class CanonicalObservation:
     origin: Origin = Origin.LIVE
     provenance: CanonicalProvenance | None = None
     correlation_id: str | None = None
+    source_sequence: int | None = None
     keepalive: bool = False
 
     def __post_init__(self) -> None:
@@ -350,6 +351,8 @@ class CanonicalObservation:
             raise ObservationError("INVALID_EPOCH", "data_epoch must be >= 1.")
         if int(self.config_revision) < 1:
             raise ObservationError("INVALID_REVISION", "config_revision must be >= 1.")
+        if self.source_sequence is not None and int(self.source_sequence) < 0:
+            raise ObservationError("INVALID_SEQUENCE", "source_sequence must be >= 0.")
 
         object.__setattr__(self, "acquired_at", ensure_utc(self.acquired_at))
         if self.source_time is not None:
@@ -438,6 +441,7 @@ class CanonicalObservation:
             "origin": self.origin.value,
             "provenance": self.provenance.to_dict() if self.provenance else None,
             "correlation_id": self.correlation_id,
+            "source_sequence": int(self.source_sequence) if self.source_sequence is not None else None,
             "keepalive": self.keepalive,
         }
 
@@ -472,6 +476,7 @@ class CanonicalObservation:
             origin=Origin(str(data.get("origin") or "LIVE").upper()),
             provenance=CanonicalProvenance.from_dict(data.get("provenance")) if data.get("provenance") else None,
             correlation_id=str(data["correlation_id"]) if data.get("correlation_id") is not None else None,
+            source_sequence=int(data["source_sequence"]) if data.get("source_sequence") is not None else None,
             keepalive=bool(data.get("keepalive", False)),
         )
 

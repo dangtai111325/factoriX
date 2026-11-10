@@ -1,0 +1,24 @@
+[project]
+name = "factorix-acquisition"
+version = "1.0.0"
+description = "FactoriX Self-Contained Local Acquisition Worker"
+requires-python = ">=3.12"
+dependencies = [
+  "asyncpg==0.32.0",
+  "aio-pika==10.2.3",
+  "cryptography==50.0.2",
+  "httpx==0.28.1",
+  "paho-mqtt==2.1.0",
+  "pymodbus==3.16.1",
+  "asyncua==2.1.0",
+  "websockets==15.0.1",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../center/src"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]

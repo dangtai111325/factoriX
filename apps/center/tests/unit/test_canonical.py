@@ -69,6 +69,7 @@ def _sample(value_type: str, value: object, **overrides: object) -> CanonicalObs
             address_summary="ns=2;s=Machine.Temp",
         ),
         "correlation_id": "corr-123",
+        "source_sequence": 42,
     }
     kwargs.update(overrides)
     return CanonicalObservation(**kwargs)  # type: ignore[arg-type]
@@ -108,6 +109,7 @@ def test_canonical_round_trip_all_types(value_type: str, value: object) -> None:
     assert restored.provenance is not None
     assert restored.provenance.protocol == "opcua"
     assert restored.provenance.config_revision == 4
+    assert restored.source_sequence == 42
     assert restored.to_value_json() == {"v": value}
 
 

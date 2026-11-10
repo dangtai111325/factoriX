@@ -605,6 +605,11 @@ async def bump_edge_release(session: AsyncSession, tenant_id: UUID, actor: UUID,
         )
     for e in edges:
         await publish_release(session, tenant_id, actor, ReleaseIn(edge_id=str(e["id"])), correlation_id)
+    await execute(
+        session,
+        "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
+        {"channel": "factorix_config_changed", "payload": json.dumps({"tenant_id": str(tenant_id)})},
+    )
 
 
 def _queue_connection_health(session: AsyncSession, tenant_id: UUID, connection: dict[str, Any]) -> None:
@@ -803,6 +808,11 @@ async def capture_connection(
         },
     )
     await audit(session, tenant_id=tenant_id, event_type="CAPTURE_REQUEST", actor_id=actor, entity_type="connection", entity_id=connection_id, before=None, after={"job_id": str(job_id), "protocol": conn["protocol"]}, correlation_id=correlation_id)
+    await execute(
+        session,
+        "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
+        {"channel": "factorix_commissioning", "payload": json.dumps({"job_id": str(job_id), "connection_id": str(connection_id)})},
+    )
     return {"job_id": str(job_id), "status": "PENDING", "poll_url": f"/api/v1/commissioning/{job_id}"}
 
 
@@ -1989,6 +1999,11 @@ async def request_commission(
         },
     )
     await audit(session, tenant_id=tenant_id, event_type="COMMISSION_REQUEST", actor_id=actor, entity_type="connection", entity_id=connection_id, before=None, after={"job_id": str(job_id), "protocol": public_protocol(protocol), "mode": mode_upper, "draft_config": bool(config)}, correlation_id=correlation_id)
+    await execute(
+        session,
+        "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
+        {"channel": "factorix_commissioning", "payload": json.dumps({"job_id": str(job_id), "connection_id": str(connection_id)})},
+    )
     return {"job_id": str(job_id), "status": "PENDING", "poll_url": f"/api/v1/commissioning/{job_id}"}
 
 

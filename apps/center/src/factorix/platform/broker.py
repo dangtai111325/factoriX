@@ -11,7 +11,7 @@ import asyncio
 import logging
 import random
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -259,6 +259,8 @@ class RabbitMQPublisher:
             "x-signal-id": str(obs.signal_id),
             "x-value-type": obs.value_type,
         }
+        if obs.source_sequence is not None:
+            headers["x-source-sequence"] = int(obs.source_sequence)
         await self.publish_bytes(
             payload=obs.to_json_bytes(),
             routing_key=tenant_routing_key(obs.tenant_id),
@@ -266,6 +268,32 @@ class RabbitMQPublisher:
             correlation_id=obs.correlation_id,
             headers=headers,
         )
+
+    async def publish_observations_partial(
+        self,
+        observations: Sequence[CanonicalObservation],
+    ) -> tuple[list[str], list[tuple[CanonicalObservation, BrokerError]]]:
+        """Publish observations concurrently (bounded by ``max_inflight_publishes``) with confirms.
+
+        Returns ``(confirmed_event_uids, failed_items_with_errors)`` so outage spooling only
+        stores observations that RabbitMQ did not confirm.
+        """
+        if not observations:
+            return [], []
+        results = await asyncio.gather(
+            *(self.publish_observation(obs) for obs in observations),
+            return_exceptions=True,
+        )
+        confirmed: list[str] = []
+        failed: list[tuple[CanonicalObservation, BrokerError]] = []
+        for obs, outcome in zip(observations, results):
+            if outcome is None:
+                confirmed.append(obs.event_uid)
+            elif isinstance(outcome, BrokerError):
+                failed.append((obs, outcome))
+            elif isinstance(outcome, BaseException):
+                failed.append((obs, BrokerUnavailableError(f"RabbitMQ publish failed for {obs.event_uid}: {outcome}")))
+        return confirmed, failed
 
     async def publish_bytes(
         self,

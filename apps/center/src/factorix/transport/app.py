@@ -1014,6 +1014,11 @@ async def create_or_get_job(body: JobIn, principal: dict[str, Any] = Depends(adm
     job = await fetch_one(session, "SELECT id FROM acquisition_jobs WHERE connection_id = :id", {"id": conn_id})
     if job:
         await execute(session, "UPDATE acquisition_jobs SET mode = :mode, interval_ms = :interval_ms WHERE id = :id", {"id": job["id"], "mode": body.mode, "interval_ms": body.interval_ms})
+        await execute(
+            session,
+            "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
+            {"channel": "factorix_config_changed", "payload": f'{{"tenant_id":"{tenant_id}"}}'},
+        )
         return {"id": str(job["id"])}
     job_id = uuid4()
     await execute(
@@ -1023,6 +1028,11 @@ async def create_or_get_job(body: JobIn, principal: dict[str, Any] = Depends(adm
         VALUES (:id, :connection_id, :mode, :interval_ms, 3000, TRUE, 1, 1, 1)
         """,
         {"id": job_id, "connection_id": conn_id, "mode": body.mode, "interval_ms": body.interval_ms},
+    )
+    await execute(
+        session,
+        "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
+        {"channel": "factorix_config_changed", "payload": f'{{"tenant_id":"{tenant_id}"}}'},
     )
     return {"id": str(job_id)}
 

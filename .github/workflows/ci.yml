@@ -21,9 +21,9 @@ jobs:
           FACTORIX_DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/factorix_test
           FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
           FACTORIX_ENVIRONMENT: test
-          PYTHONPATH: ".:apps/center/src:apps/edge/src"
+          PYTHONPATH: ".:apps/center/src:apps/acquisition/src:apps/edge/src"
         run: |
-          python -m pytest apps/center/tests/unit apps/edge/tests tests/safety tests/simulators -q
+          python -m pytest apps/center/tests/unit apps/acquisition/tests/unit apps/edge/tests tests/safety tests/simulators -q
 
   web-build:
     runs-on: ubuntu-latest
@@ -88,7 +88,7 @@ jobs:
           FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
           FACTORIX_RABBITMQ_URL: amqp://guest:guest@127.0.0.1:5672/
           FACTORIX_TDENGINE_DSN: ws://root:taosdata@127.0.0.1:6041
-          PYTHONPATH: ".:apps/center/src:apps/edge/src"
+          PYTHONPATH: ".:apps/center/src:apps/acquisition/src:apps/edge/src"
         run: |
           cd apps/center && alembic upgrade head && cd ../..
-          python -m pytest apps/center/tests/integration -q
+          python -m pytest apps/center/tests/integration apps/acquisition/tests/integration -q
