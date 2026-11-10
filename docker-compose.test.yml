@@ -1,0 +1,74 @@
+# Isolated dev/E2E stack for FactoriX Storage & Historian (project: factorix-storage-e2e).
+# NEVER uses factorix-data volume or port 8080 (live appliance remains untouched).
+name: factorix-storage-e2e
+
+services:
+  postgres-test:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-factorix_test}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-factorix-test-ephemeral-pw}
+      POSTGRES_DB: ${POSTGRES_DB:-factorix_test}
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - e2e_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-factorix_test} -d $${POSTGRES_DB:-factorix_test}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq-test:
+    image: rabbitmq:4.0-management-alpine
+    hostname: factorix-rmq-test
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-factorix_mq_test}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-factorix-mq-test-pw}
+      RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_ERLANG_COOKIE:-factorix-test-erlang-cookie}
+    ports:
+      - "127.0.0.1:15673:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - e2e_rmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "su-exec", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      start_period: 15s
+      retries: 20
+
+  tdengine-test:
+    image: tdengine/tdengine:3.3.6.13
+    hostname: factorix-td-test
+    ports:
+      - "127.0.0.1:16041:6041"
+    volumes:
+      - e2e_td_data:/var/lib/taos
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6041/-/ping >/dev/null || taos -s 'SHOW DATABASES;' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 25
+
+  simulators:
+    image: python:3.12-slim-bookworm
+    profiles: ["sim"]
+    working_dir: /workspace
+    volumes:
+      - .:/workspace:ro
+    command: >
+      bash -c "pip install --no-cache-dir pymodbus==3.16.1 asyncua==2.1.0 websockets==15.0.1 &&
+               python -m tests.simulators --host 0.0.0.0 --modbus-port 15020 --opcua-port 14840 --mqtt-port 11883 --http-port 18443 --ws-port 18765 --control-port 19000"
+    ports:
+      - "127.0.0.1:15020:15020"
+      - "127.0.0.1:14840:14840"
+      - "127.0.0.1:11883:11883"
+      - "127.0.0.1:18443:18443"
+      - "127.0.0.1:18765:18765"
+      - "127.0.0.1:19000:19000"
+
+volumes:
+  e2e_pg_data:
+  e2e_rmq_data:
+  e2e_td_data:
