@@ -31,6 +31,34 @@ class Settings(BaseSettings):
     data_dir: str = ""
     web_dist: str = ""
 
+    # RabbitMQ transport (§4)
+    rabbitmq_url: str = ""
+    rabbitmq_mgmt_url: str = ""
+    rabbitmq_exchange: str = "factorix.telemetry.ingress"
+    rabbitmq_queue: str = "factorix.telemetry.ingest.q"
+    rabbitmq_dlx: str = "factorix.telemetry.dlx"
+    rabbitmq_dlq: str = "factorix.telemetry.dlq"
+    rabbitmq_max_length_bytes: int = Field(default=512 * 1024 * 1024, ge=65536)
+    rabbitmq_delivery_limit: int = Field(default=5, ge=1, le=100)
+    rabbitmq_prefetch: int = Field(default=128, ge=1, le=4096)
+    rabbitmq_publisher_max_inflight: int = Field(default=64, ge=1, le=2048)
+    rabbitmq_confirm_timeout_s: float = Field(default=10.0, ge=0.5, le=120.0)
+
+    # TDengine data plane & exports (§5)
+    tdengine_dsn: str = ""
+    tdengine_db: str = "factorix_ts"
+    tdengine_db_prefix: str = "fx_t_"
+    operational_history_days: int = Field(default=7, ge=1, le=3650)
+    storage_export_dir: str = ""
+
+    # Ingestion & local acquisition (§3, §4, §7)
+    ingestion_batch_size: int = Field(default=256, ge=1, le=4096)
+    ingestion_flush_ms: int = Field(default=100, ge=10, le=5000)
+    ot_allowlist: str = ""
+    acquisition_spool_path: str = ""
+    acquisition_spool_max_bytes: int = Field(default=128 * 1024 * 1024, ge=1_048_576)
+    enable_destructive_tests: str = ""
+
     @field_validator("database_url")
     @classmethod
     def _db(cls, value: str) -> str:
@@ -44,6 +72,26 @@ class Settings(BaseSettings):
         if value.strip().lower() in _PLACEHOLDERS or len(value) < 32:
             raise ValueError("FACTORIX_DATA_KEY không hợp lệ.")
         return value
+
+    @field_validator("rabbitmq_url")
+    @classmethod
+    def _rmq(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            return ""
+        if not text.startswith(("amqp://", "amqps://")):
+            raise ValueError("FACTORIX_RABBITMQ_URL must start with amqp:// or amqps://.")
+        return text
+
+    @field_validator("tdengine_dsn")
+    @classmethod
+    def _td(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            return ""
+        if not text.startswith(("ws://", "wss://", "http://", "https://", "taos://", "taos+ws://")):
+            raise ValueError("FACTORIX_TDENGINE_DSN must use ws://, wss://, or taos+ws://.")
+        return text
 
     @property
     def secure_cookies(self) -> bool:
