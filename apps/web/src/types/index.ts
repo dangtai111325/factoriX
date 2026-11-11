@@ -140,11 +140,22 @@ export interface SignalItem {
   /** Effective status code (SignalQuality), always upper case. */
   quality: SignalQuality | string;
   reasonCode?: string;
-  /** Last read = acquisition time on the edge (`received_time`). Same as `receivedTime`. */
+  /** Last read = acquisition time on the edge (`received_time` / `last_acquired_at`). */
   lastUpdated: string;
   receivedTime?: string;
-  /** Last change = source-reported group timestamp (`source_time`), metadata only. */
+  /** Last authentic acquisition receipt (stays distinct from value change under ON_CHANGE). */
+  lastAcquiredAt?: string;
+  /** Last change = timestamp of last value/quality change (falls back to `source_time` for legacy rows). */
+  lastValueChangedAt?: string;
   sourceTime?: string;
+  /** Center evaluation metadata and independent health dimensions (S08). */
+  evaluatedAt?: string;
+  staleAfterMs?: number;
+  dataEpoch?: number;
+  sourceHealth?: string;
+  connectionHealth?: string;
+  brokerHealth?: string;
+  storageHealth?: string;
   version?: number;
   addressKind?: string;
   addressJson?: Record<string, unknown>;

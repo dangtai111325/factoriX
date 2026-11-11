@@ -571,7 +571,7 @@ async def list_connections(session: AsyncSession, tenant_id: UUID, *, protocol: 
                e.name AS edge_name, e.enrollment_status AS edge_enrollment_status, e.health AS edge_raw_health,
                e.last_heartbeat AS edge_last_heartbeat,
                COALESCE(sig.signal_count, 0) AS signal_count,
-               COALESCE(obs.messages_per_min, 0) AS messages_per_min,
+               0 AS messages_per_min,
                (SELECT j.interval_ms FROM acquisition_jobs j WHERE j.connection_id = c.id ORDER BY j.id LIMIT 1) AS interval_ms
         FROM connections c
         LEFT JOIN edge_nodes e ON e.id = c.edge_id
@@ -584,12 +584,6 @@ async def list_connections(session: AsyncSession, tenant_id: UUID, *, protocol: 
             WHERE b.enabled = TRUE AND b.valid_to IS NULL AND s.status = 'ACTIVE'
             GROUP BY j.connection_id
         ) sig ON sig.connection_id = c.id
-        LEFT JOIN (
-            SELECT o.connection_id, count(*) AS messages_per_min
-            FROM observations o
-            WHERE o.tenant_id = :tenant_id AND o.event_time >= now() - INTERVAL '60 seconds'
-            GROUP BY o.connection_id
-        ) obs ON obs.connection_id = c.id
         WHERE {' AND '.join(where)}
         ORDER BY c.name
         """,

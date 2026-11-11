@@ -9,6 +9,7 @@ import signal
 import sys
 
 from factorix.modules.ingestion_worker import DEFAULT_INSTANCE_ID, IngestionWorker, PgIngestionStore
+from factorix.modules.live_state import TDengineLiveStateProvider, configure_live_state_provider
 from factorix.platform.broker import BrokerConfig
 from factorix.platform.settings import get_settings
 from factorix.platform.tdengine import TDEngineClient, TDEngineConfig
@@ -45,6 +46,8 @@ async def run_forever() -> None:
         min_pool=2,
         max_pool=max(8, min(32, broker_cfg.consumer_concurrency // 4)),
     )
+    live_provider = TDengineLiveStateProvider(td_client)
+    configure_live_state_provider(live_provider)
     worker = IngestionWorker(
         pg_store=pg_store,
         tdengine=td_client,
@@ -53,6 +56,7 @@ async def run_forever() -> None:
         batch_size=settings.ingestion_batch_size,
         flush_ms=settings.ingestion_flush_ms,
         shadow_pg=settings.ingestion_shadow_pg,
+        live_provider=live_provider,
         db_dsn_for_notify=settings.database_url,
     )
 

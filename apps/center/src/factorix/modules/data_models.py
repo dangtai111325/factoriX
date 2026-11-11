@@ -247,21 +247,29 @@ def _latest_out(row: dict[str, Any] | None) -> dict[str, Any]:
 
 async def signal_states(session: AsyncSession, tenant_id: UUID, signal_ids: Iterable[str]) -> dict[str, B.SignalStatus]:
     """Effective status (GOOD / STALE / PAUSED / …, canonical rules of signal_state) of each signal (R4-DM-08)."""
+    from sqlalchemy import text as _sa_text
+    from sqlalchemy.exc import SQLAlchemyError as _SQLAlchemyError
+
+    from factorix.modules.live_state import get_live_state_provider, record_from_pg_row
+
     ids = E._uuids(signal_ids)
     if not ids:
         return {}
     rows = await fetch_all(
         session,
         """
-        SELECT s.id AS signal_id, s.status AS signal_status, s.expected_interval_ms,
-               l.signal_id AS has_obs, l.quality, l.value_json, l.event_time, l.received_time,
+        SELECT s.id AS signal_id, s.resource_id, s.data_type, s.unit, s.status AS signal_status, s.expected_interval_ms,
+               l.signal_id AS has_obs, l.observation_id, l.value_type, l.quality, l.reason_code,
+               l.value_json, l.event_time, l.received_time, l.last_acquired_at, l.last_value_changed_at,
+               l.source_time, l.data_epoch, l.source_sequence, l.event_uid, l.config_revision, l.origin, l.updated_at,
                l.last_good_value_json, l.last_good_event_time,
-               nb.nullable, nb.enabled, nb.connection_status, nb.connection_id, nb.connection_name
+               nb.nullable, nb.enabled, nb.connection_status, nb.connection_id, nb.connection_name, nb.connection_health
         FROM signal_definitions s
         LEFT JOIN latest_signal_state l ON l.tenant_id = s.tenant_id AND l.signal_id = s.id
         LEFT JOIN LATERAL (
             SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable, b.enabled,
-                   c.status AS connection_status, c.id AS connection_id, c.name AS connection_name
+                   c.status AS connection_status, c.id AS connection_id, c.name AS connection_name,
+                   c.health AS connection_health
             FROM signal_bindings b
             JOIN source_fields f ON f.id = b.source_field_id
             LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
@@ -275,25 +283,93 @@ async def signal_states(session: AsyncSession, tenant_id: UUID, signal_ids: Iter
         {"tenant_id": tenant_id, "ids": ids},
     )
     now = utcnow()
+    active_epoch = 1
+    live_provider = get_live_state_provider() if isinstance(session, AsyncSession) else None
+    if isinstance(session, AsyncSession):
+        try:
+            async with session.begin_nested():
+                gen_row = (
+                    await session.execute(
+                        _sa_text("SELECT active_epoch FROM telemetry_generations WHERE tenant_id = :tenant_id"),
+                        {"tenant_id": tenant_id},
+                    )
+                ).mappings().first()
+                if gen_row and gen_row.get("active_epoch") is not None:
+                    active_epoch = max(1, int(gen_row["active_epoch"]))
+        except _SQLAlchemyError:
+            active_epoch = 1
+
+    if live_provider is not None:
+        live_provider.set_active_epoch(tenant_id, active_epoch)
+        missing_specs = {
+            (r["signal_id"] if isinstance(r["signal_id"], UUID) else UUID(str(r["signal_id"]))): r
+            for r in rows
+            if live_provider.get_entry(
+                tenant_id, r["signal_id"] if isinstance(r["signal_id"], UUID) else UUID(str(r["signal_id"]))
+            )
+            is None
+        }
+        if missing_specs:
+            await live_provider.warm_from_tdengine(
+                tenant_id, missing_specs, active_epoch=active_epoch, mark_unverified=True
+            )
+
     out: dict[str, B.SignalStatus] = {}
     for row in rows:
-        value_json = E._json(row.get("value_json"))
-        good_json = E._json(row.get("last_good_value_json"))
-        result = evaluate_signal_state(
-            has_observation=row.get("has_obs") is not None,
-            raw_quality=row.get("quality"),
-            raw_value=value_json.get("v") if isinstance(value_json, dict) else None,
-            event_time=row.get("event_time"),
-            last_acquired_at=row.get("received_time"),
-            expected_interval_ms=row.get("expected_interval_ms"),
-            last_good_value=good_json.get("v") if isinstance(good_json, dict) else None,
-            last_good_time=row.get("last_good_event_time"),
-            null_allowed=bool(row.get("nullable")),
-            binding_enabled=row.get("enabled") is not False and str(row.get("signal_status") or "ACTIVE") == "ACTIVE",
-            connection_paused=str(row.get("connection_status") or "") == "PAUSED",
-            now=now,
-        )
-        out[str(row["signal_id"]).lower()] = B.SignalStatus(
+        sid = row["signal_id"] if isinstance(row["signal_id"], UUID) else UUID(str(row["signal_id"]))
+        binding_enabled = row.get("enabled") is not False and str(row.get("signal_status") or "ACTIVE") == "ACTIVE"
+        conn_paused = str(row.get("connection_status") or "") == "PAUSED"
+        row_has_obs = row.get("has_obs") is not None
+        row_epoch = int(row.get("data_epoch") or 1)
+        if row_has_obs and isinstance(session, AsyncSession) and row_epoch < active_epoch:
+            row_has_obs = False
+
+        if live_provider is not None:
+            if row_has_obs:
+                pg_rec, pg_seq, pg_upd = record_from_pg_row(row, tenant_id=tenant_id)
+                post_boot = live_provider.is_verified_in_session(tenant_id, sid) or (
+                    pg_upd is not None
+                    and pg_upd > live_provider.started_at
+                    and pg_rec.last_acquired_at > live_provider.started_at
+                )
+                live_provider.seed_from_record(
+                    pg_rec,
+                    source_sequence=pg_seq,
+                    restored_unverified=not post_boot,
+                    expected_interval_ms=row.get("expected_interval_ms"),
+                    null_allowed=bool(row.get("nullable")),
+                )
+            result = live_provider.evaluate_signal(
+                tenant_id,
+                sid,
+                binding_enabled=binding_enabled,
+                expected_interval_ms=row.get("expected_interval_ms"),
+                null_allowed=bool(row.get("nullable")),
+                connection_paused=conn_paused,
+                connection_health=row.get("connection_health"),
+                connection_status=row.get("connection_status"),
+                active_bindings=1 if binding_enabled else 0,
+                now=now,
+            ).evaluation
+        else:
+            value_json = E._json(row.get("value_json"))
+            good_json = E._json(row.get("last_good_value_json"))
+            result = evaluate_signal_state(
+                has_observation=row_has_obs,
+                raw_quality=row.get("quality"),
+                raw_value=value_json.get("v") if isinstance(value_json, dict) else None,
+                event_time=row.get("event_time"),
+                last_acquired_at=row.get("last_acquired_at") or row.get("received_time"),
+                expected_interval_ms=row.get("expected_interval_ms"),
+                last_good_value=good_json.get("v") if isinstance(good_json, dict) else None,
+                last_good_time=row.get("last_good_event_time"),
+                raw_reason_code=row.get("reason_code"),
+                null_allowed=bool(row.get("nullable")),
+                binding_enabled=binding_enabled,
+                connection_paused=conn_paused,
+                now=now,
+            )
+        out[str(sid).lower()] = B.SignalStatus(
             status=result.effective_status,
             reason=result.reason_code,
             connection_id=str(row["connection_id"]) if row.get("connection_id") else None,

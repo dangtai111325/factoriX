@@ -29,6 +29,15 @@ export interface LatestMsg {
   reason_code?: string | null
   received_time?: string | null
   source_time?: string | null
+  evaluated_at?: string | null
+  stale_after_ms?: number | null
+  data_epoch?: number | null
+  last_acquired_at?: string | null
+  last_value_changed_at?: string | null
+  source_health?: string | null
+  connection_health?: string | null
+  broker_health?: string | null
+  storage_health?: string | null
 }
 
 export interface HealthMsg {

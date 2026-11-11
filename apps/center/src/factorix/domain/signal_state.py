@@ -41,6 +41,7 @@ class ReasonCode(StrEnum):
     RAW_SOURCE_BAD = "RAW_SOURCE_BAD"
     RAW_SOURCE_UNCERTAIN = "RAW_SOURCE_UNCERTAIN"
     NO_FRESH_ACQUISITION = "NO_FRESH_ACQUISITION"
+    UNVERIFIED_AFTER_RESTART = "UNVERIFIED_AFTER_RESTART"
     CONNECTION_OFFLINE = "CONNECTION_OFFLINE"
     CONNECTION_PAUSED = "CONNECTION_PAUSED"
     NULL_VALUE = "NULL_VALUE"
@@ -79,6 +80,7 @@ def evaluate_signal_state(
     acquisition_mode: str = "POLL",
     null_allowed: bool = False,
     connection_paused: bool = False,
+    restored_unverified: bool = False,
 ) -> SignalEvaluationResult:
     """Canonical single-source-of-truth evaluator for effective signal status across FactoriX."""
     eval_now = now or datetime.now(timezone.utc)
@@ -191,6 +193,18 @@ def evaluate_signal_state(
             freshness=str(Freshness.STALE),
             effective_status=str(EffectiveStatus.STALE),
             reason_code=str(ReasonCode.NO_FRESH_ACQUISITION),
+            evaluated_at=eval_now_iso,
+            stale_after_ms=stale_after_ms,
+            last_good=last_good_payload,
+        )
+
+    # 5b. Conservatively recovered crash/restart checkpoint awaiting first verified acquisition
+    if restored_unverified:
+        return SignalEvaluationResult(
+            source_quality=str(SourceQuality.UNCERTAIN),
+            freshness=str(Freshness.UNKNOWN),
+            effective_status=str(EffectiveStatus.UNCERTAIN),
+            reason_code=str(ReasonCode.UNVERIFIED_AFTER_RESTART),
             evaluated_at=eval_now_iso,
             stale_after_ms=stale_after_ms,
             last_good=last_good_payload,

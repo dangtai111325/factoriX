@@ -200,8 +200,11 @@ export function useLiveValues(ids: string[]): Map<string, LiveValue> {
     if (stream === 'open') {
       const unsub = subscribeSignals(list, (msg) =>
         setValues((prev) => {
+          const cur = prev.get(msg.signal_id);
+          const nextTime = msg.last_acquired_at ?? msg.received_time ?? null;
+          if (cur?.receivedTime && nextTime && Date.parse(nextTime) < Date.parse(cur.receivedTime)) return prev;
           const next = new Map(prev);
-          next.set(msg.signal_id, { value: msg.value, quality: msg.effective_status || msg.quality || null, receivedTime: msg.received_time ?? null });
+          next.set(msg.signal_id, { value: msg.value, quality: msg.effective_status || msg.quality || null, receivedTime: nextTime });
           return next;
         }),
       );

@@ -50,8 +50,9 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
   const quality = !isEnabled ? 'DISABLED' : normalizeQuality(signal.quality);
   const formattedVal = formatValue(signal.value);
   // Center rule: stale after max(2 x expected interval, 12 s) without a new read.
-  const staleSec = Math.round(Math.max(2 * (signal.expectedIntervalMs || 1000), 12000) / 1000);
-  const lastRead = signal.receivedTime || signal.lastUpdated;
+  const staleSec = Math.round((signal.staleAfterMs ?? Math.max(2 * (signal.expectedIntervalMs || 1000), 12000)) / 1000);
+  const lastRead = signal.lastAcquiredAt || signal.receivedTime || signal.lastUpdated;
+  const lastChange = signal.lastValueChangedAt || signal.sourceTime;
 
   return (
     <aside
@@ -92,8 +93,8 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
               <div className="text-[11px] text-[#657794] mt-0.5" title={formatTimestamp(lastRead)}>
                 Last read {timeAgo(lastRead)}
               </div>
-              <div className="text-[11px] text-[#657794]" title={formatTimestamp(signal.sourceTime)}>
-                Last change {signal.sourceTime ? timeAgo(signal.sourceTime) : '—'}
+              <div className="text-[11px] text-[#657794]" title={formatTimestamp(lastChange)}>
+                Last change {lastChange ? timeAgo(lastChange) : '—'}
               </div>
             </div>
             <StatusBadge status={quality} />
@@ -109,6 +110,8 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
               ? 'Value read successfully within the expected interval.'
               : quality === 'STALE'
               ? `No new read within ${staleSec} s.`
+              : quality === 'UNCERTAIN' && signal.reasonCode === 'UNVERIFIED_AFTER_RESTART'
+              ? 'Restored from historian after restart; waiting for the first fresh acquisition.'
               : quality === 'UNCERTAIN'
               ? 'The source or the collector flagged this value as uncertain.'
               : quality === 'BAD'

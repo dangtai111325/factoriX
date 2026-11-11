@@ -282,6 +282,15 @@ interface LiveState {
   reasonCode: string
   receivedTime: string
   sourceTime: string
+  lastAcquiredAt?: string
+  lastValueChangedAt?: string
+  evaluatedAt?: string
+  staleAfterMs?: number
+  dataEpoch?: number
+  sourceHealth?: string
+  connectionHealth?: string
+  brokerHealth?: string
+  storageHealth?: string
 }
 
 function timeOf(iso: string): number {
@@ -290,14 +299,33 @@ function timeOf(iso: string): number {
   return Number.isNaN(ts) ? 0 : ts
 }
 
+function optNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
 function liveFromRow(row: Record<string, unknown>): LiveState {
   const value = row.value !== undefined ? row.value : (row.value_json as { v?: unknown } | undefined)?.v
+  const receivedTime = text(row.last_acquired_at || row.received_time || row.event_time)
   return {
     value: value === undefined ? null : value,
     quality: normalizeQuality(row.effective_status ?? row.quality),
     reasonCode: text(row.reason_code),
-    receivedTime: text(row.received_time || row.event_time),
+    receivedTime,
     sourceTime: text(row.source_time),
+    lastAcquiredAt: text(row.last_acquired_at || row.received_time || row.event_time) || undefined,
+    lastValueChangedAt: text(row.last_value_changed_at) || undefined,
+    evaluatedAt: text(row.evaluated_at) || undefined,
+    staleAfterMs: optNumber(row.stale_after_ms),
+    dataEpoch: optNumber(row.data_epoch),
+    sourceHealth: text(row.source_health) || undefined,
+    connectionHealth: text(row.connection_health) || undefined,
+    brokerHealth: text(row.broker_health) || undefined,
+    storageHealth: text(row.storage_health) || undefined,
   }
 }
 
@@ -373,6 +401,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Live values live outside the metadata so a metadata refresh never wipes them.
   const liveRef = useRef<Map<string, LiveState>>(new Map())
+  const serverOffsetMsRef = useRef(0)
   const [liveTick, setLiveTick] = useState(0)
   // Re-evaluates client-side staleness between server reconciliations.
   const [clockTick, setClockTick] = useState(0)
@@ -396,19 +425,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => window.clearInterval(timer)
   }, [])
 
-  /** Merge one live state; older samples (by received_time) never overwrite newer ones. */
+  /** Merge one live state; older epoch or older acquisition never overwrites newer state. */
   const applyLive = useCallback((signalId: string, next: LiveState): boolean => {
+    if (next.evaluatedAt) {
+      const serverTs = timeOf(next.evaluatedAt)
+      if (serverTs > 0) serverOffsetMsRef.current = serverTs - Date.now()
+    }
     const current = liveRef.current.get(signalId)
     if (current) {
-      const curTs = timeOf(current.receivedTime)
-      const nextTs = timeOf(next.receivedTime)
-      if (curTs && nextTs && nextTs < curTs) return false
+      const curEpoch = current.dataEpoch ?? 1
+      const nextEpoch = next.dataEpoch ?? curEpoch
+      if (next.dataEpoch !== undefined && nextEpoch < curEpoch) return false
+      const curTs = timeOf(current.lastAcquiredAt || current.receivedTime)
+      const nextTs = timeOf(next.lastAcquiredAt || next.receivedTime)
+      if (nextEpoch === curEpoch && curTs && nextTs && nextTs < curTs) return false
       if (
+        nextEpoch === curEpoch &&
         curTs === nextTs &&
         current.value === next.value &&
         current.quality === next.quality &&
         current.sourceTime === next.sourceTime &&
-        current.reasonCode === next.reasonCode
+        current.reasonCode === next.reasonCode &&
+        current.lastValueChangedAt === next.lastValueChangedAt &&
+        current.sourceHealth === next.sourceHealth &&
+        current.connectionHealth === next.connectionHealth &&
+        current.brokerHealth === next.brokerHealth &&
+        current.storageHealth === next.storageHealth &&
+        current.staleAfterMs === next.staleAfterMs
       ) {
         return false
       }
@@ -502,21 +545,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       if (!live) return meta
       const value = live.value as SignalItem['value']
-      // Same rule as the Center (max(2 x interval, 12 s) since received_time), so a source that stopped
-      // pushing is shown Stale before the next server reconciliation.
-      const staleAfter = Math.max(2 * (meta.expectedIntervalMs || 1000), 12000)
-      const receivedTs = timeOf(live.receivedTime)
-      const quality = live.quality === 'GOOD' && receivedTs && now - receivedTs > staleAfter ? 'STALE' : live.quality
+      // Same rule as the Center (max(2 x interval, 12 s) since last_acquired_at), adjusted by
+      // server clock offset so staleness transitions match server evaluation without browser clock skew.
+      const staleAfter = live.staleAfterMs || Math.max(2 * (meta.expectedIntervalMs || 1000), 12000)
+      const acquiredTime = live.lastAcquiredAt || live.receivedTime
+      const acquiredTs = timeOf(acquiredTime)
+      const approxNow = now + serverOffsetMsRef.current
+      const becameStale = live.quality === 'GOOD' && acquiredTs > 0 && approxNow - acquiredTs > staleAfter
+      const quality = becameStale ? 'STALE' : live.quality
+      const reasonCode = becameStale ? 'NO_FRESH_ACQUISITION' : live.reasonCode || undefined
       return {
         ...meta,
         value: value == null ? null : value,
         currentValue: value == null ? '—' : value,
         quality,
-        reasonCode: live.reasonCode || undefined,
-        qualityReason: live.reasonCode || undefined,
-        lastUpdated: live.receivedTime,
-        receivedTime: live.receivedTime,
+        reasonCode,
+        qualityReason: reasonCode,
+        lastUpdated: acquiredTime,
+        receivedTime: live.receivedTime || acquiredTime,
+        lastAcquiredAt: acquiredTime || undefined,
+        lastValueChangedAt: live.lastValueChangedAt,
         sourceTime: live.sourceTime,
+        evaluatedAt: live.evaluatedAt,
+        staleAfterMs: staleAfter,
+        dataEpoch: live.dataEpoch,
+        sourceHealth: becameStale ? 'STALE' : live.sourceHealth,
+        connectionHealth: live.connectionHealth,
+        brokerHealth: live.brokerHealth,
+        storageHealth: live.storageHealth,
       }
     })
   }, [signalMeta, liveTick, clockTick, connectivityLost, connections])
@@ -720,13 +776,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       reportApiSuccess()
       const id = text(msg.signal_id)
       const current = liveRef.current.get(id)
+      const acquired = text(msg.last_acquired_at || msg.received_time) || new Date().toISOString()
       const next: LiveState = {
         value: msg.value === undefined ? null : msg.value,
         quality: normalizeQuality(msg.effective_status ?? msg.quality),
         reasonCode: text(msg.reason_code),
         // Older servers do not send received_time: treat the push as "now" so it is not discarded.
-        receivedTime: text(msg.received_time) || new Date().toISOString(),
+        receivedTime: text(msg.received_time) || acquired,
+        lastAcquiredAt: acquired,
+        lastValueChangedAt:
+          msg.last_value_changed_at != null
+            ? text(msg.last_value_changed_at) || undefined
+            : current?.lastValueChangedAt,
         sourceTime: msg.source_time !== undefined ? text(msg.source_time) : current?.sourceTime || '',
+        evaluatedAt: msg.evaluated_at ? text(msg.evaluated_at) : current?.evaluatedAt,
+        staleAfterMs: optNumber(msg.stale_after_ms) ?? current?.staleAfterMs,
+        dataEpoch: optNumber(msg.data_epoch) ?? current?.dataEpoch,
+        sourceHealth: msg.source_health ? text(msg.source_health) : current?.sourceHealth,
+        connectionHealth: msg.connection_health ? text(msg.connection_health) : current?.connectionHealth,
+        brokerHealth: msg.broker_health ? text(msg.broker_health) : current?.brokerHealth,
+        storageHealth: msg.storage_health ? text(msg.storage_health) : current?.storageHealth,
       }
       if (applyLive(id, next)) scheduleLiveFlush()
     }

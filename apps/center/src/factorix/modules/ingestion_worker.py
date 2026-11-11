@@ -32,6 +32,8 @@ from factorix.domain.formula import FormulaError, bind, evaluate, output_quality
 from factorix.domain.health import NO_DATA_PREFIX, effective_connection_health
 from factorix.domain.observation import ObservationError, resolve_times
 from factorix.domain.quality import Origin, Quality
+from factorix.modules.common import iso_ms
+from factorix.modules.live_state import TDengineLiveStateProvider
 from factorix.modules.providers import LiveSignalRecord, RecordingDecision, RecordingPolicyEvaluator
 from factorix.modules.recording_policy import (
     DefaultRecordingPolicyEvaluator,
@@ -137,11 +139,14 @@ class LatencyHistogram:
         self._acq_to_commit_ms: list[float] = []
         self._ingest_to_commit_ms: list[float] = []
         self._events: dict[UUID, list[float]] = {}
+        self._conn_events: dict[UUID, list[float]] = {}
 
-    def record(self, tenant_id: UUID, sli: LatencySLIs) -> None:
+    def record(self, tenant_id: UUID, sli: LatencySLIs, *, connection_id: UUID | None = None) -> None:
         now = time.monotonic()
         bucket = self._events.setdefault(tenant_id, [])
         bucket.append(now)
+        if connection_id is not None:
+            self._conn_events.setdefault(connection_id, []).append(now)
         if sli.acquisition_to_commit_ms is not None:
             self._acq_to_commit_ms.append(sli.acquisition_to_commit_ms)
             if len(self._acq_to_commit_ms) > self.max_samples:
@@ -161,6 +166,18 @@ class LatencyHistogram:
                 out[str(tid)] = len(recent)
             else:
                 self._events.pop(tid, None)
+        return out
+
+    def connection_rates_per_min(self) -> dict[str, int]:
+        cutoff = time.monotonic() - 60.0
+        out: dict[str, int] = {}
+        for cid in list(self._conn_events):
+            recent = [t for t in self._conn_events[cid] if t >= cutoff]
+            if recent:
+                self._conn_events[cid] = recent
+                out[str(cid)] = len(recent)
+            else:
+                self._conn_events.pop(cid, None)
         return out
 
     @staticmethod
@@ -733,7 +750,7 @@ class PgIngestionStore:
                                    COALESCE(NULLIF(latest_signal_state.event_uid, ''), latest_signal_state.observation_id::text)
                                )
                            )
-                        RETURNING signal_id
+                        RETURNING signal_id, last_acquired_at, last_value_changed_at, data_epoch
                         """,
                         tenant_id,
                         now,
@@ -757,7 +774,10 @@ class PgIngestionStore:
                         goods,
                         good_times,
                     )
-                    replaced_signals = {UUID(str(r["signal_id"])) for r in ret_rows}
+                    returned_rows = {UUID(str(r["signal_id"])): dict(r) for r in ret_rows}
+                    replaced_signals = set(returned_rows.keys())
+                else:
+                    returned_rows = {}
 
                 if live_connection_ids:
                     conn_rows = await conn.fetch(
@@ -821,11 +841,24 @@ class PgIngestionStore:
                         )
 
                 # Filter stream latest events to signals that actually advanced in latest_signal_state
-                to_notify = [
-                    ev
-                    for ev in stream_events
-                    if ev.get("kind") != "latest" or UUID(str(ev["signal_id"])) in replaced_signals
-                ] + health_events
+                to_notify: list[dict[str, Any]] = []
+                for ev in stream_events:
+                    if ev.get("kind") != "latest":
+                        to_notify.append(ev)
+                        continue
+                    sid = UUID(str(ev["signal_id"]))
+                    if sid not in replaced_signals:
+                        continue
+                    meta_row = returned_rows.get(sid) or {}
+                    payload = dict(ev.get("payload") or {})
+                    if meta_row.get("last_value_changed_at") is not None:
+                        payload["last_value_changed_at"] = iso_ms(meta_row["last_value_changed_at"])
+                    if meta_row.get("last_acquired_at") is not None:
+                        payload["last_acquired_at"] = iso_ms(meta_row["last_acquired_at"])
+                    if meta_row.get("data_epoch") is not None:
+                        payload["data_epoch"] = int(meta_row["data_epoch"])
+                    to_notify.append({**ev, "payload": payload})
+                to_notify.extend(health_events)
                 await _emit_chunked_notify(conn, NOTIFY_CHANNEL_STREAM, to_notify)
                 if health_events:
                     await _emit_chunked_notify(conn, NOTIFY_CHANNEL_HEALTH, health_events)
@@ -992,6 +1025,7 @@ class IngestionWorker:
         flush_ms: int = 20,
         shadow_pg: bool = False,
         recording_evaluator: RecordingPolicyEvaluator | None = None,
+        live_provider: TDengineLiveStateProvider | None = None,
         db_dsn_for_notify: str | None = None,
     ) -> None:
         self.pg = pg_store
@@ -1003,6 +1037,9 @@ class IngestionWorker:
         self.shadow_pg = bool(shadow_pg)
         self.recording_evaluator: RecordingPolicyEvaluator = (
             recording_evaluator if recording_evaluator is not None else DefaultRecordingPolicyEvaluator()
+        )
+        self.live_provider: TDengineLiveStateProvider = (
+            live_provider if live_provider is not None else TDengineLiveStateProvider(tdengine)
         )
         self._notify_dsn = to_asyncpg_dsn(db_dsn_for_notify) if db_dsn_for_notify else None
 
@@ -1033,16 +1070,21 @@ class IngestionWorker:
         if tenant_id is None:
             self._catalogs.clear()
             self._live_cache.clear()
-            if epoch_changed and hasattr(self.recording_evaluator, "invalidate_tenant"):
-                self.recording_evaluator.invalidate_tenant(None)
+            if epoch_changed:
+                if hasattr(self.recording_evaluator, "invalidate_tenant"):
+                    self.recording_evaluator.invalidate_tenant(None)
+                self.live_provider.invalidate_epoch_sync(None, 1)
             return
         cat = self._catalogs.get(tenant_id)
         if cat is not None:
             cat.loaded_at = 0.0
             cat.epoch_loaded_at = 0.0
         self._live_cache.pop(tenant_id, None)
-        if epoch_changed and hasattr(self.recording_evaluator, "invalidate_tenant"):
-            self.recording_evaluator.invalidate_tenant(tenant_id)
+        if epoch_changed:
+            if hasattr(self.recording_evaluator, "invalidate_tenant"):
+                self.recording_evaluator.invalidate_tenant(tenant_id)
+            next_ep = (cat.active_epoch + 1) if cat is not None else 1
+            self.live_provider.invalidate_epoch_sync(tenant_id, next_ep)
 
     async def start(self) -> None:
         self._stopping = False
@@ -1226,6 +1268,9 @@ class IngestionWorker:
                     self._live_cache.pop(tenant_id, None)
                     if hasattr(self.recording_evaluator, "invalidate_tenant"):
                         self.recording_evaluator.invalidate_tenant(tenant_id)
+                    await self.live_provider.invalidate_epoch(tenant_id, cat.active_epoch)
+                else:
+                    self.live_provider.set_active_epoch(tenant_id, cat.active_epoch)
                 self._catalogs[tenant_id] = cat
                 return cat
             cat = prev_cat
@@ -1236,6 +1281,7 @@ class IngestionWorker:
                     self._live_cache.pop(tenant_id, None)
                     if hasattr(self.recording_evaluator, "invalidate_tenant"):
                         self.recording_evaluator.invalidate_tenant(tenant_id)
+                    await self.live_provider.invalidate_epoch(tenant_id, epoch)
                 cat.active_epoch = epoch
                 cat.lifecycle_state = state
                 cat.epoch_loaded_at = now_mono
@@ -1247,6 +1293,7 @@ class IngestionWorker:
                         self._live_cache.pop(tenant_id, None)
                         if hasattr(self.recording_evaluator, "invalidate_tenant"):
                             self.recording_evaluator.invalidate_tenant(tenant_id)
+                        await self.live_provider.invalidate_epoch(tenant_id, cat.active_epoch)
                     cat.last_miss_refresh_at = now_mono
                     self._catalogs[tenant_id] = cat
             return cat
@@ -2038,25 +2085,51 @@ class IngestionWorker:
 
         now_commit = _utcnow()
         latest_list = list(newest_map.values())
-        stream_events = [
-            {
-                "kind": "latest",
-                "tenant_id": str(tenant_id),
-                "signal_id": str(r["signal_id"]),
-                "payload": latest_stream_payload(
-                    signal_id=r["signal_id"],
-                    value=r["value"],
-                    quality=r["quality"],
-                    reason=r["reason_code"],
-                    received_time=r["received_time"],
-                    source_time=r["source_time"],
-                    expected_interval_ms=r.get("expected_interval_ms"),
-                    null_allowed=bool(r.get("nullable")),
-                    now=now_commit,
-                ),
-            }
-            for r in latest_list
-        ]
+        t_cache_preview = self._live_cache.get(tenant_id, {})
+        stream_events = []
+        for r in latest_list:
+            prev_rec_preview = t_cache_preview.get(r["signal_id"])
+            preview_changed = (
+                prev_rec_preview is None
+                or prev_rec_preview.data_epoch != int(r["data_epoch"])
+                or prev_rec_preview.value != r["value"]
+                or prev_rec_preview.raw_quality != r["quality"]
+                or (prev_rec_preview.reason_code or "") != (r["reason_code"] or "")
+            )
+            preview_changed_at = (
+                r["event_time"]
+                if preview_changed
+                else (prev_rec_preview.last_value_changed_at or prev_rec_preview.event_time)  # type: ignore[union-attr]
+            )
+            stream_events.append(
+                {
+                    "kind": "latest",
+                    "tenant_id": str(tenant_id),
+                    "signal_id": str(r["signal_id"]),
+                    "resource_id": str(r["resource_id"]),
+                    "value_type": str(r["value_type"]),
+                    "unit": r.get("unit"),
+                    "event_uid": r.get("event_uid"),
+                    "source_sequence": r.get("source_sequence"),
+                    "config_revision": int(r.get("config_revision") or 1),
+                    "origin": str(r.get("origin") or "LIVE"),
+                    "payload": latest_stream_payload(
+                        signal_id=r["signal_id"],
+                        value=r["value"],
+                        quality=r["quality"],
+                        reason=r["reason_code"],
+                        received_time=r["received_time"],
+                        source_time=r["source_time"],
+                        expected_interval_ms=r.get("expected_interval_ms"),
+                        null_allowed=bool(r.get("nullable")),
+                        now=now_commit,
+                        include_meta=True,
+                        data_epoch=int(r["data_epoch"]),
+                        last_acquired_at=r["last_acquired_at"],
+                        last_value_changed_at=preview_changed_at,
+                    ),
+                }
+            )
 
         try:
             replaced_signals, _health_events = await self._retry_pg_op(
@@ -2121,6 +2194,26 @@ class IngestionWorker:
                 updated_at=now_commit,
             )
 
+        # Feed committed observations & calculated outputs into LiveStateProvider in causal order
+        ordered_for_live = sorted(
+            committed_items,
+            key=lambda item: (
+                item[1].obs.data_epoch,
+                item[1].received_time,
+                item[1].obs.source_sequence if item[1].obs.source_sequence is not None else -1,
+                item[1].obs.event_uid,
+            ),
+        )
+        for _env, prep in ordered_for_live:
+            await self.live_provider.apply_observation(
+                prep.obs,
+                expected_interval_ms=prep.owned.get("expected_interval_ms"),
+                null_allowed=bool(prep.owned.get("nullable")),
+            )
+        for crec in calc_td:
+            calc_obs = self._build_calc_obs(tenant_id, crec)
+            await self.live_provider.apply_observation(calc_obs)
+
         committed_at = _utcnow()
         for env, prep in committed_items:
             self.recent_uids.mark((tenant_id, prep.obs.event_uid))
@@ -2129,7 +2222,9 @@ class IngestionWorker:
                 ingested_at=prep.ingested_at,
                 committed_at=committed_at,
             )
-            self.hist.record(tenant_id, sli)
+            conn_raw = prep.owned.get("connection_id")
+            conn_uuid = conn_raw if isinstance(conn_raw, UUID) else (UUID(str(conn_raw)) if conn_raw else None)
+            self.hist.record(tenant_id, sli, connection_id=conn_uuid)
             self.metrics.acked_total += 1
             if not env.future.done():
                 env.future.set_result(ConsumeOutcome.ACK)
@@ -2387,10 +2482,12 @@ class IngestionWorker:
                     td_ok = False
                 broker_ok = bool(self._consumer is not None)
                 rates = self.hist.tenant_rates_per_min()
+                conn_rates = self.hist.connection_rates_per_min()
                 slis = self.hist.snapshot()
                 self._sync_policy_metrics()
                 queues_json = {
                     "tenant_rates": rates,
+                    "conn_rates": conn_rates,
                     "acked_total": self.metrics.acked_total,
                     "dlq_total": self.metrics.dlq_total,
                     "retried_total": self.metrics.retried_total,

@@ -547,8 +547,8 @@ export const SignalsCatalogPage: React.FC = () => {
           s.value,
           s.unit || '',
           normalizeQuality(s.quality),
-          s.receivedTime || s.lastUpdated || '',
-          s.sourceTime || '',
+          s.lastAcquiredAt || s.receivedTime || s.lastUpdated || '',
+          s.lastValueChangedAt || s.sourceTime || '',
         ].map(cell);
       }),
     ];
@@ -956,10 +956,10 @@ export const SignalsCatalogPage: React.FC = () => {
                         <StatusBadge status={sig.quality || 'NO_DATA'} />
                         <span
                           className="text-[#657794] font-mono text-[10px] text-right"
-                          title={`Last read ${formatTimestamp(sig.receivedTime || sig.lastUpdated)} · Last change ${formatTimestamp(sig.sourceTime)}`}
+                          title={`Last read ${formatTimestamp(sig.lastAcquiredAt || sig.receivedTime || sig.lastUpdated)} · Last change ${formatTimestamp(sig.lastValueChangedAt || sig.sourceTime)}`}
                         >
-                          read {timeAgo(sig.receivedTime || sig.lastUpdated)}
-                          {sig.sourceTime ? ` · changed ${timeAgo(sig.sourceTime)}` : ''}
+                          read {timeAgo(sig.lastAcquiredAt || sig.receivedTime || sig.lastUpdated)}
+                          {(sig.lastValueChangedAt || sig.sourceTime) ? ` · changed ${timeAgo(sig.lastValueChangedAt || sig.sourceTime)}` : ''}
                         </span>
                       </div>
                     </div>
@@ -1079,15 +1079,15 @@ export const SignalsCatalogPage: React.FC = () => {
                             </td>
                             <td
                               className="py-2.5 px-3 text-right text-[#657794] font-mono text-[11px] whitespace-nowrap"
-                              title={formatTimestamp(sig.receivedTime || sig.lastUpdated)}
+                              title={formatTimestamp(sig.lastAcquiredAt || sig.receivedTime || sig.lastUpdated)}
                             >
-                              {timeAgo(sig.receivedTime || sig.lastUpdated)}
+                              {timeAgo(sig.lastAcquiredAt || sig.receivedTime || sig.lastUpdated)}
                             </td>
                             <td
                               className="py-2.5 px-3 text-right text-[#657794] font-mono text-[11px] whitespace-nowrap"
-                              title={formatTimestamp(sig.sourceTime)}
+                              title={formatTimestamp(sig.lastValueChangedAt || sig.sourceTime)}
                             >
-                              {sig.sourceTime ? timeAgo(sig.sourceTime) : '—'}
+                              {(sig.lastValueChangedAt || sig.sourceTime) ? timeAgo(sig.lastValueChangedAt || sig.sourceTime) : '—'}
                             </td>
                           </tr>
                         );
