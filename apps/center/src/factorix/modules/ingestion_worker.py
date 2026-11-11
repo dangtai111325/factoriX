@@ -33,16 +33,25 @@ from factorix.domain.health import NO_DATA_PREFIX, effective_connection_health
 from factorix.domain.observation import ObservationError, resolve_times
 from factorix.domain.quality import Origin, Quality
 from factorix.modules.providers import LiveSignalRecord, RecordingDecision, RecordingPolicyEvaluator
+from factorix.modules.recording_policy import (
+    DefaultRecordingPolicyEvaluator,
+    ManagedBindingTarget,
+    ManagedSubtableWrite,
+    build_managed_target_from_row,
+)
 from factorix.modules.telemetry import RejectionThrottle, connection_health_payload, latest_stream_payload, select_binding
 from factorix.platform.broker import BrokerConfig, ConsumeOutcome, RabbitMQConsumer
 from factorix.platform.tdengine import (
     BatchWriteFailure,
     BatchWriteResult,
+    SubtableWriteItem,
     TDEngineClient,
     TDEngineError,
     op_stable_for_type,
     op_subtable_name,
     tenant_database_name,
+    to_td_timestamp_us,
+    to_utc_datetime,
 )
 
 logger = logging.getLogger(__name__)
@@ -186,6 +195,11 @@ class WorkerMetrics:
     tdengine_permanent_errors: int = 0
     pg_retryable_errors: int = 0
     formula_writes: int = 0
+    managed_writes: int = 0
+    managed_checkpoints: int = 0
+    managed_gap_markers: int = 0
+    managed_write_errors: int = 0
+    managed_skips_by_reason: dict[str, int] = field(default_factory=dict)
     batches_committed: int = 0
     last_commit_at: datetime | None = None
     last_error: str | None = None
@@ -200,6 +214,9 @@ class TenantCatalog:
     formula_inputs: set[UUID] = field(default_factory=set)
     formulas_by_dep: dict[UUID, list[dict[str, Any]]] = field(default_factory=dict)
     formula_aliases: dict[UUID, list[dict[str, Any]]] = field(default_factory=dict)
+    managed_targets_by_signal: dict[UUID, list[ManagedBindingTarget]] = field(default_factory=dict)
+    managed_targets_by_model: dict[tuple[UUID, str], list[ManagedBindingTarget]] = field(default_factory=dict)
+    all_managed_targets: tuple[ManagedBindingTarget, ...] = ()
     loaded_at: float = 0.0
     epoch_loaded_at: float = 0.0
     last_miss_refresh_at: float = 0.0
@@ -376,6 +393,79 @@ class PgIngestionStore:
                         fid = UUID(str(r["formula_id"]))
                         formula_aliases.setdefault(fid, []).append(dict(r))
 
+                managed_rows = await conn.fetch(
+                    """
+                    SELECT d.id AS design_id,
+                           d.status AS design_status,
+                           ds.id AS dataset_id,
+                           ds.dataset_key,
+                           ds.semantics,
+                           ds.time_axis,
+                           ds.tags_json,
+                           ds.status AS dataset_status,
+                           fb.field_key,
+                           fb.value_type,
+                           fb.max_length,
+                           fb.source_kind AS field_source_kind,
+                           fb.signal_id,
+                           fb.model_id,
+                           fb.model_field_path,
+                           fb.resource_id,
+                           fb.source_revision,
+                           fb.transform_json,
+                           fb.nullable,
+                           fb.required,
+                           COALESCE(rp.mode, 'ON_CHANGE') AS recording_mode,
+                           COALESCE(rp.policy_json, '{}'::jsonb) AS policy_json,
+                           COALESCE(rp.version, 1) AS policy_version,
+                           COALESCE(rp.enabled, TRUE) AS policy_enabled,
+                           pr.design_version_id,
+                           pr.td_database,
+                           pr.td_stable,
+                           pr.td_subtable,
+                           pr.series_key AS registry_series_key,
+                           pr.status AS registry_status
+                    FROM storage_datasets ds
+                    JOIN storage_designs d ON d.id = ds.design_id
+                    JOIN storage_field_bindings fb ON fb.dataset_id = ds.id
+                    LEFT JOIN storage_recording_policies rp ON rp.dataset_id = ds.id
+                    JOIN storage_physical_registry pr
+                      ON pr.tenant_id = ds.tenant_id
+                     AND pr.tier = 'MANAGED'
+                     AND pr.dataset_id = ds.id
+                     AND (
+                          (fb.signal_id IS NOT NULL AND pr.series_key IN (
+                              concat(CAST(ds.id AS text), ':sig:', lower(CAST(fb.signal_id AS text))),
+                              concat(CAST(d.id AS text), ':sig:', lower(CAST(fb.signal_id AS text)))
+                          ))
+                          OR (fb.model_id IS NOT NULL AND pr.series_key IN (
+                              concat(CAST(ds.id AS text), ':mod:', lower(CAST(fb.model_id AS text)), ':', COALESCE(NULLIF(fb.model_field_path, ''), fb.field_key)),
+                              concat(CAST(d.id AS text), ':mod:', lower(CAST(fb.model_id AS text)), ':', COALESCE(NULLIF(fb.model_field_path, ''), fb.field_key))
+                          ))
+                          OR (fb.signal_id IS NULL AND fb.model_id IS NULL AND pr.series_key IN (
+                              concat(CAST(ds.id AS text), ':fld:', ds.dataset_key, ':', fb.field_key),
+                              concat(CAST(d.id AS text), ':fld:', ds.dataset_key, ':', fb.field_key)
+                          ))
+                     )
+                    WHERE ds.tenant_id = $1
+                      AND d.status IN ('RUNNING', 'PAUSED')
+                      AND ds.status IN ('RUNNING', 'PAUSED')
+                      AND pr.status IN ('ACTIVE', 'PAUSED')
+                    ORDER BY ds.id, fb.ordinal, fb.field_key
+                    """,
+                    tenant_id,
+                )
+                managed_by_signal: dict[UUID, list[ManagedBindingTarget]] = {}
+                managed_by_model: dict[tuple[UUID, str], list[ManagedBindingTarget]] = {}
+                all_managed: list[ManagedBindingTarget] = []
+                for r in managed_rows:
+                    target = build_managed_target_from_row(dict(r))
+                    all_managed.append(target)
+                    if target.signal_id is not None:
+                        managed_by_signal.setdefault(target.signal_id, []).append(target)
+                    if target.model_id is not None and target.model_field_path:
+                        managed_by_model.setdefault((target.model_id, target.model_field_path), []).append(target)
+
         return TenantCatalog(
             tenant_id=tenant_id,
             active_epoch=active_epoch,
@@ -384,6 +474,9 @@ class PgIngestionStore:
             formula_inputs=formula_inputs,
             formulas_by_dep=formulas_by_dep,
             formula_aliases=formula_aliases,
+            managed_targets_by_signal=managed_by_signal,
+            managed_targets_by_model=managed_by_model,
+            all_managed_targets=tuple(all_managed),
             loaded_at=now_mono,
             epoch_loaded_at=now_mono,
             last_miss_refresh_at=0.0,
@@ -471,6 +564,54 @@ class PgIngestionStore:
                 "quality": str(r["quality"]),
                 "received_time": r["received_time"],
             }
+        return out
+
+    async def fetch_latest_states_for_eval(
+        self, tenant_id: UUID, signal_ids: Sequence[UUID]
+    ) -> dict[UUID, LiveSignalRecord]:
+        if self._pool is None or not signal_ids:
+            return {}
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT tenant_id, signal_id, resource_id, observation_id, event_uid, data_epoch,
+                       value_type, value_json, unit, quality, reason_code,
+                       event_time, last_acquired_at, last_value_changed_at, source_time,
+                       config_revision, origin, last_good_value_json, last_good_event_time,
+                       updated_at, received_time
+                FROM latest_signal_state
+                WHERE tenant_id = $1 AND signal_id = ANY($2::uuid[])
+                """,
+                tenant_id,
+                list(signal_ids),
+            )
+        out: dict[UUID, LiveSignalRecord] = {}
+        for r in rows:
+            sid = UUID(str(r["signal_id"]))
+            vj = _json_val(r["value_json"])
+            gv = _json_val(r["last_good_value_json"])
+            out[sid] = LiveSignalRecord(
+                tenant_id=UUID(str(r["tenant_id"])),
+                signal_id=sid,
+                resource_id=UUID(str(r["resource_id"])),
+                observation_id=UUID(str(r["observation_id"])) if r.get("observation_id") else None,
+                event_uid=str(r["event_uid"]) if r.get("event_uid") else None,
+                data_epoch=int(r.get("data_epoch") or 1),
+                value_type=str(r["value_type"]),
+                value=vj.get("v") if isinstance(vj, dict) else None,
+                unit=r.get("unit"),
+                raw_quality=str(r["quality"]),
+                reason_code=r.get("reason_code"),
+                event_time=r["event_time"],
+                last_acquired_at=r.get("last_acquired_at") or r["received_time"],
+                last_value_changed_at=r.get("last_value_changed_at") or r["event_time"],
+                source_time=r.get("source_time"),
+                config_revision=int(r.get("config_revision") or 1),
+                origin=str(r.get("origin") or "LIVE"),
+                last_good_value=gv.get("v") if isinstance(gv, dict) else None,
+                last_good_at=r.get("last_good_event_time"),
+                updated_at=r.get("updated_at"),
+            )
         return out
 
     async def commit_batch_metadata(
@@ -860,7 +1001,9 @@ class IngestionWorker:
         self.batch_size = max(1, min(1000, int(batch_size)))
         self.flush_interval_s = max(0.002, int(flush_ms) / 1000.0)
         self.shadow_pg = bool(shadow_pg)
-        self.recording_evaluator = recording_evaluator
+        self.recording_evaluator: RecordingPolicyEvaluator = (
+            recording_evaluator if recording_evaluator is not None else DefaultRecordingPolicyEvaluator()
+        )
         self._notify_dsn = to_asyncpg_dsn(db_dsn_for_notify) if db_dsn_for_notify else None
 
         self.metrics = WorkerMetrics()
@@ -870,6 +1013,8 @@ class IngestionWorker:
 
         self._catalogs: dict[UUID, TenantCatalog] = {}
         self._catalog_locks: dict[UUID, asyncio.Lock] = {}
+        self._eval_locks: dict[UUID, asyncio.Lock] = {}
+        self._live_cache: dict[UUID, dict[UUID, LiveSignalRecord]] = {}
         self._ensured_tenants: set[UUID] = set()
         self._consumer: RabbitMQConsumer | None = None
 
@@ -884,14 +1029,20 @@ class IngestionWorker:
         self._notify_task: asyncio.Task[None] | None = None
         self._notify_conn: asyncpg.Connection | None = None
 
-    def invalidate_tenant_cache(self, tenant_id: UUID | None = None) -> None:
+    def invalidate_tenant_cache(self, tenant_id: UUID | None = None, *, epoch_changed: bool = False) -> None:
         if tenant_id is None:
             self._catalogs.clear()
+            self._live_cache.clear()
+            if epoch_changed and hasattr(self.recording_evaluator, "invalidate_tenant"):
+                self.recording_evaluator.invalidate_tenant(None)
             return
         cat = self._catalogs.get(tenant_id)
         if cat is not None:
             cat.loaded_at = 0.0
             cat.epoch_loaded_at = 0.0
+        self._live_cache.pop(tenant_id, None)
+        if epoch_changed and hasattr(self.recording_evaluator, "invalidate_tenant"):
+            self.recording_evaluator.invalidate_tenant(tenant_id)
 
     async def start(self) -> None:
         self._stopping = False
@@ -1066,19 +1217,36 @@ class IngestionWorker:
         lock = self._catalog_locks.setdefault(tenant_id, asyncio.Lock())
         async with lock:
             now_mono = time.monotonic()
-            cat = self._catalogs.get(tenant_id)
-            if cat is None or cat.loaded_at <= 0.0 or (now_mono - cat.loaded_at) > 30.0:
+            prev_cat = self._catalogs.get(tenant_id)
+            prev_epoch = prev_cat.active_epoch if prev_cat is not None else None
+            if prev_cat is None or prev_cat.loaded_at <= 0.0 or (now_mono - prev_cat.loaded_at) > 30.0:
                 cat = await self._retry_pg_op(lambda: self.pg.load_tenant_catalog(tenant_id))
+                if prev_epoch is not None and cat.active_epoch > prev_epoch:
+                    self.recent_uids.clear_tenant(tenant_id)
+                    self._live_cache.pop(tenant_id, None)
+                    if hasattr(self.recording_evaluator, "invalidate_tenant"):
+                        self.recording_evaluator.invalidate_tenant(tenant_id)
                 self._catalogs[tenant_id] = cat
                 return cat
+            cat = prev_cat
             if cat.epoch_loaded_at <= 0.0 or (now_mono - cat.epoch_loaded_at) > 2.0:
                 epoch, state = await self._retry_pg_op(lambda: self.pg.fetch_tenant_epoch(tenant_id))
+                if epoch > cat.active_epoch:
+                    self.recent_uids.clear_tenant(tenant_id)
+                    self._live_cache.pop(tenant_id, None)
+                    if hasattr(self.recording_evaluator, "invalidate_tenant"):
+                        self.recording_evaluator.invalidate_tenant(tenant_id)
                 cat.active_epoch = epoch
                 cat.lifecycle_state = state
                 cat.epoch_loaded_at = now_mono
             if need_signal is not None and need_signal not in cat.bindings:
                 if (now_mono - cat.last_miss_refresh_at) >= 2.0:
                     cat = await self._retry_pg_op(lambda: self.pg.load_tenant_catalog(tenant_id))
+                    if prev_epoch is not None and cat.active_epoch > prev_epoch:
+                        self.recent_uids.clear_tenant(tenant_id)
+                        self._live_cache.pop(tenant_id, None)
+                        if hasattr(self.recording_evaluator, "invalidate_tenant"):
+                            self.recording_evaluator.invalidate_tenant(tenant_id)
                     cat.last_miss_refresh_at = now_mono
                     self._catalogs[tenant_id] = cat
             return cat
@@ -1401,6 +1569,203 @@ class IngestionWorker:
             return True
         return False
 
+    async def _hydrate_previous_live(
+        self, tenant_id: UUID, signal_ids: Sequence[UUID]
+    ) -> dict[UUID, LiveSignalRecord]:
+        t_cache = self._live_cache.setdefault(tenant_id, {})
+        missing = [sid for sid in dict.fromkeys(signal_ids) if sid not in t_cache]
+        if missing and hasattr(self.pg, "fetch_latest_states_for_eval"):
+            try:
+                loaded = await self._retry_pg_op(
+                    lambda: self.pg.fetch_latest_states_for_eval(tenant_id, missing)
+                )
+                t_cache.update(loaded)
+            except _WorkerStoppingRetry:
+                raise
+        return {sid: t_cache[sid] for sid in signal_ids if sid in t_cache}
+
+    async def _hydrate_managed_states(
+        self,
+        tenant_id: UUID,
+        cat: TenantCatalog,
+        targets: Sequence[ManagedBindingTarget],
+    ) -> bool:
+        """Hydrate missing per-series Managed states from TDengine ``LAST_ROW`` on cold start.
+
+        Returns ``True`` if aborted cleanly due to worker shutdown.
+        """
+        if not isinstance(self.recording_evaluator, DefaultRecordingPolicyEvaluator):
+            return False
+        if not hasattr(self.td, "query_last_row"):
+            return False
+
+        deduped: dict[tuple[UUID, str], ManagedBindingTarget] = {}
+        for t in targets:
+            deduped.setdefault((t.dataset_id, t.series_key), t)
+
+        need = [
+            t
+            for t in deduped.values()
+            if not self.recording_evaluator.has_series_state(tenant_id, t.dataset_id, t.series_key)
+        ]
+        for target in need:
+            delay = 0.25
+            while True:
+                try:
+                    row = await self.td.query_last_row(target.td_database, target.td_subtable)
+                except TDEngineError as exc:
+                    low = exc.message.lower()
+                    if any(tok in low for tok in ("not exist", "doesn't exist", "does not exist")):
+                        row = None
+                    elif exc.retryable:
+                        self.metrics.tdengine_retryable_errors += 1
+                        self.metrics.last_error = f"TDengine Managed hydration unavailable: {exc.message}"[:300]
+                        if self._stopping:
+                            return True
+                        try:
+                            await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                            return True
+                        except asyncio.TimeoutError:
+                            pass
+                        delay = min(5.0, delay * 2.0)
+                        continue
+                    else:
+                        logger.warning(
+                            "Non-retryable Managed LAST_ROW error for %s.%s: %s",
+                            target.td_database,
+                            target.td_subtable,
+                            exc.message,
+                        )
+                        row = None
+                self.recording_evaluator.seed_series_state_from_row(
+                    tenant_id,
+                    target,
+                    row,
+                    active_epoch=cat.active_epoch,
+                )
+                break
+        return False
+
+    async def _write_managed_td_with_retry(
+        self,
+        tenant_id: UUID,
+        writes: Sequence[ManagedSubtableWrite],
+    ) -> tuple[set[str], dict[str, BatchWriteFailure], bool]:
+        """Write Managed dataset rows cleanly via ``TDEngineClient.write_batch`` with retry isolation."""
+        if not writes or not hasattr(self.td, "write_batch"):
+            return set(), {}, False
+
+        seen_ts: dict[tuple[str, str], dict[int, str]] = {}
+        by_db: dict[str, list[SubtableWriteItem]] = {}
+        for w in writes:
+            sub_key = (w.target.td_database, w.target.td_subtable)
+            sub_seen = seen_ts.setdefault(sub_key, {})
+            ts_us = to_td_timestamp_us(w.ts)
+            while ts_us in sub_seen and sub_seen[ts_us] != w.event_uid:
+                ts_us += 1
+            sub_seen[ts_us] = w.event_uid
+            item = w.to_subtable_item(ts_override=to_utc_datetime(ts_us))
+            by_db.setdefault(w.target.td_database, []).append(item)
+
+        succeeded_all: set[str] = set()
+        perm_failures: dict[str, BatchWriteFailure] = {}
+        for db_name, db_items in by_db.items():
+            pending = list(db_items)
+            delay = 0.25
+            while pending:
+                try:
+                    res: BatchWriteResult = await self.td.write_batch(db_name, pending)
+                except TDEngineError as exc:
+                    if not exc.retryable:
+                        self.metrics.managed_write_errors += len(pending)
+                        self.metrics.last_error = f"Managed TDengine write error: {exc.message}"[:300]
+                        for it in pending:
+                            perm_failures[it.item_id] = BatchWriteFailure(
+                                it.item_id,
+                                it.subtable,
+                                exc.code,
+                                exc.message,
+                                retryable=False,
+                            )
+                        break
+                    self.metrics.tdengine_retryable_errors += 1
+                    self.metrics.last_error = f"Managed TDengine unavailable: {exc.message}"[:300]
+                    if self._stopping:
+                        return succeeded_all, perm_failures, True
+                    try:
+                        await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                        return succeeded_all, perm_failures, True
+                    except asyncio.TimeoutError:
+                        pass
+                    delay = min(5.0, delay * 2.0)
+                    continue
+
+                succeeded_all.update(res.succeeded_ids)
+                retry_ids: set[str] = set()
+                for fail in res.failures:
+                    if fail.retryable:
+                        retry_ids.add(fail.item_id)
+                    else:
+                        self.metrics.managed_write_errors += 1
+                        self.metrics.last_error = f"Managed write rejected ({fail.code}): {fail.message}"[:300]
+                        perm_failures[fail.item_id] = fail
+
+                if not retry_ids:
+                    break
+                pending = [it for it in pending if it.item_id in retry_ids]
+                self.metrics.tdengine_retryable_errors += len(pending)
+                if self._stopping:
+                    return succeeded_all, perm_failures, True
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                    return succeeded_all, perm_failures, True
+                except asyncio.TimeoutError:
+                    pass
+                delay = min(5.0, delay * 2.0)
+
+        return succeeded_all, perm_failures, False
+
+    @staticmethod
+    def _build_calc_obs(tenant_id: UUID, rec: Mapping[str, Any]) -> CanonicalObservation:
+        vtype = str(rec.get("value_type") or "float64")
+        val = rec.get("value")
+        qual_str = str(rec.get("raw_quality") or "GOOD").upper()
+        reason = str(rec["reason_code"]) if rec.get("reason_code") else None
+        if vtype == "float64" and isinstance(val, (int, float)) and not isinstance(val, bool):
+            fval = float(val)
+            if not math.isfinite(fval):
+                val = None
+                qual_str = "BAD"
+                reason = reason or "NON_FINITE"
+        return CanonicalObservation(
+            event_uid=str(rec["event_uid"]),
+            tenant_id=tenant_id,
+            site_id=None,
+            connection_id=None,
+            acquisition_job_id=None,
+            source_field_id=None,
+            signal_id=UUID(str(rec["signal_id"])),
+            resource_id=UUID(str(rec["resource_id"])),
+            source_time=rec.get("source_time"),
+            acquired_at=rec["acquired_at"],
+            value_type=vtype,
+            value=val,
+            unit=rec.get("unit"),
+            quality=Quality(qual_str),
+            quality_reason=reason,
+            origin=Origin.CALCULATED,
+            data_epoch=int(rec.get("data_epoch") or 1),
+            config_revision=max(1, int(rec.get("config_revision") or 1)),
+            source_sequence=None,
+        )
+
+    def _sync_policy_metrics(self) -> None:
+        if isinstance(self.recording_evaluator, DefaultRecordingPolicyEvaluator):
+            pm = self.recording_evaluator.metrics
+            self.metrics.managed_checkpoints = pm.managed_checkpoints
+            self.metrics.managed_gap_markers = pm.managed_gap_markers
+            self.metrics.managed_skips_by_reason = dict(pm.managed_skipped_by_reason)
+
     async def _persist_tenant_batch(
         self,
         tenant_id: UUID,
@@ -1428,14 +1793,30 @@ class IngestionWorker:
         if not still_items:
             return
 
+        is_default_eval = isinstance(self.recording_evaluator, DefaultRecordingPolicyEvaluator)
+        custom_prev_live: dict[UUID, LiveSignalRecord] = {}
+        if not is_default_eval:
+            try:
+                custom_prev_live = await self._hydrate_previous_live(
+                    tenant_id, [p.obs.signal_id for _, p in still_items]
+                )
+            except _WorkerStoppingRetry:
+                for env, _ in still_items:
+                    if not env.future.done():
+                        env.future.set_result(ConsumeOutcome.RETRY)
+                        self.metrics.retried_total += 1
+                return
+
         td_records: list[dict[str, Any]] = []
         env_by_uid: dict[str, tuple[_PendingEnvelope, _PreparedObs]] = {}
         for env, prep in still_items:
             obs = prep.obs
             env_by_uid[obs.event_uid] = (env, prep)
             op_write = True
-            if self.recording_evaluator is not None:
-                decision: RecordingDecision = self.recording_evaluator.evaluate(obs, previous_live=None)
+            if not is_default_eval:
+                decision: RecordingDecision = self.recording_evaluator.evaluate(
+                    obs, previous_live=custom_prev_live.get(obs.signal_id)
+                )
                 op_write = bool(decision.write_operational)
             if op_write:
                 td_records.append(
@@ -1554,6 +1935,7 @@ class IngestionWorker:
                 formula_triggers.append(prep)
 
         # Evaluate synchronous published formulas (depth <= 4) & write calculated outputs to TDengine before PG commit
+        calc_td: list[dict[str, Any]] = []
         if formula_triggers:
             calc_td, calc_latest, calc_shadow, calc_stopped = await self._evaluate_formulas(
                 tenant_id, cat, formula_triggers, newest_map
@@ -1570,6 +1952,89 @@ class IngestionWorker:
                     newest_map[sig_id] = row
             shadow_rows.extend(calc_shadow)
             self.metrics.formula_writes += len(calc_td)
+
+        # Evaluate Managed Recording Policies & persist Managed datasets to TDengine BEFORE PG commit / RMQ ACK
+        if is_default_eval and cat.managed_targets_by_signal:
+            assert isinstance(self.recording_evaluator, DefaultRecordingPolicyEvaluator)
+            managed_inputs: list[
+                tuple[CanonicalObservation, str | None, str | None, list[ManagedBindingTarget]]
+            ] = []
+            ordered_committed = sorted(
+                committed_items,
+                key=lambda item: (
+                    item[1].obs.data_epoch,
+                    item[1].received_time,
+                    item[1].obs.source_sequence if item[1].obs.source_sequence is not None else -1,
+                    item[1].obs.event_uid,
+                ),
+            )
+            for _env, prep in ordered_committed:
+                targets = cat.managed_targets_by_signal.get(prep.obs.signal_id)
+                if targets:
+                    managed_inputs.append((prep.obs, prep.norm_quality, prep.reason_code, targets))
+            for crec in calc_td:
+                calc_sig = UUID(str(crec["signal_id"]))
+                targets = cat.managed_targets_by_signal.get(calc_sig)
+                if targets:
+                    calc_obs = self._build_calc_obs(tenant_id, crec)
+                    managed_inputs.append((calc_obs, calc_obs.quality.value, calc_obs.quality_reason, targets))
+
+            if managed_inputs:
+                targets_needed = [t for _obs, _q, _r, tlist in managed_inputs for t in tlist]
+                sigs_needed = [obs.signal_id for obs, _q, _r, _tlist in managed_inputs]
+                try:
+                    prev_live_map = await self._hydrate_previous_live(tenant_id, sigs_needed)
+                except _WorkerStoppingRetry:
+                    for env, _prep in committed_items:
+                        if not env.future.done():
+                            env.future.set_result(ConsumeOutcome.RETRY)
+                            self.metrics.retried_total += 1
+                    return
+
+                eval_lock = self._eval_locks.setdefault(tenant_id, asyncio.Lock())
+                async with eval_lock:
+                    hyd_stopped = await self._hydrate_managed_states(tenant_id, cat, targets_needed)
+                    if hyd_stopped:
+                        for env, _prep in committed_items:
+                            if not env.future.done():
+                                env.future.set_result(ConsumeOutcome.RETRY)
+                                self.metrics.retried_total += 1
+                        return
+
+                    all_managed_writes: list[ManagedSubtableWrite] = []
+                    for m_obs, m_qual, m_reason, m_targets in managed_inputs:
+                        det = self.recording_evaluator.evaluate_for_targets(
+                            m_obs,
+                            targets=m_targets,
+                            previous_live=prev_live_map.get(m_obs.signal_id),
+                            active_epoch=cat.active_epoch,
+                            norm_quality=m_qual,
+                            reason_code=m_reason,
+                        )
+                        if det.writes:
+                            all_managed_writes.extend(det.writes)
+
+                    m_succ, m_perm, m_stopped = await self._write_managed_td_with_retry(
+                        tenant_id, all_managed_writes
+                    )
+                    if m_stopped:
+                        self.recording_evaluator.invalidate_tenant(tenant_id)
+                        for env, _prep in committed_items:
+                            if not env.future.done():
+                                env.future.set_result(ConsumeOutcome.RETRY)
+                                self.metrics.retried_total += 1
+                        return
+
+                    self.metrics.managed_writes += len(m_succ)
+                    self._sync_policy_metrics()
+                    for item_id, fail in m_perm.items():
+                        await self._safe_quarantine(
+                            tenant_id=tenant_id,
+                            edge_id=None,
+                            event_uid=item_id[:256],
+                            reason=f"MANAGED_TDENGINE_REJECTED ({fail.code}): {fail.message}",
+                            payload={"subtable": fail.subtable, "item_id": item_id},
+                        )
 
         now_commit = _utcnow()
         latest_list = list(newest_map.values())
@@ -1594,7 +2059,7 @@ class IngestionWorker:
         ]
 
         try:
-            await self._retry_pg_op(
+            replaced_signals, _health_events = await self._retry_pg_op(
                 lambda: self.pg.commit_batch_metadata(
                     tenant_id=tenant_id,
                     latest_rows=latest_list,
@@ -1610,6 +2075,51 @@ class IngestionWorker:
                     env.future.set_result(ConsumeOutcome.RETRY)
                     self.metrics.retried_total += 1
             return
+
+        t_cache = self._live_cache.setdefault(tenant_id, {})
+        for sig_id, row in newest_map.items():
+            if sig_id not in replaced_signals and sig_id in t_cache:
+                continue
+            prev_rec = t_cache.get(sig_id)
+            val_changed = (
+                prev_rec is None
+                or prev_rec.data_epoch != int(row["data_epoch"])
+                or prev_rec.value != row["value"]
+                or prev_rec.raw_quality != row["quality"]
+                or (prev_rec.reason_code or "") != (row["reason_code"] or "")
+            )
+            good_val = row["value"] if (row["quality"] == "GOOD" and row["value"] is not None) else (
+                prev_rec.last_good_value if prev_rec else None
+            )
+            good_at = row["event_time"] if (row["quality"] == "GOOD" and row["value"] is not None) else (
+                prev_rec.last_good_at if prev_rec else None
+            )
+            t_cache[sig_id] = LiveSignalRecord(
+                tenant_id=tenant_id,
+                signal_id=sig_id,
+                resource_id=row["resource_id"],
+                observation_id=row["observation_id"],
+                event_uid=row["event_uid"],
+                data_epoch=int(row["data_epoch"]),
+                value_type=row["value_type"],
+                value=row["value"],
+                unit=row["unit"],
+                raw_quality=row["quality"],
+                reason_code=row["reason_code"],
+                event_time=row["event_time"],
+                last_acquired_at=row["last_acquired_at"],
+                last_value_changed_at=(
+                    row["event_time"]
+                    if val_changed
+                    else (prev_rec.last_value_changed_at or prev_rec.event_time)
+                ),
+                source_time=row["source_time"],
+                config_revision=int(row["config_revision"]),
+                origin=row["origin"],
+                last_good_value=good_val,
+                last_good_at=good_at,
+                updated_at=now_commit,
+            )
 
         committed_at = _utcnow()
         for env, prep in committed_items:
@@ -1633,14 +2143,17 @@ class IngestionWorker:
         triggers: list[_PreparedObs],
         overlay_latest: Mapping[UUID, dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[UUID, dict[str, Any]], list[dict[str, Any]], bool]:
-        """Compute published formulas up to depth 4 and persist calculated outputs to TDengine."""
-        state_cache: dict[UUID, tuple[Any, str, datetime]] = {
-            sid: (row["value"], str(row["quality"]), row["received_time"])
-            for sid, row in overlay_latest.items()
-        }
+        """Compute published formulas up to depth 4 in causal chronological order and persist to TDengine."""
+        # Seed pre-batch cache ONLY from already-committed live state (never future values in this batch!)
+        trigger_sigs = {p.obs.signal_id for p in triggers}
+        state_cache: dict[UUID, tuple[Any, str, datetime]] = {}
+        live_t = self._live_cache.get(tenant_id, {})
+        for sid, rec in live_t.items():
+            if rec.data_epoch == cat.active_epoch:
+                state_cache[sid] = (rec.value, str(rec.raw_quality), rec.last_acquired_at)
 
         # Pre-collect all alias signal IDs needed by potentially reachable formulas up to depth 4
-        frontier_sigs = {p.obs.signal_id for p in triggers}
+        frontier_sigs = set(trigger_sigs)
         needed_aliases: set[UUID] = set()
         seen_fids: set[UUID] = set()
         scan_sigs = set(frontier_sigs)
@@ -1660,134 +2173,161 @@ class IngestionWorker:
                 break
             scan_sigs = next_sigs
 
-        missing_from_overlay = [sid for sid in needed_aliases if sid not in state_cache]
-        if missing_from_overlay:
+        missing_from_cache = [sid for sid in needed_aliases if sid not in state_cache]
+        if missing_from_cache:
             try:
                 pg_latest = await self._retry_pg_op(
-                    lambda: self.pg.fetch_latest_values(tenant_id, missing_from_overlay)
+                    lambda: self.pg.fetch_latest_values(tenant_id, missing_from_cache)
                 )
             except _WorkerStoppingRetry:
                 return [], {}, [], True
             for sid, data in pg_latest.items():
                 state_cache[sid] = (data["value"], data["quality"], data["received_time"])
 
+        for sid, row in overlay_latest.items():
+            if sid not in trigger_sigs and sid not in state_cache:
+                state_cache[sid] = (row["value"], str(row["quality"]), row["received_time"])
+
         calc_td_records: list[dict[str, Any]] = []
         calc_latest_rows: dict[UUID, dict[str, Any]] = {}
         calc_shadow_rows: list[dict[str, Any]] = []
 
-        # Process each trigger chronologically
-        queue: list[tuple[UUID, datetime, datetime, int, str, int]] = [
-            (p.obs.signal_id, p.event_time, p.received_time, p.obs.data_epoch, p.obs.event_uid, 0)
-            for p in triggers
-        ]
+        ordered_triggers = sorted(
+            triggers,
+            key=lambda p: (
+                p.obs.data_epoch,
+                p.received_time,
+                p.obs.source_sequence if p.obs.source_sequence is not None else -1,
+                p.obs.event_uid,
+            ),
+        )
         visited_evals: set[tuple[UUID, str]] = set()
-        while queue:
-            trig_sig, ev_time, rx_time, data_epoch, trig_uid, depth = queue.pop(0)
-            if depth >= MAX_FORMULA_DEPTH:
-                continue
-            for formula in cat.formulas_by_dep.get(trig_sig, []):
-                fid = UUID(str(formula["formula_id"]))
-                if (fid, trig_uid) in visited_evals:
-                    continue
-                visited_evals.add((fid, trig_uid))
-                aliases = cat.formula_aliases.get(fid, [])
-                if not aliases:
-                    continue
-                values: dict[str, Any] = {}
-                qualities: list[str] = []
-                alias_ids: dict[str, UUID] = {}
-                ready = True
-                for al in aliases:
-                    dep_id = UUID(str(al["dependency_signal_id"]))
-                    dep_state = state_cache.get(dep_id)
-                    if dep_state is None:
-                        ready = False
-                        break
-                    values[str(al["variable_alias"])] = dep_state[0]
-                    qualities.append(dep_state[1])
-                    alias_ids[str(al["variable_alias"])] = dep_id
-                if not ready:
-                    continue
-                try:
-                    program = bind(parse_expression(str(formula["expression_source"])), alias_ids)
-                    val = evaluate(program, values)
-                except (FormulaError, ZeroDivisionError, OverflowError, ValueError):
-                    continue
-                qual = output_quality(qualities, val)
-                output_id = UUID(str(formula["output_id"]))
-                resource_id = UUID(str(formula["resource_id"]))
-                site_id = UUID(str(formula["site_id"])) if formula.get("site_id") else None
-                rev = int(formula["revision"] or 1)
-                vtype = str(formula["data_type"])
-                calc_uid = _deterministic_calc_uid(fid, rev, output_id, trig_uid)
-                obs_id = uuid4()
-
-                calc_td_records.append(
-                    {
-                        "event_uid": calc_uid,
-                        "signal_id": output_id,
-                        "resource_id": resource_id,
-                        "connection_id": None,
-                        "value_type": vtype,
-                        "value": val,
-                        "unit": formula.get("unit"),
-                        "raw_quality": qual,
-                        "reason_code": None,
-                        "origin": Origin.CALCULATED.value,
-                        "event_time": ev_time,
-                        "acquired_at": rx_time,
-                        "source_time": None,
-                        "config_revision": rev,
-                        "data_epoch": data_epoch,
-                        "source_seq": None,
-                    }
+        for trig_prep in ordered_triggers:
+            state_cache[trig_prep.obs.signal_id] = (
+                trig_prep.obs.value,
+                trig_prep.norm_quality,
+                trig_prep.received_time,
+            )
+            queue: list[tuple[UUID, datetime, datetime, int, str, int]] = [
+                (
+                    trig_prep.obs.signal_id,
+                    trig_prep.event_time,
+                    trig_prep.received_time,
+                    trig_prep.obs.data_epoch,
+                    trig_prep.obs.event_uid,
+                    0,
                 )
-                state_cache[output_id] = (val, qual, rx_time)
-                calc_latest_rows[output_id] = {
-                    "_sort_key": (data_epoch, rx_time, -1, calc_uid),
-                    "signal_id": output_id,
-                    "resource_id": resource_id,
-                    "observation_id": obs_id,
-                    "value_type": vtype,
-                    "value": val,
-                    "unit": formula.get("unit"),
-                    "quality": qual,
-                    "event_time": ev_time,
-                    "received_time": rx_time,
-                    "last_acquired_at": rx_time,
-                    "source_time": None,
-                    "config_revision": rev,
-                    "origin": Origin.CALCULATED.value,
-                    "data_epoch": data_epoch,
-                    "source_sequence": None,
-                    "reason_code": None,
-                    "event_uid": calc_uid,
-                    "expected_interval_ms": formula.get("expected_interval_ms"),
-                    "nullable": False,
-                }
-                if self.shadow_pg:
-                    calc_shadow_rows.append(
+            ]
+            while queue:
+                trig_sig, ev_time, rx_time, data_epoch, trig_uid, depth = queue.pop(0)
+                if depth >= MAX_FORMULA_DEPTH:
+                    continue
+                for formula in cat.formulas_by_dep.get(trig_sig, []):
+                    fid = UUID(str(formula["formula_id"]))
+                    if (fid, trig_uid) in visited_evals:
+                        continue
+                    visited_evals.add((fid, trig_uid))
+                    aliases = cat.formula_aliases.get(fid, [])
+                    if not aliases:
+                        continue
+                    values: dict[str, Any] = {}
+                    qualities: list[str] = []
+                    alias_ids: dict[str, UUID] = {}
+                    ready = True
+                    for al in aliases:
+                        dep_id = UUID(str(al["dependency_signal_id"]))
+                        dep_state = state_cache.get(dep_id)
+                        if dep_state is None:
+                            ready = False
+                            break
+                        values[str(al["variable_alias"])] = dep_state[0]
+                        qualities.append(dep_state[1])
+                        alias_ids[str(al["variable_alias"])] = dep_id
+                    if not ready:
+                        continue
+                    try:
+                        program = bind(parse_expression(str(formula["expression_source"])), alias_ids)
+                        val = evaluate(program, values)
+                    except (FormulaError, ZeroDivisionError, OverflowError, ValueError):
+                        continue
+                    qual = output_quality(qualities, val)
+                    output_id = UUID(str(formula["output_id"]))
+                    resource_id = UUID(str(formula["resource_id"]))
+                    site_id = UUID(str(formula["site_id"])) if formula.get("site_id") else None
+                    rev = int(formula["revision"] or 1)
+                    vtype = str(formula["data_type"])
+                    calc_uid = _deterministic_calc_uid(fid, rev, output_id, trig_uid)
+                    obs_id = uuid4()
+
+                    calc_td_records.append(
                         {
-                            "observation_id": obs_id,
-                            "site_id": site_id,
-                            "resource_id": resource_id,
-                            "signal_id": output_id,
-                            "connection_id": None,
                             "event_uid": calc_uid,
+                            "signal_id": output_id,
+                            "resource_id": resource_id,
+                            "connection_id": None,
+                            "value_type": vtype,
+                            "value": val,
+                            "unit": formula.get("unit"),
+                            "raw_quality": qual,
+                            "reason_code": None,
+                            "origin": Origin.CALCULATED.value,
                             "event_time": ev_time,
-                            "received_time": rx_time,
+                            "acquired_at": rx_time,
                             "source_time": None,
+                            "config_revision": rev,
+                            "data_epoch": data_epoch,
+                            "source_seq": None,
+                        }
+                    )
+                    state_cache[output_id] = (val, qual, rx_time)
+                    cand_sort_key = (data_epoch, rx_time, -1, calc_uid)
+                    prev_latest = calc_latest_rows.get(output_id)
+                    if prev_latest is None or cand_sort_key > prev_latest["_sort_key"]:
+                        calc_latest_rows[output_id] = {
+                            "_sort_key": cand_sort_key,
+                            "signal_id": output_id,
+                            "resource_id": resource_id,
+                            "observation_id": obs_id,
                             "value_type": vtype,
                             "value": val,
                             "unit": formula.get("unit"),
                             "quality": qual,
-                            "origin": Origin.CALCULATED.value,
+                            "event_time": ev_time,
+                            "received_time": rx_time,
+                            "last_acquired_at": rx_time,
+                            "source_time": None,
                             "config_revision": rev,
-                            "provenance": {"formula_id": str(fid), "formula_revision": rev},
+                            "origin": Origin.CALCULATED.value,
+                            "data_epoch": data_epoch,
+                            "source_sequence": None,
+                            "reason_code": None,
+                            "event_uid": calc_uid,
+                            "expected_interval_ms": formula.get("expected_interval_ms"),
+                            "nullable": False,
                         }
-                    )
-                if output_id in cat.formula_inputs and depth + 1 < MAX_FORMULA_DEPTH:
-                    queue.append((output_id, ev_time, rx_time, data_epoch, calc_uid, depth + 1))
+                    if self.shadow_pg:
+                        calc_shadow_rows.append(
+                            {
+                                "observation_id": obs_id,
+                                "site_id": site_id,
+                                "resource_id": resource_id,
+                                "signal_id": output_id,
+                                "connection_id": None,
+                                "event_uid": calc_uid,
+                                "event_time": ev_time,
+                                "received_time": rx_time,
+                                "source_time": None,
+                                "value_type": vtype,
+                                "value": val,
+                                "unit": formula.get("unit"),
+                                "quality": qual,
+                                "origin": Origin.CALCULATED.value,
+                                "config_revision": rev,
+                                "provenance": {"formula_id": str(fid), "formula_revision": rev},
+                            }
+                        )
+                    if output_id in cat.formula_inputs and depth + 1 < MAX_FORMULA_DEPTH:
+                        queue.append((output_id, ev_time, rx_time, data_epoch, calc_uid, depth + 1))
 
         if calc_td_records:
             _succ, _perm, aborted = await self._write_td_with_retry(
@@ -1797,6 +2337,44 @@ class IngestionWorker:
                 return [], {}, [], True
 
         return calc_td_records, calc_latest_rows, calc_shadow_rows, False
+
+    async def _sweep_all_interval_gaps(self) -> None:
+        if not isinstance(self.recording_evaluator, DefaultRecordingPolicyEvaluator):
+            return
+        if not hasattr(self.td, "write_batch"):
+            return
+        for tid, cat in list(self._catalogs.items()):
+            if cat.lifecycle_state != "ACTIVE" or not cat.all_managed_targets:
+                continue
+            eval_lock = self._eval_locks.setdefault(tid, asyncio.Lock())
+            if eval_lock.locked():
+                continue
+            async with eval_lock:
+                interval_targets = [t for t in cat.all_managed_targets if t.mode.value == "INTERVAL" and not t.is_paused]
+                if not interval_targets:
+                    continue
+                stopped = await self._hydrate_managed_states(tid, cat, interval_targets)
+                if stopped:
+                    return
+                gaps = self.recording_evaluator.sweep_interval_gaps(
+                    tid, targets=interval_targets, active_epoch=cat.active_epoch
+                )
+                if not gaps:
+                    continue
+                succ, perm, aborted = await self._write_managed_td_with_retry(tid, gaps)
+                if aborted:
+                    self.recording_evaluator.invalidate_tenant(tid)
+                    return
+                self.metrics.managed_writes += len(succ)
+                self._sync_policy_metrics()
+                for item_id, fail in perm.items():
+                    await self._safe_quarantine(
+                        tenant_id=tid,
+                        edge_id=None,
+                        event_uid=item_id[:256],
+                        reason=f"INTERVAL_GAP_WRITE_REJECTED ({fail.code}): {fail.message}",
+                        payload={"subtable": fail.subtable, "item_id": item_id},
+                    )
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -1810,6 +2388,7 @@ class IngestionWorker:
                 broker_ok = bool(self._consumer is not None)
                 rates = self.hist.tenant_rates_per_min()
                 slis = self.hist.snapshot()
+                self._sync_policy_metrics()
                 queues_json = {
                     "tenant_rates": rates,
                     "acked_total": self.metrics.acked_total,
@@ -1817,6 +2396,11 @@ class IngestionWorker:
                     "retried_total": self.metrics.retried_total,
                     "epoch_fenced_dropped": self.metrics.epoch_fenced_dropped,
                     "tdengine_writes": self.metrics.tdengine_writes,
+                    "managed_writes": self.metrics.managed_writes,
+                    "managed_checkpoints": self.metrics.managed_checkpoints,
+                    "managed_gap_markers": self.metrics.managed_gap_markers,
+                    "managed_write_errors": self.metrics.managed_write_errors,
+                    "managed_skips_by_reason": dict(self.metrics.managed_skips_by_reason),
                     "tdengine_ok": td_ok,
                     **slis,
                 }
@@ -1828,6 +2412,8 @@ class IngestionWorker:
                     broker_ok=broker_ok,
                     diagnostic=self.metrics.last_error,
                 )
+                if td_ok and not self._stop_event.is_set():
+                    await self._sweep_all_interval_gaps()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Ingestion heartbeat update failed: %s", exc)
             try:
@@ -1844,8 +2430,9 @@ class IngestionWorker:
                     tid = UUID(str(obj["tenant_id"]))
             except (ValueError, json.JSONDecodeError):
                 tid = None
-        self.invalidate_tenant_cache(tid)
-        if channel == "factorix_epoch_changed" and tid is not None:
+        is_epoch = channel == "factorix_epoch_changed"
+        self.invalidate_tenant_cache(tid, epoch_changed=is_epoch)
+        if is_epoch and tid is not None:
             self.recent_uids.clear_tenant(tid)
 
     async def _notify_loop(self) -> None:

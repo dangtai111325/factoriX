@@ -94,18 +94,23 @@ class MiniMqttBroker:
         self.port = int(sock.getsockname()[1])
         return self.port
 
+    async def _safe_drain(self, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(writer.drain(), timeout=1.0)
+
     async def stop(self) -> None:
         await self.disconnect_clients()
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
             self._server = None
 
     async def disconnect_clients(self) -> None:
         for sess in list(self._sessions):
             with contextlib.suppress(Exception):
                 sess.writer.close()
-                await sess.writer.wait_closed()
+                await asyncio.wait_for(sess.writer.wait_closed(), timeout=1.0)
         self._sessions.clear()
 
     async def publish_local(self, topic: str, payload: bytes | str, *, qos: int = 0, retain: bool = False) -> None:
@@ -128,8 +133,10 @@ class MiniMqttBroker:
         body = vh + payload
         pkt = bytes([0x30 | flags]) + _encode_remaining_length(len(body)) + body
         async with sess.lock:
+            if sess.writer.is_closing():
+                raise ConnectionError("client writer closing")
             sess.writer.write(pkt)
-            await sess.writer.drain()
+            await asyncio.wait_for(sess.writer.drain(), timeout=1.0)
 
     async def _fanout(self, topic: str, payload: bytes, *, qos: int = 0, retain: bool = False) -> None:
         for sess in list(self._sessions):
@@ -178,7 +185,7 @@ class MiniMqttBroker:
                         if uname != self.expected_user or pwd != (self.expected_password or ""):
                             rc = 5
                     writer.write(bytes([0x20, 0x02, 0x00, rc]))
-                    await writer.drain()
+                    await asyncio.wait_for(writer.drain(), timeout=1.0)
                     if rc != 0:
                         break
                     sess = _ClientSession(client_id=cid or f"anon-{id(writer)}", writer=writer, subscriptions={}, lock=asyncio.Lock())
@@ -201,7 +208,7 @@ class MiniMqttBroker:
                     if qos == 1 and pid is not None:
                         async with sess.lock:
                             writer.write(struct.pack("!BBH", 0x40, 2, pid))
-                            await writer.drain()
+                            await asyncio.wait_for(writer.drain(), timeout=1.0)
                     await self._fanout(topic, payload, qos=qos)
 
                 elif pkt_type == 8 and sess is not None:  # SUBSCRIBE
@@ -219,7 +226,7 @@ class MiniMqttBroker:
                     body = struct.pack("!H", pid) + bytes(granted)
                     async with sess.lock:
                         writer.write(bytes([0x90]) + _encode_remaining_length(len(body)) + body)
-                        await writer.drain()
+                        await asyncio.wait_for(writer.drain(), timeout=1.0)
                     for tpat, _q in new_topics:
                         for rtopic, (rpay, rqos) in list(self._retained.items()):
                             if topic_matches(tpat, rtopic):
@@ -233,19 +240,19 @@ class MiniMqttBroker:
                         sess.subscriptions.pop(tpat, None)
                     async with sess.lock:
                         writer.write(struct.pack("!BBH", 0xB0, 2, pid))
-                        await writer.drain()
+                        await asyncio.wait_for(writer.drain(), timeout=1.0)
 
                 elif pkt_type == 12:  # PINGREQ
                     writer.write(b"\xD0\x00")
-                    await writer.drain()
+                    await asyncio.wait_for(writer.drain(), timeout=1.0)
 
                 elif pkt_type == 14:  # DISCONNECT
                     break
-        except (asyncio.IncompleteReadError, ConnectionError, EOFError, ValueError):
+        except (asyncio.IncompleteReadError, ConnectionError, EOFError, ValueError, asyncio.TimeoutError):
             pass
         finally:
             if sess is not None:
                 self._sessions.discard(sess)
             with contextlib.suppress(Exception):
                 writer.close()
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)

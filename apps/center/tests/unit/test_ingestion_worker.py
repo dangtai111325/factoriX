@@ -656,3 +656,71 @@ async def test_overview_and_ready_report_degraded_or_503_when_ingestion_missing_
     ov = await transport_app.overview(principal={"tenant_id": str(uuid4()), "admin_id": str(uuid4())}, session=_FakeSession())  # type: ignore[arg-type]
     assert ov["collector_status"] == "DEGRADED"
 
+
+@pytest.mark.asyncio
+async def test_multi_sample_formula_batch_evaluates_chronologically() -> None:
+    tid, rid, cid, fid, stid = uuid4(), uuid4(), uuid4(), uuid4(), uuid4()
+    s0, s1, f0 = uuid4(), uuid4(), uuid4()
+    cat = TenantCatalog(
+        tenant_id=tid,
+        active_epoch=1,
+        lifecycle_state="ACTIVE",
+        bindings={
+            s0: [
+                {
+                    "signal_id": s0,
+                    "valid_from": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "valid_to": None,
+                    "resource_id": rid,
+                    "expected_interval_ms": 1000,
+                    "site_id": stid,
+                    "connection_id": cid,
+                    "source_field_id": fid,
+                    "nullable": False,
+                }
+            ]
+        },
+        formula_inputs={s0},
+        formulas_by_dep={
+            s0: [
+                {
+                    "dependency_signal_id": s0,
+                    "formula_id": f0,
+                    "output_id": s1,
+                    "expression_source": "x * 2",
+                    "revision": 1,
+                    "resource_id": rid,
+                    "data_type": "float64",
+                    "unit": "°C",
+                    "expected_interval_ms": 1000,
+                    "site_id": stid,
+                }
+            ]
+        },
+        formula_aliases={f0: [{"formula_id": f0, "variable_alias": "x", "dependency_signal_id": s0}]},
+    )
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)  # type: ignore[arg-type]
+
+    t0 = _now()
+    b0 = _make_obs(tenant_id=tid, signal_id=s0, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=10.0, acquired_at=t0, seq=1)
+    b1 = _make_obs(tenant_id=tid, signal_id=s0, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=10.5, acquired_at=t0 + timedelta(seconds=1), seq=2)
+    b2 = _make_obs(tenant_id=tid, signal_id=s0, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=12.0, quality=Quality.BAD, acquired_at=t0 + timedelta(seconds=2), seq=3)
+
+    # Deliberately pass b2 before b0/b1 inside the same batch to verify causal chronological ordering!
+    out = await w.ingest_direct_bytes(
+        [
+            (b2.to_json_bytes(), {}, b2.event_uid, False),
+            (b0.to_json_bytes(), {}, b0.event_uid, False),
+            (b1.to_json_bytes(), {}, b1.event_uid, False),
+        ]
+    )
+    assert out == [ConsumeOutcome.ACK, ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+    assert len(td.writes) == 2
+    calc_recs = td.writes[1]
+    assert [r["value"] for r in calc_recs] == [20.0, 21.0, 24.0]
+    assert [r["raw_quality"] for r in calc_recs] == ["GOOD", "GOOD", "BAD"]
+    latest_s1 = next(r for r in pg.commits[-1]["latest_rows"] if r["signal_id"] == s1)
+    assert latest_s1["value"] == 24.0 and latest_s1["quality"] == "BAD"
+

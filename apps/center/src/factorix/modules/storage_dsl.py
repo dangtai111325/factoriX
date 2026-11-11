@@ -1387,7 +1387,7 @@ def compile_storage_plan(
     full_hash = design.full_hash()
     max_keep = max((ds.retention.days for ds in design.spec.datasets), default=90)
     ddl: list[str] = [
-        f"CREATE DATABASE IF NOT EXISTS `{db_name}` PRECISION 'us' KEEP {max_keep}d CACHEMODEL 'last_row' CACHESIZE 16"
+        f"CREATE DATABASE IF NOT EXISTS `{db_name}` PRECISION 'us' KEEP {max_keep}d CACHEMODEL 'last_row' CACHESIZE 16 VGROUPS 1"
     ]
 
     ds_plans: list[dict[str, Any]] = []

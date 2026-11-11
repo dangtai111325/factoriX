@@ -176,7 +176,7 @@ async def apply_compiled_plan(
                 "design_version_id": design_version_id,
                 "dataset_id": ds_uuid,
                 "signal_id": UUID(s.signal_id) if s.signal_id else None,
-                "series_key": f"{design_id}:{s.series_key}",
+                "series_key": f"{ds_uuid or design_id}:{s.series_key}",
                 "value_type": s.value_type,
                 "td_database": s.td_database,
                 "td_stable": s.td_stable,
