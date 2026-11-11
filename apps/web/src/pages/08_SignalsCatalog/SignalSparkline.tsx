@@ -52,16 +52,17 @@ export const SignalSparkline: React.FC<SignalSparklineProps> = ({ signalId, qual
     const fetchHistory = async () => {
       try {
         const res = await runSparkline(
-          () => api<{ items: Array<{ value: unknown }> }>(`/api/v1/observations/history?signal_id=${signalId}&from=now-15m&limit=30`),
+          () => api<{ items: Array<{ value: unknown; quality?: string }> }>(`/api/v1/observations/history?signal_id=${signalId}&from=now-15m&limit=30`),
           () => isCurrent,
         );
         if (res === null) return;
         const numericValues = (res.items || [])
+          .filter((item) => item.value !== null && item.value !== undefined && typeof item.value !== 'boolean')
           .map((item) => Number(item.value))
-          .filter((v) => !isNaN(v));
+          .filter((v) => Number.isFinite(v));
 
         if (isCurrent) {
-          setPoints(numericValues.length > 1 ? numericValues : null);
+          setPoints(numericValues.length > 0 ? numericValues : null);
         }
       } catch {
         if (isCurrent) setPoints(null);
@@ -74,14 +75,16 @@ export const SignalSparkline: React.FC<SignalSparklineProps> = ({ signalId, qual
     };
   }, [signalId]);
 
-  if (!points || points.length < 2) {
+  if (!points || points.length < 1) {
     return <span className="text-slate-300 text-[11px]">—</span>;
   }
 
+  const renderPoints = points.length === 1 ? [points[0], points[0]] : points;
+
   const width = 80;
   const height = 18;
-  const min = Math.min(...points);
-  const max = Math.max(...points);
+  const min = Math.min(...renderPoints);
+  const max = Math.max(...renderPoints);
   const span = max - min || 1;
 
   const strokeColor =
@@ -93,16 +96,16 @@ export const SignalSparkline: React.FC<SignalSparklineProps> = ({ signalId, qual
       ? '#EF4444'
       : '#94A3B8';
 
-  const polyPoints = points
+  const polyPoints = renderPoints
     .map((v, i) => {
-      const x = (i / (points.length - 1)) * (width - 4) + 2;
+      const x = (i / (renderPoints.length - 1)) * (width - 4) + 2;
       const y = height - 2 - ((v - min) / span) * (height - 4);
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(' ');
 
   const lastX = width - 2;
-  const lastY = height - 2 - ((points[points.length - 1] - min) / span) * (height - 4);
+  const lastY = height - 2 - ((renderPoints[renderPoints.length - 1] - min) / span) * (height - 4);
 
   return (
     <svg className="w-20 h-4 overflow-visible" viewBox={`0 0 ${width} ${height}`}>

@@ -376,40 +376,67 @@ async def load_samples(
 
         missing_fb = []
         for sid_key, at in fallbacks_p.items():
-            cached = _fallback_source_cache.get((str(tenant_id), sid_key, at))
+            cached = _fallback_source_cache.get((str(tenant_id), active_epoch, sid_key, at))
             if cached is _Lru.MISS:
                 missing_fb.append((sid_key, at))
             elif cached is not None:
                 samples_p[sid_key] = _with_source(samples_p[sid_key], cached)
         if missing_fb and isinstance(session, AsyncSession):
-            try:
-                async with session.begin_nested():
-                    found = await fetch_all(
-                        session,
-                        """
-                        SELECT q.signal_id, o.source_time
-                        FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[])) AS q(signal_id, at)
-                        LEFT JOIN LATERAL (
-                            SELECT source_time FROM observations o
-                            WHERE o.tenant_id = :tenant_id AND o.signal_id = q.signal_id AND o.event_time = q.at
-                            ORDER BY o.received_time DESC
-                            LIMIT 1
-                        ) o ON TRUE
-                        """,
-                        {
-                            "tenant_id": tenant_id,
-                            "ids": [UUID(sid_k) for sid_k, _ in missing_fb],
-                            "ats": [at for _, at in missing_fb],
-                        },
+            from factorix.modules.history_repository import get_history_provider
+
+            hist_provider = get_history_provider()
+            remaining_fb = list(missing_fb)
+            if hist_provider is not None:
+                try:
+                    td_fb = await hist_provider.fallback_source_times(
+                        tenant_id,
+                        remaining_fb,
+                        session=session,
+                        active_epoch=active_epoch,
                     )
-                    by_id = {str(row["signal_id"]).lower(): R.as_utc(row.get("source_time")) for row in found}
-                    for sid_key, at in missing_fb:
-                        source = by_id.get(sid_key)
-                        _fallback_source_cache.put((str(tenant_id), sid_key, at), source)
-                        if source is not None:
-                            samples_p[sid_key] = _with_source(samples_p[sid_key], source)
-            except _SQLAlchemyError:
-                pass
+                    still_missing: list[tuple[str, datetime]] = []
+                    for sid_key, at in remaining_fb:
+                        src = td_fb.get((sid_key, at))
+                        if src is not None:
+                            _fallback_source_cache.put((str(tenant_id), active_epoch, sid_key, at), src)
+                            samples_p[sid_key] = _with_source(samples_p[sid_key], src)
+                        elif active_epoch > 1:
+                            _fallback_source_cache.put((str(tenant_id), active_epoch, sid_key, at), None)
+                        else:
+                            still_missing.append((sid_key, at))
+                    remaining_fb = still_missing
+                except Exception:  # noqa: BLE001 - fall back to PG when epoch == 1
+                    pass
+
+            if remaining_fb and active_epoch == 1:
+                try:
+                    async with session.begin_nested():
+                        found = await fetch_all(
+                            session,
+                            """
+                            SELECT q.signal_id, o.source_time
+                            FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[])) AS q(signal_id, at)
+                            LEFT JOIN LATERAL (
+                                SELECT source_time FROM observations o
+                                WHERE o.tenant_id = :tenant_id AND o.signal_id = q.signal_id AND o.event_time = q.at
+                                ORDER BY o.received_time DESC
+                                LIMIT 1
+                            ) o ON TRUE
+                            """,
+                            {
+                                "tenant_id": tenant_id,
+                                "ids": [UUID(sid_k) for sid_k, _ in remaining_fb],
+                                "ats": [at for _, at in remaining_fb],
+                            },
+                        )
+                        by_id = {str(row["signal_id"]).lower(): R.as_utc(row.get("source_time")) for row in found}
+                        for sid_key, at in remaining_fb:
+                            source = by_id.get(sid_key)
+                            _fallback_source_cache.put((str(tenant_id), active_epoch, sid_key, at), source)
+                            if source is not None:
+                                samples_p[sid_key] = _with_source(samples_p[sid_key], source)
+                except _SQLAlchemyError:
+                    pass
         return samples_p, qualities_p
 
     rows = await fetch_all(
@@ -473,11 +500,37 @@ async def fetch_value_at(
 ) -> dict[tuple[str, datetime], R.Sample | None]:
     """Value of each signal as of an instant: ``requests`` = ``[(signal_id, at, mode)]``.
 
-    ``mode`` ``"s"`` searches by source_time (index ``observations_signal_source``); ``"e"`` by
-    event_time for sources without a group timestamp (index ``observations_signal_time``).
+    ``mode`` ``"s"`` searches by source_time; ``"e"`` by event_time. Uses TDengine
+    ``TDengineHistoryRepository`` when active, with ``active_epoch == 1`` PG fallback bridge.
     """
     if not requests:
         return {}
+
+    from factorix.modules.history_repository import _active_epoch_for, get_history_provider
+
+    hist_provider = get_history_provider() if isinstance(session, AsyncSession) else None
+    remaining = requests
+    out: dict[tuple[str, datetime], R.Sample | None] = {(sid, at): None for sid, at, _mode in requests}
+    if hist_provider is not None:
+        active_epoch = await _active_epoch_for(session, tenant_id)
+        td_res = await hist_provider.value_at_batch(
+            tenant_id,
+            requests=requests,
+            session=session,
+            active_epoch=active_epoch,
+        )
+        missing_pg: list[tuple[str, datetime, str]] = []
+        for sid, at, mode in requests:
+            hit = td_res.get((sid, at))
+            if hit is not None:
+                val, qual, src_ts, rcv_ts = hit
+                out[(sid, at)] = R.Sample(value=val, quality=qual, source_time=src_ts, received_time=rcv_ts)
+            elif active_epoch == 1:
+                missing_pg.append((sid, at, mode))
+        if active_epoch > 1 or not missing_pg:
+            return out
+        remaining = missing_pg
+
     rows = await fetch_all(
         session,
         """
@@ -505,15 +558,14 @@ async def fetch_value_at(
         """,
         {
             "tenant_id": tenant_id,
-            "ids": [UUID(sid) for sid, _at, _mode in requests],
-            "ats": [at for _sid, at, _mode in requests],
-            "modes": [mode for _sid, _at, mode in requests],
-            "idx": list(range(len(requests))),
+            "ids": [UUID(sid) for sid, _at, _mode in remaining],
+            "ats": [at for _sid, at, _mode in remaining],
+            "modes": [mode for _sid, _at, mode in remaining],
+            "idx": list(range(len(remaining))),
         },
     )
-    out: dict[tuple[str, datetime], R.Sample | None] = {(sid, at): None for sid, at, _mode in requests}
     for row in rows:
-        sid, at, _mode = requests[int(row["idx"])]
+        sid, at, _mode = remaining[int(row["idx"])]
         if row.get("quality") is None:
             continue
         value_json = _json(row.get("value_json"))
@@ -541,15 +593,18 @@ async def evaluate_once(
         samples, qualities = await load_samples(session, tenant_id, compiled.signal_ids)
     qualities = qualities or {}
     tenant_key = str(tenant_id)
+    from factorix.modules.history_repository import _active_epoch_for
+
+    active_epoch = await _active_epoch_for(session, tenant_id) if isinstance(session, AsyncSession) else 1
 
     def lookup(signal_id: str, at: datetime) -> R.Sample | None:
-        hit = _value_at_cache.get((tenant_key, signal_id, at))
+        hit = _value_at_cache.get((tenant_key, active_epoch, signal_id, at))
         if hit is _Lru.MISS:
             raise R.LookupPending(signal_id, at)
         return hit
 
     def lookup_final(signal_id: str, at: datetime) -> R.Sample | None:
-        hit = _value_at_cache.get((tenant_key, signal_id, at))
+        hit = _value_at_cache.get((tenant_key, active_epoch, signal_id, at))
         return None if hit is _Lru.MISS else hit
 
     result: EvalResult | None = None
@@ -566,16 +621,28 @@ async def evaluate_once(
             requests.append((signal_id, at, mode))
         fetched = await fetch_value_at(session, tenant_id, requests)
         for (signal_id, at), sample in fetched.items():
-            _value_at_cache.put((tenant_key, signal_id, at), sample, _value_at_ttl(at, now, sample is not None))
+            _value_at_cache.put((tenant_key, active_epoch, signal_id, at), sample, _value_at_ttl(at, now, sample is not None))
     assert result is not None
     return result
 
 
 async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> None:
-    """Upsert ``model_state`` and append ``model_snapshots`` for one batch (two statements)."""
+    """Upsert ``model_state`` (PG control plane) and append ``model_snapshots`` (TDengine or PG fallback)."""
     if not rows:
         return
-    rows = sorted(rows, key=lambda row: str(row["group_id"]))
+    rows = sorted(rows, key=lambda row: (str(row["group_id"]), row["sampled_at"]))
+    latest_by_group: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        latest_by_group[str(row["group_id"])] = row
+    state_rows = [latest_by_group[k] for k in sorted(latest_by_group)]
+    state_params = {
+        "ids": [row["group_id"] for row in state_rows],
+        "tenants": [row["tenant_id"] for row in state_rows],
+        "bodies": [row["body"] for row in state_rows],
+        "ats": [row["sampled_at"] for row in state_rows],
+        "errors": [row["errors_json"] for row in state_rows],
+        "counts": [row["error_count"] for row in state_rows],
+    }
     params = {
         "ids": [row["group_id"] for row in rows],
         "tenants": [row["tenant_id"] for row in rows],
@@ -592,6 +659,7 @@ async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> No
         FROM unnest(CAST(:ids AS uuid[]), CAST(:tenants AS uuid[]), CAST(:bodies AS text[]),
                     CAST(:ats AS timestamptz[]), CAST(:errors AS text[]), CAST(:counts AS integer[]))
              AS t(group_id, tenant_id, body, at, errors, n)
+        JOIN output_groups og ON og.id = t.group_id
         ON CONFLICT (group_id) DO UPDATE SET
             body_text = EXCLUDED.body_text,
             sampled_at = EXCLUDED.sampled_at,
@@ -599,8 +667,37 @@ async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> No
             error_count = EXCLUDED.error_count,
             updated_at = EXCLUDED.updated_at
         """,
-        params,
+        state_params,
     )
+
+    from factorix.modules.history_repository import _active_epoch_for, get_model_snapshot_provider
+    from factorix.modules.providers import ModelSnapshotRecord
+
+    snap_provider = get_model_snapshot_provider() if isinstance(session, AsyncSession) else None
+    if snap_provider is not None:
+        by_tenant: dict[UUID, list[dict[str, Any]]] = {}
+        for row in rows:
+            tid = row["tenant_id"] if isinstance(row["tenant_id"], UUID) else UUID(str(row["tenant_id"]))
+            by_tenant.setdefault(tid, []).append(row)
+        for tid, t_rows in by_tenant.items():
+            epoch = await _active_epoch_for(session, tid)
+            records = []
+            for r in t_rows:
+                raw_errs = _json(r.get("errors_json"))
+                errs_list = raw_errs if isinstance(raw_errs, list) else []
+                records.append(
+                    ModelSnapshotRecord(
+                        group_id=r["group_id"] if isinstance(r["group_id"], UUID) else UUID(str(r["group_id"])),
+                        sampled_at=r["sampled_at"],
+                        body=str(r.get("body") or ""),
+                        errors=errs_list,
+                        error_count=int(r.get("error_count") or len(errs_list)),
+                        data_epoch=epoch,
+                    )
+                )
+            await snap_provider.append_snapshots_batch(tid, records)
+        return
+
     await execute(
         session,
         """
@@ -609,6 +706,7 @@ async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> No
         FROM unnest(CAST(:ids AS uuid[]), CAST(:tenants AS uuid[]), CAST(:bodies AS text[]),
                     CAST(:ats AS timestamptz[]), CAST(:errors AS text[]), CAST(:counts AS integer[]))
              AS t(group_id, tenant_id, body, at, errors, n)
+        JOIN output_groups og ON og.id = t.group_id
         """,
         params,
     )
@@ -618,6 +716,24 @@ async def prune_snapshots(session: AsyncSession, group_ids: list[Any], keep: int
     ids = _uuids(group_ids)
     if not ids:
         return
+    from factorix.modules.history_repository import get_model_snapshot_provider
+
+    snap_provider = get_model_snapshot_provider() if isinstance(session, AsyncSession) else None
+    if snap_provider is not None:
+        owner_rows = await fetch_all(
+            session,
+            "SELECT id, tenant_id FROM output_groups WHERE id = ANY(:ids)",
+            {"ids": ids},
+        )
+        by_tenant: dict[UUID, list[UUID]] = {}
+        for orow in owner_rows:
+            tid = orow["tenant_id"] if isinstance(orow["tenant_id"], UUID) else UUID(str(orow["tenant_id"]))
+            gid = orow["id"] if isinstance(orow["id"], UUID) else UUID(str(orow["id"]))
+            by_tenant.setdefault(tid, []).append(gid)
+        for tid, gids in by_tenant.items():
+            await snap_provider.prune_snapshots(tid, gids, keep=keep)
+        return
+
     await execute(
         session,
         """
@@ -798,15 +914,20 @@ class ModelEngine:
                 await after_commit.flush(session)
         return self.next_delay(utcnow())
 
-    async def _catalog(self, session: AsyncSession, tenant_id: str) -> R.Catalog:
+    async def _catalog(
+        self,
+        session: AsyncSession,
+        tenant_id: str,
+        extra_signal_ids: Iterable[str] | None = None,
+    ) -> R.Catalog:
         cached = self._catalogs.get(tenant_id)
         if cached is not None and time.monotonic() - cached[0] < CATALOG_TTL_S:
             return cached[1]
-        signal_ids: set[str] = set()
+        signal_ids: set[str] = set(extra_signal_ids or ())
         for model in self.models.values():
             if model.tenant_id == tenant_id:
                 signal_ids |= model.compiled.signal_ids
-        catalog = await load_catalog(session, UUID(tenant_id), signal_ids)
+        catalog = await load_catalog(session, UUID(tenant_id), signal_ids or None)
         self._catalogs[tenant_id] = (time.monotonic(), catalog)
         return catalog
 
@@ -820,10 +941,10 @@ class ModelEngine:
         prune: list[str] = []
         for tenant_id, group in by_tenant.items():
             tenant = UUID(tenant_id)
-            catalog = await self._catalog(session, tenant_id)
             signal_ids: set[str] = set()
             for model in group:
                 signal_ids |= model.compiled.signal_ids
+            catalog = await self._catalog(session, tenant_id, signal_ids)
             samples, qualities = (
                 await load_samples(session, tenant, signal_ids, live_provider=self.live_provider)
                 if self.live_provider is not None

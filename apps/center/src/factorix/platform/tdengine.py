@@ -20,6 +20,7 @@ import logging
 import math
 import re
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -220,7 +221,26 @@ class TDEngineHealth:
     error: str | None = None
 
 
+def _is_creating_or_warming_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        needle in text
+        for needle in (
+            "creating status",
+            "database in creating",
+            "0x0396",
+            "database not ready",
+            "vnode is not ready",
+            "dnode is not ready",
+            "mnode is not ready",
+            "sync leader",
+        )
+    )
+
+
 def _is_retryable_error(exc: BaseException) -> bool:
+    if _is_creating_or_warming_error(exc):
+        return True
     text = str(exc).lower()
     if any(
         needle in text
@@ -299,7 +319,7 @@ class TDEngineClient:
                 pass
 
     def _run_sync(self, fn: Callable[[Any], Any], *, allow_reconnect: bool = True) -> Any:
-        attempts = 2 if allow_reconnect else 1
+        attempts = 6 if allow_reconnect else 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
             conn = self._get_conn()
@@ -309,7 +329,10 @@ class TDEngineClient:
                 raise
             except Exception as exc:
                 last_exc = exc
-                if attempt + 1 < attempts and _is_retryable_error(exc):
+                if attempt + 1 < attempts and _is_creating_or_warming_error(exc):
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                if attempt < 1 and allow_reconnect and _is_retryable_error(exc):
                     logger.warning("TDengine transport drop detected (%s); reconnecting.", exc)
                     self._drop_thread_conn()
                     continue

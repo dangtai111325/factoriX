@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import collect, edge_sync, identity, resources, telemetry
 from factorix.modules import models_engine
+from factorix.modules import telemetry_reset
 from factorix.modules.live_state import (
     TDengineLiveStateProvider,
     configure_live_state_provider,
@@ -32,7 +33,7 @@ from factorix.modules.live_state import (
     get_live_state_provider,
 )
 from factorix.modules.providers import LiveSignalRecord
-from factorix.transport import data_models_api
+from factorix.transport import data_models_api, storage_api
 from factorix.modules import usage
 from factorix.modules.collect import (
     CaptureIn,
@@ -697,6 +698,12 @@ async def _stop(task: asyncio.Task[Any]) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    from factorix.modules.history_repository import (
+        TDengineHistoryRepository,
+        TDengineModelSnapshotProvider,
+        configure_history_provider,
+        configure_model_snapshot_provider,
+    )
     from factorix.platform.tdengine import TDEngineClient, TDEngineConfig
 
     cfg = _settings()
@@ -704,10 +711,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if cfg.tdengine_dsn:
         td_client = TDEngineClient(TDEngineConfig(dsn=cfg.tdengine_dsn, db_prefix=cfg.tdengine_db_prefix))
         live_provider = TDengineLiveStateProvider(td_client)
+        history_provider = TDengineHistoryRepository(td_client)
+        snapshot_provider = TDengineModelSnapshotProvider(td_client)
         configure_live_state_provider(live_provider)
+        configure_history_provider(history_provider)
+        configure_model_snapshot_provider(snapshot_provider)
         models_engine.ENGINE.live_provider = live_provider
         app.state.td_client = td_client
         app.state.live_state_provider = live_provider
+        app.state.history_provider = history_provider
+        app.state.model_snapshot_provider = snapshot_provider
 
     task = asyncio.create_task(_background_health_loop(), name="health-loop")
     enroll_task = asyncio.create_task(_appliance_auto_enroll(), name="appliance-enroll")
@@ -723,6 +736,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await models_engine.ENGINE.stop()
         await _stop(task)
         configure_live_state_provider(None)
+        configure_history_provider(None)
+        configure_model_snapshot_provider(None)
         models_engine.ENGINE.live_provider = None
         if td_client is not None:
             await td_client.close()
@@ -1510,6 +1525,8 @@ async def history(
     from_time: str | None = Query(None, alias="from"),
     limit: int = 500,
     cursor: str | None = None,
+    mode: str = "operational",
+    dataset_id: str | None = None,
     principal: dict[str, Any] = Depends(admin),
     session: AsyncSession = Depends(db_session),
 ) -> dict[str, Any]:
@@ -1537,7 +1554,17 @@ async def history(
     else:
         end_dt = now
 
-    return await telemetry.history(session, tenant_id, signal_id=parse_uuid(signal_id), start=start_dt, end=end_dt, limit=limit, cursor=cursor)
+    return await telemetry.history(
+        session,
+        tenant_id,
+        signal_id=parse_uuid(signal_id),
+        start=start_dt,
+        end=end_dt,
+        limit=limit,
+        cursor=cursor,
+        mode=mode,
+        dataset_id=parse_uuid(dataset_id) if dataset_id else None,
+    )
 
 
 @app.get("/api/v1/observations/aggregate")
@@ -2085,6 +2112,8 @@ def _mount_spa() -> None:
 
 
 app.include_router(data_models_api.build_router(admin, db_session))
+app.include_router(storage_api.build_router(admin, db_session))
+app.include_router(telemetry_reset.build_router(admin, db_session))
 _mount_spa()
 
 

@@ -473,13 +473,37 @@ async def latest(session: AsyncSession, tenant_id: UUID, model_id: UUID) -> dict
 
 async def snapshots(session: AsyncSession, tenant_id: UUID, model_id: UUID, *, limit: int = 20) -> list[dict[str, Any]]:
     await _model_row(session, tenant_id, model_id)
+    bounded = min(max(int(limit), 1), SNAPSHOT_LIMIT)
+    if isinstance(session, AsyncSession):
+        from factorix.modules.history_repository import _active_epoch_for, get_model_snapshot_provider
+
+        snap_provider = get_model_snapshot_provider()
+        if snap_provider is not None:
+            epoch = await _active_epoch_for(session, tenant_id)
+            td_records = await snap_provider.list_snapshots(
+                tenant_id,
+                model_id,
+                limit=bounded,
+                active_epoch=epoch,
+            )
+            if td_records or epoch > 1:
+                return [
+                    {
+                        "sampled_at": iso_ms(rec.sampled_at),
+                        "body": rec.body,
+                        "errors": rec.errors,
+                        "error_count": rec.error_count,
+                    }
+                    for rec in td_records
+                ]
+
     rows = await fetch_all(
         session,
         """
         SELECT sampled_at, body_text, errors_json, error_count FROM model_snapshots
         WHERE group_id = :id ORDER BY id DESC LIMIT :limit
         """,
-        {"id": model_id, "limit": min(max(int(limit), 1), SNAPSHOT_LIMIT)},
+        {"id": model_id, "limit": bounded},
     )
     out = []
     for row in rows:
@@ -644,6 +668,12 @@ async def _archive(session: AsyncSession, tenant_id: UUID, actor: UUID | None, r
     )
     await execute(session, "DELETE FROM model_snapshots WHERE group_id = :id", {"id": row["id"]})
     await execute(session, "DELETE FROM model_state WHERE group_id = :id", {"id": row["id"]})
+    if isinstance(session, AsyncSession):
+        from factorix.modules.history_repository import get_model_snapshot_provider
+
+        snap_provider = get_model_snapshot_provider()
+        if snap_provider is not None:
+            await snap_provider.delete_model_snapshots(tenant_id, as_uuid(row["id"]))
     await audit(
         session,
         tenant_id=tenant_id,
@@ -1030,8 +1060,8 @@ async def catalog_tree(session: AsyncSession, tenant_id: UUID, *, resource_id: s
                     "ref": catalog.signal_text(sig.id),
                     "value": None if sample is None else sample.value,
                     "quality": qualities.get(sig.id),
-                    "source_time": iso_ms(t.get("source_time")) if t else None,
-                    "received_time": iso_ms(t.get("received_time")) if t else None,
+                    "source_time": iso_ms(t.get("source_time")) if t else (iso_ms(sample.source_time) if sample else None),
+                    "received_time": iso_ms(t.get("received_time")) if t else (iso_ms(sample.received_time) if sample else None),
                     "protocol": info.get("protocol"),
                     "connection_id": info.get("connection_id"),
                     "connection_name": info.get("connection_name"),

@@ -37,6 +37,10 @@ from tests.safety.test_destructive_guard import check_destructive_test_db_guard
 @pytest.fixture(autouse=True)
 async def _close_pool_between_tests():
     yield
+    try:
+        await _wipe()
+    except Exception:
+        pass
     engine = db_module._engine
     db_module._engine = None
     db_module._session_factory = None
@@ -66,6 +70,9 @@ async def _wipe() -> None:
                   observations, ingest_dedup, latest_signal_state, observation_quarantine,
                   dashboards, dashboard_revisions, retention_policies, retention_jobs,
                   saved_queries, audit_events, export_jobs,
+                  storage_operations, storage_dependencies, storage_physical_registry,
+                  storage_design_versions, storage_recording_policies, storage_field_bindings,
+                  storage_datasets, storage_designs,
                   collector_runtime_status, telemetry_generations
                 RESTART IDENTITY CASCADE
                 """

@@ -68,6 +68,16 @@ const mainNav: NavGroup[] = [
       { label: 'Model Catalog', path: '/models' },
     ],
   },
+  {
+    id: 'historian',
+    label: 'Historian & Storage',
+    icon: LineChart,
+    children: [
+      { label: 'Designer', path: '/historian/designer' },
+      { label: 'Catalog', path: '/historian/catalog' },
+      { label: 'Historian', path: '/historian/historian' },
+    ],
+  },
 ];
 
 const COMING_SOON_KEY = 'fx.sidebar.comingSoon.v2';
@@ -84,18 +94,6 @@ const comingSoonNav: NavGroup[] = [
       { label: 'Dashboard Library', path: '/dashboards/library' },
       { label: 'Dashboard Builder', path: '/dashboards/builder' },
       { label: 'Widget Library', path: '/dashboards/widgets' },
-    ],
-  },
-  {
-    id: 'historian',
-    label: 'Historian & Storage',
-    icon: Database,
-    path: '/historian',
-    soon: true,
-    children: [
-      { label: 'Data Explorer', path: '/historian/explorer' },
-      { label: 'Storage Policies', path: '/historian/policies' },
-      { label: 'Retention & Export', path: '/historian/retention' },
     ],
   },
   {
@@ -202,7 +200,7 @@ export const Sidebar: React.FC = () => {
     } catch {
       // fallback
     }
-    return { factory: true, collector: true, models: true };
+    return { factory: true, collector: true, models: true, historian: true };
   });
 
   // "Coming soon" section: collapsed by default so the released modules stay in view. The choice is
@@ -298,6 +296,19 @@ export const Sidebar: React.FC = () => {
     }
     if (path === '/models') {
       return location.pathname === '/models';
+    }
+    if (path === '/historian/designer') {
+      return location.pathname.startsWith('/historian/designer');
+    }
+    if (path === '/historian/catalog') {
+      return location.pathname.startsWith('/historian/catalog');
+    }
+    if (path === '/historian/historian') {
+      return (
+        location.pathname === '/historian/historian' ||
+        location.pathname === '/historian' ||
+        location.pathname === '/historian/explorer'
+      );
     }
     return location.pathname === path;
   };

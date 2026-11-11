@@ -12,6 +12,7 @@ import {
   AlertTriangle,
   Play,
   Square,
+  LineChart,
 } from 'lucide-react';
 import { SignalItem } from '../../types';
 import { Button } from '../../components/common/Button';
@@ -25,6 +26,7 @@ interface SignalInspectorProps {
   onEdit: (signal: SignalItem) => void;
   onToggleEnabled: (signal: SignalItem) => void;
   onDelete: (signal: SignalItem) => void;
+  onOpenHistorian?: (signal: SignalItem) => void;
   /** True while an enable / disable request runs (the button is disabled). */
   togglePending?: boolean;
   resourceName?: string;
@@ -39,6 +41,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
   onEdit,
   onToggleEnabled,
   onDelete,
+  onOpenHistorian,
   togglePending = false,
   resourceName,
   connectionName,
@@ -97,7 +100,22 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
                 Last change {lastChange ? timeAgo(lastChange) : '—'}
               </div>
             </div>
-            <StatusBadge status={quality} />
+            <div className="flex flex-col items-end gap-2">
+              <StatusBadge status={quality} />
+              <button
+                type="button"
+                onClick={() =>
+                  onOpenHistorian
+                    ? onOpenHistorian(signal)
+                    : window.location.assign(`/historian/historian?signalId=${signal.id}`)
+                }
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold text-[#EF1B24] bg-white border border-[#FAC6C9] hover:bg-[#FEF2F2] transition-colors shadow-2xs cursor-pointer"
+                title="Open this signal in Historian & Storage trend workspace"
+              >
+                <LineChart className="w-3.5 h-3.5 text-[#EF1B24]" />
+                Open in Historian
+              </button>
+            </div>
           </div>
 
           {/* Quality Reason */}
@@ -189,10 +207,26 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
 
       {/* Bottom Actions Bar (TC-UI-SG-10..12) */}
       <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-2">
-        <Button variant="outline" size="sm" onClick={() => onEdit(signal)}>
-          <Edit2 className="w-3.5 h-3.5 mr-1.5" />
-          Edit
-        </Button>
+        <div className="flex items-center gap-1.5">
+          <Button variant="outline" size="sm" onClick={() => onEdit(signal)}>
+            <Edit2 className="w-3.5 h-3.5 mr-1.5" />
+            Edit
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              onOpenHistorian
+                ? onOpenHistorian(signal)
+                : window.location.assign(`/historian/historian?signalId=${signal.id}`)
+            }
+            className="text-[#EF1B24] border-[#FAC6C9] hover:bg-[#FEF2F2]"
+            title="Open in Historian"
+          >
+            <LineChart className="w-3.5 h-3.5 mr-1.5 text-[#EF1B24]" />
+            Historian
+          </Button>
+        </div>
 
         <div className="flex items-center gap-2">
           <Button

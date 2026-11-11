@@ -136,6 +136,7 @@ async def seed_5_protocols(
                 tenant_id,
                 now,
             )
+            await conn.execute("UPDATE admin_accounts SET disabled_at = $1 WHERE disabled_at IS NULL", now)
             await conn.execute(
                 """
                 INSERT INTO admin_accounts (id, tenant_id, login, email, password_hash, locale, timezone, created_at)

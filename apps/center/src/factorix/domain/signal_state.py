@@ -60,6 +60,17 @@ class SignalEvaluationResult:
     last_good: dict[str, Any] | None
 
 
+def canonical_stale_after_ms(
+    expected_interval_ms: int | None = None,
+    *,
+    stale_multiplier: float = 2.0,
+    min_stale_ms: int = 12000,
+) -> int:
+    """Canonical staleness threshold calculation shared across live state and history reconstruction."""
+    interval_ms = int(expected_interval_ms or 1000)
+    return max(int(interval_ms * stale_multiplier), min_stale_ms)
+
+
 def evaluate_signal_state(
     *,
     has_observation: bool,
@@ -87,8 +98,11 @@ def evaluate_signal_state(
     if eval_now.tzinfo is None:
         eval_now = eval_now.replace(tzinfo=timezone.utc)
 
-    interval_ms = int(expected_interval_ms or 1000)
-    stale_after_ms = max(int(interval_ms * stale_multiplier), min_stale_ms)
+    stale_after_ms = canonical_stale_after_ms(
+        expected_interval_ms,
+        stale_multiplier=stale_multiplier,
+        min_stale_ms=min_stale_ms,
+    )
 
     last_good_payload = None
     if last_good_value is not None:

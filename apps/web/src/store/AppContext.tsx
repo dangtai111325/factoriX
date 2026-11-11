@@ -94,7 +94,8 @@ interface AppContextType {
   loadError: string | null
   /** Re-run the metadata load (Retry button). */
   retryLoad: () => Promise<void>
-  revertToZero: (confirm: string) => Promise<void>
+  revertToZero: (confirm?: string, password?: string) => Promise<void>
+  refreshSystemState: () => Promise<void>
   refresh: () => Promise<void>
   isDemoMode: boolean
   demoScenario: 'healthy'
@@ -891,23 +892,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [fetchLatest, isStreaming])
 
-  const revertToZero = async (confirm: string) => {
-    await api('/api/v1/admin/revert-to-zero', {
-      method: 'POST',
-      body: JSON.stringify({ confirm }),
-    })
-    setAllResources([])
-    setConnections([])
-    setEdges([])
-    setSignalMeta([])
+  const refreshSystemState = useCallback(async () => {
     liveRef.current.clear()
-    setLayoutNodes([])
-    setDataModels([])
-    setActivities([])
-    setDiagnostics([])
-    setPlants([])
-    setCurrentPlant(EMPTY_PLANT)
-    window.location.assign('/register')
+    await refresh()
+  }, [refresh])
+
+  const revertToZero = async (confirm = 'CLEAR TELEMETRY', password = '') => {
+    try {
+      await api('/api/v1/admin/telemetry-reset/execute', {
+        method: 'POST',
+        body: JSON.stringify({
+          confirm_phrase: confirm || 'CLEAR TELEMETRY',
+          password: password || undefined,
+        }),
+      })
+    } catch {
+      await api('/api/v1/admin/revert-to-zero', {
+        method: 'POST',
+        body: JSON.stringify({ confirm: confirm || 'CLEAR TELEMETRY' }),
+      })
+    }
+    // Telemetry-only reset: invalidate live observation caches and reload system metadata in place
+    await refreshSystemState()
   }
 
   const addResource = async (resource: Partial<ResourceNode>) => {
@@ -1167,6 +1173,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     loadError,
     retryLoad,
     revertToZero,
+    refreshSystemState,
     refresh,
     isDemoMode: false,
     demoScenario: 'healthy',

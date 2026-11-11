@@ -1109,6 +1109,7 @@ export const SignalsCatalogPage: React.FC = () => {
         connectionName={selectedSignal?.sourceConnectionName || connections.find((c) => c.id === selectedSignal?.sourceConnectionId)?.name}
         edgeName={selectedSignal?.edgeName}
         onClose={() => setSelectedSignal(null)}
+        onOpenHistorian={(sig) => navigate(`/historian/historian?signalId=${sig.id}`)}
         onEdit={(sig) => setEditTarget(sig)}
         onToggleEnabled={handleToggleEnabled}
         togglePending={setEnabled.pending}

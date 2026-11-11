@@ -5,7 +5,7 @@ import { SignalItem } from '../../types';
 interface ObservationPoint {
   source_time: string;
   received_time: string;
-  value: number | string | boolean;
+  value: number | string | boolean | null;
   quality: string;
 }
 
@@ -206,10 +206,10 @@ export const TrendChart: React.FC<TrendChartProps> = ({
 
             {/* Series Paths */}
             {seriesData.map(({ signal, color, points }) => {
-              if (points.length < 2) return null;
-              const pathD = points
-                .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${getX(pt.time)} ${getY(pt.value)}`)
-                .join(' ');
+              if (points.length === 0) return null;
+              const pathD = points.length >= 2
+                ? points.map((pt, i) => `${i === 0 ? 'M' : 'L'} ${getX(pt.time)} ${getY(pt.value)}`).join(' ')
+                : `M ${paddingLeft} ${getY(points[0].value)} L ${getX(points[0].time)} ${getY(points[0].value)}`;
 
               return (
                 <g key={signal.id}>
