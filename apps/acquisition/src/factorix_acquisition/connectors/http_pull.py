@@ -28,6 +28,7 @@ DEFAULT_RATE_PER_MIN = 60
 
 _SSL_CTX_LOCK = threading.Lock()
 _DEFAULT_SSL_CONTEXT: ssl.SSLContext | None = None
+_UNVERIFIED_SSL_CONTEXT: ssl.SSLContext | None = None
 
 
 def _get_default_ssl_context() -> ssl.SSLContext:
@@ -42,6 +43,34 @@ def _get_default_ssl_context() -> ssl.SSLContext:
 
             _DEFAULT_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
         return _DEFAULT_SSL_CONTEXT
+
+
+def _get_unverified_ssl_context() -> ssl.SSLContext:
+    """Build and cache a lightweight TLS context (no Windows cert store scan) for plain HTTP clients."""
+    global _UNVERIFIED_SSL_CONTEXT
+    if _UNVERIFIED_SSL_CONTEXT is not None:
+        return _UNVERIFIED_SSL_CONTEXT
+    with _SSL_CTX_LOCK:
+        if _UNVERIFIED_SSL_CONTEXT is None:
+            import httpcore  # noqa: F401, PLC0415
+
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            _UNVERIFIED_SSL_CONTEXT = ctx
+        return _UNVERIFIED_SSL_CONTEXT
+
+
+async def prewarm_http_ssl() -> None:
+    """Ensure the shared HTTPS CA context is initialized off the event loop before poll timers start."""
+    if _DEFAULT_SSL_CONTEXT is None:
+        await asyncio.to_thread(_get_default_ssl_context)
+
+
+async def prewarm_unverified_ssl() -> None:
+    """Ensure the plain-HTTP TLS context stub is initialized off-loop to avoid httpx verify=False delays."""
+    if _UNVERIFIED_SSL_CONTEXT is None:
+        await asyncio.to_thread(_get_unverified_ssl_context)
 
 
 class TokenBucket:
@@ -154,18 +183,32 @@ class HttpPullConnector:
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            verify: ssl.SSLContext | bool = _DEFAULT_SSL_CONTEXT if _DEFAULT_SSL_CONTEXT is not None else True
+            is_https = self.base_url.lower().startswith("https://")
+            if is_https:
+                verify: ssl.SSLContext | bool = _DEFAULT_SSL_CONTEXT if _DEFAULT_SSL_CONTEXT is not None else True
+            else:
+                verify = _get_unverified_ssl_context()
             self._client = httpx.AsyncClient(
                 timeout=self.timeout_s,
                 follow_redirects=False,
+                trust_env=False,
                 verify=verify,
                 limits=httpx.Limits(max_connections=16, max_keepalive_connections=16),
             )
         return self._client
 
+    async def prewarm(self, *, ssl_always: bool = True) -> None:
+        if ssl_always or self.base_url.lower().startswith("https://"):
+            await prewarm_http_ssl()
+        else:
+            await prewarm_unverified_ssl()
+        self._http()
+
     async def _ensure_http(self) -> httpx.AsyncClient:
-        if _DEFAULT_SSL_CONTEXT is None:
-            await asyncio.to_thread(_get_default_ssl_context)
+        if self.base_url.lower().startswith("https://"):
+            await prewarm_http_ssl()
+        else:
+            await prewarm_unverified_ssl()
         return self._http()
 
     def url_for(self, path: str) -> str:

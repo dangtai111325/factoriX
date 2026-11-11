@@ -172,10 +172,14 @@ class TDEngineConfig:
     db_prefix: str = "fx_t_"
     default_keep_days: int = 30
     default_cache_mb: int = 16
+    default_vgroups: int | None = 1
     max_workers: int = 4
     batch_chunk_rows: int = 200
     max_sql_bytes: int = 240 * 1024
     connect_timeout_s: float = 10.0
+    query_timeout_s: float = 15.0
+    ddl_timeout_s: float = 45.0
+    probe_timeout_s: float = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +199,7 @@ class BatchWriteFailure:
     subtable: str
     code: str
     message: str
+    retryable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +259,7 @@ class TDEngineClient:
             raise TDEngineError("MISSING_DSN", "FACTORIX_TDENGINE_DSN is empty.")
         self._config = config
         self._executor = ThreadPoolExecutor(max_workers=max(1, config.max_workers), thread_name_prefix="fx-td")
+        self._probe_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fx-td-probe")
         self._local = threading.local()
         self._conns_lock = threading.Lock()
         self._conns: list[Any] = []
@@ -323,6 +329,7 @@ class TDEngineClient:
             except Exception:
                 pass
         self._executor.shutdown(wait=False)
+        self._probe_executor.shutdown(wait=False)
 
     async def __aenter__(self) -> TDEngineClient:
         return self
@@ -330,17 +337,48 @@ class TDEngineClient:
     async def __aexit__(self, *_: object) -> None:
         await self.close()
 
-    async def execute_sql(self, sql: str) -> int:
-        loop = asyncio.get_running_loop()
+    def _effective_timeout(self, sql: str, timeout_s: float | None, *, use_probe_pool: bool = False) -> float:
+        if timeout_s is not None:
+            return max(0.5, float(timeout_s))
+        if use_probe_pool:
+            return max(0.5, float(self._config.probe_timeout_s))
+        head = sql.lstrip()[:16].upper()
+        if head.startswith(("CREATE ", "ALTER ", "DROP ")):
+            return max(1.0, float(self._config.ddl_timeout_s))
+        return max(1.0, float(self._config.query_timeout_s))
 
+    async def _run_in_pool(
+        self,
+        fn: Callable[[Any], Any],
+        *,
+        timeout_s: float,
+        use_probe_pool: bool = False,
+    ) -> Any:
+        loop = asyncio.get_running_loop()
+        pool = self._probe_executor if use_probe_pool else self._executor
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(pool, lambda: self._run_sync(fn)), timeout=timeout_s)
+        except asyncio.TimeoutError as exc:
+            raise TDEngineError(
+                "TDENGINE_TIMEOUT",
+                f"TDengine operation timed out after {timeout_s:.1f}s.",
+                retryable=True,
+            ) from exc
+
+    async def execute_sql(self, sql: str, *, timeout_s: float | None = None, use_probe_pool: bool = False) -> int:
         def _exec(conn: Any) -> int:
             return int(conn.execute(sql) or 0)
 
-        return await loop.run_in_executor(self._executor, lambda: self._run_sync(_exec))
+        eff_timeout = self._effective_timeout(sql, timeout_s, use_probe_pool=use_probe_pool)
+        return await self._run_in_pool(_exec, timeout_s=eff_timeout, use_probe_pool=use_probe_pool)
 
-    async def query_rows(self, sql: str) -> list[dict[str, Any]]:
-        loop = asyncio.get_running_loop()
-
+    async def query_rows(
+        self,
+        sql: str,
+        *,
+        timeout_s: float | None = None,
+        use_probe_pool: bool = False,
+    ) -> list[dict[str, Any]]:
         def _query(conn: Any) -> list[dict[str, Any]]:
             # Escape { / } so taosws.Cursor.execute does not run PEP-249 .format() on JSON strings in predicates.
             safe_sql = sql.replace("{", "{{").replace("}", "}}")
@@ -357,7 +395,8 @@ class TDEngineClient:
                     pass
             return [{col: _normalize_cell(val) for col, val in zip(cols, row, strict=True)} for row in raw_rows]
 
-        return await loop.run_in_executor(self._executor, lambda: self._run_sync(_query))
+        eff_timeout = self._effective_timeout(sql, timeout_s, use_probe_pool=use_probe_pool)
+        return await self._run_in_pool(_query, timeout_s=eff_timeout, use_probe_pool=use_probe_pool)
 
     # ------------------------------------------------------------------
     # Tenant DB & Operational History schema provisioning
@@ -369,16 +408,24 @@ class TDEngineClient:
         *,
         keep_days: int | None = None,
         cache_mb: int | None = None,
+        vgroups: int | None = None,
     ) -> str:
         db = tenant_database_name(tenant_id, prefix=self._config.db_prefix)
         keep = int(keep_days if keep_days is not None else self._config.default_keep_days)
         cache = int(cache_mb if cache_mb is not None else self._config.default_cache_mb)
+        vg = vgroups if vgroups is not None else self._config.default_vgroups
         if not (1 <= keep <= 3650):
             raise TDEngineError("INVALID_KEEP_DAYS", f"keep_days must be in [1, 3650], got {keep}")
         if not (0 <= cache <= 4096):
             raise TDEngineError("INVALID_CACHE_MB", f"cache_mb must be in [0, 4096], got {cache}")
+        vg_clause = ""
+        if vg is not None:
+            vg_int = int(vg)
+            if not (1 <= vg_int <= 64):
+                raise TDEngineError("INVALID_VGROUPS", f"vgroups must be in [1, 64], got {vg}")
+            vg_clause = f" VGROUPS {vg_int}"
         await self.execute_sql(
-            f"CREATE DATABASE IF NOT EXISTS {quote_ident(db)} PRECISION 'us' KEEP {keep}d CACHEMODEL 'last_row' CACHESIZE {cache}"
+            f"CREATE DATABASE IF NOT EXISTS {quote_ident(db)} PRECISION 'us' KEEP {keep}d CACHEMODEL 'last_row' CACHESIZE {cache}{vg_clause}"
         )
         return db
 
@@ -388,8 +435,9 @@ class TDEngineClient:
         *,
         keep_days: int | None = None,
         cache_mb: int | None = None,
+        vgroups: int | None = None,
     ) -> str:
-        db = await self.ensure_tenant_database(tenant_id, keep_days=keep_days, cache_mb=cache_mb)
+        db = await self.ensure_tenant_database(tenant_id, keep_days=keep_days, cache_mb=cache_mb, vgroups=vgroups)
         for stable, val_col_type in OP_STABLE_COL_TYPES.items():
             fq = quote_fq_table(db, stable)
             await self.execute_sql(
@@ -467,40 +515,73 @@ class TDEngineClient:
             except TDEngineError as exc:
                 failures.append(BatchWriteFailure(item.item_id, item.subtable, exc.code, exc.message))
 
-        idx = 0
-        while idx < len(prepared):
-            chunk: list[tuple[SubtableWriteItem, str, str]] = []
-            approx_len = len("INSERT INTO ")
-            while idx < len(prepared) and len(chunk) < self._config.batch_chunk_rows:
-                item, header, val_tuple = prepared[idx]
-                add_len = len(header) + len(val_tuple) + 10
-                if chunk and (approx_len + add_len > self._config.max_sql_bytes):
-                    break
-                chunk.append((item, header, val_tuple))
-                approx_len += add_len
-                idx += 1
+        # Group items by exact subtable header first (preserving per-subtable arrival order)
+        # so multi-sample bursts emit one ``USING ... TAGS (...) VALUES (...), (...)`` per subtable.
+        grouped_prepared: dict[str, list[tuple[SubtableWriteItem, str]]] = {}
+        for item, header, val_tuple in prepared:
+            grouped_prepared.setdefault(header, []).append((item, val_tuple))
 
-            # Group consecutive/same-header rows into multi-value tuples per subtable for speed.
-            grouped: dict[str, list[str]] = {}
-            for _, header, val_tuple in chunk:
-                grouped.setdefault(header, []).append(val_tuple)
+        chunks: list[tuple[list[SubtableWriteItem], dict[str, list[str]], list[tuple[SubtableWriteItem, str, str]]]] = []
+        max_rows = max(1, int(self._config.batch_chunk_rows))
+        max_bytes = max(1024, int(self._config.max_sql_bytes))
+
+        cur_items: list[SubtableWriteItem] = []
+        cur_groups: dict[str, list[str]] = {}
+        cur_flat: list[tuple[SubtableWriteItem, str, str]] = []
+        approx_len = len("INSERT INTO ")
+
+        for header, rows in grouped_prepared.items():
+            hdr_overhead = len(header) + 9  # " " + " VALUES "
+            for item, val_tuple in rows:
+                is_new_hdr = header not in cur_groups
+                add_len = (hdr_overhead if is_new_hdr else 2) + len(val_tuple)
+                if cur_items and (len(cur_items) >= max_rows or approx_len + add_len > max_bytes):
+                    chunks.append((cur_items, cur_groups, cur_flat))
+                    cur_items = []
+                    cur_groups = {}
+                    cur_flat = []
+                    approx_len = len("INSERT INTO ")
+                    is_new_hdr = True
+                    add_len = hdr_overhead + len(val_tuple)
+                cur_items.append(item)
+                cur_groups.setdefault(header, []).append(val_tuple)
+                cur_flat.append((item, header, val_tuple))
+                approx_len += add_len
+        if cur_items:
+            chunks.append((cur_items, cur_groups, cur_flat))
+
+        for chunk_items, grouped, flat_chunk in chunks:
             stmt = "INSERT INTO " + " ".join(f"{hdr} VALUES {', '.join(vals)}" for hdr, vals in grouped.items())
 
             try:
                 await self.execute_sql(stmt)
-                succeeded.extend(it.item_id for it, _, _ in chunk)
+                succeeded.extend(it.item_id for it in chunk_items)
             except TDEngineError as exc:
-                if len(chunk) == 1:
-                    only_item = chunk[0][0]
-                    failures.append(BatchWriteFailure(only_item.item_id, only_item.subtable, exc.code, exc.message))
+                if len(flat_chunk) == 1:
+                    only_item = flat_chunk[0][0]
+                    failures.append(
+                        BatchWriteFailure(
+                            only_item.item_id,
+                            only_item.subtable,
+                            exc.code,
+                            exc.message,
+                            retryable=exc.retryable,
+                        )
+                    )
                     continue
-                for sub_item, hdr, val_tuple in chunk:
+                for sub_item, hdr, val_tuple in flat_chunk:
                     try:
                         await self.execute_sql(f"INSERT INTO {hdr} VALUES {val_tuple}")
                         succeeded.append(sub_item.item_id)
                     except TDEngineError as item_exc:
                         failures.append(
-                            BatchWriteFailure(sub_item.item_id, sub_item.subtable, item_exc.code, item_exc.message)
+                            BatchWriteFailure(
+                                sub_item.item_id,
+                                sub_item.subtable,
+                                item_exc.code,
+                                item_exc.message,
+                                retryable=item_exc.retryable,
+                            )
                         )
 
         return BatchWriteResult(succeeded_ids=tuple(succeeded), failures=tuple(failures))
@@ -757,26 +838,30 @@ class TDEngineClient:
 
     async def health_probe(self) -> TDEngineHealth:
         try:
-            ver_rows = await self.query_rows("SELECT SERVER_VERSION() AS ver, NOW() AS now_ts")
+            ver_rows = await self.query_rows("SELECT SERVER_VERSION() AS ver, NOW() AS now_ts", use_probe_pool=True)
             server_version = str(ver_rows[0]["ver"]) if ver_rows else None
             server_now = to_utc_datetime(ver_rows[0]["now_ts"]) if ver_rows else None
-            cluster_rows = await self.query_rows("SELECT version AS edition FROM information_schema.ins_cluster")
+            cluster_rows = await self.query_rows("SELECT version AS edition FROM information_schema.ins_cluster", use_probe_pool=True)
             edition = str(cluster_rows[0]["edition"]) if cluster_rows else None
-            dnode_rows = await self.query_rows("SELECT status FROM information_schema.ins_dnodes")
+            dnode_rows = await self.query_rows("SELECT status FROM information_schema.ins_dnodes", use_probe_pool=True)
             dnode_status = str(dnode_rows[0]["status"]) if dnode_rows else None
             db_rows = await self.query_rows(
-                f"SELECT COUNT(*) AS cnt FROM information_schema.ins_databases WHERE name LIKE {quote_str(self._config.db_prefix + '%')}"
+                f"SELECT COUNT(*) AS cnt FROM information_schema.ins_databases WHERE name LIKE {quote_str(self._config.db_prefix + '%')}",
+                use_probe_pool=True,
             )
             tenant_db_count = int(db_rows[0]["cnt"]) if db_rows else 0
             disk_used: int | None = None
             try:
                 disk_rows = await self.query_rows(
-                    "SELECT SUM(COALESCE(wal, 0) + COALESCE(data1, 0) + COALESCE(data2, 0) + "
-                    "COALESCE(data3, 0) + COALESCE(cache_rdb, 0) + COALESCE(table_meta, 0)) AS used_kb "
-                    "FROM information_schema.ins_disk_usage"
+                    "SELECT wal, data1, data2, data3, cache_rdb, table_meta FROM information_schema.ins_disk_usage",
+                    use_probe_pool=True,
                 )
-                if disk_rows and disk_rows[0].get("used_kb") is not None:
-                    disk_used = int(disk_rows[0]["used_kb"]) * 1024
+                used_kb = sum(
+                    int(row.get(col) or 0)
+                    for row in disk_rows
+                    for col in ("wal", "data1", "data2", "data3", "cache_rdb", "table_meta")
+                )
+                disk_used = used_kb * 1024
             except Exception:
                 disk_used = None
             return TDEngineHealth(

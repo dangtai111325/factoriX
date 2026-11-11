@@ -69,7 +69,7 @@ def isolated_broker_cfg(amqp_url: str, mgmt_url: str) -> BrokerConfig:
 
 
 async def cleanup_broker_topology(cfg: BrokerConfig) -> None:
-    conn = await aio_pika.connect_robust(cfg.amqp_url, timeout=5.0)
+    conn = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
     try:
         ch = await conn.channel()
         for qname in (cfg.queue_name, cfg.dlq_name):

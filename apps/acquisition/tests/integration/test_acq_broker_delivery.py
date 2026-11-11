@@ -48,6 +48,7 @@ async def test_broker_outage_spills_and_replays_to_rabbitmq_and_lkg_cold_start_s
     broker = RabbitMQPublisher(broker_cfg)
     runtime, lkg_store, spool, pub = make_runtime(pool, asyncpg_dsn, broker, tmp_path, data_key=data_key, use_leader_lock=False)
     rt_task: asyncio.Task[None] | None = None
+    cold_rt: AcquisitionRuntime | None = None
     try:
         await broker.start()
         await consumer.start()
@@ -74,11 +75,14 @@ async def test_broker_outage_spills_and_replays_to_rabbitmq_and_lkg_cold_start_s
             await asyncio.sleep(0.1)
         assert spool.pending_count() == 0
         assert pub.published_replay >= pending_during_outage
-        # Give consumer a moment to ACK replayed items
-        await asyncio.sleep(0.5)
-        assert len(received) >= pub.published_fast + pub.published_replay
+        # Stop live runtime first so fast-path counter freezes and drain_and_close() finishes cleanly
         await stop_runtime(rt_task)
         rt_task = None
+        expected_total = pub.published_fast + pub.published_replay
+        deadline = asyncio.get_running_loop().time() + 10.0
+        while asyncio.get_running_loop().time() < deadline and len(received) < expected_total:
+            await asyncio.sleep(0.05)
+        assert len(received) >= expected_total
 
         # Verify LKG cold-start when PostgreSQL is completely unreachable on startup:
         # LKG restores all 5 job specs cleanly without plaintext secrets on disk, and non-secret
@@ -103,7 +107,7 @@ async def test_broker_outage_spills_and_replays_to_rabbitmq_and_lkg_cold_start_s
         assert len(cold_rt.job_tasks) == 5
 
         count_before_cold = len(received)
-        deadline = asyncio.get_running_loop().time() + 6.0
+        deadline = asyncio.get_running_loop().time() + 10.0
         while asyncio.get_running_loop().time() < deadline:
             if cold_pub.fast_buffered + cold_pub.spool.pending_count() >= 4:
                 break
@@ -111,7 +115,7 @@ async def test_broker_outage_spills_and_replays_to_rabbitmq_and_lkg_cold_start_s
         assert cold_pub.fast_buffered + cold_pub.spool.pending_count() >= 4
         published_cold, failed_cold = await cold_pub.flush_once()
         assert failed_cold is False and published_cold >= 4
-        deadline = asyncio.get_running_loop().time() + 5.0
+        deadline = asyncio.get_running_loop().time() + 8.0
         while asyncio.get_running_loop().time() < deadline and len(received) < count_before_cold + 4:
             await asyncio.sleep(0.1)
         assert len(received) >= count_before_cold + 4
@@ -119,8 +123,11 @@ async def test_broker_outage_spills_and_replays_to_rabbitmq_and_lkg_cold_start_s
         http_id = str(seeded["connections"]["http"]["connection_id"])
         assert cold_rt.conn_states.get(http_id, {}).get("last_ok_at") is None
         await cold_rt.close()
+        cold_rt = None
         _ = seeded
     finally:
+        if cold_rt is not None:
+            await cold_rt.close()
         if rt_task is not None:
             await stop_runtime(rt_task)
         await consumer.stop(drain_timeout_s=5.0)

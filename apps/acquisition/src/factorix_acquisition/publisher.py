@@ -108,6 +108,7 @@ class ObservationPublisher:
         max_spool_bytes: int = 512 * 1024 * 1024,
         max_memory_queue: int = MAX_MEMORY_QUEUE,
         on_wake: Any = None,
+        on_broker_restored: Any = None,
     ) -> None:
         self.broker = broker
         self.spool = spool
@@ -116,10 +117,13 @@ class ObservationPublisher:
         self.max_spool_bytes = max(0, int(max_spool_bytes))
         self.max_memory_queue = max(100, int(max_memory_queue))
         self._on_wake = on_wake
+        self._on_broker_restored = on_broker_restored
 
         self._fast_queue: deque[CanonicalObservation] = deque()
+        self._inflight_flushes = 0
         self._seq: dict[tuple[str, str], int] = {}
         self._tenant_epochs: dict[str, int] = {}
+        self._broker_gen = 0
         self._broker_down = broker is None
         self.storage_error: str | None = None
         self.broker_ok: bool = broker is not None
@@ -128,9 +132,16 @@ class ObservationPublisher:
         self.spilled = 0
 
     def set_broker(self, broker: BrokerPublisherProtocol | None) -> None:
+        was_down = self._broker_down or not self.broker_ok
+        self._broker_gen += 1
         self.broker = broker
         self.broker_ok = broker is not None
         self._broker_down = broker is None
+        if broker is not None:
+            if self._on_broker_restored is not None:
+                self._on_broker_restored()
+            elif self._on_wake is not None and (was_down or self.has_pending()):
+                self._on_wake()
 
     def set_tenant_epochs(self, epochs: dict[str, int]) -> int:
         changed = False
@@ -323,72 +334,83 @@ class ObservationPublisher:
 
         Returns ``(published_count, failed_or_broker_unavailable)``.
         """
-        published = 0
-        # 1. If recovering from broker outage, move any residual RAM fast-queue items into the
-        # spool first so latest-per-signal ordering stays monotonic across disk + RAM.
-        if self._broker_down and self._fast_queue:
-            self._spill(list(self._fast_queue))
-            self._fast_queue.clear()
+        self._inflight_flushes += 1
+        try:
+            published = 0
+            # 1. If recovering from broker outage, move any residual RAM fast-queue items into the
+            # spool first so latest-per-signal ordering stays monotonic across disk + RAM.
+            if self._broker_down and self._fast_queue:
+                self._spill(list(self._fast_queue))
+                self._fast_queue.clear()
 
-        # 2. When healthy, drain fast-queue items directly to RabbitMQ without hitting SQLite.
-        while self._fast_queue and not self._broker_down:
-            batch: list[CanonicalObservation] = []
-            while self._fast_queue and len(batch) < BATCH_ROWS:
-                obs = self._fast_queue.popleft()
-                if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
-                    batch.append(obs)
-            if not batch:
-                continue
-            ok_count, failed = await self._publish_or_spill(batch)
-            published += ok_count
-            if failed:
-                if self._fast_queue:
-                    self._spill(list(self._fast_queue))
-                    self._fast_queue.clear()
-                return published, True
-
-        # 3. Replay outage spool if pending rows exist: latest-per-signal lane first, then history.
-        if self.spool.pending_count() > 0:
-            self.spool.purge_old_epochs(self._tenant_epochs)
-            latest_rows = self.spool.latest_pending(BATCH_ROWS)
-            if latest_rows:
-                count, ok = await self._replay_rows(latest_rows)
-                published += count
-                if not ok:
+            # 2. When healthy, drain fast-queue items directly to RabbitMQ without hitting SQLite.
+            while self._fast_queue and not self._broker_down:
+                batch: list[CanonicalObservation] = []
+                while self._fast_queue and len(batch) < BATCH_ROWS:
+                    obs = self._fast_queue.popleft()
+                    if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
+                        batch.append(obs)
+                if not batch:
+                    continue
+                ok_count, failed = await self._publish_or_spill(batch)
+                published += ok_count
+                if failed:
+                    if self._fast_queue:
+                        self._spill(list(self._fast_queue))
+                        self._fast_queue.clear()
                     return published, True
 
-            deadline = time.monotonic() + max(0.0, budget_s)
-            while True:
-                rows = self.spool.pending(BATCH_ROWS)
-                if not rows:
-                    break
-                count, ok = await self._replay_rows(rows)
-                published += count
-                if not ok:
-                    return published, True
-                if len(rows) < BATCH_ROWS or time.monotonic() >= deadline:
-                    break
-        return published, False
+            # 3. Replay outage spool if pending rows exist: latest-per-signal lane first, then history.
+            if self.spool.pending_count() > 0:
+                self.spool.purge_old_epochs(self._tenant_epochs)
+                latest_rows = self.spool.latest_pending(BATCH_ROWS)
+                if latest_rows:
+                    count, ok = await self._replay_rows(latest_rows)
+                    published += count
+                    if not ok:
+                        return published, True
+
+                deadline = time.monotonic() + max(0.0, budget_s)
+                while True:
+                    rows = self.spool.pending(BATCH_ROWS)
+                    if not rows:
+                        break
+                    count, ok = await self._replay_rows(rows)
+                    published += count
+                    if not ok:
+                        return published, True
+                    if len(rows) < BATCH_ROWS or time.monotonic() >= deadline:
+                        break
+            return published, False
+        finally:
+            self._inflight_flushes = max(0, self._inflight_flushes - 1)
 
     async def _publish_or_spill(self, batch: list[CanonicalObservation]) -> tuple[int, bool]:
-        if self.broker is None:
+        broker = self.broker
+        gen = self._broker_gen
+        if broker is None:
             self._spill(batch)
             self._broker_down = True
             self.broker_ok = False
             return 0, True
-        confirmed, failed = await self.broker.publish_observations_partial(batch)
+        confirmed, failed = await broker.publish_observations_partial(batch)
         self.published_fast += len(confirmed)
+        same_gen = gen == self._broker_gen
         if not failed:
-            self._broker_down = False
-            self.broker_ok = True
-            return len(confirmed), False
-        self._broker_down = True
-        self.broker_ok = False
+            if same_gen:
+                self._broker_down = False
+                self.broker_ok = True
+            return len(confirmed), (not same_gen and self.broker is None)
+        if same_gen:
+            self._broker_down = True
+            self.broker_ok = False
         self._spill([obs for obs, _err in failed])
         return len(confirmed), True
 
     async def _replay_rows(self, rows: list[Any]) -> tuple[int, bool]:
-        if self.broker is None:
+        broker = self.broker
+        gen = self._broker_gen
+        if broker is None:
             self._broker_down = True
             self.broker_ok = False
             return 0, False
@@ -417,17 +439,20 @@ class ObservationPublisher:
         if not valid_obs:
             return 0, True
 
-        confirmed, failed = await self.broker.publish_observations_partial(valid_obs)
+        confirmed, failed = await broker.publish_observations_partial(valid_obs)
         if confirmed:
             self.spool.mark_sent(confirmed)
             self.published_replay += len(confirmed)
+        same_gen = gen == self._broker_gen
         if not failed:
-            self._broker_down = False
-            self.broker_ok = True
-            return len(confirmed), True
+            if same_gen:
+                self._broker_down = False
+                self.broker_ok = True
+            return len(confirmed), (same_gen or self.broker is not None)
 
-        self._broker_down = True
-        self.broker_ok = False
+        if same_gen:
+            self._broker_down = True
+            self.broker_ok = False
         backpressure_uids = [obs.event_uid for obs, err in failed if isinstance(err, BrokerBackpressureError)]
         if backpressure_uids:
             self.spool.note_attempt(backpressure_uids, self.max_attempts)
@@ -435,7 +460,7 @@ class ObservationPublisher:
         return len(confirmed), False
 
     def has_pending(self) -> bool:
-        return bool(self._fast_queue) or self.spool.pending_count() > 0
+        return bool(self._fast_queue) or self._inflight_flushes > 0 or self.spool.pending_count() > 0
 
     async def drain_and_close(self, *, timeout_s: float = 5.0) -> None:
         """Flush buffered observations on shutdown; spill any unconfirmed items cleanly."""

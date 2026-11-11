@@ -104,6 +104,7 @@ class AcquisitionRuntime:
         self._baked_secrets: dict[str, tuple[str, str]] = {}
         self._commands: set[asyncio.Task[None]] = set()
         self._flush_event = asyncio.Event()
+        self._backoff_reset_event = asyncio.Event()
         self._unflushed = 0
         self._is_leader = leader_lock is None
         self._stopping = False
@@ -112,9 +113,14 @@ class AcquisitionRuntime:
         self.activation_error: str | None = None
         self.commissioner = Commissioner(self.control_plane.finish_commissioning, self.allowlist_for, self.secret)
         self.publisher._on_wake = self._wake_flusher
+        self.publisher._on_broker_restored = self._on_broker_restored
 
     def _wake_flusher(self) -> None:
         self._unflushed += 1
+        self._flush_event.set()
+
+    def _on_broker_restored(self) -> None:
+        self._backoff_reset_event.set()
         self._flush_event.set()
 
     # ------------------------------------------------------------------ secrets & connectors
@@ -190,7 +196,7 @@ class AcquisitionRuntime:
                 query=config.get("query") or None,
                 rate_limit_per_min=config.get("rate_limit_per_min"),
             )
-            await http_conn._ensure_http()
+            await http_conn.prewarm(ssl_always=False)
             return http_conn
         if spec.protocol == "websocket":
             headers = await http_headers(config, connection.get("secret_ref"), self.secret)
@@ -278,7 +284,7 @@ class AcquisitionRuntime:
                 logger.warning("PostgreSQL config fetch failed: %r", exc)
             self.config_ok = False
             if self.snapshot is None:
-                lkg = self.config_provider.load_lkg()
+                lkg = await asyncio.to_thread(self.config_provider.load_lkg)
                 if lkg is not None and lkg.snapshot is not None:
                     await self.apply_snapshot(lkg.snapshot, lkg.revision, lkg.digest, start_jobs=start_jobs)
                     self.config_provider.mark_applied(lkg.revision, lkg.digest, lkg.struct_hash)
@@ -525,7 +531,7 @@ class AcquisitionRuntime:
                     await self.send_heartbeat()
                     ok = True
                 except Exception as exc:  # noqa: BLE001
-                    logger.info("Heartbeat report failed: %r", exc)
+                    logger.warning("Heartbeat report failed: %r", exc, exc_info=True)
             self._write_health(ok)
             next_due += self.heartbeat_s
             now = time.monotonic()
@@ -555,21 +561,43 @@ class AcquisitionRuntime:
         backoff = 0.0
         while not self._stopping:
             if backoff:
-                await asyncio.sleep(backoff)
-            else:
+                if not self._stopping and not self.publisher.broker_ok:
+                    try:
+                        await asyncio.wait_for(self._backoff_reset_event.wait(), timeout=backoff)
+                    except asyncio.TimeoutError:
+                        pass
+                self._backoff_reset_event.clear()
+                if self._stopping:
+                    break
+                if self.publisher.broker_ok:
+                    backoff = 0.0
+            if not backoff:
                 try:
                     await bounded(self._flush_event.wait(), timeout=1.0)
                 except asyncio.TimeoutError:
                     if not self.publisher.has_pending():
                         continue
+            if self._stopping:
+                break
             self._flush_event.clear()
-            linger_end = time.monotonic() + LINGER_S
-            while self._unflushed < BATCH_ROWS and time.monotonic() < linger_end:
-                await asyncio.sleep(0.01)
+            if self.publisher.spool.pending_count() == 0 and self.publisher.fast_buffered < BATCH_ROWS:
+                linger_end = time.monotonic() + LINGER_S
+                while (
+                    self._unflushed < BATCH_ROWS
+                    and self.publisher.fast_buffered < BATCH_ROWS
+                    and time.monotonic() < linger_end
+                ):
+                    await asyncio.sleep(0.01)
             self._unflushed = 0
             _sent, failed = await self.publisher.flush_once(budget_s=HISTORY_SLICE_S)
             if failed:
-                backoff = min(30.0, max(1.0, backoff * 2))
+                if self.publisher.broker_ok:
+                    backoff = 0.0
+                    if self.publisher.has_pending():
+                        self._flush_event.set()
+                        await asyncio.sleep(0)
+                else:
+                    backoff = min(30.0, max(1.0, backoff * 2))
                 continue
             backoff = 0.0
             if self.publisher.has_pending():
@@ -613,7 +641,7 @@ class AcquisitionRuntime:
             await self.leader_lock.probe()
             self._is_leader = self.leader_lock.is_leader
         if self._is_leader:
-            await self.sync_config()
+            await self.sync_config(start_jobs=False)
         try:
             async with asyncio.TaskGroup() as group:
                 if self.leader_lock is not None:
@@ -623,11 +651,17 @@ class AcquisitionRuntime:
                 group.create_task(self._supervise("commands", self._commands_loop), name="commands-loop")
                 group.create_task(self._supervise("publisher", self._publisher_loop), name="publisher-loop")
                 group.create_task(self._supervise("maintenance", self._maintenance_loop), name="maintenance-loop")
+                if self._is_leader:
+                    for spec in self.specs.values():
+                        if spec.job_id not in self.job_tasks:
+                            self._start_job(spec)
         finally:
             await self.close()
 
     async def close(self) -> None:
         self._stopping = True
+        self._backoff_reset_event.set()
+        self._flush_event.set()
         await self._stop_all_jobs_and_connectors()
         if self.notify_listener is not None:
             await self.notify_listener.close()

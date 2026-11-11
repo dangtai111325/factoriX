@@ -5,16 +5,24 @@ name: factorix-storage-e2e
 services:
   postgres-test:
     image: postgres:17-alpine
+    command:
+      - postgres
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_wal_size=2GB
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-factorix_test}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-factorix-test-ephemeral-pw}
-      POSTGRES_DB: ${POSTGRES_DB:-factorix_test}
+      POSTGRES_USER: ${TEST_POSTGRES_USER:-factorix_test}
+      POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD:-factorix-test-ephemeral-pw}
+      POSTGRES_DB: ${TEST_POSTGRES_DB:-factorix_test}
     ports:
       - "127.0.0.1:15432:5432"
     volumes:
       - e2e_pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-factorix_test} -d $${POSTGRES_DB:-factorix_test}"]
+      test: ["CMD-SHELL", "pg_isready -U $${TEST_POSTGRES_USER:-factorix_test} -d $${TEST_POSTGRES_DB:-factorix_test}"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -23,9 +31,9 @@ services:
     image: rabbitmq:4.0-management-alpine
     hostname: factorix-rmq-test
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-factorix_mq_test}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-factorix-mq-test-pw}
-      RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_ERLANG_COOKIE:-factorix-test-erlang-cookie}
+      RABBITMQ_DEFAULT_USER: ${TEST_RABBITMQ_USER:-factorix_mq_test}
+      RABBITMQ_DEFAULT_PASS: ${TEST_RABBITMQ_PASS:-factorix-mq-test-pw}
+      RABBITMQ_ERLANG_COOKIE: ${TEST_RABBITMQ_ERLANG_COOKIE:-factorix-test-erlang-cookie}
     ports:
       - "127.0.0.1:15673:5672"
       - "127.0.0.1:15672:15672"
@@ -33,10 +41,10 @@ services:
       - e2e_rmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "su-exec", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 5s
-      timeout: 5s
-      start_period: 15s
-      retries: 20
+      interval: 10s
+      timeout: 15s
+      start_period: 20s
+      retries: 15
 
   tdengine-test:
     image: tdengine/tdengine:3.3.6.13

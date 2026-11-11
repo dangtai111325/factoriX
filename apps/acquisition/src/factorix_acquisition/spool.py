@@ -205,13 +205,31 @@ class AcquisitionSpool:
         """Delete or fence spooled rows belonging to epochs strictly older than active_epoch."""
         if not active_epochs:
             return 0
+        if max((int(v) for v in active_epochs.values()), default=1) <= 1:
+            return 0
         removed = 0
         with self._lock:
+            has_old = False
+            for tenant_id, active_epoch in active_epochs.items():
+                ep = int(active_epoch)
+                if ep <= 1:
+                    continue
+                if self.connection.execute(
+                    "SELECT 1 FROM spool WHERE tenant_id = ? AND data_epoch < ? LIMIT 1",
+                    (str(tenant_id), ep),
+                ).fetchone():
+                    has_old = True
+                    break
+            if not has_old:
+                return 0
             with self.connection:
                 for tenant_id, active_epoch in active_epochs.items():
+                    ep = int(active_epoch)
+                    if ep <= 1:
+                        continue
                     cur = self.connection.execute(
                         "DELETE FROM spool WHERE tenant_id = ? AND data_epoch < ?",
-                        (str(tenant_id), int(active_epoch)),
+                        (str(tenant_id), ep),
                     )
                     removed += max(0, cur.rowcount)
             if removed:

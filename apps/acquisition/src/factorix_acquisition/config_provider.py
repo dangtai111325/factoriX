@@ -648,7 +648,7 @@ class ConfigProvider:
         self.last_error = None
         if struct_hash == self.structure_hash and rev == self.revision and self.revision > 0:
             return ConfigUpdate(changed=False, revision=rev, digest=digest, struct_hash=struct_hash, source="pg")
-        self.lkg.save(snapshot, rev, digest)
+        await asyncio.to_thread(self.lkg.save, snapshot, rev, digest)
         return ConfigUpdate(changed=True, snapshot=snapshot, revision=rev, digest=digest, struct_hash=struct_hash, source="pg")
 
     def mark_applied(self, revision: int, digest: str, struct_hash: str) -> None:

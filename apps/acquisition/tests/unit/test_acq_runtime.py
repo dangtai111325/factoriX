@@ -13,6 +13,8 @@ import pytest
 from factorix.domain.canonical import CanonicalObservation
 from factorix_acquisition.config_provider import ConfigProvider, LkgSnapshotStore, PgSecretStore, checksum, structure_digest
 from factorix_acquisition.connectors.errors import ConnectorError
+from factorix_acquisition.jobs import build_specs
+from factorix_acquisition.mapping import Sample
 from factorix_acquisition.publisher import ObservationPublisher
 from factorix_acquisition.runtime import AcquisitionRuntime
 from factorix_acquisition.spool import AcquisitionSpool
@@ -339,3 +341,86 @@ async def test_leader_lock_demotion_stops_all_jobs_and_prevents_standby_polling(
         await task
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_publisher_loop_interrupts_outage_backoff_immediately_on_broker_restore(tmp_path: Path) -> None:
+    snap = _snapshot([{"name": "a"}])
+    runtime, broker, _control = _runtime({"snap": snap}, tmp_path, {_uid("conn", "a"): GoodDevice()})
+    pub = runtime.publisher
+    spec = next(iter(build_specs(snap).values()))
+
+    # Force long backoff scenario: broker starts as None, samples spill -> _publisher_loop enters backoff sleep
+    pub.set_broker(None)
+    pub.emit(spec, [Sample(spec.fields[0]["id"], 42, "GOOD")])
+    loop_task = asyncio.create_task(runtime._publisher_loop())
+    await asyncio.sleep(0.25)  # Allow loop to attempt flush, fail, and enter >= 1.0s backoff wait
+    assert pub.spool.pending_count() == 1
+    assert len(broker.observations) == 0
+
+    t_restore = asyncio.get_running_loop().time()
+    pub.set_broker(broker)
+    deadline = t_restore + 0.5  # Must flush well under 1.0s backoff without waiting out sleep!
+    while asyncio.get_running_loop().time() < deadline and pub.spool.pending_count() > 0:
+        await asyncio.sleep(0.02)
+    assert pub.spool.pending_count() == 0
+    assert len(broker.observations) == 1
+    await runtime.close()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_http_job_prewarms_ssl_before_first_read_budget(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import factorix_acquisition.jobs as jobs_mod
+
+    events: list[str] = []
+
+    async def fake_prewarm() -> None:
+        events.append("prewarm")
+
+    monkeypatch.setattr(jobs_mod, "prewarm_http_ssl", fake_prewarm)
+
+    class OkHttp:
+        async def request_json(self, *args: Any, **kwargs: Any) -> Any:
+            events.append("read")
+            return {"v": 99}
+
+        async def close(self) -> None:
+            return None
+
+    snap = _snapshot(
+        [
+            {
+                "name": "http_tls",
+                "protocol": "http",
+                "config": {"base_url": "https://127.0.0.1:18443", "auth": "none"},
+                "address": {"path": "/telemetry", "jsonpath": "$.v"},
+                "interval_ms": 1000,
+            }
+        ]
+    )
+    runtime, broker, _ = _runtime({"snap": snap}, tmp_path, {_uid("conn", "http_tls"): OkHttp()})
+    await _run_for(runtime, 0.35)
+    assert events and events[0] == "prewarm"
+    assert "read" in events
+    assert [o for o in broker.observations if o.value == 99]
+
+
+@pytest.mark.asyncio
+async def test_plain_http_ensure_does_not_load_ssl_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    from factorix.domain.network import parse_allowlist
+    import factorix_acquisition.connectors.http_pull as http_pull_mod
+    from factorix_acquisition.connectors.http_pull import HttpPullConnector
+
+    called = False
+
+    async def fail_if_called() -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(http_pull_mod, "prewarm_http_ssl", fail_if_called)
+    conn = HttpPullConnector("http://127.0.0.1:18080", parse_allowlist(["127.0.0.1:18080"]), timeout_s=2.0)
+    await conn.prewarm(ssl_always=False)
+    assert called is False
+    await conn.close()
+

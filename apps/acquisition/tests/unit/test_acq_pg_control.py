@@ -25,11 +25,13 @@ class _FakeConn:
         self._rows = rows
         self._counts = counts or []
         self.executed: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetched: list[str] = []
 
     def transaction(self) -> _TxCtx:
         return _TxCtx()
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.fetched.append(sql)
         if "FROM connections" in sql:
             return self._rows
         if "active_bindings" in sql:
@@ -92,6 +94,7 @@ async def test_flush_connection_reports_handles_down_before_first_success() -> N
     )
 
     assert updated == 1
+    assert any("FOR NO KEY UPDATE" in sql and "FROM connections" in sql for sql in conn.fetched)
     update_calls = [(sql, args) for sql, args in conn.executed if sql.startswith("UPDATE connections")]
     assert len(update_calls) == 1
     _sql, args = update_calls[0]
@@ -142,6 +145,7 @@ async def test_flush_connection_reports_recovers_from_degraded_to_healthy() -> N
     )
 
     assert updated == 1
+    assert any("FOR NO KEY UPDATE" in sql and "FROM connections" in sql for sql in conn.fetched)
     update_calls = [(sql, args) for sql, args in conn.executed if sql.startswith("UPDATE connections")]
     assert update_calls[0][1][0] == "HEALTHY"
     assert update_calls[0][1][1] is None

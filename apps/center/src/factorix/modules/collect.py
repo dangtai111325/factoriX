@@ -208,6 +208,24 @@ async def _assert_edge_can_run(session: AsyncSession, edge: dict[str, Any]) -> N
     raise AppError(409, "EDGE_NOT_ENROLLED", "No enrolled collector for this site. Enroll the Edge first.")
 
 
+async def _assert_local_acquisition_can_run(session: AsyncSession) -> None:
+    """Allow commissioning/capture for local-acquisition connections when appliance/acquisition mode is active or heartbeat is fresh."""
+    from factorix.domain.health import heartbeat_fresh
+    from factorix.platform.settings import get_settings
+
+    settings = get_settings()
+    if settings.appliance or settings.collector_mode == "acquisition":
+        return
+    row = await fetch_one(
+        session,
+        "SELECT last_heartbeat, health FROM collector_runtime_status WHERE role = 'acquisition' ORDER BY last_heartbeat DESC LIMIT 1",
+        {},
+    )
+    if row is not None and heartbeat_fresh(row.get("last_heartbeat"), utcnow()):
+        return
+    raise AppError(409, "EDGE_NOT_ENROLLED", "Local acquisition worker is not running. Start factorix-acquisition first.")
+
+
 async def _owned_edge(session: AsyncSession, tenant_id: UUID, edge_id: UUID) -> dict[str, Any]:
     row = await fetch_one(
         session,
@@ -336,10 +354,12 @@ async def create_connection(
     _require_secret(protocol, config, bool(body.secret_input))
     mode, interval = _job_defaults(protocol, interval_override)
 
+    from factorix.platform.settings import get_settings
+
     edge = None
     if body.edge_id:
         edge = await _owned_edge(session, tenant_id, parse_uuid(body.edge_id))
-    else:
+    elif get_settings().collector_mode != "acquisition":
         edge = await fetch_one(
             session,
             "SELECT * FROM edge_nodes WHERE tenant_id = :tenant_id AND site_id = :site_id AND enrollment_status <> 'REVOKED' ORDER BY created_at LIMIT 1",
@@ -363,9 +383,12 @@ async def create_connection(
                 {"id": edge_id, "tenant_id": tenant_id, "site_id": site_id, "name": f"Edge {site_name}"[:160], "now": utcnow()},
             )
             edge = await _owned_edge(session, tenant_id, edge_id)
-    body.edge_id = str(edge["id"])
-    if str(edge["site_id"]) != str(site_id):
-        raise AppError(422, "SCOPE", "Edge does not belong to the selected site.")
+    if edge is not None:
+        body.edge_id = str(edge["id"])
+        if str(edge["site_id"]) != str(site_id):
+            raise AppError(422, "SCOPE", "Edge does not belong to the selected site.")
+    else:
+        body.edge_id = None
     secret_ref = None
     if body.secret_input:
         if len(body.secret_input) > 4096:
@@ -396,7 +419,7 @@ async def create_connection(
             "id": connection_id,
             "tenant_id": tenant_id,
             "site_id": site_id,
-            "edge_id": as_uuid(edge["id"]),
+            "edge_id": as_uuid(edge["id"]) if edge is not None else None,
             "protocol": protocol,
             "name": body.name.strip(),
             "endpoint": redacted_endpoint(protocol, config),
@@ -420,7 +443,10 @@ async def create_connection(
             "timeout_ms": int(config.get("timeout_ms") or 3000),
         },
     )
-    await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(edge["id"]))
+    if edge is not None:
+        await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(edge["id"]))
+    else:
+        await _notify_config_changed(session, tenant_id)
     await audit(session, tenant_id=tenant_id, event_type="CONNECTION_CREATE", actor_id=actor, entity_type="connection", entity_id=connection_id, before=None, after={"name": body.name.strip(), "protocol": body.protocol}, correlation_id=correlation_id)
     result = await get_connection(session, tenant_id, connection_id)
     warnings = _connection_warnings(protocol, config, interval, path_count=1)
@@ -505,14 +531,18 @@ async def get_connection(session: AsyncSession, tenant_id: UUID, connection_id: 
         "SELECT id, mode, interval_ms, timeout_ms, enabled, version FROM acquisition_jobs WHERE connection_id = :id",
         {"id": connection_id},
     )
-    edge = await fetch_one(
-        session,
-        "SELECT id, name, enrollment_status, health, last_heartbeat, desired_revision, active_revision FROM edge_nodes WHERE id = :id",
-        {"id": as_uuid(row["edge_id"])},
-    )
+    edge = None
+    if row.get("edge_id"):
+        edge = await fetch_one(
+            session,
+            "SELECT id, name, enrollment_status, health, last_heartbeat, desired_revision, active_revision FROM edge_nodes WHERE id = :id",
+            {"id": as_uuid(row["edge_id"])},
+        )
     counts = await _active_binding_counts(session, [connection_id])
     if edge is not None:
         row["edge_name"] = edge["name"]
+    else:
+        row.setdefault("edge_name", "Local Acquisition" if row.get("edge_id") is None else None)
     return _decorate_connection(row, active_bindings=counts.get(str(connection_id), 0), edge=edge, now=utcnow())
 
 
@@ -565,23 +595,58 @@ async def list_connections(session: AsyncSession, tenant_id: UUID, *, protocol: 
         """,
         params,
     )
+    conn_rates: dict[str, int] = {}
+    if session is not None and hasattr(session, "begin_nested"):
+        from sqlalchemy.exc import SQLAlchemyError
+
+        try:
+            async with session.begin_nested():
+                rt_rows = await fetch_all(
+                    session,
+                    """
+                    SELECT queues_json
+                    FROM collector_runtime_status
+                    WHERE role = 'ingestion' AND last_heartbeat >= now() - INTERVAL '45 seconds'
+                    """,
+                    {},
+                )
+                for rt in rt_rows:
+                    q = rt.get("queues_json") or {}
+                    if isinstance(q, dict) and isinstance(q.get("conn_rates"), dict):
+                        for cid, cnt in q["conn_rates"].items():
+                            conn_rates[str(cid)] = conn_rates.get(str(cid), 0) + int(cnt or 0)
+        except SQLAlchemyError:
+            pass
     now = utcnow()
     for row in rows:
+        edge_enrollment_status = row.pop("edge_enrollment_status", None)
+        edge_raw_health = row.pop("edge_raw_health", None)
+        edge_last_heartbeat = row.pop("edge_last_heartbeat", None)
         edge = None
         if row.get("edge_id"):
             edge = {
-                "enrollment_status": row.pop("edge_enrollment_status", None),
-                "health": row.pop("edge_raw_health", None),
-                "last_heartbeat": row.pop("edge_last_heartbeat", None),
+                "enrollment_status": edge_enrollment_status,
+                "health": edge_raw_health,
+                "last_heartbeat": edge_last_heartbeat,
             }
+        elif not row.get("edge_name"):
+            row["edge_name"] = "Local Acquisition"
         row["signal_count"] = int(row.get("signal_count") or 0)
-        row["messages_per_min"] = int(row.get("messages_per_min") or 0)
+        row["messages_per_min"] = max(int(row.get("messages_per_min") or 0), conn_rates.get(str(row["id"]), 0))
         _decorate_connection(row, active_bindings=row["signal_count"], edge=edge, now=now)
     return rows
 
 
 def _signal_type(value: str) -> str:
     return "bool" if value == "boolean" else value
+
+
+async def _notify_config_changed(session: AsyncSession, tenant_id: UUID) -> None:
+    await execute(
+        session,
+        "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
+        {"channel": "factorix_config_changed", "payload": json.dumps({"tenant_id": str(tenant_id)})},
+    )
 
 
 async def bump_edge_release(session: AsyncSession, tenant_id: UUID, actor: UUID, correlation_id: str, edge_id: UUID | None = None) -> None:
@@ -605,11 +670,7 @@ async def bump_edge_release(session: AsyncSession, tenant_id: UUID, actor: UUID,
         )
     for e in edges:
         await publish_release(session, tenant_id, actor, ReleaseIn(edge_id=str(e["id"])), correlation_id)
-    await execute(
-        session,
-        "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
-        {"channel": "factorix_config_changed", "payload": json.dumps({"tenant_id": str(tenant_id)})},
-    )
+    await _notify_config_changed(session, tenant_id)
 
 
 def _queue_connection_health(session: AsyncSession, tenant_id: UUID, connection: dict[str, Any]) -> None:
@@ -638,7 +699,10 @@ async def pause_connection(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         "UPDATE connections SET status = 'PAUSED', health = 'PAUSED', version = version + 1, updated_at = :now WHERE id = :id",
         {"now": utcnow(), "id": connection_id},
     )
-    await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
+    if current.get("edge_id"):
+        await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
+    else:
+        await _notify_config_changed(session, tenant_id)
     await audit(session, tenant_id=tenant_id, event_type="CONNECTION_PAUSE", actor_id=actor, entity_type="connection", entity_id=connection_id, before={"status": current["status"]}, after={"status": "PAUSED"}, correlation_id=correlation_id)
     result = await get_connection(session, tenant_id, connection_id)
     _queue_connection_health(session, tenant_id, result)
@@ -649,13 +713,16 @@ async def resume_connection(session: AsyncSession, tenant_id: UUID, actor: UUID,
     current = await _connection_row(session, tenant_id, connection_id, lock=True)
     if current["status"] == "ARCHIVED":
         raise AppError(409, "ARCHIVED", "Archived connections cannot be resumed.")
-    # No evidence yet: UNKNOWN until the edge reports the connection or a sample arrives.
+    # No evidence yet: UNKNOWN until the collector reports the connection or a sample arrives.
     await execute(
         session,
         "UPDATE connections SET status = 'ACTIVE', health = 'UNKNOWN', last_error = NULL, version = version + 1, updated_at = :now WHERE id = :id",
         {"now": utcnow(), "id": connection_id},
     )
-    await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
+    if current.get("edge_id"):
+        await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
+    else:
+        await _notify_config_changed(session, tenant_id)
     await audit(session, tenant_id=tenant_id, event_type="CONNECTION_RESUME", actor_id=actor, entity_type="connection", entity_id=connection_id, before={"status": current["status"]}, after={"status": "ACTIVE"}, correlation_id=correlation_id)
     result = await get_connection(session, tenant_id, connection_id)
     _queue_connection_health(session, tenant_id, result)
@@ -746,7 +813,10 @@ async def patch_connection(
         """,
         {"connection_id": connection_id, "timeout_ms": int(config.get("timeout_ms") or 3000), **({"interval_ms": interval} if interval is not None else {})},
     )
-    await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
+    if current.get("edge_id"):
+        await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
+    else:
+        await _notify_config_changed(session, tenant_id)
     await audit(session, tenant_id=tenant_id, event_type="CONNECTION_UPDATE", actor_id=actor, entity_type="connection", entity_id=connection_id, before={"version": current["version"]}, after={"version": int(current["version"]) + 1, "name": name}, correlation_id=correlation_id)
     result = await get_connection(session, tenant_id, connection_id)
     paths = await fetch_one(
@@ -774,8 +844,11 @@ async def capture_connection(
     correlation_id: str,
 ) -> dict[str, Any]:
     conn = await get_connection(session, tenant_id, connection_id)
-    edge = await _owned_edge(session, tenant_id, as_uuid(conn["edge_id"]))
-    await _assert_edge_can_run(session, edge)
+    if conn.get("edge_id"):
+        edge = await _owned_edge(session, tenant_id, as_uuid(conn["edge_id"]))
+        await _assert_edge_can_run(session, edge)
+    else:
+        await _assert_local_acquisition_can_run(session)
 
     topic_filter = body.topic_filter or (body.topics[0] if body.topics else "#")
     meta = {
@@ -1103,7 +1176,7 @@ async def _rebind_signal(session: AsyncSession, tenant_id: UUID, signal_id: UUID
             "now": now,
         },
     )
-    return {as_uuid(current["edge_id"]), as_uuid(target["edge_id"])}
+    return {as_uuid(x) for x in (current.get("edge_id"), target.get("edge_id")) if x}
 
 
 _SOURCE_SQL = """
@@ -1265,6 +1338,7 @@ async def bulk_address_signals(session: AsyncSession, tenant_id: UUID, actor: UU
     updated: list[dict[str, Any]] = []
     unchanged: list[str] = []
     edges: set[UUID] = set()
+    local_changed = False
     now = utcnow()
     for signal_id, signal, source, check in planned:
         before = source.get("address_json") or {}
@@ -1279,11 +1353,16 @@ async def bulk_address_signals(session: AsyncSession, tenant_id: UUID, actor: UU
         if bumped is None:
             raise AppError(409, "RESOURCE_VERSION_CONFLICT", "A signal was modified elsewhere during the update. Nothing was changed; reload and try again.", extra={"signal_id": str(signal_id)})
         field_id = await _readdress(session, signal_id, source, check)
-        edges.add(as_uuid(source["edge_id"]))
+        if source.get("edge_id"):
+            edges.add(as_uuid(source["edge_id"]))
+        else:
+            local_changed = True
         await audit(session, tenant_id=tenant_id, event_type="SIGNAL_ADDRESS_UPDATE", actor_id=actor, entity_type="signal", entity_id=signal_id, before={"address": before, "version": int(signal["version"])}, after={"address": check.address, "version": int(bumped["version"]), "bulk": True}, correlation_id=correlation_id)
         updated.append({"signal_id": str(signal_id), "version": int(bumped["version"]), "source": _source_view(source, address=check.address, field_id=field_id)})
     for edge_id in sorted(edges, key=str):
         await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=edge_id)
+    if local_changed and not edges:
+        await _notify_config_changed(session, tenant_id)
     return {"updated": updated, "unchanged": unchanged, "count": len(updated)}
 
 
@@ -1378,6 +1457,7 @@ async def bulk_properties_signals(session: AsyncSession, tenant_id: UUID, actor:
     updated: list[dict[str, Any]] = []
     unchanged: list[str] = []
     edges: set[UUID] = set()
+    local_changed = False
     now = utcnow()
     for signal_id, signal, check in planned:
         before: dict[str, Any] = {}
@@ -1412,12 +1492,17 @@ async def bulk_properties_signals(session: AsyncSession, tenant_id: UUID, actor:
             raise AppError(409, "RESOURCE_VERSION_CONFLICT", "A signal was modified elsewhere during the update. Nothing was changed; reload and try again.", extra={"signal_id": str(signal_id)})
         if check is not None:
             await _readdress(session, signal_id, sources[signal_id], check)
-            edges.add(as_uuid(sources[signal_id]["edge_id"]))
+            if sources[signal_id].get("edge_id"):
+                edges.add(as_uuid(sources[signal_id]["edge_id"]))
+            else:
+                local_changed = True
         before["version"], after["version"] = int(signal["version"]), int(bumped["version"])
         await audit(session, tenant_id=tenant_id, event_type="SIGNAL_UPDATE", actor_id=actor, entity_type="signal", entity_id=signal_id, before=before, after={**after, "bulk": True}, correlation_id=correlation_id)
         updated.append({"signal_id": str(signal_id), "version": int(bumped["version"]), "changed": sorted(k for k in after if k != "version")})
     for edge_id in sorted(edges, key=str):
         await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=edge_id)
+    if local_changed and not edges:
+        await _notify_config_changed(session, tenant_id)
     return {"updated": updated, "unchanged": unchanged, "count": len(updated)}
 
 
@@ -1467,17 +1552,24 @@ async def patch_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, sign
     if updated != 1:
         raise AppError(409, "RESOURCE_VERSION_CONFLICT", "This signal was modified elsewhere. Reload it and try again.")
     edges: set[UUID] = set()
+    config_changed = False
     new_field_id: UUID | None = None
     if address_check is not None and source is not None:
         new_field_id = await _readdress(session, signal_id, source, address_check)
-        edges.add(as_uuid(source["edge_id"]))
+        config_changed = True
+        if source.get("edge_id"):
+            edges.add(as_uuid(source["edge_id"]))
     if body.connection_id:
+        config_changed = True
         edges |= await _rebind_signal(session, tenant_id, signal_id, parse_uuid(body.connection_id))
     if body.enabled is not None:
+        config_changed = True
         edges |= await _edges_of_signals(session, [signal_id])
         await _set_binding_enabled(session, [signal_id], body.enabled)
     for edge_id in sorted(edges, key=str):
         await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=edge_id)
+    if config_changed and not edges:
+        await _notify_config_changed(session, tenant_id)
 
     await audit(
         session,
@@ -1512,6 +1604,8 @@ async def delete_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, sig
     await _set_binding_enabled(session, [signal_id], False)
     for edge_id in sorted(edges, key=str):
         await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=edge_id)
+    if not edges:
+        await _notify_config_changed(session, tenant_id)
     await audit(session, tenant_id=tenant_id, event_type="SIGNAL_DELETE", actor_id=actor, entity_type="signal", entity_id=signal_id, before={"status": sig["status"]}, after={"status": "ARCHIVED"}, correlation_id=correlation_id)
     return {"id": str(signal_id), "status": "ARCHIVED"}
 
@@ -1546,6 +1640,8 @@ async def bulk_action_signals(session: AsyncSession, tenant_id: UUID, actor: UUI
         await _set_binding_enabled(session, ids, False)
     for edge_id in sorted(edges, key=str):
         await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=edge_id)
+    if not edges:
+        await _notify_config_changed(session, tenant_id)
     await audit(session, tenant_id=tenant_id, event_type=f"SIGNAL_BULK_{action.upper()}", actor_id=actor, entity_type="signal", entity_id=ids[0], before=None, after={"action": action, "count": len(ids), "ids": [str(item) for item in ids]}, correlation_id=correlation_id)
     return {"affected": len(ids), "action": action}
 
@@ -1752,6 +1848,7 @@ async def publish_formula(session: AsyncSession, tenant_id: UUID, actor: UUID, f
     except FormulaError as exc:
         raise AppError(422, exc.code, str(exc)) from exc
     await execute(session, "UPDATE formula_definitions SET status = 'PUBLISHED', revision = revision + 1 WHERE id = :id", {"id": formula_id})
+    await _notify_config_changed(session, tenant_id)
     await audit(session, tenant_id=tenant_id, event_type="FORMULA_PUBLISH", actor_id=actor, entity_type="formula", entity_id=formula_id, before={"status": formula["status"]}, after={"status": "PUBLISHED"}, correlation_id=correlation_id)
     return {"id": str(formula_id), "status": "PUBLISHED"}
 
@@ -1954,8 +2051,11 @@ async def request_commission(
     connection = await _connection_row(session, tenant_id, connection_id)
     if connection["status"] == "ARCHIVED":
         raise AppError(409, "ARCHIVED", "Archived connections cannot be tested.")
-    edge = await _owned_edge(session, tenant_id, as_uuid(connection["edge_id"]))
-    await _assert_edge_can_run(session, edge)
+    if connection.get("edge_id"):
+        edge = await _owned_edge(session, tenant_id, as_uuid(connection["edge_id"]))
+        await _assert_edge_can_run(session, edge)
+    else:
+        await _assert_local_acquisition_can_run(session)
     probe_path = (test_path or "").strip() or None
     if probe_path is not None and ("://" in probe_path or probe_path.startswith("//")):
         raise AppError(422, "TEST_PATH", "The test path must be relative to the base URL, for example /api/v1/status.", field_errors=[{"path": "test_path", "code": "INVALID"}])
@@ -2034,7 +2134,10 @@ async def archive_connection(session: AsyncSession, tenant_id: UUID, actor: UUID
         """,
         {"connection_id": connection_id},
     )
-    await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
+    if current.get("edge_id"):
+        await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
+    else:
+        await _notify_config_changed(session, tenant_id)
     await audit(
         session,
         tenant_id=tenant_id,

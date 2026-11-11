@@ -20,6 +20,7 @@ keys and with ``type = kind``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
@@ -190,3 +191,22 @@ def origin_allowed(origin: str | None, host: str | None, allowed_origins: Iterab
     if host and parsed.netloc.lower() == host.strip().lower():
         return True
     return False
+
+
+def parse_pg_notify_events(channel: str, payload: str) -> list[dict[str, Any]]:
+    """Decode asyncpg NOTIFY payloads from IngestionWorker or local Acquisition pg_control."""
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    events = data.get("events")
+    if isinstance(events, list):
+        return [ev for ev in events if isinstance(ev, dict) and ev.get("kind") and ev.get("tenant_id")]
+    if isinstance(data.get("event"), dict) and data.get("tenant_id"):
+        kind = "health" if channel == "factorix_health_changed" or data["event"].get("type") == "health" else str(data["event"].get("type") or "health")
+        return [{"kind": kind, "tenant_id": str(data["tenant_id"]), "payload": data["event"]}]
+    return []

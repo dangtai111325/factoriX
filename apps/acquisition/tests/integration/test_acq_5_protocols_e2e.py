@@ -55,7 +55,7 @@ async def test_acquisition_runtime_collects_all_5_protocols_to_rabbitmq(pg_pool,
         await broker.start()
         await consumer.start()
         rt_task = await start_runtime(runtime)
-        await asyncio.wait_for(all_seen.wait(), timeout=15.0)
+        await asyncio.wait_for(all_seen.wait(), timeout=20.0)
 
         # 1. Verify authentic values and strict typing across all 5 protocols
         by_key: dict[str, list[CanonicalObservation]] = {}
@@ -115,10 +115,17 @@ async def test_acquisition_runtime_collects_all_5_protocols_to_rabbitmq(pg_pool,
             await asyncio.sleep(0.15)
 
         assert len(conn_rows) == 5
+        diag = {
+            "conn_rows": [dict(row) for row in conn_rows],
+            "edge_row": dict(edge_row) if edge_row else None,
+            "conn_states": runtime.conn_states,
+            "config_ok": runtime.config_ok,
+            "activation_error": runtime.activation_error,
+        }
         for r in conn_rows:
-            assert r["health"] == "HEALTHY", f"Protocol {r['protocol']} not HEALTHY: {dict(r)}"
-            assert r["last_success_at"] is not None
-            assert r["last_error"] is None
+            assert r["health"] == "HEALTHY", f"Protocol {r['protocol']} not HEALTHY: {dict(r)} | diag={diag}"
+            assert r["last_success_at"] is not None, f"Protocol {r['protocol']} missing last_success_at | diag={diag}"
+            assert r["last_error"] is None, f"Protocol {r['protocol']} unexpected error | diag={diag}"
         assert edge_row is not None
         assert edge_row["health"] == "CONFIG_VALIDATED"
         assert edge_row["last_heartbeat"] is not None

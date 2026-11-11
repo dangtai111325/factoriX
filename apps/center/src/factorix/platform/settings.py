@@ -48,12 +48,21 @@ class Settings(BaseSettings):
     tdengine_dsn: str = ""
     tdengine_db: str = "factorix_ts"
     tdengine_db_prefix: str = "fx_t_"
+    tdengine_default_keep_days: int = Field(default=30, ge=1, le=3650)
+    tdengine_default_cache_mb: int = Field(default=16, ge=0, le=4096)
+    tdengine_pool_size: int = Field(default=4, ge=1, le=64)
+    tdengine_vgroups: int | None = Field(default=1, ge=1, le=64)
+    tdengine_query_timeout_s: float = Field(default=15.0, ge=1.0, le=120.0)
+    tdengine_ddl_timeout_s: float = Field(default=45.0, ge=5.0, le=300.0)
     operational_history_days: int = Field(default=7, ge=1, le=3650)
     storage_export_dir: str = ""
 
     # Ingestion & local acquisition (§3, §4, §7)
     ingestion_batch_size: int = Field(default=256, ge=1, le=4096)
     ingestion_flush_ms: int = Field(default=100, ge=10, le=5000)
+    ingestion_consumer_concurrency: int = Field(default=128, ge=1, le=2048)
+    ingestion_shadow_pg: bool = False
+    collector_mode: str = "edge"
     ot_allowlist: str = ""
     acquisition_spool_path: str = ""
     acquisition_spool_max_bytes: int = Field(default=128 * 1024 * 1024, ge=1_048_576)

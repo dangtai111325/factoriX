@@ -1,4 +1,5 @@
-# One-click FactoriX appliance: web + Postgres + Center + Edge on port 8080.
+# One-click FactoriX appliance: web + Postgres + Center + collector on port 8080.
+# Opt-in '--profile storage' adds external RabbitMQ 4.0 + TDengine 3.3.6.13 + separate workers (§4.1, §7).
 services:
   factorix:
     build: .
@@ -11,6 +12,73 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    networks:
+      - factorix-net
+
+  factorix-rabbitmq:
+    image: rabbitmq:4.0.9-management-alpine
+    profiles: ["storage"]
+    container_name: factorix-rabbitmq
+    hostname: factorix-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${FACTORIX_RABBITMQ_USER:-factorix_mq}
+      RABBITMQ_DEFAULT_PASS: ${FACTORIX_RABBITMQ_PASSWORD:-}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - factorix-rmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "su-exec", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 15s
+      start_period: 20s
+      retries: 15
+    restart: unless-stopped
+    networks:
+      - factorix-net
+
+  factorix-tdengine:
+    image: tdengine/tdengine:3.3.6.13
+    profiles: ["storage"]
+    container_name: factorix-tdengine
+    hostname: factorix-tdengine
+    ports:
+      - "127.0.0.1:6041:6041"
+    volumes:
+      - factorix-td-data:/var/lib/taos
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6041/-/ping >/dev/null || taos -s 'SHOW DATABASES;' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      start_period: 15s
+      retries: 25
+    restart: unless-stopped
+    networks:
+      - factorix-net
+
+  factorix-ingestion-worker:
+    image: factorix:latest
+    profiles: ["storage"]
+    container_name: factorix-ingestion-worker
+    entrypoint: ["python", "-m", "factorix.ingestion"]
+    working_dir: /opt/factorix/apps/center
+    env_file:
+      - .env
+    depends_on:
+      factorix-rabbitmq:
+        condition: service_healthy
+      factorix-tdengine:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - factorix-net
 
 volumes:
   factorix-data:
+  factorix-rmq-data:
+  factorix-td-data:
+
+networks:
+  factorix-net:
+    driver: bridge

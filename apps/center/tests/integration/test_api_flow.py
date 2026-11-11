@@ -65,7 +65,8 @@ async def _wipe() -> None:
                   configuration_drafts, configuration_releases, deployment_events, commissioning_jobs,
                   observations, ingest_dedup, latest_signal_state, observation_quarantine,
                   dashboards, dashboard_revisions, retention_policies, retention_jobs,
-                  saved_queries, audit_events, export_jobs
+                  saved_queries, audit_events, export_jobs,
+                  collector_runtime_status, telemetry_generations
                 RESTART IDENTITY CASCADE
                 """
             )

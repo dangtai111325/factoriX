@@ -112,16 +112,29 @@ async def test_pg_notify_reloads_pause_resume_secret_rotation_without_touching_o
         while asyncio.get_running_loop().time() < deadline and mb_job_id in runtime.job_tasks:
             await asyncio.sleep(0.05)
         assert mb_job_id not in runtime.job_tasks
+        paused_at = datetime.now(timezone.utc)
 
         # Drain any Modbus observations already submitted to the publisher or in-flight in AMQP before pause completed
         deadline = asyncio.get_running_loop().time() + 5.0
         while asyncio.get_running_loop().time() < deadline and runtime.publisher.has_pending():
             await asyncio.sleep(0.05)
-        await asyncio.sleep(0.35)
+        # Allow any AMQP messages already confirmed before pause to finish consumer delivery, then confirm quiet window
+        last_mb_idx = sum(1 for o in received if o.signal_id == mb_sig_id)
+        quiet_since = asyncio.get_running_loop().time()
+        drain_deadline = quiet_since + 3.0
+        while asyncio.get_running_loop().time() < drain_deadline:
+            cur_mb_idx = sum(1 for o in received if o.signal_id == mb_sig_id)
+            if cur_mb_idx != last_mb_idx:
+                last_mb_idx = cur_mb_idx
+                quiet_since = asyncio.get_running_loop().time()
+            elif asyncio.get_running_loop().time() - quiet_since >= 0.35:
+                break
+            await asyncio.sleep(0.05)
 
         pause_mark = len(received)
         await asyncio.sleep(0.6)
         assert not any(o.signal_id == mb_sig_id for o in received[pause_mark:]), "Paused Modbus connection still emitted observations"
+        assert not any(o.signal_id == mb_sig_id and o.acquired_at > paused_at for o in received), "Modbus acquired after pause completed"
 
         # 3. Resume Modbus -> resumes without restart
         async with pool.acquire() as conn:

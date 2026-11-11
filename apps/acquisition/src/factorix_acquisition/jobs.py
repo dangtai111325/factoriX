@@ -23,7 +23,7 @@ from factorix.domain.modbus_decode import ModbusPlanError, ReadBlock, SourceSpan
 from factorix.domain.network import NetworkPolicyError
 from factorix_acquisition.aio import bounded
 from factorix_acquisition.connectors.errors import ConnectorError
-from factorix_acquisition.connectors.http_pull import HttpPullConnector
+from factorix_acquisition.connectors.http_pull import HttpPullConnector, prewarm_http_ssl
 from factorix_acquisition.connectors.modbus import ModbusConnector, decode_block
 from factorix_acquisition.connectors.mqtt import Message, MqttConnector
 from factorix_acquisition.connectors.opcua import CONNECT_FACTOR as OPC_CONNECT_FACTOR, OpcUaConnector
@@ -568,6 +568,9 @@ class JobRunner:
 
     async def _run_poll(self) -> None:
         spec = self.spec
+        http_url = str(spec.config.get("base_url") or spec.config.get("url") or "").strip().lower()
+        if spec.protocol == "http" and http_url.startswith("https://"):
+            await prewarm_http_ssl()
         budget = read_budget_s(spec)
         next_due = time.monotonic()
         while True:

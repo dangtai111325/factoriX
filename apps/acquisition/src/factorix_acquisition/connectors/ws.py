@@ -102,7 +102,7 @@ class WebSocketConnector:
                 raise ConnectorError(self.last_error_code, self.last_error or "WebSocket connection failed.")
             if remaining <= 0:
                 raise ConnectorError("TIMEOUT", f"WebSocket {self.url} did not open in time.")
-            await asyncio.sleep(min(0.1, remaining))
+            await asyncio.sleep(min(0.02, remaining))
 
     async def next_frame(self, after_seq: int, timeout_s: float | None) -> Frame | None:
         async with self._new_frame:
@@ -180,10 +180,10 @@ class WebSocketConnector:
 
 async def capture(connector: WebSocketConnector, seconds: float, max_messages: int) -> list[Frame]:
     """Collect up to ``max_messages`` distinct frames within ``seconds``."""
+    last = connector.latest.seq if connector.latest else 0
     await connector.start()
     await connector.wait_connected(connector.timeout_s)
     frames: list[Frame] = []
-    last = connector.latest.seq if connector.latest else 0
     deadline = time.monotonic() + seconds
     while len(frames) < max_messages:
         remaining = deadline - time.monotonic()

@@ -83,6 +83,7 @@ class BrokerConfig:
             prefetch_count=int(settings.rabbitmq_prefetch),
             max_inflight_publishes=int(settings.rabbitmq_publisher_max_inflight),
             confirm_timeout_s=float(settings.rabbitmq_confirm_timeout_s),
+            consumer_concurrency=int(getattr(settings, "ingestion_consumer_concurrency", 32) or 32),
         )
 
 
@@ -434,7 +435,7 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
     warnings: list[str] = []
 
     try:
-        conn = await aio_pika.connect_robust(cfg.amqp_url, timeout=min(cfg.confirm_timeout_s, 5.0))
+        conn = await aio_pika.connect(cfg.amqp_url, timeout=min(cfg.confirm_timeout_s, 5.0))
         try:
             channel = await conn.channel()
             try:
@@ -467,21 +468,25 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
         auth = (parsed_amqp.username, parsed_amqp.password or "") if parsed_amqp.username else None
         base = cfg.mgmt_url.rstrip("/")
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
                 resp = await client.get(f"{base}/api/queues/{vhost}/{quote(cfg.queue_name, safe='')}", auth=auth)
                 if resp.status_code == 200:
                     data = resp.json()
-                    ready_count = int(data.get("messages_ready", ready_count or 0))
+                    # Keep synchronous AMQP queue.declare_ok message_count authoritative when
+                    # available; Management HTTP stats lag up to ~5s behind real-time ACKs.
+                    if ready_count is None:
+                        ready_count = int(data.get("messages_ready", 0))
                     unacked_count = int(data.get("messages_unacknowledged", 0))
                     head_ts = data.get("head_message_timestamp")
-                    if isinstance(head_ts, (int, float)) and head_ts > 0:
+                    if isinstance(head_ts, (int, float)) and head_ts > 0 and (ready_count or 0) > 0:
                         oldest_age_s = max(0.0, round(time.time() - float(head_ts), 3))
                     else:
                         oldest_age_s = 0.0 if ready_count == 0 else None
                 dlq_resp = await client.get(f"{base}/api/queues/{vhost}/{quote(cfg.dlq_name, safe='')}", auth=auth)
                 if dlq_resp.status_code == 200:
                     dlq_data = dlq_resp.json()
-                    dlq_count = int(dlq_data.get("messages_ready", dlq_count or 0))
+                    if dlq_count is None:
+                        dlq_count = int(dlq_data.get("messages_ready", 0))
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"Management HTTP probe unavailable: {exc}")
 

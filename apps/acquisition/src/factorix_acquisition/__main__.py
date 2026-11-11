@@ -60,7 +60,7 @@ async def build_and_run() -> None:
     lock_key = _env_int("FACTORIX_ACQUISITION_LOCK_KEY", DEFAULT_LOCK_KEY)
 
     asyncpg_dsn = to_asyncpg_dsn(dsn)
-    pool = await asyncpg.create_pool(asyncpg_dsn, min_size=1, max_size=8)
+    pool = await asyncpg.create_pool(asyncpg_dsn, min_size=2, max_size=8)
 
     broker_cfg = BrokerConfig(
         amqp_url=amqp_url,

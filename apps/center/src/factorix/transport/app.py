@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -14,10 +15,12 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import asyncpg
 from fastapi import Depends, FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import collect, edge_sync, identity, resources, telemetry
@@ -48,11 +51,13 @@ from factorix.domain.health import (
     data_collection_status,
     edge_config_state,
     effective_edge_health,
+    heartbeat_fresh,
     no_data_message,
 )
 from factorix.modules.common import as_uuid, audit, execute, execute_rowcount, fetch_all, fetch_one, iso_ms, parse_uuid, queue_stream_event, utcnow
+from factorix.modules.ingestion_worker import to_asyncpg_dsn
 from factorix.platform.after_commit import flush, listen
-from factorix.transport.hub import Channel, Hub, origin_allowed
+from factorix.transport.hub import Channel, Hub, origin_allowed, parse_pg_notify_events
 from factorix.modules.identity import (
     SESSION_COOKIE,
     BootstrapIn,
@@ -89,10 +94,15 @@ from factorix.platform.db import get_engine, session_factory
 from factorix.platform.errors import AppError
 from factorix.platform.http import correlation_id, json_error
 from factorix.platform.security import hash_password, verify_password
-from factorix.platform.settings import get_settings
+from factorix.platform.settings import Settings, get_settings
 
-settings = get_settings()
+_INITIAL_SETTINGS = settings = get_settings()
 logger = logging.getLogger(__name__)
+
+
+def _settings() -> Settings:
+    """Resolve current settings while still honoring test monkeypatches on `app.settings`."""
+    return get_settings() if settings is _INITIAL_SETTINGS else settings
 
 
 async def _flush_events(session: AsyncSession) -> None:
@@ -208,23 +218,40 @@ async def _evaluate_edges(session: AsyncSession) -> None:
 
 
 async def _evaluate_connections(session: AsyncSession) -> None:
-    """Center-side fallback: DEGRADED only when an online, in-sync edge delivers no samples.
+    """Center-side fallback: DEGRADED only when an online collector delivers no samples.
 
     A connection without active bindings is never degraded (its effective health is IDLE). The
     reference time is the latest of the last sample, the binding change, the connection change
-    and the edge's last configuration activation, so new work is not degraded prematurely.
+    and the collector's last configuration activation, so new work is not degraded prematurely.
     """
     now = utcnow()
+    acq_runtime: dict[str, Any] | None = None
+    try:
+        async with session.begin_nested():
+            acq_runtime = await fetch_one(
+                session,
+                """
+                SELECT health, last_heartbeat
+                FROM collector_runtime_status
+                WHERE role = 'acquisition'
+                ORDER BY last_heartbeat DESC
+                LIMIT 1
+                """,
+                {},
+            )
+    except SQLAlchemyError:
+        acq_runtime = None
+
     rows = await fetch_all(
         session,
         """
-        SELECT c.id, c.tenant_id, c.health, c.last_error, c.last_success_at, c.created_at, c.updated_at,
+        SELECT c.id, c.tenant_id, c.edge_id, c.health, c.last_error, c.last_success_at, c.created_at, c.updated_at,
                e.enrollment_status, e.health AS edge_health, e.last_heartbeat, e.desired_revision, e.active_revision,
                (SELECT max(d.at) FROM deployment_events d WHERE d.edge_id = e.id AND d.state = 'ACTIVE') AS activated_at,
                bnd.active_bindings, bnd.bindings_since,
                (SELECT min(j.interval_ms) FROM acquisition_jobs j WHERE j.connection_id = c.id AND j.enabled = TRUE) AS interval_ms
         FROM connections c
-        JOIN edge_nodes e ON e.id = c.edge_id
+        LEFT JOIN edge_nodes e ON e.id = c.edge_id
         JOIN LATERAL (
             SELECT count(DISTINCT b.signal_id) AS active_bindings, max(b.valid_from) AS bindings_since
             FROM acquisition_jobs j
@@ -241,15 +268,21 @@ async def _evaluate_connections(session: AsyncSession) -> None:
     for row in rows:
         if int(row.get("active_bindings") or 0) <= 0:
             continue
-        edge = {
-            "enrollment_status": row["enrollment_status"],
-            "health": row["edge_health"],
-            "last_heartbeat": row["last_heartbeat"],
-            "desired_revision": row["desired_revision"],
-            "active_revision": row["active_revision"],
-        }
-        if effective_edge_health(edge, now) != "ONLINE" or edge_config_state(edge) == "PENDING":
-            continue
+        if row.get("edge_id") is not None:
+            edge = {
+                "enrollment_status": row["enrollment_status"],
+                "health": row["edge_health"],
+                "last_heartbeat": row["last_heartbeat"],
+                "desired_revision": row["desired_revision"],
+                "active_revision": row["active_revision"],
+            }
+            if effective_edge_health(edge, now) != "ONLINE" or edge_config_state(edge) == "PENDING":
+                continue
+        else:
+            if acq_runtime is None or not heartbeat_fresh(acq_runtime.get("last_heartbeat"), now):
+                continue
+            if str(acq_runtime.get("health") or "").upper() in {"OFFLINE", "DOWN"}:
+                continue
         since_candidates = [row.get(key) for key in ("bindings_since", "created_at", "updated_at", "activated_at") if row.get(key)]
         since = max(since_candidates) if since_candidates else None
         if not connection_no_data_due(last_success_at=row.get("last_success_at"), since=since, interval_ms=row.get("interval_ms"), now=now):
@@ -379,7 +412,8 @@ async def _prune(session: AsyncSession) -> None:
 
 
 def _appliance_paths() -> tuple[Path, Path]:
-    data_dir = Path(settings.data_dir)
+    cfg = _settings()
+    data_dir = Path(cfg.data_dir)
     token_path = Path(os.environ.get("FACTORIX_ENROLLMENT_FILE") or (data_dir / "enrollment"))
     credential_path = Path(os.environ.get("FACTORIX_CREDENTIAL_PATH") or (data_dir / "edge-credential"))
     return token_path, credential_path
@@ -408,7 +442,8 @@ async def _ensure_appliance_enrollment(session: AsyncSession) -> None:
     """Appliance mode: keep an unused enrollment token in the shared data directory while the local
     edge is not genuinely enrolled (for example right after Revert-To-Zero, or after the edge
     discarded a credential that Center rejected)."""
-    if not settings.appliance or not settings.data_dir:
+    cfg = _settings()
+    if not cfg.appliance or not cfg.data_dir:
         return
     edge = await fetch_one(
         session,
@@ -452,7 +487,7 @@ async def _ensure_appliance_enrollment(session: AsyncSession) -> None:
 
 async def _ensure_initial_release(session: AsyncSession) -> None:
     """Appliance boot: an edge with active connections but no published release gets one."""
-    if not settings.appliance:
+    if not _settings().appliance:
         return
     edge = await fetch_one(session, "SELECT id, tenant_id FROM edge_nodes WHERE enrollment_status <> 'REVOKED' ORDER BY created_at ASC LIMIT 1", {})
     if edge is None:
@@ -468,10 +503,57 @@ async def _ensure_initial_release(session: AsyncSession) -> None:
 
 
 async def _appliance_auto_enroll() -> None:
-    if not settings.appliance or not settings.data_dir:
+    cfg = _settings()
+    if not cfg.appliance or not cfg.data_dir or cfg.collector_mode == "acquisition":
         return
     await _run_step("appliance_initial_release", _ensure_initial_release)
     await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
+
+
+_parse_pg_notify_events = parse_pg_notify_events
+
+
+async def _pg_notify_bridge_loop() -> None:
+    """Subscribe to PG LISTEN/NOTIFY channels so out-of-process IngestionWorker pushes /stream live."""
+    dsn = to_asyncpg_dsn(_settings().database_url)
+    if not dsn.startswith("postgresql://"):
+        return
+    backoff = 0.5
+    while True:
+        conn: asyncpg.Connection | None = None
+        try:
+            conn = await asyncpg.connect(dsn, timeout=5.0)
+            stop_ev = asyncio.Event()
+
+            def _on_notify(_c: Any, _pid: int, channel: str, payload: str) -> None:
+                events = _parse_pg_notify_events(channel, payload)
+                if events:
+                    hub.dispatch(events)
+
+            def _on_close(_c: Any) -> None:
+                stop_ev.set()
+
+            conn.add_termination_listener(_on_close)
+            await conn.add_listener("factorix_stream_events", _on_notify)
+            await conn.add_listener("factorix_health_changed", _on_notify)
+            backoff = 0.5
+            while not stop_ev.is_set() and not conn.is_closed():
+                try:
+                    await asyncio.wait_for(stop_ev.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    await conn.execute("SELECT 1")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("PG NOTIFY bridge unavailable (%s); reconnecting in %.1fs", type(exc).__name__, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(10.0, backoff * 2.0)
+        finally:
+            if conn is not None and not conn.is_closed():
+                try:
+                    await conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 async def _background_health_loop() -> None:
@@ -486,7 +568,8 @@ async def _background_health_loop() -> None:
             await _run_step("edge_health", _evaluate_edges)
             await _run_step("connection_health", _evaluate_connections)
             await _run_step("commissioning_reaper", _reap_commissioning)
-            if settings.appliance:
+            cfg = _settings()
+            if cfg.appliance and cfg.collector_mode != "acquisition":
                 await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
             if tick % PRUNE_EVERY_TICKS == 0:
                 await _run_step("prune", _prune)
@@ -508,12 +591,14 @@ async def _stop(task: asyncio.Task[Any]) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     task = asyncio.create_task(_background_health_loop(), name="health-loop")
     enroll_task = asyncio.create_task(_appliance_auto_enroll(), name="appliance-enroll")
+    notify_task = asyncio.create_task(_pg_notify_bridge_loop(), name="pg-notify-bridge")
     # Data Model v2: one sampling scheduler, the only writer of model_state / model_snapshots.
     models_engine.ENGINE.start()
-    app.state.background_tasks = (task, enroll_task)
+    app.state.background_tasks = (task, enroll_task, notify_task)
     try:
         yield
     finally:
+        await _stop(notify_task)
         await _stop(enroll_task)
         await models_engine.ENGINE.stop()
         await _stop(task)
@@ -573,39 +658,69 @@ async def live() -> dict[str, str]:
 @app.get("/health/ready")
 async def ready(session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     await fetch_one(session, "SELECT 1 AS ok", {})
-    health_path = os.environ.get("FACTORIX_EDGE_HEALTH", "")
-    if settings.appliance and health_path:
-        file = Path(health_path)
-        if file.is_file():
-            import json
-            import time
-
+    cfg = _settings()
+    if cfg.appliance:
+        if cfg.collector_mode == "acquisition":
+            now = utcnow()
+            rt_rows: list[dict[str, Any]] = []
             try:
-                body = json.loads(file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                body = {"ok": False}
-            age = time.time() - file.stat().st_mtime
-            if not body.get("ok") or age > 30:
-                raise AppError(503, "EDGE_DOWN", "The acquisition loop is not healthy.")
+                async with session.begin_nested():
+                    rt_rows = await fetch_all(
+                        session,
+                        "SELECT role, health, broker_ok, last_heartbeat FROM collector_runtime_status",
+                        {},
+                    )
+            except SQLAlchemyError:
+                rt_rows = []
+            acq_ok = any(
+                r.get("role") == "acquisition"
+                and heartbeat_fresh(r.get("last_heartbeat"), now)
+                and str(r.get("health") or "").upper() != "DOWN"
+                for r in rt_rows
+            )
+            if not acq_ok:
+                raise AppError(503, "ACQUISITION_DOWN", "The local acquisition worker is not healthy.")
+            if cfg.tdengine_dsn:
+                ing_ok = any(
+                    r.get("role") == "ingestion"
+                    and heartbeat_fresh(r.get("last_heartbeat"), now)
+                    and str(r.get("health") or "").upper() != "DOWN"
+                    for r in rt_rows
+                )
+                if not ing_ok:
+                    raise AppError(503, "INGESTION_DOWN", "The ingestion worker is not healthy.")
+        else:
+            health_path = os.environ.get("FACTORIX_EDGE_HEALTH", "")
+            if health_path:
+                file = Path(health_path)
+                if file.is_file():
+                    try:
+                        body = json.loads(file.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        body = {"ok": False}
+                    age = time.time() - file.stat().st_mtime
+                    if not body.get("ok") or age > 30:
+                        raise AppError(503, "EDGE_DOWN", "The acquisition loop is not healthy.")
     return {"status": "ready"}
 
 
 @app.post("/api/v1/auth/bootstrap", status_code=201)
 async def bootstrap(request: Request, body: BootstrapIn, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
-    require_bootstrap_token(settings, request.headers.get("x-bootstrap-token"))
+    require_bootstrap_token(_settings(), request.headers.get("x-bootstrap-token"))
     return await bootstrap_admin(session, body, actor_ip_note="")
 
 
 @app.post("/api/v1/auth/login")
 async def login(body: LoginIn, response: Response, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
-    tokens = await login_admin(session, settings, body)
-    identity._cookies(response, settings, tokens["session_token"], tokens["csrf_token"])
+    cfg = _settings()
+    tokens = await login_admin(session, cfg, body)
+    identity._cookies(response, cfg, tokens["session_token"], tokens["csrf_token"])
     return {"status": "authenticated"}
 
 
 @app.post("/api/v1/auth/forgot")
 async def forgot(body: ForgotIn, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
-    mailer = getattr(app.state, "mailer", None) or SmtpMailer(settings)
+    mailer = getattr(app.state, "mailer", None) or SmtpMailer(_settings())
     return await request_password_reset(session, body, mailer)
 
 
@@ -641,7 +756,7 @@ async def reset_password_link(body: ResetLinkIn, session: AsyncSession = Depends
 @app.post("/api/v1/auth/logout")
 async def logout(response: Response, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     await identity.execute_logout(session, as_uuid(principal["session_id"]))
-    clear_cookies(response, settings)
+    clear_cookies(response, _settings())
     return {"status": "signed_out"}
 
 
@@ -654,10 +769,11 @@ async def revert_zero(body: RevertIn, response: Response, principal: dict[str, A
     del principal
     if body.confirm != "REVERT":
         raise AppError(422, "CONFIRM", "Type REVERT exactly to wipe this installation.")
+    cfg = _settings()
     await identity.revert_to_zero(session)
     await _commit_now(session)
-    if settings.data_dir:
-        root = Path(settings.data_dir)
+    if cfg.data_dir:
+        root = Path(cfg.data_dir)
         for name in (
             "enrollment",
             "edge-credential",
@@ -677,19 +793,20 @@ async def revert_zero(body: RevertIn, response: Response, principal: dict[str, A
     # is written as soon as an edge exists again (first connection) by the appliance enrollment
     # step, which also runs here for completeness.
     await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
-    clear_cookies(response, settings)
+    clear_cookies(response, cfg)
     return {"status": "empty"}
 
 
 @app.get("/api/v1/auth/status")
 async def auth_status(session: AsyncSession = Depends(db_session)) -> dict[str, bool]:
+    cfg = _settings()
     existing = await fetch_one(session, "SELECT id FROM admin_accounts WHERE disabled_at IS NULL LIMIT 1", {})
-    open_first_run = settings.environment == "development" and not settings.bootstrap_token
+    open_first_run = cfg.environment == "development" and not cfg.bootstrap_token
     return {
         "admin_exists": existing is not None,
-        "bootstrap_enabled": bool(settings.bootstrap_token) or open_first_run,
-        "setup_code_required": bool(settings.bootstrap_token),
-        "appliance": settings.appliance,
+        "bootstrap_enabled": bool(cfg.bootstrap_token) or open_first_run,
+        "setup_code_required": bool(cfg.bootstrap_token),
+        "appliance": cfg.appliance,
     }
 
 
@@ -901,8 +1018,9 @@ async def connections(protocol: str | None = None, site_id: str | None = None, s
 @app.post("/api/v1/connections", status_code=201)
 async def create_connection(body: ConnectionIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
-    created = await collect.create_connection(session, tenant_id, actor, body, data_key=settings.data_key, correlation_id=correlation_id(request))
-    if settings.appliance:
+    cfg = _settings()
+    created = await collect.create_connection(session, tenant_id, actor, body, data_key=cfg.data_key, correlation_id=correlation_id(request))
+    if cfg.appliance and cfg.collector_mode != "acquisition":
         # A first connection may have created the local edge: hand it an enrollment token now.
         await _commit_now(session)
         await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
@@ -918,7 +1036,7 @@ async def connection_detail(connection_id: str, principal: dict[str, Any] = Depe
 @app.patch("/api/v1/connections/{connection_id}")
 async def patch_connection(connection_id: str, body: ConnectionPatch, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
-    return await collect.patch_connection(session, tenant_id, actor, parse_uuid(connection_id), body, data_key=settings.data_key, correlation_id=correlation_id(request))
+    return await collect.patch_connection(session, tenant_id, actor, parse_uuid(connection_id), body, data_key=_settings().data_key, correlation_id=correlation_id(request))
 
 
 @app.post("/api/v1/connections/{connection_id}/pause")
@@ -1228,7 +1346,8 @@ async def enrollment(edge_id: str, request: Request, principal: dict[str, Any] =
 
 @app.post("/api/v1/edges/{edge_id}/appliance", status_code=201)
 async def appliance_enrollment(edge_id: str, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
-    if not settings.appliance or not settings.data_dir:
+    cfg = _settings()
+    if not cfg.appliance or not cfg.data_dir:
         raise AppError(404, "NOT_FOUND", "Appliance enrollment is not enabled.")
     tenant_id, actor = _ids(principal)
     issued = await collect.issue_enrollment(session, tenant_id, parse_uuid(edge_id), actor, correlation_id(request))
@@ -1507,6 +1626,49 @@ async def overview(principal: dict[str, Any] = Depends(admin), session: AsyncSes
     for state in connection_states:
         health_counts[state] = health_counts.get(state, 0) + 1
     online_edges = sum(1 for edge in edges if edge["effective_health"] == "ONLINE")
+    edge_states = [edge["effective_health"] for edge in edges]
+    overall_collector_status = collector_status(edge_states)
+    runtime_rows: list[dict[str, Any]] = []
+    try:
+        async with session.begin_nested():
+            runtime_rows = await fetch_all(
+                session,
+                """
+                SELECT instance_id, role, health, broker_ok, last_heartbeat
+                FROM collector_runtime_status
+                ORDER BY last_heartbeat DESC
+                """,
+                {},
+            )
+    except SQLAlchemyError:
+        runtime_rows = []
+    cfg = _settings()
+    if cfg.collector_mode == "acquisition" or (not edges and runtime_rows):
+        acq_rows = [row for row in runtime_rows if row.get("role") == "acquisition"]
+        if acq_rows:
+            acq_states: list[str] = []
+            for row in acq_rows:
+                health_raw = str(row.get("health") or "").upper()
+                if not heartbeat_fresh(row.get("last_heartbeat"), now) or health_raw in {"OFFLINE", "DOWN"}:
+                    acq_states.append("OFFLINE")
+                elif health_raw == "DEGRADED" or not bool(row.get("broker_ok", True)):
+                    acq_states.append("DEGRADED")
+                else:
+                    acq_states.append("ONLINE")
+            computed = collector_status(acq_states)
+            ing_rows = [row for row in runtime_rows if row.get("role") == "ingestion"]
+            if computed == "ONLINE" and (ing_rows or cfg.tdengine_dsn):
+                ing_healthy = any(
+                    heartbeat_fresh(row.get("last_heartbeat"), now)
+                    and str(row.get("health") or "").upper() not in {"OFFLINE", "DOWN"}
+                    and bool(row.get("broker_ok", True))
+                    for row in ing_rows
+                )
+                if not ing_healthy:
+                    computed = "DEGRADED"
+            overall_collector_status = computed
+        elif cfg.collector_mode == "acquisition" and not edges:
+            overall_collector_status = "OFFLINE" if connection_items else "NONE"
     storage = await telemetry.storage_overview(session, tenant_id)
     last_obs = await fetch_one(session, "SELECT max(received_time) AS last_at FROM latest_signal_state WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
     recent_errors = [
@@ -1530,7 +1692,7 @@ async def overview(principal: dict[str, Any] = Depends(admin), session: AsyncSes
         "healthy_edges": online_edges,
         "edges_online": online_edges,
         "edges_total": len(edges),
-        "collector_status": collector_status([edge["effective_health"] for edge in edges]),
+        "collector_status": overall_collector_status,
         "data_collection_status": data_collection_status(connection_states),
         "last_data_at": iso_ms(last_obs["last_at"]) if last_obs else None,
         "ingest_per_minute": storage["ingest_per_minute"],
@@ -1612,7 +1774,7 @@ async def edge_ack(body: EdgeAckIn, request: Request, session: AsyncSession = De
 @app.get("/api/v1/edge-sync/secrets/{secret_id}")
 async def edge_secret(secret_id: str, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
-    return await edge_sync.read_secret(session, edge, parse_uuid(secret_id), settings.data_key)
+    return await edge_sync.read_secret(session, edge, parse_uuid(secret_id), _settings().data_key)
 
 
 @app.post("/api/v1/edge-sync/observations")
@@ -1712,7 +1874,8 @@ async def _stream_subscribe_models(channel: Channel, tenant_id: UUID, message: d
 
 @app.websocket("/stream")
 async def stream(socket: WebSocket) -> None:
-    allowed = [settings.web_origin] if settings.web_origin else []
+    cfg = _settings()
+    allowed = [cfg.web_origin] if cfg.web_origin else []
     if not origin_allowed(socket.headers.get("origin"), socket.headers.get("host"), allowed):
         await socket.close(code=4403)
         return
@@ -1760,9 +1923,10 @@ async def stream(socket: WebSocket) -> None:
 
 
 def _mount_spa() -> None:
-    if not settings.web_dist:
+    cfg = _settings()
+    if not cfg.web_dist:
         return
-    root = Path(settings.web_dist).resolve()
+    root = Path(cfg.web_dist).resolve()
     index = root / "index.html"
     if not index.is_file():
         return

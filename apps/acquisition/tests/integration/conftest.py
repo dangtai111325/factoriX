@@ -19,7 +19,7 @@ from tests.simulators.ot_simulators import SimulatorSuite  # noqa: E402
 @pytest_asyncio.fixture
 async def pg_pool():
     asyncpg_dsn, _amqp, _mgmt, _key = assert_isolated_test_env()
-    pool = await asyncpg.create_pool(asyncpg_dsn, min_size=1, max_size=8)
+    pool = await asyncpg.create_pool(asyncpg_dsn, min_size=2, max_size=8)
     await reset_ephemeral_pg(pool)
     try:
         yield pool, asyncpg_dsn

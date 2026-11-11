@@ -713,7 +713,7 @@ async def _store_observation(
 async def _mark_connections_live(
     session: AsyncSession,
     tenant_id: UUID,
-    edge_id: UUID,
+    edge_id: UUID | None,
     connection_ids: set[UUID],
     now: datetime,
 ) -> None:
@@ -729,7 +729,10 @@ async def _mark_connections_live(
         WITH prev AS (
             SELECT id, health AS old_health
             FROM connections
-            WHERE id = ANY(:ids) AND tenant_id = :tenant_id AND edge_id = :edge_id AND status = 'ACTIVE'
+            WHERE id = ANY(:ids)
+              AND tenant_id = :tenant_id
+              AND (CAST(:edge_id AS uuid) IS NULL OR edge_id = CAST(:edge_id AS uuid))
+              AND status = 'ACTIVE'
             ORDER BY id
             FOR UPDATE
         )
@@ -958,7 +961,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
         session,
         """
         SELECT l.*, s.key, s.display_name, s.expected_interval_ms,
-               CASE WHEN l.quality <> 'GOOD' THEN (
+               CASE WHEN l.reason_code IS NULL AND l.quality <> 'GOOD' THEN (
                    SELECT o.provenance_json->>'reason'
                    FROM observations o
                    WHERE o.event_time = l.event_time AND o.id = l.observation_id
@@ -990,16 +993,20 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
         if row.get("last_good_value_json") is not None and isinstance(row["last_good_value_json"], dict):
             last_good_val = row["last_good_value_json"].get("v")
 
+        raw_reason = row.pop("raw_reason", None)
+        reason_code_in = row.get("reason_code") or raw_reason
+        last_acq = row.get("last_acquired_at") or row.get("received_time")
+
         eval_result = evaluate_signal_state(
             has_observation=True,
             raw_quality=row.get("quality"),
             raw_value=val,
             event_time=row.get("event_time"),
-            last_acquired_at=row.get("received_time"),
+            last_acquired_at=last_acq,
             expected_interval_ms=row.get("expected_interval_ms"),
             last_good_value=last_good_val,
             last_good_time=row.get("last_good_event_time"),
-            raw_reason_code=row.pop("raw_reason", None),
+            raw_reason_code=reason_code_in,
             null_allowed=bool(row.get("nullable")),
             connection_paused=bool(row.pop("connection_paused", False)),
             now=now,
@@ -1015,6 +1022,9 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
         row["quality"] = eval_result.effective_status
         for field in _LATEST_TIME_FIELDS:
             row[field] = iso_ms(row.get(field))
+        for opt_field in ("last_acquired_at", "last_value_changed_at"):
+            if opt_field in row:
+                row[opt_field] = iso_ms(row.get(opt_field))
     return rows
 
 
@@ -1230,7 +1240,7 @@ async def _observation_totals(session: AsyncSession, tenant_id: UUID) -> dict[st
 
 async def storage_overview(session: AsyncSession, tenant_id: UUID) -> dict[str, Any]:
     totals = await _observation_totals(session, tenant_id)
-    recent = {"count": _INGEST_RATE.per_minute(str(tenant_id))}
+    ingest_per_minute = int(_INGEST_RATE.per_minute(str(tenant_id)))
     quality = await fetch_all(
         session,
         """
@@ -1243,20 +1253,51 @@ async def storage_overview(session: AsyncSession, tenant_id: UUID) -> dict[str, 
     )
     quarantine = {"count": totals.get("quarantine", 0)}
     dedup = {"count": totals.get("dedup_keys", 0)}
-    backlog = await fetch_one(
+    backlog_row = await fetch_one(
         session,
         "SELECT COALESCE(sum(outbox_pending), 0) AS pending FROM edge_nodes WHERE tenant_id = :tenant_id",
         {"tenant_id": tenant_id},
     )
+    backlog = int(backlog_row["pending"]) if backlog_row else 0
+    if hasattr(session, "begin_nested"):
+        try:
+            async with session.begin_nested():
+                cutoff = utcnow() - timedelta(seconds=30)
+                runtime_rows = await fetch_all(
+                    session,
+                    """
+                    SELECT role, spool_pending, fast_buffered, queues_json, last_heartbeat
+                    FROM collector_runtime_status
+                    WHERE last_heartbeat >= :cutoff
+                    """,
+                    {"cutoff": cutoff},
+                )
+                worker_rate = 0
+                acq_backlog = 0
+                tenant_key = str(tenant_id)
+                for rt in runtime_rows:
+                    role = str(rt.get("role") or "")
+                    if role == "acquisition":
+                        acq_backlog += int(rt.get("spool_pending") or 0) + int(rt.get("fast_buffered") or 0)
+                    elif role == "ingestion":
+                        qj = rt.get("queues_json") or {}
+                        if isinstance(qj, dict):
+                            tr = qj.get("tenant_rates") or {}
+                            if isinstance(tr, dict):
+                                worker_rate += int(tr.get(tenant_key) or 0)
+                ingest_per_minute = max(ingest_per_minute, worker_rate)
+                backlog += acq_backlog
+        except Exception:  # noqa: BLE001 - optional when running against mocked or pre-0008 test DBs
+            pass
     return {
         "observations": int(totals["observations"]) if totals else 0,
         "oldest": totals["oldest"] if totals else None,
         "newest": totals["newest"] if totals else None,
-        "ingest_per_minute": int(recent["count"]) if recent else 0,
+        "ingest_per_minute": ingest_per_minute,
         "quality": quality,
         "quarantine": int(quarantine["count"]) if quarantine else 0,
         "dedup_keys": int(dedup["count"]) if dedup else 0,
-        "backlog": int(backlog["pending"]) if backlog else 0,
+        "backlog": backlog,
         "disk_bytes": None,
         "approximate": bool(totals.get("approximate")),
         "note": "Disk usage is shown only when the server can measure it.",

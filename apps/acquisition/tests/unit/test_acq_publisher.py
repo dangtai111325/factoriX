@@ -144,3 +144,113 @@ async def test_set_tenant_epochs_purges_old_epoch_in_ram_and_spool(tmp_path: Pat
     assert [o.value for o in broker.published] == [12.0]
     assert broker.published[0].data_epoch == 2
     spool.close()
+
+
+@pytest.mark.asyncio
+async def test_has_pending_stays_true_while_flush_awaiting_broker_confirm(tmp_path: Path) -> None:
+    import asyncio
+
+    spec, _, _ = _spec()
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowBroker:
+        async def publish_observations_partial(
+            self, observations: list[CanonicalObservation]
+        ) -> tuple[list[str], list[tuple[CanonicalObservation, BrokerError]]]:
+            entered.set()
+            await release.wait()
+            return [o.event_uid for o in observations], []
+
+    pub = ObservationPublisher(SlowBroker(), spool)
+    field_id = spec.fields[0]["id"]
+    pub.emit(spec, [Sample(field_id, 1.0, "GOOD")])
+    task = asyncio.create_task(pub.flush_once())
+    await entered.wait()
+    # _fast_queue is already empty, yet publish is still in-flight awaiting confirm!
+    assert pub.fast_buffered == 0
+    assert pub.has_pending() is True
+    release.set()
+    sent, failed = await task
+    assert sent == 1 and failed is False
+    assert pub.has_pending() is False
+    spool.close()
+
+
+def test_set_broker_triggers_wake_and_recovery_callbacks(tmp_path: Path) -> None:
+    wakes = 0
+    restores = 0
+
+    def _wake() -> None:
+        nonlocal wakes
+        wakes += 1
+
+    def _restored() -> None:
+        nonlocal restores
+        restores += 1
+
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    pub = ObservationPublisher(None, spool, on_wake=_wake)
+    pub.set_broker(RecordingBroker())
+    assert wakes == 1
+    assert pub.broker_ok is True
+
+    pub2 = ObservationPublisher(None, spool, on_wake=_wake, on_broker_restored=_restored)
+    pub2.set_broker(RecordingBroker())
+    assert restores == 1
+    assert wakes == 1  # on_broker_restored handled wake cleanly
+    spool.close()
+
+
+@pytest.mark.asyncio
+async def test_set_broker_generation_prevents_inflight_flush_from_clobbering_outage_or_restore(tmp_path: Path) -> None:
+    import asyncio
+
+    spec, _, _ = _spec()
+    field_id = spec.fields[0]["id"]
+    spool = AcquisitionSpool(tmp_path / "gen.sqlite")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class HangingOkBroker:
+        async def publish_observations_partial(self, observations: list[CanonicalObservation]):
+            entered.set()
+            await release.wait()
+            return [o.event_uid for o in observations], []
+
+    pub = ObservationPublisher(HangingOkBroker(), spool)
+    pub.emit(spec, [Sample(field_id, 1.0, "GOOD")])
+    task = asyncio.create_task(pub.flush_once())
+    await entered.wait()
+
+    # Outage triggered mid-await -> stale in-flight success MUST NOT clear _broker_down or set broker_ok=True
+    pub.set_broker(None)
+    release.set()
+    sent, failed = await task
+    assert sent == 1 and failed is True
+    assert pub._broker_down is True
+    assert pub.broker_ok is False
+
+    # Reverse race: failing publish mid-await when broker is restored via set_broker(healthy) -> keep broker_ok=True
+    entered2 = asyncio.Event()
+    release2 = asyncio.Event()
+
+    class FailingLateBroker:
+        async def publish_observations_partial(self, observations: list[CanonicalObservation]):
+            entered2.set()
+            await release2.wait()
+            return [], [(o, BrokerUnavailableError("late fail")) for o in observations]
+
+    pub2 = ObservationPublisher(FailingLateBroker(), spool)
+    pub2.emit(spec, [Sample(field_id, 2.0, "GOOD")])
+    task2 = asyncio.create_task(pub2.flush_once())
+    await entered2.wait()
+    pub2.set_broker(RecordingBroker())
+    release2.set()
+    sent2, failed2 = await task2
+    assert sent2 == 0 and failed2 is True
+    assert pub2.broker_ok is True
+    assert pub2._broker_down is False
+    assert spool.pending_count() == 1
+    spool.close()

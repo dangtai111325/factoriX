@@ -51,7 +51,7 @@ class PgControlPlane:
                     WHERE j.status = 'PENDING'
                     ORDER BY j.started_at NULLS LAST, j.id
                     LIMIT $1
-                    FOR UPDATE OF j SKIP LOCKED
+                    FOR NO KEY UPDATE OF j SKIP LOCKED
                 )
                 UPDATE commissioning_jobs j
                 SET status = 'RUNNING', started_at = now()
@@ -149,7 +149,7 @@ class PgControlPlane:
                     FROM connections
                     WHERE id = ANY($1::uuid[])
                     ORDER BY id
-                    FOR UPDATE
+                    FOR NO KEY UPDATE
                     """,
                     ids,
                 )

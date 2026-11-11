@@ -9,7 +9,8 @@ import pytest
 from factorix.domain.network import AllowedEndpoint, NetworkPolicyError, assert_allowed, assert_url, endpoint_from_url, parse_allowlist
 from factorix_acquisition.config_provider import endpoints_for
 from factorix_acquisition.connectors.errors import CAPABILITIES, ConnectorError
-from factorix_acquisition.connectors.http_pull import TokenBucket, parse_retry_after
+from factorix_acquisition.connectors.http_pull import HttpPullConnector, TokenBucket, parse_retry_after
+import factorix_acquisition.connectors.http_pull as http_pull_mod
 from factorix_acquisition.timeutil import from_epoch_ms, iso_ms, normalize_time
 
 
@@ -122,3 +123,17 @@ def test_parse_retry_after() -> None:
     assert parse_retry_after("12") == 12.0
     assert parse_retry_after(None, 60.0) == 60.0
     assert 0 <= parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") <= 1
+
+
+@pytest.mark.asyncio
+async def test_http_pull_disables_env_proxies_and_prewarms_ssl(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    allow = parse_allowlist(["127.0.0.1:18443"])
+    conn = HttpPullConnector("http://127.0.0.1:18443", allow, timeout_s=2.0)
+    await conn.prewarm()
+    assert http_pull_mod._DEFAULT_SSL_CONTEXT is not None
+    client = conn._http()
+    assert client.trust_env is False
+    assert dict(client._mounts) == {}
+    await conn.close()

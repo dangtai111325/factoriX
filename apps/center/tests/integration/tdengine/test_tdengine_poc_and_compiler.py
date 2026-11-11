@@ -55,6 +55,7 @@ async def test_tdengine_health_probe_and_typed_round_trip() -> None:
             assert health.server_version == "3.3.6.13"
             assert health.edition == "community"
             assert health.dnode_status == "ready"
+            assert health.disk_used_bytes is not None and health.disk_used_bytes >= 0
 
             created_db = await td.ensure_operational_schema(tenant_id, keep_days=30, cache_mb=16)
             assert created_db == db

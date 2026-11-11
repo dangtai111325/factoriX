@@ -28,33 +28,22 @@ python /opt/factorix/infrastructure/docker/bootstrap_db.py
 cd /opt/factorix/apps/center
 alembic upgrade head
 
-# Supervise exactly one collector runtime (never both simultaneously to avoid double-polling OT sources).
-# S06 switches default FACTORIX_COLLECTOR_MODE to 'acquisition' once IngestionWorker + RabbitMQ + TDengine are active.
-COLLECTOR_MODULE="factorix_edge"
-if [ "${FACTORIX_COLLECTOR_MODE:-edge}" = "acquisition" ]; then
-  if [ -z "${FACTORIX_RABBITMQ_URL:-}" ]; then
-    echo "FACTORIX_COLLECTOR_MODE=acquisition requires FACTORIX_RABBITMQ_URL; refusing unsafe startup." >&2
-    exit 1
-  fi
-  mkdir -p "${FACTORIX_ACQUISITION_DIR:-/data/acquisition}"
-  COLLECTOR_MODULE="factorix_acquisition"
-fi
-
-supervise_collector() {
+supervise_process() {
+  local module_name="$1"
   set +e
   local child=0
   local backoff=1
   trap 'kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM INT
   while true; do
     local started=$SECONDS
-    python -m "$COLLECTOR_MODULE" &
+    python -m "$module_name" &
     child=$!
     wait "$child"
     local code=$?
     if [ $((SECONDS - started)) -ge 60 ]; then
       backoff=1
     fi
-    echo "$COLLECTOR_MODULE exited with code $code; restarting in ${backoff}s" >&2
+    echo "$module_name exited with code $code; restarting in ${backoff}s" >&2
     sleep "$backoff" &
     wait $!
     if [ "$backoff" -lt 30 ]; then
@@ -63,13 +52,30 @@ supervise_collector() {
   done
 }
 
-supervise_collector &
-EDGE_PID=$!
+# Supervise strictly one acquisition path (never edge + acquisition simultaneously to prevent double polling).
+WORKERS=()
+MODE="${FACTORIX_COLLECTOR_MODE:-edge}"
+if [ "$MODE" = "acquisition" ]; then
+  if [ -z "${FACTORIX_RABBITMQ_URL:-}" ] || [ -z "${FACTORIX_TDENGINE_DSN:-}" ]; then
+    echo "FACTORIX_COLLECTOR_MODE=acquisition requires FACTORIX_RABBITMQ_URL and FACTORIX_TDENGINE_DSN; refusing unsafe startup." >&2
+    exit 1
+  fi
+  mkdir -p "${FACTORIX_ACQUISITION_DIR:-/data/acquisition}" "${FACTORIX_STORAGE_EXPORT_DIR:-/data/exports}"
+  supervise_process "factorix_acquisition" &
+  WORKERS+=($!)
+  supervise_process "factorix.ingestion" &
+  WORKERS+=($!)
+else
+  supervise_process "factorix_edge" &
+  WORKERS+=($!)
+fi
+
 python -m uvicorn factorix.transport.app:app --host 0.0.0.0 --port 8080 &
 APP_PID=$!
 
 stop() {
-  kill "$APP_PID" "$EDGE_PID" 2>/dev/null || true
+  kill "$APP_PID" "${WORKERS[@]}" 2>/dev/null || true
+  wait "$APP_PID" "${WORKERS[@]}" 2>/dev/null || true
   su postgres -c "$PG_BIN/pg_ctl -D $PGDATA -m fast -w stop" || true
 }
 trap stop TERM INT
