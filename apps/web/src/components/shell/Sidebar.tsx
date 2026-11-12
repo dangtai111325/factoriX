@@ -73,8 +73,7 @@ const mainNav: NavGroup[] = [
     label: 'Historian & Storage',
     icon: LineChart,
     children: [
-      { label: 'Designer', path: '/historian/designer' },
-      { label: 'Catalog', path: '/historian/catalog' },
+      { label: 'Storage Management', path: '/historian/storage' },
       { label: 'Historian', path: '/historian/historian' },
     ],
   },
@@ -297,11 +296,8 @@ export const Sidebar: React.FC = () => {
     if (path === '/models') {
       return location.pathname === '/models';
     }
-    if (path === '/historian/designer') {
-      return location.pathname.startsWith('/historian/designer');
-    }
-    if (path === '/historian/catalog') {
-      return location.pathname.startsWith('/historian/catalog');
+    if (path === '/historian/storage') {
+      return location.pathname.startsWith('/historian/storage');
     }
     if (path === '/historian/historian') {
       return (

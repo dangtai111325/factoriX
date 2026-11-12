@@ -1,0 +1,5 @@
+container_name,component,baseline_cpu_perc,baseline_mem_usage,baseline_pids,measured_optimized_cpu_perc,measured_mem_usage,measured_pids,reduction_pct,optimization_actions
+factorix-appliance,FastAPI + Ingestion Worker + Model Engine,390.83%,418.5MiB,41,261.86%,253.5MiB,36,-32.99%,"LRU formula AST compilation cache (_formula_ast_cache), BatchWriteFailure code fix, batch latest_signal_state update"
+factorix-rabbitmq,RabbitMQ 4.4 Quorum Queues (Beam VM),190.05%,385.1MiB,71,50.54%,775.3MiB,37,-73.40%,"Consumer concurrency alignment, queue backpressure stabilization"
+factorix-postgres,PostgreSQL 17 Control Plane,53.46%,166.6MiB,24,31.06%,120.3MiB,17,-41.90%,"latest_signal_state write coalescing, connection pool cap optimization"
+factorix-tdengine,TDengine 3.4.3.9 TSDB (Vnode threads),43.76%,760.7MiB,227,29.88%,774.7MiB,234,-31.71%,"Optimized SQL batch string assembly, avoidance of unnecessary fallback loops"

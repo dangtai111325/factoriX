@@ -1035,6 +1035,7 @@ class IngestionWorker:
         self.batch_size = max(1, min(1000, int(batch_size)))
         self.flush_interval_s = max(0.002, int(flush_ms) / 1000.0)
         self.shadow_pg = bool(shadow_pg)
+        self._formula_ast_cache: dict[tuple[UUID, int], Any] = {}
         self.recording_evaluator: RecordingPolicyEvaluator = (
             recording_evaluator if recording_evaluator is not None else DefaultRecordingPolicyEvaluator()
         )
@@ -2342,7 +2343,15 @@ class IngestionWorker:
                     if not ready:
                         continue
                     try:
-                        program = bind(parse_expression(str(formula["expression_source"])), alias_ids)
+                        rev = int(formula.get("revision") or 1)
+                        cache_key = (fid, rev)
+                        program = self._formula_ast_cache.get(cache_key)
+                        if program is None:
+                            ast = parse_expression(str(formula["expression_source"]))
+                            program = bind(ast, alias_ids)
+                            if len(self._formula_ast_cache) >= 5000:
+                                self._formula_ast_cache.pop(next(iter(self._formula_ast_cache)))
+                            self._formula_ast_cache[cache_key] = program
                         val = evaluate(program, values)
                     except (FormulaError, ZeroDivisionError, OverflowError, ValueError):
                         continue

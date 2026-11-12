@@ -244,10 +244,12 @@ class TDengineModelSnapshotProvider:
                 retry_res = await self._client.write_batch(db, retry_items)
                 if retry_res.failures:
                     first = retry_res.failures[0]
-                    raise TDEngineError(first.error_code, first.message, retryable=first.retryable)
+                    err_code = getattr(first, "code", getattr(first, "error_code", "UNKNOWN"))
+                    raise TDEngineError(err_code, first.message, retryable=first.retryable)
             else:
                 first = res.failures[0]
-                raise TDEngineError(first.error_code, first.message, retryable=first.retryable)
+                err_code = getattr(first, "code", getattr(first, "error_code", "UNKNOWN"))
+                raise TDEngineError(err_code, first.message, retryable=first.retryable)
 
     async def list_snapshots(
         self,

@@ -20,9 +20,11 @@ import { KnowledgeGraphPage } from './pages/04_KnowledgeGraph/KnowledgeGraphPage
 import { ConnectionsPage } from './pages/05_Connections/ConnectionsPage';
 import { AddDataWizardPage } from './pages/06_AddDataWizard/AddDataWizardPage';
 import { SignalsCatalogPage } from './pages/08_SignalsCatalog/SignalsCatalogPage';
-import { StorageDesignerPage } from './pages/10_StorageDesigner/StorageDesignerPage';
-import { HistorianExplorerPage } from './pages/11_HistorianExplorer/HistorianExplorerPage';
-import { StorageCatalogPage } from './pages/11_StorageCatalog/StorageCatalogPage';
+import { StorageManagementPage } from './pages/storage-management/StorageManagementPage';
+import { CreateStorageObjectWizard } from './pages/storage-management/wizards/CreateStorageObjectWizard';
+import { EditStorageObjectWizard } from './pages/storage-management/wizards/EditStorageObjectWizard';
+import { StorageObjectDetailPage } from './pages/storage-management/StorageObjectDetailPage';
+import { HistorianExplorerPage } from './pages/historian/HistorianExplorerPage';
 import { DataModelsPage } from './pages/13_DataModels/DataModelsPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
 import { NotFoundPage } from './pages/NotFound/NotFoundPage';
@@ -44,6 +46,13 @@ const RedirectWithQuery: React.FC<{ to: string; extraParams?: Record<string, str
   return <Navigate to={destination} replace />;
 };
 
+// Legacy catalog/:id -> /historian/storage/object/:id
+const LegacyCatalogRedirect: React.FC = () => {
+  const location = useLocation();
+  const id = location.pathname.replace('/historian/catalog/', '');
+  return <Navigate to={`/historian/storage/object/${encodeURIComponent(id)}`} replace />;
+};
+
 const ROUTE_TITLES: Record<string, string> = {
   '/overview': 'Overview',
   '/factory/structure': 'Hierarchy Structure',
@@ -53,9 +62,8 @@ const ROUTE_TITLES: Record<string, string> = {
   '/collector/signals': 'Signals',
   '/models': 'Model Catalog',
   '/dashboards': 'Dashboards',
-  '/historian/designer': 'Storage Designer',
-  '/historian/catalog': 'Storage Catalog',
-  '/historian/historian': 'Historian Explorer',
+  '/historian/storage': 'Storage Management',
+  '/historian/historian': 'Historian',
   '/historian': 'Historian & Storage',
   '/alarms': 'Alarms & Events',
   '/analytics': 'Analytics',
@@ -102,10 +110,19 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/collector/diagnostics" element={<Navigate to="/collector/connections" replace />} />
 
               {/* Storage & Historian Routes */}
-              <Route path="/historian/designer" element={<StorageDesignerPage />} />
-              <Route path="/historian/catalog" element={<StorageCatalogPage />} />
+              <Route path="/historian/storage" element={<StorageManagementPage />} />
+              <Route path="/historian/storage/create" element={<CreateStorageObjectWizard />} />
+              <Route path="/historian/storage/edit/:objectId" element={<EditStorageObjectWizard />} />
+              <Route path="/historian/storage/object/:objectId" element={<StorageObjectDetailPage />} />
               <Route path="/historian/historian" element={<HistorianExplorerPage />} />
-              <Route path="/historian" element={<Navigate to="/historian/designer" replace />} />
+
+              {/* Legacy query-preserving redirects */}
+              <Route path="/historian/designer" element={<RedirectWithQuery to="/historian/storage" />} />
+              <Route path="/historian/designer/:designId" element={<RedirectWithQuery to="/historian/storage" />} />
+              <Route path="/historian/catalog" element={<RedirectWithQuery to="/historian/storage" extraParams={{ tab: 'objects' }} />} />
+              <Route path="/historian/catalog/:id" element={<LegacyCatalogRedirect />} />
+              <Route path="/historian" element={<RedirectWithQuery to="/historian/storage" />} />
+              <Route path="/storage" element={<RedirectWithQuery to="/historian/storage" />} />
 
               {/* Coming soon routes */}
               <Route path="/dashboards/*" element={<ComingSoonPage />} />
@@ -136,7 +153,6 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/live/activity" element={<RedirectWithQuery to="/collector/connections" />} />
               <Route path="/signals/output-groups" element={<RedirectWithQuery to="/models" />} />
               <Route path="/signals/calculated" element={<RedirectWithQuery to="/models" extraParams={{ tab: 'calculations' }} />} />
-              <Route path="/storage" element={<RedirectWithQuery to="/historian" />} />
 
               {/* R3-NAV-01: unknown routes get a real Not Found page instead of a silent redirect. */}
               <Route path="*" element={<NotFoundPage />} />
