@@ -51,7 +51,7 @@ jobs:
           POSTGRES_DB: factorix_test
         ports: ["5432:5432"]
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -80,15 +80,25 @@ jobs:
         run: |
           python -m pip install -r infrastructure/docker/requirements.txt
           python -m pip install aio-pika taos-ws-py pyyaml pytest pytest-asyncio
-      - name: Run Postgres migrations & integration tests
+      - name: Run Postgres migrations
+        env:
+          FACTORIX_ENVIRONMENT: test
+          FACTORIX_DATABASE_URL: postgresql+asyncpg://test:test@127.0.0.1:5432/factorix_test
+          FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+          PYTHONPATH: "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/apps/center/src:$GITHUB_WORKSPACE/apps/acquisition/src:$GITHUB_WORKSPACE/apps/edge/src"
+        working-directory: apps/center
+        run: |
+          python -m alembic upgrade head
+
+      - name: Run integration tests
         env:
           FACTORIX_ENVIRONMENT: test
           FACTORIX_ENABLE_DESTRUCTIVE_TESTS: YES_I_USE_EPHEMERAL_DB
           FACTORIX_DATABASE_URL: postgresql+asyncpg://test:test@127.0.0.1:5432/factorix_test
           FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
           FACTORIX_RABBITMQ_URL: amqp://guest:guest@127.0.0.1:5672/
+          FACTORIX_RABBITMQ_MGMT_URL: http://127.0.0.1:15672
           FACTORIX_TDENGINE_DSN: ws://root:taosdata@127.0.0.1:6041
-          PYTHONPATH: ".:apps/center/src:apps/acquisition/src:apps/edge/src"
+          PYTHONPATH: "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/apps/center/src:$GITHUB_WORKSPACE/apps/acquisition/src:$GITHUB_WORKSPACE/apps/edge/src"
         run: |
-          cd apps/center && alembic upgrade head && cd ../..
-          python -m pytest apps/center/tests/integration apps/acquisition/tests/integration -q
+          python -m pytest apps/center/tests/integration apps/acquisition/tests/integration -v --tb=short

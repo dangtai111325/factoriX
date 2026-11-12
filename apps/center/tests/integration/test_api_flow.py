@@ -11,11 +11,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 ROOT = Path(__file__).resolve().parents[4]
-for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, value = line.split("=", 1)
-    os.environ.setdefault(key.strip(), value)
+for candidate in (ROOT / ".env", ROOT / ".env.test.example"):
+    if candidate.is_file():
+        for line in candidate.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
 os.environ["FACTORIX_BOOTSTRAP_TOKEN"] = "integration-bootstrap-token"
 os.environ["FACTORIX_ENVIRONMENT"] = "test"
 os.environ["FACTORIX_COOKIE_SECURE"] = "false"
