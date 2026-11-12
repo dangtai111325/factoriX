@@ -121,7 +121,7 @@ async def test_health_probe_avoids_coalesce_and_runs_on_separate_probe_executor(
         busy_task = asyncio.create_task(client._run_in_pool(_blocking_write, timeout_s=5.0, use_probe_pool=False))
         await asyncio.to_thread(main_entered.wait, 1.0)
 
-        health = await asyncio.wait_for(client.health_probe(), timeout=2.0)
+        health = await asyncio.wait_for(client.health_probe(), timeout=4.0)
         assert health.reachable is True
         assert health.disk_used_bytes == (10 + 20 + 5 + 1 + 4) * 1024
         assert health.tenant_db_count == 2

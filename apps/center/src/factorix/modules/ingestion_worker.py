@@ -1865,7 +1865,7 @@ class IngestionWorker:
                 )
                 op_write = bool(decision.write_operational)
             else:
-                op_write = getattr(self.recording_evaluator, "write_operational", False)
+                op_write = getattr(self.recording_evaluator, "write_operational", True)
             if op_write:
                 td_records.append(
                     {
