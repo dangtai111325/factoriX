@@ -330,12 +330,15 @@ class AcquisitionSpool:
                 )
                 removed += max(0, cur.rowcount)
             if self.db_bytes() > max_bytes:
-                while self.pending_count() > 0 and self.db_bytes() > max_bytes:
+                max_iterations = 10
+                iterations = 0
+                while self.pending_count() > 0 and self.db_bytes() > max_bytes and iterations < max_iterations:
+                    iterations += 1
                     with self.connection:
                         cur = self.connection.execute(
                             """
                             DELETE FROM spool WHERE seq IN (
-                                SELECT seq FROM spool WHERE state = 'PENDING' ORDER BY seq ASC LIMIT 1000
+                                SELECT seq FROM spool WHERE state = 'PENDING' ORDER BY seq ASC LIMIT 5000
                             )
                             """
                         )
@@ -347,6 +350,12 @@ class AcquisitionSpool:
                     except sqlite3.Error:
                         break
                 self._rebuild_counters()
+                if removed > 0 or self.db_bytes() > max_bytes:
+                    try:
+                        self.connection.execute("VACUUM")
+                        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except sqlite3.Error:
+                        pass
         return removed
 
     def pending_count(self) -> int:
