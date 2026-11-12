@@ -35,7 +35,7 @@ export const PostgresExplorerView: React.FC = () => {
   const [tableDetail, setTableDetail] = useState<PgTableDetail | null>(null);
   const [erdData, setErdData] = useState<PgErdResponse | null>(null);
   const [activeTab, setActiveTab] = useState<'erd' | 'columns' | 'preview'>('erd');
-  const [previewRows, setPreviewRows] = useState<{ columns: string[]; rows: unknown[][]; total_estimate: number } | null>(null);
+  const [previewRows, setPreviewRows] = useState<{ columns: string[]; rows: (unknown[] | Record<string, unknown>)[]; total_estimate: number } | null>(null);
   const [searchTable, setSearchTable] = useState('');
   const [loading, setLoading] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -470,7 +470,7 @@ export const PostgresExplorerView: React.FC = () => {
                   <div className="py-12 text-center text-[#657794] text-[13px]">
                     Loading sanitized rows...
                   </div>
-                ) : !previewRows || previewRows.rows.length === 0 ? (
+                ) : !previewRows || !Array.isArray(previewRows.rows) || previewRows.rows.length === 0 ? (
                   <div className="py-12 text-center text-[#657794] text-[13px]">
                     No rows found in this table.
                   </div>
@@ -487,21 +487,26 @@ export const PostgresExplorerView: React.FC = () => {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-[#F1F5FA]">
-                        {previewRows.rows.map((row, idx) => (
-                          <tr key={idx} className="hover:bg-[#F8FAFC]">
-                            {row.map((val, cellIdx) => (
-                              <td key={cellIdx} className="py-1.5 px-3 text-[#111B37] whitespace-nowrap">
-                                {val === null ? (
-                                  <span className="text-[#94A3B8] italic">null</span>
-                                ) : typeof val === 'object' ? (
-                                  JSON.stringify(val)
-                                ) : (
-                                  String(val)
-                                )}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
+                        {previewRows.rows.map((row, idx) => {
+                          const cells: unknown[] = Array.isArray(row)
+                            ? row
+                            : (previewRows.columns || []).map((c) => (row as Record<string, unknown>)?.[c]);
+                          return (
+                            <tr key={idx} className="hover:bg-[#F8FAFC]">
+                              {cells.map((val, cellIdx) => (
+                                <td key={cellIdx} className="py-1.5 px-3 text-[#111B37] whitespace-nowrap">
+                                  {val === null || val === undefined ? (
+                                    <span className="text-[#94A3B8] italic">null</span>
+                                  ) : typeof val === 'object' ? (
+                                    JSON.stringify(val)
+                                  ) : (
+                                    String(val)
+                                  )}
+                                </td>
+                              ))}
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

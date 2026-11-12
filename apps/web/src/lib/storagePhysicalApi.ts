@@ -542,7 +542,7 @@ export async function getPgTablePreview(
   schema: string,
   table: string,
   params?: { limit?: number; offset?: number; sort_column?: string; sort_dir?: 'asc' | 'desc' }
-): Promise<{ columns: string[]; rows: unknown[][]; total_estimate: number }> {
+): Promise<{ columns: string[]; rows: (unknown[] | Record<string, unknown>)[]; total_estimate: number }> {
   const qs = new URLSearchParams();
   if (params?.limit) qs.set('limit', String(params.limit));
   if (params?.offset) qs.set('offset', String(params.offset));
