@@ -150,35 +150,46 @@ export const StorageManagementPage: React.FC = () => {
         observed_at: new Date().toISOString(),
       }));
 
-      setNodes(topo.nodes);
-      setEdges(topo.edges);
+      const safeNodes: TopologyNode[] = Array.isArray(topo?.nodes)
+        ? topo.nodes.map((n: any) => ({
+            ...n,
+            object_type: (n.object_type || n.kind || 'database') as 'database' | 'stable' | 'subtable',
+            physical_name: n.physical_name || n.label || n.name || '',
+            display_name: n.display_name || n.label || n.physical_name || '',
+            status: n.status || 'ACTIVE',
+          }))
+        : [];
+      const safeEdges: TopologyEdge[] = Array.isArray(topo?.edges) ? topo.edges : [];
+
+      setNodes(safeNodes);
+      setEdges(safeEdges);
 
       // 2. Fetch stats
       const st = await getStorageStats().catch(() => ({
-        database_count: 1,
-        stable_count: 2,
-        subtable_count: 12,
-        recording_active: 10,
-        recording_paused: 2,
+        database_count: safeNodes.filter((n) => n.object_type === 'database').length,
+        stable_count: safeNodes.filter((n) => n.object_type === 'stable').length,
+        subtable_count: safeNodes.filter((n) => n.object_type === 'subtable').length,
+        recording_active: 0,
+        recording_paused: 0,
         recording_error: 0,
         observed_at: new Date().toISOString(),
       }));
 
       setStats({
-        databaseCount: st.database_count,
-        stableCount: st.stable_count,
-        subtableCount: st.subtable_count,
-        recordingActive: st.recording_active,
-        recordingPaused: st.recording_paused,
-        recordingError: st.recording_error,
-        lastObservedAt: st.observed_at,
+        databaseCount: st?.database_count ?? 0,
+        stableCount: st?.stable_count ?? 0,
+        subtableCount: st?.subtable_count ?? 0,
+        recordingActive: st?.recording_active ?? 0,
+        recordingPaused: st?.recording_paused ?? 0,
+        recordingError: st?.recording_error ?? 0,
+        lastObservedAt: st?.observed_at || new Date().toISOString(),
       });
 
       // 3. Flatten objects for table view
-      const rows: StorageObjectRow[] = topo.nodes.map((n) => ({
+      const rows: StorageObjectRow[] = safeNodes.map((n) => ({
         id: n.node_id,
         physical_name: n.physical_name,
-        display_name: 'display_name' in n ? (n.display_name as string) : null,
+        display_name: n.display_name || null,
         object_type: (n.object_type === 'engine' ? 'database' : n.object_type) as 'database' | 'stable' | 'subtable',
         parent_name: (n.metadata?.database_name as string) || (n.metadata?.stable_name as string) || null,
         parent_id: n.parent_id,
@@ -186,7 +197,7 @@ export const StorageManagementPage: React.FC = () => {
         tag_count: n.metadata?.tag_count as number | undefined,
         subtable_count: (n.metadata?.subtable_count as number | undefined) || (n.metadata?.stable_count as number | undefined),
         binding_count: 1,
-        last_verified_at: topo.observed_at,
+        last_verified_at: topo?.observed_at || new Date().toISOString(),
         status: n.status,
       }));
       setTableObjects(rows);

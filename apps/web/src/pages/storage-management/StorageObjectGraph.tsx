@@ -160,13 +160,16 @@ interface StorageObjectGraphProps {
 }
 
 export const StorageObjectGraph: React.FC<StorageObjectGraphProps> = ({
-  nodes: rawNodes,
-  edges: rawEdges,
+  nodes: inputNodes = [],
+  edges: inputEdges = [],
   selectedObjectId,
   onSelectObject,
   onRefresh,
   loading = false,
 }) => {
+  const rawNodes = useMemo(() => (Array.isArray(inputNodes) ? inputNodes : []), [inputNodes]);
+  const rawEdges = useMemo(() => (Array.isArray(inputEdges) ? inputEdges : []), [inputEdges]);
+
   const [search, setSearch] = useState('');
   const [showBindings, setShowBindings] = useState(false);
   const [showMinimap, setShowMinimap] = useState(true);
@@ -181,11 +184,14 @@ export const StorageObjectGraph: React.FC<StorageObjectGraphProps> = ({
   // Filter nodes & edges based on search and selectedDb
   const filteredNodes = useMemo(() => {
     return rawNodes.filter((node) => {
+      if (!node) return false;
+      const physicalName = node.physical_name || (node as any).label || (node as any).name || '';
+      const displayName = node.display_name || physicalName;
       if (search) {
         const query = search.toLowerCase();
         const matches =
-          node.physical_name.toLowerCase().includes(query) ||
-          (node.display_name && node.display_name.toLowerCase().includes(query));
+          physicalName.toLowerCase().includes(query) ||
+          displayName.toLowerCase().includes(query);
         if (!matches) return false;
       }
       if (selectedDb !== 'all') {

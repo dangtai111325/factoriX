@@ -46,9 +46,15 @@ export const PostgresExplorerView: React.FC = () => {
     let mounted = true;
     listPgSchemas()
       .then((data) => {
-        if (mounted && data.length > 0) {
-          setSchemas(data);
-          const defaultSchema = data.find((s) => s.schema_name === 'public')?.schema_name || data[0].schema_name;
+        if (mounted && Array.isArray(data) && data.length > 0) {
+          const normalized = data.map((s: any) => ({
+            schema_name: s.schema_name || s.name || '',
+            table_count: s.table_count || 0,
+            view_count: s.view_count || 0,
+          }));
+          setSchemas(normalized);
+          const defaultSchema =
+            normalized.find((s) => s.schema_name === 'public')?.schema_name || normalized[0].schema_name;
           setSelectedSchema(defaultSchema);
         }
       })
@@ -72,9 +78,18 @@ export const PostgresExplorerView: React.FC = () => {
     setLoading(true);
     listPgTables(selectedSchema)
       .then((data) => {
-        setTables(data);
-        if (data.length > 0 && !selectedTable) {
-          setSelectedTable(data[0].table_name);
+        const normalized = Array.isArray(data)
+          ? data.map((t: any) => ({
+              schema_name: t.schema_name || t.schema || selectedSchema,
+              table_name: t.table_name || t.name || '',
+              table_type: t.table_type || t.type || 'TABLE',
+              row_count_estimate: t.row_count_estimate ?? t.estimated_rows ?? 0,
+              column_count: t.column_count || 0,
+            }))
+          : [];
+        setTables(normalized);
+        if (normalized.length > 0 && !selectedTable) {
+          setSelectedTable(normalized[0].table_name);
         }
       })
       .catch(() => {
@@ -92,7 +107,31 @@ export const PostgresExplorerView: React.FC = () => {
 
     // Load ERD data
     getPgErd(selectedSchema)
-      .then((res) => setErdData(res))
+      .then((res) => {
+        const normalizedTables = Array.isArray(res?.tables)
+          ? res.tables.map((t: any) => ({
+              schema_name: t.schema_name || t.schema || selectedSchema,
+              table_name: t.table_name || t.name || '',
+              table_type: t.table_type || t.type || 'TABLE',
+            }))
+          : [];
+        const normalizedRels = Array.isArray(res?.relationships)
+          ? res.relationships.map((r: any) => ({
+              constraint_name: r.constraint_name || '',
+              source_table: r.source_table || r.from_table || '',
+              source_column: r.source_column || r.from_column || '',
+              target_table: r.target_table || r.to_table || '',
+              target_column: r.target_column || r.to_column || '',
+              is_inferred: Boolean(r.is_inferred ?? r.inferred),
+            }))
+          : [];
+        setErdData({
+          tables: normalizedTables,
+          relationships: normalizedRels,
+          source: res?.source || 'pg_constraint',
+          observed_at: res?.observed_at || new Date().toISOString(),
+        });
+      })
       .catch(() => {
         setErdData({
           tables: [
@@ -171,7 +210,10 @@ export const PostgresExplorerView: React.FC = () => {
   }, [selectedSchema, selectedTable, previewPage]);
 
   const filteredTables = useMemo(() => {
-    return tables.filter((t) => t.table_name.toLowerCase().includes(searchTable.toLowerCase()));
+    return (tables || []).filter((t) => {
+      const name = t?.table_name || (t as any)?.name || '';
+      return name.toLowerCase().includes((searchTable || '').toLowerCase());
+    });
   }, [tables, searchTable]);
 
   return (
@@ -314,14 +356,17 @@ export const PostgresExplorerView: React.FC = () => {
                 </div>
 
                 <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-                  {erdData?.tables.map((t) => {
-                    const outgoing = erdData.relationships.filter((r) => r.source_table === t.table_name);
+                  {(erdData?.tables || []).map((t) => {
+                    const tableName = t.table_name || (t as any).name || '';
+                    const outgoing = (erdData?.relationships || []).filter(
+                      (r) => (r.source_table || (r as any).from_table) === tableName
+                    );
                     return (
                       <div
-                        key={t.table_name}
-                        onClick={() => setSelectedTable(t.table_name)}
+                        key={tableName}
+                        onClick={() => setSelectedTable(tableName)}
                         className={`p-3 bg-[#F8FAFC] border-2 rounded-xl cursor-pointer transition-all hover:shadow-sm ${
-                          selectedTable === t.table_name
+                          selectedTable === tableName
                             ? 'border-[#1976D2] ring-2 ring-[#1976D2]/20'
                             : 'border-[#E3EAF3] hover:border-[#CBD5E1]'
                         }`}
@@ -329,7 +374,7 @@ export const PostgresExplorerView: React.FC = () => {
                         <div className="flex items-center gap-2 mb-2">
                           <Table className="w-4 h-4 text-[#1976D2]" />
                           <span className="font-mono text-[12px] font-bold text-[#111B37] truncate">
-                            {t.table_name}
+                            {tableName}
                           </span>
                         </div>
 

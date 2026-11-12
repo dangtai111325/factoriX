@@ -535,6 +535,18 @@ class StorageTopologyInspector:
 # ---------------------------------------------------------------------------
 
 def topology_snapshot_to_dict(snap: TopologySnapshot) -> dict[str, Any]:
+    edges = []
+    for n in snap.nodes:
+        if n.parent_id:
+            edge_kind = "CONTAINS" if n.kind == "stable" else "INHERITS_SCHEMA"
+            edges.append({
+                "edge_id": f"{n.parent_id}->{n.node_id}",
+                "source_node_id": n.parent_id,
+                "target_node_id": n.node_id,
+                "edge_kind": edge_kind,
+                "metadata": {},
+            })
+
     return {
         "observed_at": snap.observed_at.isoformat(),
         "databases": [_db_to_dict(d) for d in snap.databases],
@@ -544,12 +556,17 @@ def topology_snapshot_to_dict(snap: TopologySnapshot) -> dict[str, Any]:
             {
                 "node_id": n.node_id,
                 "kind": n.kind,
+                "object_type": n.kind,
                 "label": n.label,
+                "physical_name": n.label,
+                "display_name": n.label,
                 "parent_id": n.parent_id,
+                "status": "ACTIVE",
                 "metadata": n.metadata,
             }
             for n in snap.nodes
         ],
+        "edges": edges,
         "drift": [
             {
                 "object_kind": d.object_kind,

@@ -67,7 +67,15 @@ class PostgresExplorerService:
             """,
             {},
         )
-        return [{"name": str(r["schema_name"])} for r in rows]
+        return [
+            {
+                "name": str(r["schema_name"]),
+                "schema_name": str(r["schema_name"]),
+                "table_count": 0,
+                "view_count": 0,
+            }
+            for r in rows
+        ]
 
     async def list_tables(
         self,
@@ -100,9 +108,13 @@ class PostgresExplorerService:
         return [
             {
                 "schema": schema,
+                "schema_name": schema,
                 "name": str(r["table_name"]),
+                "table_name": str(r["table_name"]),
                 "type": "VIEW" if "VIEW" in str(r["table_type"]).upper() else "BASE TABLE",
+                "table_type": "VIEW" if "VIEW" in str(r["table_type"]).upper() else "TABLE",
                 "estimated_rows": max(0, int(r["estimated_rows"] or 0)),
+                "row_count_estimate": max(0, int(r["estimated_rows"] or 0)),
                 "column_count": int(r["column_count"] or 0),
             }
             for r in rows
@@ -161,11 +173,14 @@ class PostgresExplorerService:
             cname = str(r["column_name"])
             columns.append({
                 "name": cname,
+                "column_name": cname,
                 "data_type": str(r["data_type"]),
                 "is_nullable": str(r["is_nullable"]).upper() == "YES",
                 "default": str(r["column_default"]) if r.get("column_default") else None,
+                "column_default": str(r["column_default"]) if r.get("column_default") else None,
                 "max_length": r.get("character_maximum_length"),
                 "is_primary_key": cname in pk_cols,
+                "is_foreign_key": False,
                 "is_sensitive": bool(SENSITIVE_COLUMN_PATTERNS.search(cname)),
             })
 
@@ -190,17 +205,22 @@ class PostgresExplorerService:
         indexes = [
             {
                 "name": str(r["index_name"]),
+                "index_name": str(r["index_name"]),
                 "is_unique": bool(r["is_unique"]),
                 "is_primary": bool(r["is_primary"]),
                 "definition": str(r["index_definition"]),
+                "columns": [],
             }
             for r in idx_rows
         ]
 
         return {
             "schema": schema,
+            "schema_name": schema,
             "name": table,
+            "table_name": table,
             "columns": columns,
+            "relationships": [],
             "indexes": indexes,
             "primary_key": sorted(pk_cols),
         }
@@ -251,7 +271,12 @@ class PostgresExplorerService:
                 "from_column": from_c,
                 "to_table": to_t,
                 "to_column": to_c,
+                "source_table": from_t,
+                "source_column": from_c,
+                "target_table": to_t,
+                "target_column": to_c,
                 "inferred": False,
+                "is_inferred": False,
                 "kind": "FOREIGN_KEY",
             })
 
@@ -287,7 +312,12 @@ class PostgresExplorerService:
                     "from_column": cname,
                     "to_table": target,
                     "to_column": "id",
+                    "source_table": tname,
+                    "source_column": cname,
+                    "target_table": target,
+                    "target_column": "id",
                     "inferred": True,
+                    "is_inferred": True,
                     "kind": "INFERRED_FK",
                 })
 

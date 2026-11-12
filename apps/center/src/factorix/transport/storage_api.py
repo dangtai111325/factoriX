@@ -758,6 +758,23 @@ def build_router(
         )
         return ST.topology_snapshot_to_dict(snap)
 
+    @router.get("/api/v1/storage/td/stats", tags=["storage"])
+    async def get_td_stats(
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        tenant_id, _actor = ids(principal)
+        snap = await topology_inspector.get_topology(tenant_id, depth=2)
+        return {
+            "database_count": len(snap.databases),
+            "stable_count": len(snap.stables),
+            "subtable_count": len(snap.subtables),
+            "recording_active": len(snap.subtables),
+            "recording_paused": 0,
+            "recording_error": 0,
+            "observed_at": snap.observed_at.isoformat(),
+        }
+
     @router.get("/api/v1/storage/td/databases", tags=["storage"])
     async def list_td_databases(
         principal: dict[str, Any] = Depends(admin_dep),
