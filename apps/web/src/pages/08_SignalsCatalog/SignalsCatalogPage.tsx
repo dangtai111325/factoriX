@@ -947,8 +947,7 @@ export const SignalsCatalogPage: React.FC = () => {
 
                       <div className="mt-2.5">
                         <div className="text-[22px] font-black font-mono text-[#0B2545] tabular-nums truncate">
-                          {formattedVal}{' '}
-                          {sig.unit && <span className="text-[12px] font-normal text-[#657794] ml-1">{sig.unit}</span>}
+                          {formattedVal}
                         </div>
                       </div>
 
@@ -1064,8 +1063,7 @@ export const SignalsCatalogPage: React.FC = () => {
                               {res?.name || sig.resourcePath || '—'}
                             </td>
                             <td className="py-2.5 px-3 font-mono font-black text-xs text-[#0B2545] tabular-nums">
-                              {formattedVal}{' '}
-                              {sig.unit && <span className="font-normal text-[#657794] text-[10px] ml-0.5">{sig.unit}</span>}
+                              {formattedVal}
                             </td>
                             <td className="py-2.5 px-3">
                               {classifyType(sig.data_type || sig.dataType) === 'text' || classifyType(sig.data_type || sig.dataType) === 'boolean' ? (

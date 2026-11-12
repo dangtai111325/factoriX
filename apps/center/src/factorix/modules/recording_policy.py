@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
 import math
+import os
 from typing import Any, Literal
 import unicodedata
 from uuid import UUID
@@ -635,6 +636,7 @@ class DefaultRecordingPolicyEvaluator:
         *,
         targets_by_signal: Mapping[UUID, Sequence[ManagedBindingTarget]] | None = None,
         metrics: PolicyMetricsCounter | None = None,
+        write_operational: bool | None = None,
     ) -> None:
         self._targets_by_signal: dict[UUID, tuple[ManagedBindingTarget, ...]] = (
             {sig: tuple(tlist) for sig, tlist in targets_by_signal.items()}
@@ -644,6 +646,11 @@ class DefaultRecordingPolicyEvaluator:
         # Keyed by (tenant_id, dataset_id, series_key)
         self._states: dict[tuple[UUID, UUID, str], ManagedSeriesState] = {}
         self.metrics = metrics or PolicyMetricsCounter()
+        if write_operational is None:
+            raw_env = os.environ.get("FACTORIX_RECORD_OPERATIONAL", "false").lower()
+            self.write_operational: bool = raw_env in ("true", "1", "yes")
+        else:
+            self.write_operational = bool(write_operational)
 
     def set_targets(self, targets_by_signal: Mapping[UUID, Sequence[ManagedBindingTarget]]) -> None:
         self._targets_by_signal = {sig: tuple(tlist) for sig, tlist in targets_by_signal.items()}
@@ -851,7 +858,7 @@ class DefaultRecordingPolicyEvaluator:
                 )
 
         dec = RecordingDecision(
-            write_operational=True,
+            write_operational=self.write_operational,
             update_live_activity=True,
             managed_directives=tuple(directives),
         )

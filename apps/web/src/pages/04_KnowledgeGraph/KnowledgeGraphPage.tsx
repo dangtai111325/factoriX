@@ -956,7 +956,6 @@ export const KnowledgeGraphPage: React.FC = () => {
                             <div className="text-right shrink-0">
                               <div className="font-mono font-bold text-xs text-[#0B2545]">
                                 {formatValue(sig.value)}
-                                {sig.unit ? <span className="font-sans font-normal text-[10px] text-slate-500 ml-1">{sig.unit}</span> : null}
                               </div>
                               <div
                                 title={QUALITY_HINT[quality]}

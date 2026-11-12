@@ -88,10 +88,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
           <div className="flex items-start justify-between">
             <div>
               <div className="text-[28px] font-extrabold text-[#111B37] tabular-nums">
-                {formattedVal}{' '}
-                {signal.unit && (
-                  <span className="text-[14px] font-normal text-[#657794]">{signal.unit}</span>
-                )}
+                {formattedVal}
               </div>
               <div className="text-[11px] text-[#657794] mt-0.5" title={formatTimestamp(lastRead)}>
                 Last read {timeAgo(lastRead)}

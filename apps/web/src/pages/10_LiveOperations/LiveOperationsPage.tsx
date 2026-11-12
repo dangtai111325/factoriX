@@ -217,7 +217,7 @@ export const LiveOperationsPage: React.FC = () => {
                         <td className="text-xs text-slate-600">{sig.asset}</td>
                         <td className="text-[11px] font-mono text-slate-500">{sig.source}</td>
                         <td className="text-xs font-extrabold text-[#EF1B24] font-mono tabular-nums">
-                          {sig.value} {sig.unit}
+                          {sig.value}
                         </td>
                         <td>
                           <Badge variant={sig.quality === 'GOOD' ? 'good' : 'warning'}>

@@ -1123,7 +1123,6 @@ export const FactoryStructurePage: React.FC = () => {
                           <div className="flex items-baseline justify-between gap-2 mt-1">
                             <span className="text-base font-bold font-mono text-[#0B2545] truncate" title={formatValue(sig.value)}>
                               {formatValue(sig.value)}
-                              {sig.unit && <span className="text-xs font-normal text-[#657794] ml-1">{sig.unit}</span>}
                             </span>
                             <span className="text-[10px] text-[#94A3B8] shrink-0" title={sig.lastUpdated ? formatTimestamp(sig.lastUpdated) : undefined}>
                               {sig.lastUpdated ? timeAgo(sig.lastUpdated) : '—'}

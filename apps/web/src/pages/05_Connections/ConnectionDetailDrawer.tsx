@@ -181,7 +181,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
                           </div>
                           <div className="text-right shrink-0">
                             <div className="font-mono font-black text-[#0B2545]">
-                              {formatValue(s.value)} <span className="font-normal text-[10px] text-[#64748B]">{s.unit || ''}</span>
+                              {formatValue(s.value)}
                             </div>
                             <StatusBadge status={s.quality || 'NO_DATA'} />
                           </div>

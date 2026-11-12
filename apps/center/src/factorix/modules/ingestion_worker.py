@@ -1859,12 +1859,13 @@ class IngestionWorker:
         for env, prep in still_items:
             obs = prep.obs
             env_by_uid[obs.event_uid] = (env, prep)
-            op_write = True
             if not is_default_eval:
                 decision: RecordingDecision = self.recording_evaluator.evaluate(
                     obs, previous_live=custom_prev_live.get(obs.signal_id)
                 )
                 op_write = bool(decision.write_operational)
+            else:
+                op_write = getattr(self.recording_evaluator, "write_operational", False)
             if op_write:
                 td_records.append(
                     {
