@@ -20,6 +20,9 @@ import { KnowledgeGraphPage } from './pages/04_KnowledgeGraph/KnowledgeGraphPage
 import { ConnectionsPage } from './pages/05_Connections/ConnectionsPage';
 import { AddDataWizardPage } from './pages/06_AddDataWizard/AddDataWizardPage';
 import { SignalsCatalogPage } from './pages/08_SignalsCatalog/SignalsCatalogPage';
+import { StorageDesignerPage } from './pages/10_StorageDesigner/StorageDesignerPage';
+import { HistorianExplorerPage } from './pages/11_HistorianExplorer/HistorianExplorerPage';
+import { StorageCatalogPage } from './pages/11_StorageCatalog/StorageCatalogPage';
 import { DataModelsPage } from './pages/13_DataModels/DataModelsPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
 import { NotFoundPage } from './pages/NotFound/NotFoundPage';
@@ -50,6 +53,9 @@ const ROUTE_TITLES: Record<string, string> = {
   '/collector/signals': 'Signals',
   '/models': 'Model Catalog',
   '/dashboards': 'Dashboards',
+  '/historian/designer': 'Storage Designer',
+  '/historian/catalog': 'Storage Catalog',
+  '/historian/historian': 'Historian Explorer',
   '/historian': 'Historian & Storage',
   '/alarms': 'Alarms & Events',
   '/analytics': 'Analytics',
@@ -95,11 +101,15 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/collector/edges" element={<Navigate to="/collector/connections" replace />} />
               <Route path="/collector/diagnostics" element={<Navigate to="/collector/connections" replace />} />
 
+              {/* Storage & Historian Routes */}
+              <Route path="/historian/designer" element={<StorageDesignerPage />} />
+              <Route path="/historian/catalog" element={<StorageCatalogPage />} />
+              <Route path="/historian/historian" element={<HistorianExplorerPage />} />
+              <Route path="/historian" element={<Navigate to="/historian/designer" replace />} />
+
               {/* Coming soon routes */}
               <Route path="/dashboards/*" element={<ComingSoonPage />} />
               <Route path="/dashboards" element={<ComingSoonPage />} />
-              <Route path="/historian/*" element={<ComingSoonPage />} />
-              <Route path="/historian" element={<ComingSoonPage />} />
               <Route path="/alarms/*" element={<ComingSoonPage />} />
               <Route path="/alarms" element={<ComingSoonPage />} />
               <Route path="/analytics/*" element={<ComingSoonPage />} />

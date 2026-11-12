@@ -136,17 +136,36 @@ def _parse_time_bounds(
 
 
 async def _active_epoch(session: AsyncSession, tenant_id: UUID) -> int:
-    row = await fetch_one(
-        session,
-        """
-        SELECT max(active_epoch) AS active_epoch
-        FROM telemetry_reset_operations
-        WHERE tenant_id = :tenant_id AND status = 'SUCCEEDED'
-        """,
-        {"tenant_id": tenant_id},
-    )
-    if row and row.get("active_epoch") is not None:
-        return int(row["active_epoch"])
+    try:
+        row = await fetch_one(
+            session,
+            """
+            SELECT active_epoch
+            FROM telemetry_generations
+            WHERE tenant_id = :tenant_id
+            """,
+            {"tenant_id": tenant_id},
+        )
+        if row and row.get("active_epoch") is not None:
+            return int(row["active_epoch"])
+    except Exception:
+        pass
+
+    try:
+        row = await fetch_one(
+            session,
+            """
+            SELECT max(active_epoch) AS active_epoch
+            FROM telemetry_reset_operations
+            WHERE tenant_id = :tenant_id AND status = 'SUCCEEDED'
+            """,
+            {"tenant_id": tenant_id},
+        )
+        if row and row.get("active_epoch") is not None:
+            return int(row["active_epoch"])
+    except Exception:
+        pass
+
     return 1
 
 

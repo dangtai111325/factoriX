@@ -94,7 +94,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
           {paused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
           <span>{pauseBusy ? (paused ? 'Resuming…' : 'Pausing…') : paused ? 'Resume' : 'Pause…'}</span>
         </button>
-        <button type="button" onClick={() => navigate(`/collector/add-data?connectionId=${encodeURIComponent(connection.id)}`)} className="py-1.5 px-2 rounded-lg bg-[#0B2545] hover:bg-[#134074] text-xs font-semibold text-white flex items-center justify-center gap-1.5 shadow-sm">
+        <button type="button" onClick={() => navigate(`/collector/add-data?connectionId=${encodeURIComponent(connection.id)}`)} className="py-1.5 px-2 rounded-lg bg-[#EF1B24] hover:bg-[#D9141D] active:bg-[#C7111A] text-xs font-semibold text-white flex items-center justify-center gap-1.5 shadow-sm">
           <PlusCircle className="w-3.5 h-3.5" />
           <span>Add data</span>
         </button>

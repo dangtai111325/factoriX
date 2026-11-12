@@ -333,10 +333,10 @@ Hệ thống FactoriX sử dụng **2 cơ sở dữ liệu chuyên biệt**:
   - Tự động chạy `VACUUM` và `wal_checkpoint(TRUNCATE)` khi phát hiện trang trống phình to.
   - **Tốc độ tăng dung lượng dài hạn**: **~0 MB/s** (dung lượng giữ ổn định quanh mốc 40 - 50 MB, không bị phình vô tận).
 
-### 2. Cơ sở dữ liệu Center: PostgreSQL 16 (`factorix` DB, Port 5432)
-- **Vị trí**: Container `factorix-appliance` (`postgresql://factorix:***@127.0.0.1:5432/factorix`).
+### 2. Cơ sở dữ liệu Center: PostgreSQL 17 (`factorix` DB, Port 5432)
+- **Vị trí**: Container `factorix-postgres` thuộc Docker Compose group `factoriX` (`postgresql://factorix:***@127.0.0.1:5432/factorix`).
 - **Nhiệm vụ**: Lưu trữ toàn bộ siêu dữ liệu nền tảng, chuỗi thời gian phân vùng, trạng thái tức thời và kiểm toán.
-- **Dung lượng hiện tại**: **18 GB** (Dung lượng thư mục `/data/pg` bao gồm WAL là **19 GB**).
+- **Dung lượng hiện tại**: **18 GB** (Dung lượng volume `factorix-pg-data`).
 - **Phân bổ bảng dung lượng lớn nhất**:
   - `observations_2026_11` (Bảng chuỗi thời gian tháng 11/2026): **15 GB** (16,55 GB).
   - `ingest_dedup` (Bảng chống trùng lặp quan sát): **2.44 GB**.
@@ -346,6 +346,14 @@ Hệ thống FactoriX sử dụng **2 cơ sở dữ liệu chuyên biệt**:
   - **Tần suất nạp**: **~298 - 300 observations/giây** (Khớp với 336 tín hiệu chu kỳ 1s).
   - **Tốc độ tăng dung lượng**: **~0.268 MB/giây** (~281 KB/s).
   - **Tốc độ tăng tích lũy**: Khoảng **16 MB/phút**, tương đương **~965 MB/giờ** (~**22.6 GB/ngày** trước khi chạy chính sách nén/retention).
+
+### 3. Time-Series Engine: TDengine 3.4.3.9 (Port 6041)
+- **Vị trí**: Container `factorix-tdengine` thuộc Docker Compose group `factoriX` (`ws://root:taosdata@127.0.0.1:6041`).
+- **Nhiệm vụ**: Lưu trữ và truy vấn chuỗi thời gian tốc độ cao (Historian, Storage Engine, Super-tables và Sub-tables).
+
+### 4. Message Broker: RabbitMQ 4.4 Management (Ports 5672, 15672)
+- **Vị trí**: Container `factorix-rabbitmq` thuộc Docker Compose group `factoriX` (`amqp://factorix_mq:***@127.0.0.1:5672/`).
+- **Nhiệm vụ**: Phân phối message ingestion, quorum queues, telemetry streaming giữa collector và engine.
 
 ---
 
@@ -358,36 +366,41 @@ Hệ thống FactoriX sử dụng **2 cơ sở dữ liệu chuyên biệt**:
 
 ### Các lệnh vận hành nhanh (CLI):
 
-#### 1. Kiểm tra trạng thái Container & Dịch vụ:
+#### 1. Kiểm tra trạng thái Container & Dịch vụ (Stack factoriX):
 ```powershell
-docker ps
+docker compose ps
 docker logs -f --tail 100 factorix-appliance
 ```
 
-#### 2. Kiểm tra chất lượng Tín hiệu trực tiếp trong PostgreSQL:
+#### 2. Kiểm tra chất lượng Tín hiệu trực tiếp trong PostgreSQL 17:
 ```powershell
-docker exec -e PGPASSWORD=8DXYA3LKOZmsg-wg0C0mkdX7XFio183L factorix-appliance psql -h 127.0.0.1 -U factorix -d factorix -c "SELECT quality, count(*) FROM latest_signal_state GROUP BY quality;"
+docker exec factorix-postgres psql -U factorix -d factorix -c "SELECT quality, count(*) FROM latest_signal_state GROUP BY quality;"
 ```
 *(Kết quả chuẩn: `GOOD | 344` hoặc `GOOD | 336`, `0 BAD`, `0 STALE`)*
 
 #### 3. Kiểm tra sức khỏe Kết nối OT:
 ```powershell
-docker exec -e PGPASSWORD=8DXYA3LKOZmsg-wg0C0mkdX7XFio183L factorix-appliance psql -h 127.0.0.1 -U factorix -d factorix -c "SELECT name, protocol, status, health FROM connections;"
+docker exec factorix-postgres psql -U factorix -d factorix -c "SELECT name, protocol, status, health FROM connections;"
 ```
 *(Kết quả chuẩn: 5 kết nối PC03 đều `ACTIVE` và `HEALTHY`)*
 
-#### 4. Kiểm tra hàng đợi Outbox trên Edge:
+#### 4. Kiểm tra TDengine và RabbitMQ:
 ```powershell
-docker exec factorix-appliance ls -lh /data/outbox.sqlite*
+# TDengine 3.4.3
+docker exec factorix-tdengine taos -s "SHOW DATABASES;"
+
+# RabbitMQ 4.4 ping
+docker exec factorix-rabbitmq rabbitmq-diagnostics -q ping
 ```
 
 #### 5. Chạy Test Suite toàn diện:
 ```powershell
-# Chạy Unit Tests Center (498 tests)
-docker exec factorix-appliance pytest /opt/factorix/apps/center/tests/unit
+# Chạy Chaotic safety tests
+python -m pytest tests/chaotic/test_chaotic_tester_scenarios.py -v
 
-# Chạy Unit Tests Edge (99 tests)
-docker exec factorix-appliance pytest /opt/factorix/apps/edge/tests
+# Chạy 100x Scale Load Benchmark (TDengine 3.4.3 & RabbitMQ 4.4)
+python -m pytest tests/scale/test_100x_scale_load.py -v
+```
 ```
 
 ---

@@ -1,17 +1,45 @@
 #!/bin/bash
 set -euo pipefail
 
-PG_BIN=/usr/lib/postgresql/17/bin
-export PGDATA=/data/pg
-mkdir -p "$PGDATA"
-chown -R postgres:postgres /data
-chmod 700 "$PGDATA"
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
-  su postgres -c "$PG_BIN/initdb -D $PGDATA --locale=C --encoding=UTF8 --auth-local=peer --auth-host=scram-sha-256"
-  printf "\nlisten_addresses = '127.0.0.1'\n" >> "$PGDATA/postgresql.conf"
+DB_URL="${FACTORIX_DATABASE_URL:-}"
+USE_EXTERNAL_PG=false
+
+if [ -n "$DB_URL" ] && ! echo "$DB_URL" | grep -q "127.0.0.1"; then
+  USE_EXTERNAL_PG=true
 fi
-if ! grep -q "synchronous_commit = off" "$PGDATA/postgresql.conf"; then
-  cat <<'EOF' >> "$PGDATA/postgresql.conf"
+
+if [ "$USE_EXTERNAL_PG" = true ]; then
+  echo "Configured for external PostgreSQL: $DB_URL"
+  until python -c "
+import asyncio, os, sys, asyncpg
+dsn = os.environ.get('FACTORIX_DATABASE_URL', '')
+if dsn.startswith('postgresql+asyncpg://'):
+    dsn = 'postgresql://' + dsn[len('postgresql+asyncpg://'):]
+async def test():
+    try:
+        conn = await asyncpg.connect(dsn, timeout=3)
+        await conn.close()
+        sys.exit(0)
+    except Exception:
+        sys.exit(1)
+asyncio.run(test())
+" 2>/dev/null; do
+    echo "Waiting for external PostgreSQL to accept connections..."
+    sleep 1
+  done
+  echo "External PostgreSQL is ready!"
+else
+  PG_BIN=/usr/lib/postgresql/17/bin
+  export PGDATA=/data/pg
+  mkdir -p "$PGDATA"
+  chown -R postgres:postgres /data
+  chmod 700 "$PGDATA"
+  if [ ! -s "$PGDATA/PG_VERSION" ]; then
+    su postgres -c "$PG_BIN/initdb -D $PGDATA --locale=C --encoding=UTF8 --auth-local=peer --auth-host=scram-sha-256"
+    printf "\nlisten_addresses = '127.0.0.1'\n" >> "$PGDATA/postgresql.conf"
+  fi
+  if ! grep -q "synchronous_commit = off" "$PGDATA/postgresql.conf"; then
+    cat <<'EOF' >> "$PGDATA/postgresql.conf"
 
 # Performance tuning for high-throughput IIoT ingestion
 shared_buffers = 1024MB
@@ -22,9 +50,11 @@ max_wal_size = 4GB
 checkpoint_completion_target = 0.9
 synchronous_commit = off
 EOF
+  fi
+  su postgres -c "$PG_BIN/pg_ctl -D $PGDATA -w -l $PGDATA/postgres.log start"
+  python /opt/factorix/infrastructure/docker/bootstrap_db.py
 fi
-su postgres -c "$PG_BIN/pg_ctl -D $PGDATA -w -l $PGDATA/postgres.log start"
-python /opt/factorix/infrastructure/docker/bootstrap_db.py
+
 cd /opt/factorix/apps/center
 alembic upgrade head
 
@@ -76,7 +106,9 @@ APP_PID=$!
 stop() {
   kill "$APP_PID" "${WORKERS[@]}" 2>/dev/null || true
   wait "$APP_PID" "${WORKERS[@]}" 2>/dev/null || true
-  su postgres -c "$PG_BIN/pg_ctl -D $PGDATA -m fast -w stop" || true
+  if [ "$USE_EXTERNAL_PG" = false ]; then
+    su postgres -c "$PG_BIN/pg_ctl -D $PGDATA -m fast -w stop" || true
+  fi
 }
 trap stop TERM INT
 wait "$APP_PID"

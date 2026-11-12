@@ -1,28 +1,35 @@
-# One-click FactoriX appliance: web + Postgres + Center + collector on port 8080.
-# Opt-in '--profile storage' adds external RabbitMQ 4.0 + TDengine 3.3.6.13 + separate workers (§4.1, §7).
+# FactoriX Enterprise IIoT Stack
+name: factoriX
+
 services:
-  factorix:
-    build: .
-    image: factorix:latest
-    container_name: factorix-appliance
+  factorix-postgres:
+    image: postgres:17-alpine
+    container_name: factorix-postgres
+    hostname: factorix-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-factorix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-8DXYA3LKOZmsg-wg0C0mkdX7XFio183L}
+      POSTGRES_DB: ${POSTGRES_DB:-factorix}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:5432:5432"
     volumes:
-      - factorix-data:/data
-    env_file:
-      - .env
+      - factorix-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factorix -d factorix"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
     networks:
       - factorix-net
 
   factorix-rabbitmq:
-    image: rabbitmq:4.0.9-management-alpine
-    profiles: ["storage"]
+    image: rabbitmq:4.4-management-alpine
     container_name: factorix-rabbitmq
     hostname: factorix-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: ${FACTORIX_RABBITMQ_USER:-factorix_mq}
-      RABBITMQ_DEFAULT_PASS: ${FACTORIX_RABBITMQ_PASSWORD:-}
+      RABBITMQ_DEFAULT_PASS: ${FACTORIX_RABBITMQ_PASSWORD:-factorix-mq-pw}
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
@@ -30,17 +37,16 @@ services:
       - factorix-rmq-data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "su-exec", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 15s
-      start_period: 20s
+      interval: 5s
+      timeout: 10s
+      start_period: 10s
       retries: 15
     restart: unless-stopped
     networks:
       - factorix-net
 
   factorix-tdengine:
-    image: tdengine/tdengine:3.3.6.13
-    profiles: ["storage"]
+    image: tdengine/tsdb:3.4.3.9
     container_name: factorix-tdengine
     hostname: factorix-tdengine
     ports:
@@ -51,21 +57,31 @@ services:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6041/-/ping >/dev/null || taos -s 'SHOW DATABASES;' >/dev/null"]
       interval: 5s
       timeout: 5s
-      start_period: 15s
+      start_period: 10s
       retries: 25
     restart: unless-stopped
     networks:
       - factorix-net
 
-  factorix-ingestion-worker:
+  factorix:
+    build: .
     image: factorix:latest
-    profiles: ["storage"]
-    container_name: factorix-ingestion-worker
-    entrypoint: ["python", "-m", "factorix.ingestion"]
-    working_dir: /opt/factorix/apps/center
+    container_name: factorix-appliance
+    ports:
+      - "8080:8080"
+    volumes:
+      - factorix-data:/data
     env_file:
       - .env
+    environment:
+      - FACTORIX_COLLECTOR_MODE=acquisition
+      - FACTORIX_DATABASE_URL=postgresql+asyncpg://factorix:8DXYA3LKOZmsg-wg0C0mkdX7XFio183L@factorix-postgres:5432/factorix
+      - FACTORIX_RABBITMQ_URL=amqp://factorix_mq:factorix-mq-pw@factorix-rabbitmq:5672/
+      - FACTORIX_RABBITMQ_MGMT_URL=http://factorix-rabbitmq:15672
+      - FACTORIX_TDENGINE_DSN=ws://root:taosdata@factorix-tdengine:6041
     depends_on:
+      factorix-postgres:
+        condition: service_healthy
       factorix-rabbitmq:
         condition: service_healthy
       factorix-tdengine:
@@ -76,6 +92,7 @@ services:
 
 volumes:
   factorix-data:
+  factorix-pg-data:
   factorix-rmq-data:
   factorix-td-data:
 

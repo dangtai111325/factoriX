@@ -216,7 +216,7 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
                 <button
                   type="submit"
                   disabled={isSubmitting}
-                  className="px-4 py-2 text-[13px] font-semibold bg-[#0B2545] text-white hover:bg-[#134074] rounded-lg shadow-sm transition-colors disabled:opacity-50"
+                  className="px-4 py-2 text-[13px] font-semibold bg-[#EF1B24] text-white hover:bg-[#D9141D] active:bg-[#C7111A] rounded-lg shadow-sm transition-colors disabled:opacity-50"
                 >
                   {isSubmitting ? 'Updating…' : 'Change password'}
                 </button>

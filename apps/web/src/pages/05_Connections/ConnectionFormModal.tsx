@@ -1162,7 +1162,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
               <button
                 type="submit"
                 disabled={busy}
-                className="py-2 px-5 rounded-xl bg-[#0B2545] hover:bg-[#134074] text-white text-xs font-bold shadow-sm transition-all disabled:opacity-50"
+                className="py-2 px-5 rounded-xl bg-[#EF1B24] hover:bg-[#D9141D] active:bg-[#C7111A] text-white text-xs font-bold shadow-sm transition-all disabled:opacity-50"
               >
                 {isSaving ? 'Saving…' : isEdit ? 'Save changes' : 'Create connection'}
               </button>

@@ -149,7 +149,9 @@ async def list_designs(
     updated: str | None = None,
     sort: str | None = None,
     limit: int = 100,
+    offset: int = 0,
     cursor: str | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """List storage designs with filtering, sorting, cursor pagination, and catalog KPI summaries."""
     clauses = ["d.tenant_id = :tenant_id"]

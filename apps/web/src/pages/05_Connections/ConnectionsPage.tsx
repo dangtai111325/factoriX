@@ -230,7 +230,7 @@ export const ConnectionsPage: React.FC = () => {
             setEditingConn(null);
             setIsFormOpen(true);
           }}
-          className="py-2 px-4 rounded-xl bg-[#0B2545] hover:bg-[#134074] text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all shrink-0"
+          className="py-2 px-4 rounded-xl bg-[#EF1B24] hover:bg-[#D9141D] active:bg-[#C7111A] text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all shrink-0"
         >
           <Plus className="w-4 h-4" />
           <span>New Connection</span>
