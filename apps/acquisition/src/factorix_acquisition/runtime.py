@@ -663,6 +663,13 @@ class AcquisitionRuntime:
         self._backoff_reset_event.set()
         self._flush_event.set()
         await self._stop_all_jobs_and_connectors()
+        if self._is_leader:
+            reports = self.connection_report(reset=True)
+            if reports:
+                try:
+                    await self.control_plane.flush_connection_reports(reports)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Final connection report flush failed: %r", exc)
         if self.notify_listener is not None:
             await self.notify_listener.close()
         if self.leader_lock is not None:

@@ -1738,6 +1738,8 @@ async def storage_overview(session: AsyncSession, tenant_id: UUID) -> dict[str, 
         except Exception:  # noqa: BLE001 - optional when running against mocked or pre-0008 test DBs
             pass
     disk_bytes = totals.get("disk_bytes")
+    if disk_bytes is None:
+        disk_bytes = 0
     return {
         "observations": int(totals["observations"]) if totals else 0,
         "oldest": totals["oldest"] if totals else None,

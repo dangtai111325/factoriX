@@ -647,8 +647,14 @@ class DefaultRecordingPolicyEvaluator:
         self._states: dict[tuple[UUID, UUID, str], ManagedSeriesState] = {}
         self.metrics = metrics or PolicyMetricsCounter()
         if write_operational is None:
-            raw_env = os.environ.get("FACTORIX_RECORD_OPERATIONAL", "true").lower()
-            self.write_operational: bool = raw_env in ("true", "1", "yes")
+            raw_env = os.environ.get("FACTORIX_RECORD_OPERATIONAL", "").strip().lower()
+            env_mode = os.environ.get("FACTORIX_ENVIRONMENT", "").strip().lower()
+            if env_mode == "test":
+                self.write_operational = True
+            elif raw_env in ("false", "0", "no"):
+                self.write_operational = False
+            else:
+                self.write_operational = True
         else:
             self.write_operational = bool(write_operational)
 

@@ -100,6 +100,7 @@ jobs:
         env:
           FACTORIX_ENVIRONMENT: test
           FACTORIX_ENABLE_DESTRUCTIVE_TESTS: YES_I_USE_EPHEMERAL_DB
+          FACTORIX_RECORD_OPERATIONAL: "true"
           FACTORIX_DATABASE_URL: postgresql+asyncpg://test:test@127.0.0.1:5432/factorix_test
           FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
           FACTORIX_RABBITMQ_URL: amqp://factorix_mq:factorix-mq-pw@127.0.0.1:5672/

@@ -1027,6 +1027,7 @@ class IngestionWorker:
         recording_evaluator: RecordingPolicyEvaluator | None = None,
         live_provider: TDengineLiveStateProvider | None = None,
         db_dsn_for_notify: str | None = None,
+        enable_gap_sweep: bool = True,
     ) -> None:
         self.pg = pg_store
         self.td = tdengine
@@ -1043,6 +1044,7 @@ class IngestionWorker:
             live_provider if live_provider is not None else TDengineLiveStateProvider(tdengine)
         )
         self._notify_dsn = to_asyncpg_dsn(db_dsn_for_notify) if db_dsn_for_notify else None
+        self.enable_gap_sweep = bool(enable_gap_sweep)
 
         self.metrics = WorkerMetrics()
         self.hist = LatencyHistogram()
@@ -2519,7 +2521,7 @@ class IngestionWorker:
                     broker_ok=broker_ok,
                     diagnostic=self.metrics.last_error,
                 )
-                if td_ok and not self._stop_event.is_set():
+                if td_ok and not self._stop_event.is_set() and self.enable_gap_sweep:
                     await self._sweep_all_interval_gaps()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Ingestion heartbeat update failed: %s", exc)

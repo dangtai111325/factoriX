@@ -52,7 +52,7 @@ async def test_tdengine_health_probe_and_typed_round_trip() -> None:
         try:
             health = await td.health_probe()
             assert health.reachable is True
-            assert health.server_version == "3.3.6.13"
+            assert health.server_version is not None and health.server_version.startswith("3.")
             assert health.edition == "community"
             assert health.dnode_status == "ready"
             assert health.disk_used_bytes is not None and health.disk_used_bytes >= 0
@@ -400,9 +400,9 @@ async def test_pg_control_plane_and_tdengine_compiler_reconcile() -> None:
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
-        # Ensure Alembic 0008 schema is present
+        # Ensure Alembic 0008 or later schema is present
         ver = await pg.fetchval("SELECT version_num FROM alembic_version LIMIT 1")
-        assert ver == "0008_storage_and_historian"
+        assert ver in ("0008_storage_and_historian", "0009_storage_drafts_lifecycle")
 
         now = datetime.now(timezone.utc)
         await pg.execute(

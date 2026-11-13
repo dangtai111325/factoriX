@@ -134,10 +134,22 @@ async def declare_telemetry_topology(
         aio_pika.ExchangeType.DIRECT,
         durable=True,
     )
-    dlq = await channel.declare_queue(
+
+    async def _declare_quorum_queue(qname: str, args: dict[str, Any]) -> AbstractRobustQueue:
+        for attempt in range(6):
+            try:
+                return await channel.declare_queue(qname, durable=True, arguments=args)
+            except Exception as exc:
+                if "cluster_not_formed" in str(exc) and attempt < 5:
+                    logger.info("Raft cluster forming for quorum queue %s (attempt %d/5)...", qname, attempt + 1)
+                    await asyncio.sleep(1.0)
+                    continue
+                raise
+        return await channel.declare_queue(qname, durable=True, arguments=args)
+
+    dlq = await _declare_quorum_queue(
         cfg.dlq_name,
-        durable=True,
-        arguments={
+        {
             "x-queue-type": "quorum",
             "x-max-length-bytes": int(cfg.dlq_max_length_bytes),
             "x-overflow": "reject-publish",
@@ -161,11 +173,7 @@ async def declare_telemetry_topology(
     }
     if cfg.max_length is not None:
         queue_args["x-max-length"] = int(cfg.max_length)
-    queue = await channel.declare_queue(
-        cfg.queue_name,
-        durable=True,
-        arguments=queue_args,
-    )
+    queue = await _declare_quorum_queue(cfg.queue_name, queue_args)
     await queue.bind(ingress, routing_key=cfg.binding_pattern)
     return ingress, queue, dlq
 

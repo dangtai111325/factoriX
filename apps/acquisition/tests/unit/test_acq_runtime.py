@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import os
 from pathlib import Path
 from typing import Any
@@ -201,9 +202,21 @@ def _runtime(
     return runtime, broker, control
 
 
-async def _run_for(runtime: AcquisitionRuntime, seconds: float) -> None:
+async def _run_for(
+    runtime: AcquisitionRuntime,
+    seconds: float,
+    *,
+    until: Callable[[], bool] | None = None,
+) -> None:
     task = asyncio.create_task(runtime.run())
-    await asyncio.sleep(seconds)
+    if until is not None:
+        deadline = asyncio.get_running_loop().time() + seconds
+        while asyncio.get_running_loop().time() < deadline:
+            if until():
+                break
+            await asyncio.sleep(0.05)
+    else:
+        await asyncio.sleep(seconds)
     task.cancel()
     try:
         await task
@@ -229,7 +242,12 @@ async def test_failing_and_hanging_jobs_do_not_stop_other_jobs_or_heartbeat(tmp_
             _uid("conn", "hang"): HangingDevice(),
         },
     )
-    await _run_for(runtime, 2.7)
+    hang_cid = _uid("conn", "hang")
+    await _run_for(
+        runtime,
+        4.0,
+        until=lambda: any(hang_cid in rep for rep in control.reports) and len(control.heartbeats) >= 8,
+    )
 
     good = [o for o in broker.observations if o.signal_id == uuid5(NAMESPACE_URL, "signal:good") and o.quality.value == "GOOD"]
     assert len(good) >= 4
@@ -291,10 +309,11 @@ async def test_http_429_emits_no_bad_sample_and_reports_rate_limited(tmp_path: P
         async def close(self) -> None:
             return None
 
-    runtime, broker, control = _runtime({"snap": snap}, tmp_path, {_uid("conn", "h"): Limited()})
-    await _run_for(runtime, 0.8)
+    h_cid = _uid("conn", "h")
+    runtime, broker, control = _runtime({"snap": snap}, tmp_path, {h_cid: Limited()})
+    await _run_for(runtime, 2.0, until=lambda: any(h_cid in rep for rep in control.reports))
     assert [o for o in broker.observations if o.signal_id == uuid5(NAMESPACE_URL, "signal:h")] == []
-    states = [rep.get(_uid("conn", "h"), {}).get("state") for rep in control.reports]
+    states = [rep.get(h_cid, {}).get("state") for rep in control.reports]
     assert "RATE_LIMITED" in states
 
 
@@ -331,7 +350,9 @@ async def test_leader_lock_demotion_stops_all_jobs_and_prevents_standby_polling(
 
     # Demote to standby (F-26 failover simulation)
     lock.should_lead = False
-    await asyncio.sleep(0.35)
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while asyncio.get_running_loop().time() < deadline and runtime._is_leader:
+        await asyncio.sleep(0.05)
     assert runtime._is_leader is False
     assert runtime.job_tasks == {}
     assert runtime.connectors == {}
@@ -400,7 +421,7 @@ async def test_http_job_prewarms_ssl_before_first_read_budget(monkeypatch: pytes
         ]
     )
     runtime, broker, _ = _runtime({"snap": snap}, tmp_path, {_uid("conn", "http_tls"): OkHttp()})
-    await _run_for(runtime, 0.35)
+    await _run_for(runtime, 2.0, until=lambda: len(events) >= 2)
     assert events and events[0] == "prewarm"
     assert "read" in events
     assert [o for o in broker.observations if o.value == 99]

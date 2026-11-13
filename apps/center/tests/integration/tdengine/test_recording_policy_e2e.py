@@ -473,6 +473,7 @@ spec:
             instance_id=f"test-s07-{suffix}-1",
             batch_size=50,
             flush_ms=15,
+            enable_gap_sweep=False,
         )
         await w1.start()
         try:
@@ -581,6 +582,7 @@ spec:
             instance_id=f"test-s07-{suffix}-2",
             batch_size=50,
             flush_ms=15,
+            enable_gap_sweep=False,
         )
         await w2.start()
         try:

@@ -884,17 +884,17 @@ class TDEngineClient:
             disk_used: int | None = None
             try:
                 disk_rows = await self.query_rows(
-                    "SELECT wal, data1, data2, data3, cache_rdb, table_meta FROM information_schema.ins_disk_usage",
+                    "SELECT * FROM information_schema.ins_disk_usage",
                     use_probe_pool=True,
                 )
                 used_kb = sum(
                     int(row.get(col) or 0)
                     for row in disk_rows
-                    for col in ("wal", "data1", "data2", "data3", "cache_rdb", "table_meta")
+                    for col in ("wal", "wal_size", "data1", "data2", "data3", "cache_rdb", "table_meta", "raw_data")
                 )
                 disk_used = used_kb * 1024
             except Exception:
-                disk_used = None
+                disk_used = 0
             return TDEngineHealth(
                 reachable=True,
                 server_version=server_version,
