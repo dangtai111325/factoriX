@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0009_storage_drafts_and_lifecycle"
+revision = "0009_storage_drafts_lifecycle"
 down_revision = "0008_storage_and_historian"
 branch_labels = None
 depends_on = None
