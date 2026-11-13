@@ -84,6 +84,8 @@ async def cleanup_broker_topology(cfg: BrokerConfig) -> None:
                 pass
     finally:
         await conn.close()
+        # Drain any pending aiormq I/O tasks to avoid "Future exception was never retrieved" on Python 3.14
+        await asyncio.sleep(0)
 
 
 async def reset_ephemeral_pg(pool: asyncpg.Pool) -> None:

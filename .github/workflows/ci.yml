@@ -57,6 +57,10 @@ jobs:
           --health-retries 10
       rabbitmq:
         image: rabbitmq:4.0-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: factorix_mq
+          RABBITMQ_DEFAULT_PASS: factorix-mq-pw
+          RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit loopback_users []"
         ports: ["5672:5672", "15672:15672"]
         options: >-
           --health-cmd "su-exec rabbitmq rabbitmq-diagnostics -q ping"
@@ -98,16 +102,30 @@ jobs:
           FACTORIX_ENABLE_DESTRUCTIVE_TESTS: YES_I_USE_EPHEMERAL_DB
           FACTORIX_DATABASE_URL: postgresql+asyncpg://test:test@127.0.0.1:5432/factorix_test
           FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
-          FACTORIX_RABBITMQ_URL: amqp://guest:guest@127.0.0.1:5672/
+          FACTORIX_RABBITMQ_URL: amqp://factorix_mq:factorix-mq-pw@127.0.0.1:5672/
           FACTORIX_RABBITMQ_MGMT_URL: http://127.0.0.1:15672
           FACTORIX_TDENGINE_DSN: ws://root:taosdata@127.0.0.1:6041
           PYTHONPATH: "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/apps/center/src:$GITHUB_WORKSPACE/apps/acquisition/src:$GITHUB_WORKSPACE/apps/edge/src"
         run: |
           set -o pipefail
-          python -m pytest apps/center/tests/integration apps/acquisition/tests/integration -v --tb=short 2>&1 | tee /tmp/test_output.log || {
-            echo "## Integration Test Failure Details" >> $GITHUB_STEP_SUMMARY
+          python -m pytest apps/center/tests/integration apps/acquisition/tests/integration -v --tb=short --junitxml=pytest-integration.xml 2>&1 | tee /tmp/test_output.log
+
+      - name: Publish Test Summary
+        if: always()
+        run: |
+          if [ -f /tmp/test_output.log ]; then
+            echo "## Integration Test Run Log" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 120 /tmp/test_output.log >> $GITHUB_STEP_SUMMARY
+            tail -n 200 /tmp/test_output.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            exit 1
-          }
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: |
+            pytest-integration.xml
+            /tmp/test_output.log
+          if-no-files-found: ignore

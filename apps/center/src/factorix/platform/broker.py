@@ -392,8 +392,23 @@ class RabbitMQConsumer:
                 await message.ack()
                 self.metrics.consumed_ack += 1
             elif outcome == ConsumeOutcome.RETRY:
-                await message.nack(requeue=True)
-                self.metrics.consumed_retry += 1
+                deliv_count = int(
+                    (message.headers or {}).get("x-delivery-count")
+                    or (message.headers or {}).get("x-acquired-count")
+                    or 0
+                )
+                if self.cfg.delivery_limit and deliv_count >= self.cfg.delivery_limit:
+                    logger.warning(
+                        "Message %s exceeded delivery limit (%s >= %s); routing to DLQ",
+                        message.message_id,
+                        deliv_count,
+                        self.cfg.delivery_limit,
+                    )
+                    await message.reject(requeue=False)
+                    self.metrics.consumed_dlq += 1
+                else:
+                    await message.nack(requeue=True)
+                    self.metrics.consumed_retry += 1
             elif outcome == ConsumeOutcome.DEAD_LETTER:
                 await message.reject(requeue=False)
                 self.metrics.consumed_dlq += 1

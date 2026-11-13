@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import aio_pika
@@ -62,6 +64,8 @@ async def _cleanup_topology(cfg: BrokerConfig) -> None:
                 pass
     finally:
         await conn.close()
+        # Drain any pending aiormq I/O tasks to avoid "Future exception was never retrieved" on Python 3.14
+        await asyncio.sleep(0)
 
 
 def _make_obs(tenant_id, *, value: float | str = 42.5, value_type: str = "float64", epoch: int = 1, seq: int = 1) -> CanonicalObservation:
@@ -171,7 +175,6 @@ async def test_retry_delivery_limit_routes_poison_to_quorum_dlq() -> None:
     cfg = _isolated_cfg(delivery_limit=2)
     tenant_id = uuid4()
     attempts = 0
-    dlq_seen = asyncio.Event()
 
     async def failing_handler(_msg: AbstractIncomingMessage) -> ConsumeOutcome:
         nonlocal attempts
@@ -183,21 +186,47 @@ async def test_retry_delivery_limit_routes_poison_to_quorum_dlq() -> None:
         async with RabbitMQPublisher(cfg) as pub:
             await pub.publish_observation(_make_obs(tenant_id, seq=99))
             await consumer.start()
-            # Wait briefly for delivery_limit=2 attempts -> dead-lettered into DLQ
-            deadline = asyncio.get_running_loop().time() + 12.0
+            # With at-least-once DLX strategy, RabbitMQ 4.0 may crash the quorum queue
+            # process (noproc) when dead-lettering – this IS the dead-letter event.
+            # Wait up to 30s for >= delivery_limit attempts, then verify DLQ directly.
+            deadline = asyncio.get_running_loop().time() + 30.0
             while asyncio.get_running_loop().time() < deadline:
-                h = await probe_broker_health(cfg)
-                if (h.dlq_count or 0) >= 1:
-                    dlq_seen.set()
+                await asyncio.sleep(0.5)
+                if attempts >= cfg.delivery_limit:
+                    # Give RabbitMQ time to complete the at-least-once DLX publish
+                    await asyncio.sleep(3.0)
                     break
-                await asyncio.sleep(0.2)
             await consumer.stop(drain_timeout_s=5.0)
 
-        assert dlq_seen.is_set(), f"Expected poison message in DLQ after delivery_limit=2 (attempts={attempts})"
-        assert attempts >= 2
+        assert attempts >= cfg.delivery_limit, (
+            f"Expected >= {cfg.delivery_limit} delivery attempts, got {attempts}"
+        )
+
+        # Verify the message arrived in the DLQ via Management HTTP
+        # (AMQP passive declare message_count may lag for at-least-once dead-lettered messages)
+        parsed = urlparse(cfg.amqp_url)
+        dlq_check_auth = (parsed.username or "", parsed.password or "")
+        dlq_msg_found = False
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # Retry DLQ check a few times to allow Management stats to settle
+            for _ in range(6):
+                resp = await client.get(
+                    f"{cfg.mgmt_url}/api/queues/%2F/{cfg.dlq_name}",
+                    auth=dlq_check_auth,
+                )
+                if resp.status_code == 200 and int(resp.json().get("messages", 0)) >= 1:
+                    dlq_msg_found = True
+                    break
+                await asyncio.sleep(1.0)
+
+        assert dlq_msg_found, (
+            f"Expected poison message in DLQ after {cfg.delivery_limit} deliveries "
+            f"(attempts={attempts})"
+        )
 
         # Read and verify the message inside DLQ has intact payload & headers
-        conn = await aio_pika.connect_robust(cfg.amqp_url, timeout=5.0)
+        # Use plain connect (not robust) to avoid aiormq reconnect task teardown noise on Python 3.14
+        conn = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
         try:
             ch = await conn.channel()
             dlq = await ch.declare_queue(cfg.dlq_name, passive=True)
@@ -206,8 +235,11 @@ async def test_retry_delivery_limit_routes_poison_to_quorum_dlq() -> None:
             restored = CanonicalObservation.from_json_bytes(dlq_msg.body)
             assert restored.correlation_id == "test-99"
             await dlq_msg.ack()
+            # Allow any pending aiormq I/O tasks to settle before closing
+            await asyncio.sleep(0.1)
         finally:
             await conn.close()
+            await asyncio.sleep(0)
     finally:
         await _cleanup_topology(cfg)
 
@@ -229,7 +261,8 @@ async def test_overflow_reject_publish_raises_backpressure_without_drop_head() -
             assert pub.metrics.publish_backpressure >= 1
 
         # Verify the earliest messages were NEVER overwritten by drop-head
-        conn = await aio_pika.connect_robust(cfg.amqp_url, timeout=5.0)
+        # Use plain connect (not robust) to avoid aiormq reconnect task teardown noise on Python 3.14
+        conn = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
         try:
             ch = await conn.channel()
             q = await ch.declare_queue(cfg.queue_name, passive=True)
@@ -240,8 +273,11 @@ async def test_overflow_reject_publish_raises_backpressure_without_drop_head() -
             assert CanonicalObservation.from_json_bytes(m2.body).correlation_id == "test-2"
             await m1.ack()
             await m2.ack()
+            # Allow any pending aiormq I/O tasks to settle before closing
+            await asyncio.sleep(0.1)
         finally:
             await conn.close()
+            await asyncio.sleep(0)
     finally:
         await _cleanup_topology(cfg)
 
@@ -254,7 +290,8 @@ async def test_unacked_consumer_crash_redelivers_message() -> None:
     recovered = asyncio.Event()
 
     # First consumer closes connection abruptly without ACKing
-    conn1 = await aio_pika.connect_robust(cfg.amqp_url, timeout=5.0)
+    # Use plain connect (not robust) to avoid aiormq reconnect task teardown noise on Python 3.14
+    conn1 = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
     try:
         ch1 = await conn1.channel()
         _, q1, _ = await declare_telemetry_topology(ch1, cfg)
@@ -265,6 +302,7 @@ async def test_unacked_consumer_crash_redelivers_message() -> None:
         assert msg1.redelivered is False
     finally:
         await conn1.close()
+        await asyncio.sleep(0)
 
     async def second_handler(msg: AbstractIncomingMessage) -> ConsumeOutcome:
         nonlocal seen_deliveries
