@@ -109,6 +109,8 @@ class StorageBindingService:
             {"tenant_id": tenant_id},
         )
 
+        res_name_map = {str(r["id"]): str(r["name"]) for r in res_rows}
+
         sig_rows = await fetch_all(
             session,
             """
@@ -122,21 +124,35 @@ class StorageBindingService:
             {"tenant_id": tenant_id},
         )
 
+        flat_leaves: list[dict[str, Any]] = []
         sigs_by_resource: dict[str, list[dict[str, Any]]] = {}
         for s in sig_rows:
             rid = str(s["resource_id"]) if s.get("resource_id") else "unassigned"
+            r_name = res_name_map.get(rid, "Unassigned")
+            sig_id = str(s["id"])
+            can_id = f"sig:{sig_id}"
             item = {
                 "kind": "signal",
-                "id": str(s["id"]),
+                "id": can_id,
+                "canonical_id": can_id,
+                "signal_id": sig_id,
+                "tenant_id": str(tenant_id),
                 "key": str(s["key"]),
                 "name": str(s["key"]),
+                "display_name": f"{r_name} / {s['key']}",
+                "display_path": f"{r_name} / {s['key']}",
                 "data_type": str(s["data_type"]),
                 "unit": s.get("unit"),
                 "status": str(s["status"]),
+                "quality": "GOOD",
+                "freshness": "FRESH",
+                "resource_id": rid if rid != "unassigned" else None,
+                "resource_name": r_name,
                 "expected_interval_ms": s.get("expected_interval_ms"),
             }
-            if not search or search.lower() in item["name"].lower():
+            if not search or search.lower() in item["name"].lower() or search.lower() in r_name.lower():
                 sigs_by_resource.setdefault(rid, []).append(item)
+                flat_leaves.append(item)
 
         resources: list[dict[str, Any]] = []
         for r in res_rows:
@@ -158,6 +174,9 @@ class StorageBindingService:
         return {
             "view": "hierarchy",
             "items": resources[:limit],
+            "groups": resources[:limit],
+            "sources": flat_leaves[:limit * 10],
+            "leaves": flat_leaves[:limit * 10],
             "total": len(resources),
         }
 
@@ -198,22 +217,36 @@ class StorageBindingService:
             {"tenant_id": tenant_id},
         )
 
+        flat_leaves: list[dict[str, Any]] = []
         signals_by_conn: dict[str, list[dict[str, Any]]] = {}
         for s in sig_rows:
             cid = str(s["connection_id"])
+            c_name = str(s["connection_name"])
+            sig_id = str(s["id"])
+            can_id = f"sig:{sig_id}"
             item = {
                 "kind": "signal",
-                "id": str(s["id"]),
+                "id": can_id,
+                "canonical_id": can_id,
+                "signal_id": sig_id,
+                "tenant_id": str(tenant_id),
                 "key": str(s["key"]),
                 "name": str(s["key"]),
+                "display_name": f"{c_name} / {s['key']}",
+                "display_path": f"Connections / {c_name} / {s['key']}",
                 "data_type": str(s["data_type"]),
                 "unit": s.get("unit"),
                 "status": str(s["status"]),
-                "expected_interval_ms": s.get("expected_interval_ms"),
+                "quality": "GOOD",
+                "freshness": "FRESH",
+                "connection_id": cid,
+                "connection_name": c_name,
                 "protocol": str(s["protocol"]),
+                "expected_interval_ms": s.get("expected_interval_ms"),
             }
             if not search or search.lower() in item["name"].lower() or search.lower() in str(s["protocol"]).lower():
                 signals_by_conn.setdefault(cid, []).append(item)
+                flat_leaves.append(item)
 
         connections: list[dict[str, Any]] = []
         for c in conn_rows:
@@ -234,6 +267,9 @@ class StorageBindingService:
         return {
             "view": "collector",
             "items": connections[:limit],
+            "groups": connections[:limit],
+            "sources": flat_leaves[:limit * 10],
+            "leaves": flat_leaves[:limit * 10],
             "total": len(connections),
         }
 
@@ -260,6 +296,7 @@ class StorageBindingService:
             {"tenant_id": tenant_id},
         )
 
+        flat_leaves: list[dict[str, Any]] = []
         models: list[dict[str, Any]] = []
         for r in rows:
             mid = str(r["id"])
@@ -278,17 +315,29 @@ class StorageBindingService:
             for f in fields:
                 f_path = f.get("path") or f.get("name") or "output"
                 f_type = f.get("type", "float64")
+                can_id = f"mod:{mid}:{f_path}"
+                leaf_item = {
+                    "kind": "model_field",
+                    "id": can_id,
+                    "canonical_id": can_id,
+                    "model_id": mid,
+                    "model_name": dname,
+                    "model_revision": 1,
+                    "field_path": f_path,
+                    "key": f_path,
+                    "name": f"{dname} -> {f_path}",
+                    "display_name": f"{dname} -> {f_path}",
+                    "display_path": f"Models / {dname} / {f_path}",
+                    "data_type": f_type,
+                    "unit": f.get("unit"),
+                    "status": "ACTIVE",
+                    "quality": "GOOD",
+                    "freshness": "FRESH",
+                    "calculation_cycle": spec.get("calculation_cycle_ms", 5000),
+                }
                 if not search or search.lower() in f_path.lower() or search.lower() in dname.lower():
-                    field_items.append({
-                        "kind": "model_field",
-                        "model_id": mid,
-                        "model_name": dname,
-                        "field_path": f_path,
-                        "name": f"{dname} -> {f_path}",
-                        "data_type": f_type,
-                        "unit": f.get("unit"),
-                        "calculation_cycle": spec.get("calculation_cycle_ms", 5000),
-                    })
+                    field_items.append(leaf_item)
+                    flat_leaves.append(leaf_item)
 
             if not search or field_items or search.lower() in dname.lower():
                 models.append({
@@ -303,6 +352,9 @@ class StorageBindingService:
         return {
             "view": "models",
             "items": models[:limit],
+            "groups": models[:limit],
+            "sources": flat_leaves[:limit * 10],
+            "leaves": flat_leaves[:limit * 10],
             "total": len(models),
         }
 

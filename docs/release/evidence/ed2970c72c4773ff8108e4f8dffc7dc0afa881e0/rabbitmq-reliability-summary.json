@@ -1,0 +1,18 @@
+{
+  "verified_at_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "queue_topology": {
+    "queue_type": "quorum",
+    "replication_factor": 1,
+    "delivery_limit": 2,
+    "dead_letter_exchange": "factorix.dlx"
+  },
+  "reliability_features": {
+    "publisher_confirms_enabled": true,
+    "manual_consumer_ack_after_persistence": true,
+    "backpressure_prefetch_count": 100,
+    "offline_disk_spool_format": "sqlite3 WAL mode",
+    "spool_max_capacity": 500000
+  },
+  "zero_data_loss_verified": true
+}

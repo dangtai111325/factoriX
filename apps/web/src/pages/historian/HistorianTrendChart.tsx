@@ -337,9 +337,6 @@ export const HistorianTrendChart: React.FC<HistorianTrendChartProps> = ({
                     style={{ backgroundColor: hidden ? '#CBD5E1' : s.color }}
                   />
                   <span className="truncate max-w-[160px]">{sigLabel}</span>
-                  {s.signal.unit && (
-                    <span className="text-[10px] font-mono text-[#657794]">({s.signal.unit})</span>
-                  )}
                   <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-white border border-[#E3EAF3] text-[#657794]">
                     {s.isDiscrete ? 'STEP' : mode === 'reconstructed' ? 'STEP-HOLD' : 'LINE'}
                   </span>
@@ -398,9 +395,9 @@ export const HistorianTrendChart: React.FC<HistorianTrendChartProps> = ({
                 const y = padTop + plotHeight - pct * plotHeight;
                 const label = primaryAxis.isDiscrete
                   ? primaryAxis.discreteLabels[Math.round(pct * (primaryAxis.discreteLabels.length - 1))] || ''
-                  : `${(primaryAxis.min + pct * primaryAxis.span).toFixed(1)}${primaryAxis.unit ? ` ${primaryAxis.unit}` : ''}`;
+                  : (primaryAxis.min + pct * primaryAxis.span).toFixed(1);
                 const rightLabel = secondaryAxis
-                  ? `${(secondaryAxis.min + pct * secondaryAxis.span).toFixed(1)}${secondaryAxis.unit ? ` ${secondaryAxis.unit}` : ''}`
+                  ? (secondaryAxis.min + pct * secondaryAxis.span).toFixed(1)
                   : null;
 
                 return (
@@ -553,7 +550,6 @@ export const HistorianTrendChart: React.FC<HistorianTrendChartProps> = ({
                         <div className="flex items-baseline justify-between gap-2 mt-0.5">
                           <span className="font-mono text-[13px] font-extrabold text-white">
                             {formatValue(point.value)}
-                            {point.unit ? ` ${point.unit}` : ''}
                           </span>
                           {point.virtual && (
                             <span className="text-[9px] font-mono uppercase px-1.5 py-0.2 rounded bg-indigo-500/30 text-indigo-200 border border-indigo-400/40">

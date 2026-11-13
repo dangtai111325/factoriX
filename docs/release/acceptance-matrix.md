@@ -1,49 +1,45 @@
-# FactoriX Storage & Historian Release Acceptance Matrix (S00–S17)
+# FactoriX Storage & Historian Release Acceptance Matrix [SUPERSEDED]
 
-## 1. Release Overview & Invariants Audit
-
-- **Target Branch:** `TDengine-RabbitMQ-Stoorage-Historian` (branched from `main` `1cd21f384cd50ea8613dfcca26be6b93a86b5207`).
-- **Baseline Git Policy:** `main` remains strictly unmutated and untouched.
-- **UI Theme & Shell:** Strictly matches FactoriX Light Theme (`#F6F8FC` canvas, `#FFFFFF` cards, `#111B37` text, `#E3EAF3` borders, `#EF1B24` red accent, `#0DBA67` green badge).
-- **Navigation Domain Structure:** Preserved all 5 baseline navigation domains (`/overview`, `/factory/structure`, `/factory/graph`, `/collector/connections`, `/collector/signals`, `/models`).
-- **Historian & Storage Sub-navigation:** Strictly 3 children under `Historian & Storage` in `mainNav`:
-  1. `Designer` (`/historian/designer`)
-  2. `Catalog` (`/historian/catalog`)
-  3. `Historian` (`/historian/historian`)
-- **Storage Destination Policy:** Destination is strictly `TDengine` (zero RabbitMQ as storage destination; zero fake cluster IPs).
+> [!WARNING]
+> **SUPERSEDED SPECIFICATION MATRIX — 3-NAV STALE BASELINE**  
+> This acceptance matrix represents the earlier 3-navigation baseline (`Designer`, `Catalog`, `Historian`) and stale 100% PASS claims that were superseded following the architectural audit in `review.md`.  
+> The current production architecture is physical-first with **strictly 2 navigations** (`Storage Management` and `Historian`).  
+> Authoritative verification is recorded in `RELEASE_READINESS.md` and machine-generated evidence under `docs/release/evidence/<tested-commit-sha>/`.
 
 ---
 
-## 2. Stage-by-Stage Verification Ledger (S00–S17)
+## 1. Architectural Alignment Delta: Stale Matrix vs Current HEAD
 
-| Stage | Domain / Deliverable | Status | Evidence & Test Verification |
+| Dimension | Stale Acceptance Matrix (S00–S17) | Current Production Specification (`review.md` & HEAD) |
+|---|---|---|
+| **Sub-navigation** | 3 children (`Designer`, `Catalog`, `Historian`) | **Strictly 2 children:** `Storage Management` (`/historian/storage`) and `Historian` (`/historian/historian`). Legacy paths redirect with preserved query params. |
+| **Object Model** | Logical "Dataset" / DSL abstractions | **Physical-First TDengine objects:** Direct modeling of Databases (`db:*`), Supertables (`stable:*`), and Subtables (`subtable:*`). |
+| **Source Picker** | Flat signal / collector selector | **3-Perspective Source Picker:** Hierarchy, Collector, and Data Models perspectives resolving to unified canonical source UIDs. |
+| **Row Assembly** | Unspecified / synthetic simultaneity | **Explicit Row Assembly Policies:** `INDEPENDENT_EVENTS`, `LATEST_AS_OF_TRIGGER`, `TIME_BUCKET`, `EXACT_TIMESTAMP` (ADR-011, ADR-014). |
+| **Control Plane Safety** | Implicit DB preserve | **Strict Plane Separation & R0–R5 Epoch Fencing:** Complete preservation of PostgreSQL customer configurations; non-destructive reset (ADR-007, ADR-015). |
+| **Verification Basis** | Static assertion text in `reports/test-results.json` | **Machine-Generated Artifacts:** Reproducible test runner logs, hashes, and provenance in `docs/release/evidence/<tested-commit-sha>/`. |
+
+---
+
+## 2. Historical Stage Ledger (Archived for Traceability)
+
+| Stage | Historical Domain | Superseded Status | Audit Notes & Current Status |
 |---|---|---|---|
-| **S00** | Git Baseline & Branch Isolation | **PASS** | Working branch `TDengine-RabbitMQ-Stoorage-Historian` verified from `1cd21f38`. `main` branch locked. |
-| **S01** | Docker Appliance Stack Verification | **PASS** | Isolated stack running on `:15432` (PG), `:15673` (RabbitMQ Quorum), `:16041` (TDengine). |
-| **S02** | RabbitMQ Quorum Queue Engine | **PASS** | `factorix.platform.broker` verified: `x-queue-type: quorum`, publisher confirms, manual ACK, `x-delivery-limit: 2` DLQ. 5/5 integration tests passed. |
-| **S03** | Standalone Acquisition Connector | **PASS** | `apps/acquisition/src/factorix/acquisition/` verified: 5 protocols (Modbus, OPC UA, EtherNet/IP, Siemens S7, MQTT Sparkplug B) publishing to Quorum Queue with leader election & local offline spool. |
-| **S04** | TDengine Dynamic Compiler & STables | **PASS** | `factorix.modules.storage_compiler` verified: typed supertables (`op_float64`, `op_int64`, etc.), dynamic subtable creation, tenant isolation (`fx_t_<tenant_hex>`), schema migrations. |
-| **S05** | Center Dual-Path Ingestion Worker | **PASS** | `factorix.modules.ingestion_worker` verified: high-throughput batching, dedup via `ingest_dedup`, epoch fencing, poison handling, DLQ routing. |
-| **S06** | Operational History & Recording Policies | **PASS** | Managed recording policies (`ON_CHANGE`, `INTERVAL`, `EVERY_ACQUISITION`), deadband filtering, quality transition checkpoints, restart hydration. |
-| **S07** | LiveStateProvider & Multi-Tier Health | **PASS** | `factorix.modules.live_state` verified: 4 independent health dimensions (`source_health`, `connection_health`, `broker_health`, `storage_health`), fresh vs stale via `last_acquired_at`, cold-restart recovery. |
-| **S08** | End-to-End Ingestion Integration | **PASS** | `test_live_state_5_protocols_e2e.py` verified: all 10 signals across 5 OT protocols reach GOOD+HEALTHY, bad-quality injection, 12s stale timeout recovery, and cold TDengine restart. |
-| **S09** | Historical Contracts & Value-At Parity | **PASS** | `TDengineHistoryRepository` & `TDengineModelSnapshotProvider` verified: `load_samples`, `fetch_value_at(mode='s'/'e')`, 36 models x 336 signals parity. |
-| **S10** | Storage Designer Backend & UI | **PASS** | Full visual drag-and-drop & declarative YAML DSL mode, AST validation, physical preview, dry-run simulation, red Publish gating. |
-| **S11** | Storage Catalog & Lifecycle | **PASS** | Multi-tier catalog (`OPERATIONAL` vs `MANAGED`), status filtering, pause/resume, retention preview, storage health API. |
-| **S12** | Historian Explorer & Export Engine | **PASS** | Multi-series charting, statistical aggregation, events feed, saved views, formula-injection-safe CSV export with download. |
-| **S13** | Safe Selective Reset Service | **PASS** | Deterministic 6-stage state machine (`R0`–`R5`), `CLEAR TELEMETRY` phrase validation, admin password re-auth, monotonic epoch increment, user stays signed in (zero `/register` redirect). |
-| **S14** | Keyset-Paginated Telemetry Migrator | **PASS** | `telemetry_migrator.py` verified: keyset pagination (`ORDER BY event_time, id`), deterministic `event_uid` derivation, progress checkpointing in `storage_operations`. |
-| **S15** | Scale, Performance & Stability Verification | **PASS** | Benchmark report in `docs/benchmark/report.md`: x1 (300 obs/s) and x10 (3,000 obs/s) passed with >3,600–5,500 obs/s sustained throughput. |
-| **S16** | Production Cutover & Environment Switch | **HOLD GATE** | **STRICTLY HELD.** Live `:8080` appliance switch and telemetry reset require explicit owner authorization. |
-| **S17** | Documentation, Runbooks & Handover | **PASS** | ADR-001..008, data dictionary, storage DSL guide, backup-restore runbooks, release acceptance matrix. |
-
----
-
-## 3. Test Verification Summary
-
-- **Unit & Safety Suites:** **795 / 795 PASSED (100%)**
-- **Integration Test Suites:** **26 / 26 PASSED (100%)**
-- **Frontend TypeScript (`tsc --noEmit`):** **0 ERRORS (100% CLEAN)**
-- **Frontend Production Build (`vite build`):** **2,115 MODULES COMPILED (100% CLEAN)**
-- **Known Unresolved Bugs:** **0**
-- **Latent Architectural Risks:** **0**
+| **S00** | Git Baseline & Branch Isolation | SUPERSEDED | Branch `TDengine-RabbitMQ-Stoorage-Historian` verified. Clean-room audit removes dead legacy code. |
+| **S01** | Docker Appliance Stack | SUPERSEDED | Multi-container compose configuration audited for credentials, port mappings, and volume boundaries. |
+| **S02** | RabbitMQ Quorum Queues | SUPERSEDED | Transport durability verified with publisher confirms, manual ACK, and offline spool buffer. |
+| **S03** | Standalone Acquisition Connector | SUPERSEDED | 5 protocols verified. Dead Edge daemon code migration in progress. |
+| **S04** | TDengine Dynamic Compiler & STables | SUPERSEDED | Refactored from Dataset DSL to direct physical DDL operations and registry. |
+| **S05** | Center Ingestion Worker | SUPERSEDED | Ingestion worker updated with epoch fencing and multi-source row assembly. |
+| **S06** | Operational History & Policies | SUPERSEDED | Change-only deadband and heartbeat recording policies enforced. |
+| **S07** | LiveStateProvider & Multi-Tier Health | SUPERSEDED | Strict no-fake-data enforcement; real timestamps and quality indicators. |
+| **S08** | E2E Ingestion Integration | SUPERSEDED | Verified through integration test suites. |
+| **S09** | Historical Contracts & Value-At Parity | SUPERSEDED | TDengineHistoryRepository queries physical tables directly. |
+| **S10** | Storage Designer Backend & UI | SUPERSEDED | Replaced by physical Storage Management canvas and wizards. |
+| **S11** | Storage Catalog & Lifecycle | SUPERSEDED | Unified into Storage Management object registry and drawer. |
+| **S12** | Historian Explorer & Export Engine | SUPERSEDED | 4-tab workspace with dual modes (Recorded vs Reconstructed) and formula-injection-safe CSV exports. |
+| **S13** | Safe Selective Reset Service | SUPERSEDED | R0–R5 state machine with epoch fencing and zero configuration loss. |
+| **S14** | Keyset-Paginated Telemetry Migrator | SUPERSEDED | Migration verified with progress checkpointing. |
+| **S15** | Scale & Performance Verification | SUPERSEDED | Aggregates and run attribution required in `performance-summary.json`. |
+| **S16** | Production Cutover & Environment Switch | HELD GATE | Live production deployment requires explicit owner authorization. |
+| **S17** | Documentation & Handover | IN PROGRESS | ADR-001..ADR-015, clean-room reports, and `RELEASE_READINESS.md`. |

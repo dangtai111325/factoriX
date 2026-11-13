@@ -482,6 +482,21 @@ export async function getStorageObject(objectId: string): Promise<TDDatabase | T
   return api(`/api/v1/storage/td/objects/${encodeURIComponent(objectId)}`);
 }
 
+export async function patchStorageObject(
+  objectId: string,
+  patch: Record<string, unknown>,
+  ifMatch?: string
+): Promise<StorageOperation | TDDatabase | TDStable | TDSubtable> {
+  return api(`/api/v1/storage/td/objects/${encodeURIComponent(objectId)}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(ifMatch ? { 'If-Match': ifMatch } : {}),
+    },
+    body: JSON.stringify(patch),
+  });
+}
+
 // --- Operations / journal ---
 
 export async function getOperation(id: string): Promise<StorageOperation> {

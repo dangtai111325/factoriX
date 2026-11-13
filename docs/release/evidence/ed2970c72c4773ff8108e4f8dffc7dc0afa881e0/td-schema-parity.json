@@ -1,0 +1,50 @@
+{
+  "verified_at_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "cluster_version": "3.4.3.9",
+  "dialect_compliance": "TDengine 3.x",
+  "schema_primitives": {
+    "database_spec": {
+      "vgroups_default": 1,
+      "precision_options": [
+        "ms",
+        "us",
+        "ns"
+      ],
+      "keep_options": [
+        "30d",
+        "90d",
+        "365d",
+        "3650d"
+      ],
+      "tenant_isolation_naming": "fx_t_<tenant_hex>"
+    },
+    "supertable_spec": {
+      "primary_key": "ts TIMESTAMP",
+      "supported_metric_types": [
+        "DOUBLE",
+        "FLOAT",
+        "BIGINT",
+        "INT",
+        "SMALLINT",
+        "TINYINT",
+        "BOOL",
+        "BINARY",
+        "NCHAR"
+      ],
+      "tag_immutability": true,
+      "max_row_bytes": 4096
+    },
+    "subtable_spec": {
+      "naming_rule": "sub_<identifier>",
+      "tag_binding": "Resolved against parent supertable tag list",
+      "source_binding": "Canonical leaf source IDs"
+    }
+  },
+  "drift_detection_modes": [
+    "IN_SYNC",
+    "DRIFT_DETECTED",
+    "ORPHANED_PHYSICAL",
+    "MISSING_PHYSICAL"
+  ]
+}

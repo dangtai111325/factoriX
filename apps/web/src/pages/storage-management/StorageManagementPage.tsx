@@ -20,6 +20,11 @@ import { StorageObjectsTable, StorageObjectRow } from './StorageObjectsTable';
 import { StorageObjectDrawer } from './StorageObjectDrawer';
 import { PostgresExplorerView } from './PostgresExplorerView';
 import {
+  RemoteErrorState,
+  RemoteLoadingState,
+  RemoteEmptyState,
+} from '../../components/common/RemoteResourceState';
+import {
   TopologyNode,
   TopologyEdge,
   getTDTopology,
@@ -73,117 +78,74 @@ export const StorageManagementPage: React.FC = () => {
     ((TDDatabase | TDStable | TDSubtable) & { object_type: 'database' | 'stable' | 'subtable' }) | null
   >(null);
 
-  // Load TDengine data
+  const [topoError, setTopoError] = useState<unknown | null>(null);
+  const [drawerError, setDrawerError] = useState<unknown | null>(null);
+
+  // Load TDengine data - strictly real data, no synthetic fallbacks
   const loadTDengineData = useCallback(async () => {
     setLoading(true);
+    setTopoError(null);
     try {
-      // 1. Fetch topology
-      const topo = await getTDTopology().catch(() => ({
-        nodes: [
-          {
-            node_id: 'db/factory_master',
-            object_type: 'database' as const,
-            physical_name: 'factory_master',
-            status: 'ACTIVE' as const,
-            metadata: { stable_count: 2, subtable_count: 12 },
-          },
-          {
-            node_id: 'stable/process_telemetry',
-            object_type: 'stable' as const,
-            physical_name: 'process_telemetry',
-            status: 'ACTIVE' as const,
-            parent_id: 'db/factory_master',
-            metadata: { database_name: 'factory_master', column_count: 8, tag_count: 2, subtable_count: 6 },
-          },
-          {
-            node_id: 'stable/event_history',
-            object_type: 'stable' as const,
-            physical_name: 'event_history',
-            status: 'ACTIVE' as const,
-            parent_id: 'db/factory_master',
-            metadata: { database_name: 'factory_master', column_count: 5, tag_count: 2, subtable_count: 6 },
-          },
-          {
-            node_id: 'subtable/cnc_01_telemetry',
-            object_type: 'subtable' as const,
-            physical_name: 'cnc_01_telemetry',
-            status: 'ACTIVE' as const,
-            parent_id: 'stable/process_telemetry',
-            metadata: { stable_name: 'process_telemetry' },
-          },
-          {
-            node_id: 'subtable/cnc_02_telemetry',
-            object_type: 'subtable' as const,
-            physical_name: 'cnc_02_telemetry',
-            status: 'ACTIVE' as const,
-            parent_id: 'stable/process_telemetry',
-            metadata: { stable_name: 'process_telemetry' },
-          },
-        ],
-        edges: [
-          {
-            edge_id: 'e1',
-            source_node_id: 'db/factory_master',
-            target_node_id: 'stable/process_telemetry',
-            edge_kind: 'CONTAINS' as const,
-          },
-          {
-            edge_id: 'e2',
-            source_node_id: 'db/factory_master',
-            target_node_id: 'stable/event_history',
-            edge_kind: 'CONTAINS' as const,
-          },
-          {
-            edge_id: 'e3',
-            source_node_id: 'stable/process_telemetry',
-            target_node_id: 'subtable/cnc_01_telemetry',
-            edge_kind: 'INHERITS_SCHEMA' as const,
-          },
-          {
-            edge_id: 'e4',
-            source_node_id: 'stable/process_telemetry',
-            target_node_id: 'subtable/cnc_02_telemetry',
-            edge_kind: 'INHERITS_SCHEMA' as const,
-          },
-        ],
-        source: 'tdengine_information_schema',
-        observed_at: new Date().toISOString(),
-      }));
+      // 1. Fetch topology from TDengine
+      const topo = await getTDTopology();
 
       const safeNodes: TopologyNode[] = Array.isArray(topo?.nodes)
-        ? topo.nodes.map((n: any) => ({
-            ...n,
-            object_type: (n.object_type || n.kind || 'database') as 'database' | 'stable' | 'subtable',
-            physical_name: n.physical_name || n.label || n.name || '',
-            display_name: n.display_name || n.label || n.physical_name || '',
-            status: n.status || 'ACTIVE',
-          }))
+        ? topo.nodes.map((n: any) => {
+            const rawType = (n.object_type || n.kind || 'database') as string;
+            const objType: 'database' | 'stable' | 'subtable' =
+              rawType === 'engine' || rawType === 'database' ? 'database' : rawType === 'stable' ? 'stable' : 'subtable';
+            const physName = n.physical_name || n.label || n.name || '';
+            // Standardize canonical object IDs: db:<name>, stable:<db>.<name>, subtable:<db>.<name>
+            let canonicalId = n.node_id || '';
+            if (!canonicalId || canonicalId.includes('/')) {
+              if (objType === 'database') canonicalId = `db:${physName}`;
+              else if (objType === 'stable') {
+                const parent = (n.metadata?.database_name as string) || n.parent_id?.replace(/^(db[:/])/, '') || 'default';
+                canonicalId = `stable:${parent}.${physName}`;
+              } else {
+                const parent = (n.metadata?.stable_name as string) || n.parent_id?.replace(/^(stable[:/])/, '') || 'default';
+                canonicalId = `subtable:${parent}.${physName}`;
+              }
+            }
+            return {
+              ...n,
+              node_id: canonicalId,
+              object_type: objType,
+              physical_name: physName,
+              display_name: n.display_name || n.label || physName,
+              status: n.status || 'ACTIVE',
+            };
+          })
         : [];
       const safeEdges: TopologyEdge[] = Array.isArray(topo?.edges) ? topo.edges : [];
 
       setNodes(safeNodes);
       setEdges(safeEdges);
 
-      // 2. Fetch stats
-      const st = await getStorageStats().catch(() => ({
-        database_count: safeNodes.filter((n) => n.object_type === 'database').length,
-        stable_count: safeNodes.filter((n) => n.object_type === 'stable').length,
-        subtable_count: safeNodes.filter((n) => n.object_type === 'subtable').length,
-        recording_active: 0,
-        recording_paused: 0,
-        recording_error: 0,
-        observed_at: new Date().toISOString(),
-      }));
-
-      setStats({
-        databaseCount: st?.database_count ?? 0,
-        stableCount: st?.stable_count ?? 0,
-        subtableCount: st?.subtable_count ?? 0,
-        recordingActive: st?.recording_active ?? 0,
-        recordingPaused: st?.recording_paused ?? 0,
-        recordingError: st?.recording_error ?? 0,
-        lastObservedAt: st?.observed_at || new Date().toISOString(),
-      });
+      // 2. Fetch real stats independent of pagination
+      try {
+        const st = await getStorageStats();
+        setStats({
+          databaseCount: st?.database_count ?? 0,
+          stableCount: st?.stable_count ?? 0,
+          subtableCount: st?.subtable_count ?? 0,
+          recordingActive: st?.recording_active ?? 0,
+          recordingPaused: st?.recording_paused ?? 0,
+          recordingError: st?.recording_error ?? 0,
+          lastObservedAt: st?.observed_at || topo?.observed_at || new Date().toISOString(),
+        });
+      } catch (stErr) {
+        console.warn('Real stats endpoint failed, using counted topology values', stErr);
+        setStats({
+          databaseCount: safeNodes.filter((n) => n.object_type === 'database').length,
+          stableCount: safeNodes.filter((n) => n.object_type === 'stable').length,
+          subtableCount: safeNodes.filter((n) => n.object_type === 'subtable').length,
+          recordingActive: 0,
+          recordingPaused: 0,
+          recordingError: 0,
+          lastObservedAt: topo?.observed_at || new Date().toISOString(),
+        });
+      }
 
       // 3. Flatten objects for table view
       const rows: StorageObjectRow[] = safeNodes.map((n) => ({
@@ -196,11 +158,17 @@ export const StorageManagementPage: React.FC = () => {
         column_count: n.metadata?.column_count as number | undefined,
         tag_count: n.metadata?.tag_count as number | undefined,
         subtable_count: (n.metadata?.subtable_count as number | undefined) || (n.metadata?.stable_count as number | undefined),
-        binding_count: 1,
+        binding_count: (n.metadata?.binding_count as number | undefined) || 0,
         last_verified_at: topo?.observed_at || new Date().toISOString(),
         status: n.status,
       }));
       setTableObjects(rows);
+    } catch (err: unknown) {
+      console.error('Failed to load TDengine topology:', err);
+      setTopoError(err);
+      setNodes([]);
+      setEdges([]);
+      setTableObjects([]);
     } finally {
       setLoading(false);
     }
@@ -212,80 +180,28 @@ export const StorageManagementPage: React.FC = () => {
     }
   }, [engine, loadTDengineData]);
 
-  // Load detailed object for drawer when selected
+  // Load detailed object for drawer when selected - strictly real data
   useEffect(() => {
     if (!selectedObjectId) {
       setSelectedObjectData(null);
+      setDrawerError(null);
       return;
     }
 
     getStorageObject(selectedObjectId)
       .then((obj) => {
-        const type: 'database' | 'stable' | 'subtable' = selectedObjectId.startsWith('db/')
-          ? 'database'
-          : selectedObjectId.startsWith('stable/')
-          ? 'stable'
-          : 'subtable';
+        const isDb = selectedObjectId.startsWith('db:') || selectedObjectId.startsWith('db/');
+        const isStable = selectedObjectId.startsWith('stable:') || selectedObjectId.startsWith('stable/');
+        const type: 'database' | 'stable' | 'subtable' = isDb ? 'database' : isStable ? 'stable' : 'subtable';
         setSelectedObjectData({ ...obj, object_type: type });
+        setDrawerError(null);
       })
-      .catch(() => {
-        // Fallback detail
-        const node = nodes.find((n) => n.node_id === selectedObjectId);
-        if (node) {
-          const type: 'database' | 'stable' | 'subtable' =
-            node.object_type === 'engine' ? 'database' : node.object_type;
-          setSelectedObjectData({
-            id: node.node_id,
-            physical_name: node.physical_name,
-            object_type: type,
-            status: node.status,
-            tenant_id: 'default',
-            observed_at: new Date().toISOString(),
-            // Mock sub-properties
-            ...(type === 'database'
-              ? { precision: 'ms' as const, stable_count: 2, subtable_count: 12 }
-              : type === 'stable'
-              ? {
-                  database_id: 'db/factory_master',
-                  database_name: 'factory_master',
-                  columns: [
-                    { name: 'ts', td_type: 'TIMESTAMP', nullable: false, role: 'timestamp' as const, immutable: true },
-                    { name: 'temperature', td_type: 'DOUBLE', nullable: true, role: 'value' as const },
-                    { name: 'pressure', td_type: 'DOUBLE', nullable: true, role: 'value' as const },
-                    { name: 'quality', td_type: 'INT', nullable: true, role: 'value' as const },
-                  ],
-                  tags: [
-                    { name: 'resource_id', td_type: 'VARCHAR(64)' },
-                    { name: 'line', td_type: 'VARCHAR(32)' },
-                  ],
-                  subtable_count: 6,
-                }
-              : {
-                  stable_id: 'stable/process_telemetry',
-                  stable_name: 'process_telemetry',
-                  database_id: 'db/factory_master',
-                  database_name: 'factory_master',
-                  tag_values: [
-                    { name: 'resource_id', td_type: 'VARCHAR(64)', value: 'cnc_01' },
-                    { name: 'line', td_type: 'VARCHAR(32)', value: 'line_a' },
-                  ],
-                  bindings: [
-                    {
-                      id: 'b1',
-                      source_kind: 'signal' as const,
-                      source_id: 'sig-temp-01',
-                      source_path: 'Modbus / CNC-01 / Temperature',
-                      destination_column: 'temperature',
-                      status: 'ACTIVE' as const,
-                      created_at: new Date().toISOString(),
-                    },
-                  ],
-                  write_active: true,
-                }),
-          } as unknown as (TDDatabase | TDStable | TDSubtable) & { object_type: 'database' | 'stable' | 'subtable' });
-        }
+      .catch((err) => {
+        console.error('Failed to load storage object detail:', err);
+        setSelectedObjectData(null);
+        setDrawerError(err);
       });
-  }, [selectedObjectId, nodes]);
+  }, [selectedObjectId]);
 
   return (
     <div className="space-y-4">
@@ -430,7 +346,23 @@ export const StorageManagementPage: React.FC = () => {
           </div>
 
           {/* Active view */}
-          {activeTab === 'topology' ? (
+          {topoError != null ? (
+            <RemoteErrorState
+              error={topoError}
+              subject="TDengine Storage Topology"
+              onRetry={loadTDengineData}
+            />
+          ) : loading && nodes.length === 0 ? (
+            <RemoteLoadingState subject="TDengine storage topology" />
+          ) : nodes.length === 0 ? (
+            <RemoteEmptyState
+              title="No Storage Objects Found"
+              description="There are no physical TDengine databases or supertables configured yet. Start by creating your first database."
+              actionLabel="Create Database"
+              onAction={() => navigate('/historian/storage/create?kind=database')}
+              icon={Database}
+            />
+          ) : activeTab === 'topology' ? (
             <StorageObjectGraph
               nodes={nodes}
               edges={edges}
@@ -456,6 +388,33 @@ export const StorageManagementPage: React.FC = () => {
               onClose={() => setSelectedObjectId(null)}
               onRefresh={loadTDengineData}
             />
+          )}
+
+          {/* Drawer Error State */}
+          {drawerError != null && selectedObjectId && !selectedObjectData && (
+            <div className="fixed inset-y-0 right-0 z-40 w-[420px] bg-white border-l border-[#FAC6C9] shadow-xl p-6 flex flex-col justify-center animate-in slide-in-from-right duration-200">
+              <RemoteErrorState
+                error={drawerError}
+                subject={`Storage Object "${selectedObjectId}"`}
+                onRetry={() => {
+                  if (selectedObjectId) {
+                    const id = selectedObjectId;
+                    setSelectedObjectId(null);
+                    setTimeout(() => setSelectedObjectId(id), 50);
+                  }
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedObjectId(null);
+                  setDrawerError(null);
+                }}
+                className="mt-4 px-4 py-2 bg-[#F1F5FA] hover:bg-[#E3EAF3] text-[#111B37] rounded-lg text-[13px] font-semibold"
+              >
+                Close Drawer
+              </button>
+            </div>
           )}
         </div>
       )}

@@ -421,6 +421,14 @@ class TDEngineClient:
         eff_timeout = self._effective_timeout(sql, timeout_s, use_probe_pool=use_probe_pool)
         return await self._run_in_pool(_query, timeout_s=eff_timeout, use_probe_pool=use_probe_pool)
 
+    async def run_read(self, sql: str, *, timeout_s: float | None = None) -> list[dict[str, Any]]:
+        """Compatibility alias for query_rows."""
+        return await self.query_rows(sql, timeout_s=timeout_s)
+
+    async def run_write(self, sql: str, *, timeout_s: float | None = None) -> int:
+        """Compatibility alias for execute_sql."""
+        return await self.execute_sql(sql, timeout_s=timeout_s)
+
     # ------------------------------------------------------------------
     # Tenant DB & Operational History schema provisioning
     # ------------------------------------------------------------------

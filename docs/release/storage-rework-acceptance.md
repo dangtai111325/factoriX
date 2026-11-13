@@ -1,9 +1,15 @@
-# Storage & Historian Refactor Release Acceptance Report
+# Storage & Historian Refactor Release Acceptance Report [SUPERSEDED]
 
+> [!WARNING]
+> **SUPERSEDED DOCUMENT — DO NOT USE AS AUTHORITATIVE RELEASE GATE**  
+> This report was generated on 2026-11-12 under historical commit `400dba192eb13be30806dbacb1568ffff23ae26b` and prematurely declared `ACCEPTED FOR RELEASE` prior to the comprehensive audit detailed in `review.md`.  
+> Authoritative release evaluation is strictly governed by `RELEASE_READINESS.md` across verified gates G0–G8.
+
+**Status:** SUPERSEDED (Archived for historical traceability)  
 **Release Target:** FactoriX Storage & Historian Physical-First Rework  
 **Branch:** `TDengine-RabbitMQ-Stoorage-Historian`  
 **Base Commit:** `1aff3d254996d1fd35a7ddc8b0ebaa700d91f94a`  
-**Current Commit:** `400dba192eb13be30806dbacb1568ffff23ae26b`  
+**Historical Commit:** `400dba192eb13be30806dbacb1568ffff23ae26b`  
 **Date:** 2026-11-12
 
 ---
@@ -49,5 +55,5 @@ The refactor successfully eliminates the confusing "Dataset" abstraction, introd
 
 ## 4. Final Verdict
 
-**VERDICT: ACCEPTED FOR RELEASE**  
-The implementation fulfills all requirements of the Master Plan. Physical storage management is cleanly isolated, intuitive for industrial engineers, and backed by robust data plane safeguards.
+**VERDICT: SUPERSEDED (DO NOT USE)**  
+This legacy acceptance claim has been superseded by `RELEASE_READINESS.md` based on active verification gates G0–G8 per `review.md`.

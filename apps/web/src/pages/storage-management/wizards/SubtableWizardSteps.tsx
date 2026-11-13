@@ -508,7 +508,6 @@ export const SubtableBindSourcesStep: React.FC<SubtableStepProps> = ({
                     <div className="text-[10px] font-mono text-[#657794] truncate">{src.path}</div>
                     <div className="flex items-center gap-2 mt-0.5 text-[10px] text-[#8C9BAE]">
                       <span>{src.data_type || 'number'}</span>
-                      {src.unit && <span>• {src.unit}</span>}
                     </div>
                   </div>
                 );
@@ -602,19 +601,17 @@ export const SubtableBindSourcesStep: React.FC<SubtableStepProps> = ({
                     <span className="font-medium text-[#111B37]">{selectedSource.kind}</span>
                   </div>
                   <div>
-                    <span className="text-[#657794]">Unit: </span>
-                    <span className="font-medium text-[#111B37]">{selectedSource.unit || '—'}</span>
-                  </div>
-                  <div>
                     <span className="text-[#657794]">Quality: </span>
-                    <span className="font-semibold text-[#0DBA67]">GOOD (192)</span>
+                    <span className="font-semibold text-[#0DBA67]">
+                      {selectedSource.quality || '—'}
+                    </span>
                   </div>
                   <div>
                     <span className="text-[#657794]">Sample: </span>
                     <span className="font-mono text-[#111B37]">
-                      {selectedSource.last_value !== undefined
+                      {selectedSource.last_value !== undefined && selectedSource.last_value !== null
                         ? String(selectedSource.last_value)
-                        : '42.8'}
+                        : '—'}
                     </span>
                   </div>
                 </div>

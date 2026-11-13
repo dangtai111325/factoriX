@@ -123,7 +123,6 @@ export const TrendChart: React.FC<TrendChartProps> = ({
                 <span className="font-semibold text-[#111B37]">
                   {signal.displayName || signal.name || signal.key}
                 </span>
-                {signal.unit && <span className="text-[#657794] text-[11px]">({signal.unit})</span>}
               </div>
             ))}
           </div>

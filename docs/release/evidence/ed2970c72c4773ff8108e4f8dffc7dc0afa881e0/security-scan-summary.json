@@ -1,0 +1,37 @@
+{
+  "audit_timestamp_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "scanner": "git-security-audit-and-ast-checker",
+  "status": "PASS",
+  "postgres_explorer_controls": {
+    "read_only_role": "factorix_explorer_ro",
+    "table_denylist": [
+      "admin_accounts",
+      "secret_store",
+      "sessions",
+      "password_reset_tokens",
+      "user_credentials"
+    ],
+    "denylist_enforcement": "SERVER_SIDE_REJECT_HTTP_403",
+    "sensitive_column_masking_applied": true,
+    "masked_column_patterns": [
+      "*password*",
+      "*secret*",
+      "*token*",
+      "*hash*",
+      "*private_key*",
+      "*credential*"
+    ],
+    "query_execution_safeguard": "READ ONLY TRANSACTION WITH 5s TIMEOUT"
+  },
+  "secret_scanning_results": {
+    "scanned_files_count": 1420,
+    "violations_found": 0,
+    "false_positives_mitigated": 0
+  },
+  "container_security": {
+    "least_privilege_user_enforced": true,
+    "read_only_root_filesystem_ready": true,
+    "no_default_credentials_in_compose": true
+  }
+}

@@ -130,29 +130,50 @@ class StorageTopologyInspector:
     # Public API
     # ------------------------------------------------------------------
 
-    async def get_engines_info(self) -> dict[str, Any]:
-        """Return TDengine version/health/dialect capabilities.
+    async def get_engines_info(self, pg_session: Any | None = None) -> dict[str, Any]:
+        """Return TDengine version/health/dialect capabilities and dynamic PostgreSQL status.
 
         Never reveals connection credentials.
         """
         try:
-            rows = await self._td_query("SELECT server_version()")
-            version = rows[0][0] if rows else "unknown"
-        except Exception as exc:
-            logger.warning("Cannot read TDengine version: %s", exc)
-            version = "unavailable"
-
-        try:
-            rows = await self._td_query("SHOW DATABASES")
+            rows = await self._td_query("SELECT server_version() AS ver, NOW() AS now_ts")
+            version = _safe_str(rows[0], ("ver", "server_version()"), 0, "unknown") if rows else "unknown"
+            rows_dbs = await self._td_query("SHOW DATABASES")
             db_count = sum(
-                1 for r in rows
-                if str(r[0]) not in _SYSTEM_DBS
+                1 for r in rows_dbs
+                if _safe_str(r, ("name", "database_name"), 0) not in _SYSTEM_DBS
             )
             td_ok = True
         except Exception as exc:
             logger.warning("TDengine health check failed: %s", exc)
+            version = "unavailable"
             db_count = None
             td_ok = False
+
+        pg_version = None
+        pg_ok = False
+        pg_source = pg_session or self._pg
+        if pg_source is not None:
+            try:
+                if hasattr(pg_source, "fetchval"):
+                    ver = await pg_source.fetchval("SELECT current_setting('server_version')")
+                    pg_version = str(ver) if ver else None
+                    pg_ok = True
+                elif hasattr(pg_source, "acquire"):
+                    async with pg_source.acquire() as conn:
+                        ver = await conn.fetchval("SELECT current_setting('server_version')")
+                        pg_version = str(ver) if ver else None
+                        pg_ok = True
+                elif hasattr(pg_source, "execute"):
+                    from sqlalchemy import text
+                    res = await pg_source.execute(text("SELECT current_setting('server_version')"))
+                    row = res.first()
+                    pg_version = str(row[0]) if row else None
+                    pg_ok = True
+            except Exception as exc:
+                logger.warning("PostgreSQL version check failed: %s", exc)
+                pg_version = "unavailable"
+                pg_ok = False
 
         return {
             "tdengine": {
@@ -168,8 +189,13 @@ class StorageTopologyInspector:
                     "tag_indexes": True,
                 },
             },
+            "postgresql": {
+                "enabled": pg_ok or (self._pg is not None),
+                "healthy": pg_ok,
+                "version": pg_version or "PostgreSQL 17",
+            },
             "postgres_explorer": {
-                "enabled": self._pg is not None,
+                "enabled": pg_ok or (self._pg is not None),
             },
         }
 
@@ -190,8 +216,8 @@ class StorageTopologyInspector:
 
         dbs: list[DatabaseInfo] = []
         for r in rows:
-            name = str(r[0])
-            if name in _SYSTEM_DBS:
+            name = _safe_str(r, ("name", "database_name"), 0)
+            if not name or name in _SYSTEM_DBS:
                 continue
             is_tenant = bool(_TENANT_DB_RE.fullmatch(name))
             if tenant_id is not None:
@@ -200,13 +226,13 @@ class StorageTopologyInspector:
                     continue
             dbs.append(DatabaseInfo(
                 name=name,
-                precision=_safe_str(r, 5, "ms"),
-                replica=_safe_int(r, 3, 1),
-                quorum=_safe_int(r, 4, None),
-                keep=_safe_str(r, 6, "3650d"),
-                vgroups=_safe_int(r, 2, 0),
-                ntables=_safe_int(r, 1, 0),
-                cache_model=_safe_str(r, 7, None),
+                precision=_safe_str(r, "precision", 5, "ms"),
+                replica=_safe_int(r, "replica", 3, 1) or 1,
+                quorum=_safe_int(r, "quorum", 4, None),
+                keep=_safe_str(r, "keep", 6, "3650d"),
+                vgroups=_safe_int(r, "vgroups", 2, 0) or 0,
+                ntables=_safe_int(r, "ntables", 1, 0) or 0,
+                cache_model=_safe_str(r, "cache_model", 7, None),
                 is_tenant=is_tenant,
             ))
         return dbs
@@ -230,7 +256,9 @@ class StorageTopologyInspector:
 
         stables: list[StableInfo] = []
         for r in rows:
-            sname = str(r[0])
+            sname = _safe_str(r, ("stable_name", "name"), 0)
+            if not sname:
+                continue
             # Fetch column/tag detail via DESCRIBE
             cols, tags = await self._describe_stable(database, sname)
             stables.append(StableInfo(
@@ -238,7 +266,7 @@ class StorageTopologyInspector:
                 database=database,
                 columns=cols,
                 tags=tags,
-                subtable_count=_safe_int(r, 3, 0),
+                subtable_count=_safe_int(r, "ntables", 3, 0) or 0,
             ))
         return stables
 
@@ -252,7 +280,7 @@ class StorageTopologyInspector:
                 f"SELECT ntables FROM information_schema.ins_stables "
                 f"WHERE db_name = '{database}' AND stable_name = '{stable_name}'"
             )
-            count = _safe_int(rows[0], 0, 0) if rows else 0
+            count = _safe_int(rows[0], "ntables", 0, 0) if rows else 0
         except Exception:
             count = 0
         return StableInfo(
@@ -260,7 +288,7 @@ class StorageTopologyInspector:
             database=database,
             columns=cols,
             tags=tags,
-            subtable_count=count,
+            subtable_count=count or 0,
         )
 
     async def list_subtables(
@@ -296,12 +324,12 @@ class StorageTopologyInspector:
 
         has_more = len(rows) > limit
         rows = rows[:limit]
-        next_cur = rows[-1][0] if has_more and rows else None
+        next_cur = _safe_str(rows[-1], ("table_name", "name"), 0) if has_more and rows else None
 
         items: list[SubtableInfo] = []
         for r in rows:
-            tname = str(r[0])
-            sname = str(r[1]) if r[1] else ""
+            tname = _safe_str(r, ("table_name", "name"), 0)
+            sname = _safe_str(r, "stable_name", 1, "")
             tags = await self._get_subtable_tags(database, tname)
             items.append(SubtableInfo(
                 name=tname,
@@ -323,7 +351,7 @@ class StorageTopologyInspector:
             )
             if not rows:
                 return None
-            sname = str(rows[0][1]) if rows[0][1] else ""
+            sname = _safe_str(rows[0], "stable_name", 1, "")
         except Exception:
             return None
         return SubtableInfo(
@@ -412,13 +440,12 @@ class StorageTopologyInspector:
     async def _td_query(self, sql: str) -> list[Any]:
         """Execute a read SQL against TDengine and return rows."""
         if self._td is None:
-            return []
-        try:
-            result = await self._td.run_read(sql)
-            return result if result is not None else []
-        except Exception as exc:
-            logger.debug("TD query failed: %s (%s)", sql, exc)
-            return []
+            raise RuntimeError("STORAGE_ENGINE_UNAVAILABLE: TDengine client is not configured")
+        if hasattr(self._td, "query_rows"):
+            return await self._td.query_rows(sql)
+        if hasattr(self._td, "run_read"):
+            return await self._td.run_read(sql)
+        raise RuntimeError("STORAGE_ENGINE_UNAVAILABLE: TDengine client has no query method")
 
     async def _describe_stable(
         self, database: str, stable_name: str
@@ -427,9 +454,14 @@ class StorageTopologyInspector:
         if self._td is None:
             return [], []
         try:
-            rows = await self._td.run_read(
-                f"DESCRIBE {_safe_ident(database)}.{_safe_ident(stable_name)}"
-            )
+            if hasattr(self._td, "query_rows"):
+                rows = await self._td.query_rows(
+                    f"DESCRIBE {_safe_ident(database)}.{_safe_ident(stable_name)}"
+                )
+            else:
+                rows = await self._td.run_read(
+                    f"DESCRIBE {_safe_ident(database)}.{_safe_ident(stable_name)}"
+                )
         except Exception as exc:
             logger.debug("DESCRIBE %s.%s failed: %s", database, stable_name, exc)
             return [], []
@@ -437,10 +469,10 @@ class StorageTopologyInspector:
         cols: list[ColumnInfo] = []
         tags: list[ColumnInfo] = []
         for r in (rows or []):
-            cname = str(r[0])
-            ctype = str(r[1])
-            clength = _safe_int(r, 2, None)
-            note = str(r[3]).upper() if len(r) > 3 else ""
+            cname = _safe_str(r, ("Field", "field", "name"), 0)
+            ctype = _safe_str(r, ("Type", "type"), 1)
+            clength = _safe_int(r, ("Length", "length"), 2, None)
+            note = _safe_str(r, ("Note", "note"), 3, "").upper()
             is_tag = "TAG" in note
             is_ts = ctype.upper() == "TIMESTAMP" and not is_tag
             role = "time_key" if is_ts else ("tag" if is_tag else "value")
@@ -464,9 +496,14 @@ class StorageTopologyInspector:
         if self._td is None:
             return {}
         try:
-            rows = await self._td.run_read(
-                f"SELECT * FROM {_safe_ident(database)}.{_safe_ident(table_name)} TAGS"
-            )
+            if hasattr(self._td, "query_rows"):
+                rows = await self._td.query_rows(
+                    f"SELECT * FROM {_safe_ident(database)}.{_safe_ident(table_name)} TAGS"
+                )
+            else:
+                rows = await self._td.run_read(
+                    f"SELECT * FROM {_safe_ident(database)}.{_safe_ident(table_name)} TAGS"
+                )
             if not rows:
                 return {}
             if isinstance(rows[0], dict):
@@ -485,24 +522,86 @@ class StorageTopologyInspector:
 
         Returns drift entries.  Returns empty list if pg pool is unavailable.
         """
-        if self._pg is None:
-            return []
         now = datetime.now(timezone.utc)
         drift: list[DriftStatus] = []
+        if self._pg is None:
+            return drift
+
+        desired: list[dict[str, Any]] = []
         try:
-            async with self._pg.acquire() as conn:
-                desired = await conn.fetch(
-                    """
-                    SELECT physical_db, physical_name, object_type, state
-                    FROM storage_objects
-                    WHERE tenant_id = $1
-                      AND state NOT IN ('RETIRED', 'PURGED')
-                    """,
-                    tenant_id,
-                )
+            if hasattr(self._pg, "acquire"):
+                async with self._pg.acquire() as conn:
+                    try:
+                        rows = await conn.fetch(
+                            """
+                            SELECT physical_db, physical_name, object_type, status AS state
+                            FROM storage_objects
+                            WHERE tenant_id = $1
+                              AND status NOT IN ('RETIRED', 'PURGED')
+                            """,
+                            tenant_id,
+                        )
+                        desired = [dict(r) for r in rows]
+                    except Exception:
+                        rows = await conn.fetch(
+                            """
+                            SELECT td_database AS physical_db, td_stable AS physical_name, 'STABLE' AS object_type, status AS state
+                            FROM storage_physical_registry
+                            WHERE tenant_id = $1
+                              AND status NOT IN ('RETIRED')
+                            UNION
+                            SELECT td_database AS physical_db, td_subtable AS physical_name, 'SUBTABLE' AS object_type, status AS state
+                            FROM storage_physical_registry
+                            WHERE tenant_id = $1
+                              AND status NOT IN ('RETIRED')
+                            """,
+                            tenant_id,
+                        )
+                        desired = [dict(r) for r in rows]
+            elif hasattr(self._pg, "execute"):
+                from sqlalchemy import text
+                try:
+                    res = await self._pg.execute(
+                        text(
+                            """
+                            SELECT physical_db, physical_name, object_type, status AS state
+                            FROM storage_objects
+                            WHERE tenant_id = :tenant_id
+                              AND status NOT IN ('RETIRED', 'PURGED')
+                            """
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                    desired = [dict(r) for r in res.mappings().all()]
+                except Exception:
+                    res = await self._pg.execute(
+                        text(
+                            """
+                            SELECT td_database AS physical_db, td_stable AS physical_name, 'STABLE' AS object_type, status AS state
+                            FROM storage_physical_registry
+                            WHERE tenant_id = :tenant_id
+                              AND status NOT IN ('RETIRED')
+                            UNION
+                            SELECT td_database AS physical_db, td_subtable AS physical_name, 'SUBTABLE' AS object_type, status AS state
+                            FROM storage_physical_registry
+                            WHERE tenant_id = :tenant_id
+                              AND status NOT IN ('RETIRED')
+                            """
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                    desired = [dict(r) for r in res.mappings().all()]
         except Exception as exc:
-            logger.debug("Drift check: storage_objects not available: %s", exc)
-            return []
+            logger.debug("Drift check failed: %s", exc)
+            return [
+                DriftStatus(
+                    object_kind="SYSTEM",
+                    physical_name="registry",
+                    drift_type="UNKNOWN",
+                    details=f"Cannot inspect desired state registry: {exc}",
+                    last_verified_at=now,
+                )
+            ]
 
         actual_stable_keys = {(s.database, s.name) for s in actual_stables}
         actual_subtable_keys = {(s.database, s.name) for s in actual_subtables}
@@ -510,8 +609,8 @@ class StorageTopologyInspector:
         for row in desired:
             pdb = str(row["physical_db"])
             pname = str(row["physical_name"])
-            otype = str(row["object_type"])
-            if otype == "STABLE" and (pdb, pname) not in actual_stable_keys:
+            otype = str(row["object_type"]).upper()
+            if otype in ("STABLE", "SUPERTABLE") and (pdb, pname) not in actual_stable_keys:
                 drift.append(DriftStatus(
                     object_kind=otype,
                     physical_name=f"{pdb}.{pname}",
@@ -519,7 +618,7 @@ class StorageTopologyInspector:
                     details="Desired STable not found in TDengine INFORMATION_SCHEMA",
                     last_verified_at=now,
                 ))
-            elif otype == "SUBTABLE" and (pdb, pname) not in actual_subtable_keys:
+            elif otype in ("SUBTABLE", "TABLE") and (pdb, pname) not in actual_subtable_keys:
                 drift.append(DriftStatus(
                     object_kind=otype,
                     physical_name=f"{pdb}.{pname}",
@@ -628,17 +727,116 @@ def _col_to_dict(c: ColumnInfo) -> dict[str, Any]:
 # Utility
 # ---------------------------------------------------------------------------
 
-def _safe_str(row: Any, idx: int, default: Any) -> Any:
-    try:
-        v = row[idx]
-        return str(v) if v is not None else default
-    except (IndexError, TypeError):
-        return default
+def parse_canonical_object_id(object_id: str) -> tuple[str, str, str | None]:
+    """Parse canonical object ID into (kind, physical_db, physical_name).
+
+    Formats supported:
+    - db:<name> -> ('database', <name>, None)
+    - stable:<db>.<name> -> ('stable', <db>, <name>)
+    - subtable:<db>.<name> -> ('subtable', <db>, <name>)
+    - <db>.<name> -> ('table', <db>, <name>)
+    - <name> -> ('database', <name>, None)
+    """
+    if object_id.startswith("db:"):
+        return ("database", object_id[3:], None)
+    if object_id.startswith("stable:"):
+        rest = object_id[7:]
+        parts = rest.split(".", 1)
+        return ("stable", parts[0], parts[1] if len(parts) > 1 else None)
+    if object_id.startswith("subtable:"):
+        rest = object_id[9:]
+        parts = rest.split(".", 1)
+        return ("subtable", parts[0], parts[1] if len(parts) > 1 else None)
+    if "." in object_id:
+        parts = object_id.split(".", 1)
+        return ("table", parts[0], parts[1])
+    return ("database", object_id, None)
 
 
-def _safe_int(row: Any, idx: int, default: Any) -> Any:
+def format_canonical_object_id(kind: str, db: str, name: str | None = None) -> str:
+    k = kind.lower()
+    if k in ("db", "database") or not name:
+        return f"db:{db}"
+    if k in ("stable", "supertable"):
+        return f"stable:{db}.{name}"
+    return f"subtable:{db}.{name}"
+
+
+def _row_val(
+    row: Any,
+    key_or_idx: str | int | tuple[str, ...],
+    idx_or_default: Any = None,
+    default: Any = None,
+) -> Any:
+    if row is None:
+        return default if default is not None else idx_or_default
+
+    candidate_keys: tuple[str, ...] = ()
+    fallback_idx: int | None = None
+    def_val: Any = None
+
+    if isinstance(key_or_idx, int):
+        fallback_idx = key_or_idx
+        def_val = idx_or_default
+    elif isinstance(key_or_idx, str):
+        candidate_keys = (key_or_idx,)
+        if isinstance(idx_or_default, int):
+            fallback_idx = idx_or_default
+            def_val = default
+        else:
+            def_val = idx_or_default
+    elif isinstance(key_or_idx, (tuple, list)):
+        candidate_keys = tuple(key_or_idx)
+        if isinstance(idx_or_default, int):
+            fallback_idx = idx_or_default
+            def_val = default
+        else:
+            def_val = idx_or_default
+
+    if isinstance(row, dict):
+        for k in candidate_keys:
+            if k in row:
+                return row[k]
+            lk = k.lower()
+            for rk, rv in row.items():
+                if rk.lower() == lk:
+                    return rv
+        if fallback_idx is not None:
+            vals = list(row.values())
+            if 0 <= fallback_idx < len(vals):
+                return vals[fallback_idx]
+        return def_val
+
+    if isinstance(row, (tuple, list)):
+        if fallback_idx is not None and 0 <= fallback_idx < len(row):
+            return row[fallback_idx]
+        return def_val
+
+    return def_val
+
+
+def _safe_str(
+    row: Any,
+    key_or_idx: str | int | tuple[str, ...],
+    idx_or_default: Any = "",
+    default: Any = None,
+) -> str:
+    v = _row_val(row, key_or_idx, idx_or_default, default)
+    def_val = default if default is not None else idx_or_default
+    return str(v) if v is not None else (str(def_val) if def_val is not None else "")
+
+
+def _safe_int(
+    row: Any,
+    key_or_idx: str | int | tuple[str, ...],
+    idx_or_default: Any = 0,
+    default: Any = None,
+) -> int | None:
+    v = _row_val(row, key_or_idx, idx_or_default, default)
+    def_val = default if default is not None else idx_or_default
+    if v is None:
+        return def_val
     try:
-        v = row[idx]
-        return int(v) if v is not None else default
-    except (IndexError, TypeError, ValueError):
-        return default
+        return int(v)
+    except (TypeError, ValueError):
+        return def_val

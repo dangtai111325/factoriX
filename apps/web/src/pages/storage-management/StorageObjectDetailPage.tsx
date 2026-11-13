@@ -27,111 +27,60 @@ import {
   TDSubtable,
   StorageObjectStatus,
 } from '../../lib/storagePhysicalApi';
+import { RemoteErrorState, RemoteLoadingState } from '../../components/common/RemoteResourceState';
 
 export const StorageObjectDetailPage: React.FC = () => {
   const { objectId } = useParams<{ objectId: string }>();
   const navigate = useNavigate();
 
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<unknown | null>(null);
   const [objectData, setObjectData] = useState<
     ((TDDatabase | TDStable | TDSubtable) & { object_type: 'database' | 'stable' | 'subtable' }) | null
   >(null);
   const [activeTab, setActiveTab] = useState<'overview' | 'schema' | 'subtables' | 'bindings' | 'ddl'>('overview');
 
-  useEffect(() => {
+  const fetchObject = () => {
     if (!objectId) return;
     setLoading(true);
+    setError(null);
     getStorageObject(objectId)
       .then((obj) => {
-        const type: 'database' | 'stable' | 'subtable' = objectId.startsWith('db/')
-          ? 'database'
-          : objectId.startsWith('stable/')
-          ? 'stable'
-          : 'subtable';
+        const isDb = objectId.startsWith('db:') || objectId.startsWith('db/');
+        const isStable = objectId.startsWith('stable:') || objectId.startsWith('stable/');
+        const type: 'database' | 'stable' | 'subtable' = isDb ? 'database' : isStable ? 'stable' : 'subtable';
         setObjectData({ ...obj, object_type: type });
       })
-      .catch(() => {
-        // Fallback detail
-        const isDb = objectId.startsWith('db/') || objectId.includes('database');
-        const isStable = objectId.startsWith('stable/') || objectId.includes('stable');
-        const type: 'database' | 'stable' | 'subtable' = isDb ? 'database' : isStable ? 'stable' : 'subtable';
-        const cleanName = objectId.split('/').pop() || objectId;
-
-        setObjectData({
-          id: objectId,
-          physical_name: cleanName,
-          display_name: cleanName,
-          object_type: type,
-          status: 'ACTIVE' as const,
-          tenant_id: 'default',
-          observed_at: new Date().toISOString(),
-          ...(type === 'database'
-            ? { precision: 'ms' as const, retention_days: 90, stable_count: 2, subtable_count: 12 }
-            : type === 'stable'
-            ? {
-                database_id: 'db/factory_master',
-                database_name: 'factory_master',
-                columns: [
-                  { name: 'ts', td_type: 'TIMESTAMP', nullable: false, role: 'timestamp' as const, immutable: true },
-                  { name: 'val_1', td_type: 'DOUBLE', nullable: true, role: 'value' as const },
-                  { name: 'val_2', td_type: 'DOUBLE', nullable: true, role: 'value' as const },
-                  { name: 'quality', td_type: 'INT', nullable: true, role: 'value' as const },
-                ],
-                tags: [
-                  { name: 'resource_id', td_type: 'VARCHAR(64)' },
-                  { name: 'site_id', td_type: 'VARCHAR(32)' },
-                ],
-                subtable_count: 6,
-              }
-            : {
-                stable_id: 'stable/process_telemetry',
-                stable_name: 'process_telemetry',
-                database_id: 'db/factory_master',
-                database_name: 'factory_master',
-                tag_values: [
-                  { name: 'resource_id', td_type: 'VARCHAR(64)', value: 'cnc_01' },
-                  { name: 'site_id', td_type: 'VARCHAR(32)', value: 'site_a' },
-                ],
-                bindings: [
-                  {
-                    id: 'b1',
-                    source_kind: 'signal' as const,
-                    source_id: 'sig-01',
-                    source_path: 'Modbus / CNC-01 / Temperature',
-                    destination_column: 'val_1',
-                    status: 'ACTIVE' as const,
-                    created_at: new Date().toISOString(),
-                  },
-                ],
-                write_active: true,
-              }),
-        } as unknown as (TDDatabase | TDStable | TDSubtable) & { object_type: 'database' | 'stable' | 'subtable' });
+      .catch((err) => {
+        console.error('Failed to load storage object:', err);
+        setError(err);
+        setObjectData(null);
       })
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchObject();
   }, [objectId]);
 
   if (loading) {
-    return (
-      <div className="py-24 text-center text-[#657794]">
-        <div className="animate-spin w-8 h-8 border-2 border-[#EF1B24] border-t-transparent rounded-full mx-auto mb-3" />
-        <p className="text-[13px] font-semibold">Loading storage object...</p>
-      </div>
-    );
+    return <RemoteLoadingState subject="storage object" />;
   }
 
-  if (!objectData) {
+  if (error || !objectData) {
     return (
-      <div className="py-24 text-center text-[#657794]">
-        <AlertCircle className="w-12 h-12 text-[#EF1B24] mx-auto mb-3" />
-        <h2 className="text-[16px] font-bold text-[#111B37] mb-1">Object Not Found</h2>
-        <p className="text-[13px] mb-4">The requested storage object does not exist or has been removed.</p>
-        <Link
-          to="/historian/storage"
-          className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#EF1B24] text-white rounded-lg text-[13px] font-bold"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          <span>Back to Storage Management</span>
-        </Link>
+      <div className="space-y-4">
+        <div className="flex items-center gap-2 text-[12px] font-medium text-[#657794] pb-2 border-b border-[#E3EAF3]">
+          <Link to="/historian/storage" className="hover:text-[#111B37] flex items-center gap-1">
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>Back to Storage Management</span>
+          </Link>
+        </div>
+        <RemoteErrorState
+          error={error || new Error('Storage object not found')}
+          subject={`Storage Object "${objectId}"`}
+          onRetry={fetchObject}
+        />
       </div>
     );
   }

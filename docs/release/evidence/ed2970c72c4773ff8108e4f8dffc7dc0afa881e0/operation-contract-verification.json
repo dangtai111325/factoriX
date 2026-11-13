@@ -1,0 +1,21 @@
+{
+  "verified_at_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "lifecycle_states": [
+    "DRAFT",
+    "VALIDATING",
+    "APPLYING",
+    "VERIFYING",
+    "APPLIED",
+    "FAILED",
+    "TIMED_OUT",
+    "ROLLED_BACK"
+  ],
+  "optimistic_concurrency_control": {
+    "header_support": "If-Match",
+    "payload_field": "expected_version",
+    "conflict_response": "HTTP 409 VERSION_CONFLICT",
+    "verified_in_tests": true
+  },
+  "verification_invariant": "status=APPLIED requires physical TDengine read-back confirmation; never reported prematurely"
+}

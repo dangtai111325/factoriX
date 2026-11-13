@@ -392,7 +392,7 @@ export const EditStorageObjectWizard: React.FC = () => {
       // Check if operation needs polling
       if (res && 'id' in res && 'operation_kind' in res) {
         const op = res as StorageOperation;
-        if (op.status === 'APPLIED') {
+        if (op.status === 'APPLIED' || (op.status as any) === 'COMPLETED') {
           navigate('/historian/storage?tab=objects');
           return;
         }
@@ -404,7 +404,7 @@ export const EditStorageObjectWizard: React.FC = () => {
         while (attempts < 30) {
           const updated = await getOperation(op.id);
           setActiveOperation(updated);
-          if (updated.status === 'APPLIED') {
+          if (updated.status === 'APPLIED' || (updated.status as any) === 'COMPLETED') {
             navigate('/historian/storage?tab=objects');
             return;
           }

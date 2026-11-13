@@ -70,7 +70,7 @@ export const SearchModal: React.FC = () => {
       )
       .map(({ s, ctx }) => {
         const quality = normalizeQuality(s.quality);
-        const value = quality === 'GOOD' || quality === 'UNCERTAIN' ? `${formatValue(s.value ?? null)}${s.unit ? ` ${s.unit}` : ''}` : QUALITY_LABEL[quality];
+        const value = quality === 'GOOD' || quality === 'UNCERTAIN' ? formatValue(s.value ?? null) : QUALITY_LABEL[quality];
         const where = [ctx.machine || s.resourcePath, ctx.line].filter(Boolean).join(' · ');
         return {
           id: s.id,

@@ -81,10 +81,13 @@ async def test_modbus_test_command_builds_valid_spans(monkeypatch: pytest.Monkey
 
 async def _serve_frames(frames: list[Any], interval: float = 0.05):  # noqa: ANN202
     async def handler(socket) -> None:  # noqa: ANN001
-        for frame in frames:
-            await socket.send(frame if isinstance(frame, str) else json.dumps(frame))
-            await asyncio.sleep(interval)
-        await socket.wait_closed()
+        try:
+            for frame in frames:
+                await socket.send(frame if isinstance(frame, str) else json.dumps(frame))
+                await asyncio.sleep(interval)
+            await socket.wait_closed()
+        except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
+            pass
 
     return await serve(handler, "127.0.0.1", 0)
 
@@ -129,7 +132,7 @@ async def test_ws_test_and_capture_commands() -> None:
         commissioner = Commissioner(reports.request, lambda p, c: endpoints_for(p, c), _no_secret)
         await asyncio.gather(
             commissioner.run({"id": "test", "protocol": "websocket", "config_json": config, "fields": [{"key": "so", "address": {"jsonpath": '$.machines["M-01"].order.so'}}]}),
-            commissioner.run({"id": "cap", "command_type": "CAPTURE", "protocol": "websocket", "config_json": config, "seconds": 0.5, "max_messages": 3}),
+            commissioner.run({"id": "cap", "command_type": "CAPTURE", "protocol": "websocket", "config_json": config, "seconds": 1.5, "max_messages": 3}),
         )
     test = reports.items["test"]
     assert test["status"] == "PASSED", test

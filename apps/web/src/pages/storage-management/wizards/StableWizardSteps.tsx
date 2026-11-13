@@ -717,7 +717,6 @@ export const StableSourceMappingStep: React.FC<StableStepProps> = ({ data, onCha
                       </div>
                       <div className="flex items-center gap-2 mt-0.5 text-[10px] text-[#8C9BAE]">
                         <span>{src.data_type || 'unknown'}</span>
-                        {src.unit && <span>• {src.unit}</span>}
                       </div>
                     </div>
 
@@ -793,7 +792,7 @@ export const StableSourceMappingStep: React.FC<StableStepProps> = ({ data, onCha
                           {mapping.source_path}
                         </div>
                         <div className="text-[#657794] text-[10px]">
-                          Kind: {mapping.source_kind} {mapping.source_unit ? `• Unit: ${mapping.source_unit}` : ''}
+                          Kind: {mapping.source_kind}
                         </div>
                       </div>
                     ) : (

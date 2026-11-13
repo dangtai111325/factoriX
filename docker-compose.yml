@@ -79,7 +79,7 @@ services:
       - FACTORIX_RABBITMQ_URL=amqp://factorix_mq:factorix-mq-pw@factorix-rabbitmq:5672/
       - FACTORIX_RABBITMQ_MGMT_URL=http://factorix-rabbitmq:15672
       - FACTORIX_TDENGINE_DSN=ws://root:taosdata@factorix-tdengine:6041
-      - FACTORIX_RECORD_OPERATIONAL=false
+      - FACTORIX_RECORD_OPERATIONAL=true
     depends_on:
       factorix-postgres:
         condition: service_healthy

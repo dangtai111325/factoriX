@@ -33,6 +33,10 @@ SYSTEM_SCHEMAS = frozenset({
 # Tables to block from previewing entirely for security
 SENSITIVE_TABLES = frozenset({
     "alembic_version",
+    "admin_accounts",
+    "secret_store",
+    "sessions",
+    "password_reset_codes",
 })
 
 # Columns whose values MUST be masked in data preview
@@ -40,6 +44,21 @@ SENSITIVE_COLUMN_PATTERNS = re.compile(
     r"(password|passwd|secret|token|hash|credential|auth_token|salt|private_key)",
     re.IGNORECASE,
 )
+
+
+def _mask_nested_secrets(obj: Any) -> Any:
+    """Recursively mask sensitive keys in nested dictionaries and lists."""
+    if isinstance(obj, dict):
+        masked: dict[str, Any] = {}
+        for k, v in obj.items():
+            if SENSITIVE_COLUMN_PATTERNS.search(str(k)):
+                masked[k] = "********" if v is not None else None
+            else:
+                masked[k] = _mask_nested_secrets(v)
+        return masked
+    elif isinstance(obj, list):
+        return [_mask_nested_secrets(item) for item in obj]
+    return obj
 
 _IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$")
 
@@ -330,8 +349,9 @@ class PostgresExplorerService:
         schema: str = "public",
         limit: int = 50,
         offset: int = 0,
+        tenant_id: UUID | str | None = None,
     ) -> dict[str, Any]:
-        """Read paginated rows from table with sensitive values masked."""
+        """Read paginated rows from table with sensitive values masked and tenant filtering."""
         _validate_ident(schema, "schema name")
         _validate_ident(table, "table name")
 
@@ -356,13 +376,23 @@ class PostgresExplorerService:
         safe_limit = min(max(1, int(limit)), 200)
         safe_offset = max(0, int(offset))
 
+        # Enforce tenant isolation if the table contains a tenant_id column
+        params: dict[str, Any] = {}
+        where_clause = ""
+        if "tenant_id" in column_names:
+            if tenant_id:
+                where_clause = ' WHERE "tenant_id" = CAST(:tenant_id AS uuid)'
+                params["tenant_id"] = str(tenant_id)
+            else:
+                raise AppError(403, "TENANT_REQUIRED", f"Table '{table}' requires tenant context to preview.")
+
         # Build SELECT with quoted columns
         quoted_cols = ", ".join(f'"{c}"' for c in column_names)
-        sql = f'SELECT {quoted_cols} FROM "{schema}"."{table}" LIMIT {safe_limit} OFFSET {safe_offset}'
+        sql = f'SELECT {quoted_cols} FROM "{schema}"."{table}"{where_clause} LIMIT {safe_limit} OFFSET {safe_offset}'
 
-        rows = await fetch_all(session, sql, {})
+        rows = await fetch_all(session, sql, params)
 
-        # Mask sensitive columns
+        # Mask sensitive columns and nested secrets in JSON
         masked_rows = []
         for r in rows:
             row_dict: dict[str, Any] = {}
@@ -370,6 +400,8 @@ class PostgresExplorerService:
                 val = r.get(col)
                 if SENSITIVE_COLUMN_PATTERNS.search(col):
                     row_dict[col] = "********" if val is not None else None
+                elif isinstance(val, (dict, list)):
+                    row_dict[col] = _mask_nested_secrets(val)
                 elif isinstance(val, (bytes, bytearray)):
                     row_dict[col] = f"<binary {len(val)} bytes>"
                 elif hasattr(val, "isoformat"):
@@ -380,11 +412,11 @@ class PostgresExplorerService:
                     row_dict[col] = val
             masked_rows.append(row_dict)
 
-        # Total rows estimate
+        # Total rows count / estimate with tenant scope applied
         count_row = await fetch_one(
             session,
-            f'SELECT count(*) AS total FROM "{schema}"."{table}"',
-            {},
+            f'SELECT count(*) AS total FROM "{schema}"."{table}"{where_clause}',
+            params,
         )
         total = int(count_row["total"]) if count_row else len(masked_rows)
 

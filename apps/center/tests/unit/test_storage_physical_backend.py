@@ -276,21 +276,22 @@ class FakeTdClient:
         self._executor = None
 
     async def run_read(self, sql):
-        if "server_version" in sql:
+        sql_lower = sql.lower()
+        if "server_version" in sql_lower:
             return [("3.4.3.9",)]
-        if "SHOW DATABASES" in sql or "ins_databases" in sql:
+        if "show databases" in sql_lower or "ins_databases" in sql_lower:
             return [("fx_t_00000000000000000000000000000001", 1, 1, 1, 1, "ms", "3650d", None)]
-        if "ins_stables" in sql or "STABLES" in sql:
+        if "ins_stables" in sql_lower or "stables" in sql_lower:
             return [("st_test", 1, 1, 1)]
-        if "DESCRIBE" in sql:
+        if "describe" in sql_lower:
             return [
                 ("ts", "TIMESTAMP", None, ""),
                 ("temperature", "DOUBLE", None, ""),
                 ("device_id", "NCHAR", 64, "TAG"),
             ]
-        if "ins_tables" in sql:
+        if "ins_tables" in sql_lower:
             return [("sub_001", "st_test", "2026-11-12")]
-        if "TAGS" in sql:
+        if "tags" in sql_lower:
             return [{"device_id": "D1"}]
         return []
 
@@ -421,4 +422,83 @@ async def test_api_physical_storage_flow():
         resp_src = await client.get("/api/v1/storage/sources?view=hierarchy")
         assert resp_src.status_code == 200
         assert "items" in resp_src.json()
+
+        # 9. Pause object
+        resp_pause = await client.post("/api/v1/storage/td/objects/fx_t_00000000000000000000000000000001.sub_001/pause")
+        assert resp_pause.status_code == 200
+        assert resp_pause.json()["status"] == "PAUSED"
+        assert resp_pause.json()["write_active"] is False
+
+        # 10. Resume object
+        resp_resume = await client.post("/api/v1/storage/td/objects/fx_t_00000000000000000000000000000001.sub_001/resume")
+        assert resp_resume.status_code == 200
+        assert resp_resume.json()["status"] == "ACTIVE"
+        assert resp_resume.json()["write_active"] is True
+
+        # 11. Retire object
+        resp_retire = await client.post("/api/v1/storage/td/objects/fx_t_00000000000000000000000000000001.sub_001/retire")
+        assert resp_retire.status_code == 200
+        assert resp_retire.json()["status"] == "RETIRED"
+
+        # 12. Delete object without confirmation phrase -> 400
+        resp_del_bad = await client.delete("/api/v1/storage/td/objects/fx_t_00000000000000000000000000000001.sub_001")
+        assert resp_del_bad.status_code == 400
+        assert resp_del_bad.json()["error"]["code"] == "CONFIRMATION_REQUIRED"
+
+        # 13. Delete object with correct confirmation -> 200
+        resp_del_ok = await client.delete("/api/v1/storage/td/objects/fx_t_00000000000000000000000000000001.sub_001?confirm_name=sub_001")
+        assert resp_del_ok.status_code == 200
+        assert resp_del_ok.json()["status"] == "PURGED"
+
+        # 14. Tenant isolation: cross-tenant access to unauthorized database -> 404
+        resp_iso = await client.get("/api/v1/storage/td/databases/fx_t_other_tenant_database")
+        assert resp_iso.status_code == 404
+
+
+def test_postgres_explorer_sensitive_tables_and_nested_masking():
+    from factorix.modules.postgres_explorer import SENSITIVE_TABLES, _mask_nested_secrets
+
+    # Verify all sensitive tables are blocked
+    assert "admin_accounts" in SENSITIVE_TABLES
+    assert "secret_store" in SENSITIVE_TABLES
+    assert "sessions" in SENSITIVE_TABLES
+    assert "password_reset_codes" in SENSITIVE_TABLES
+    assert "alembic_version" in SENSITIVE_TABLES
+
+    # Verify nested secrets masking
+    nested = {
+        "host": "localhost",
+        "nested_auth": {
+            "token": "super-secret-token",
+            "password": "my-password",
+            "safe_val": 42,
+        },
+        "items": [
+            {"secret_key": "raw-key", "label": "ok"}
+        ]
+    }
+    masked = _mask_nested_secrets(nested)
+    assert masked["host"] == "localhost"
+    assert masked["nested_auth"]["token"] == "********"
+    assert masked["nested_auth"]["password"] == "********"
+    assert masked["nested_auth"]["safe_val"] == 42
+    assert masked["items"][0]["secret_key"] == "********"
+    assert masked["items"][0]["label"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_revert_to_zero_is_disabled():
+    from factorix.transport.app import revert_zero, RevertIn
+    from factorix.platform.errors import AppError
+
+    body = RevertIn(confirm="REVERT")
+    response = MagicMock()
+    session = FakeAsyncSession()
+    principal = {"tenant_id": "00000000-0000-0000-0000-000000000001", "role": "admin"}
+
+    with pytest.raises(AppError) as exc_info:
+        await revert_zero(body, response, principal=principal, session=session)
+    assert exc_info.value.status == 410
+    assert exc_info.value.code == "ENDPOINT_GONE"
+
 

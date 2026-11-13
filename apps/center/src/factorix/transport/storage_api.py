@@ -10,6 +10,8 @@ a module-level :data:`router` configured with default dependencies.
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 from uuid import UUID, uuid4
@@ -24,11 +26,13 @@ from factorix.modules import storage_designs as SD
 from factorix.modules import storage_objects as SO
 from factorix.modules import storage_revisions as SR
 from factorix.modules import storage_topology as ST
-from factorix.modules.common import as_uuid, fetch_all, fetch_one, iso_ms, parse_uuid, utcnow
+from factorix.modules.common import as_uuid, execute, fetch_all, fetch_one, iso_ms, parse_uuid, utcnow
 from factorix.platform.errors import AppError
 from factorix.platform.http import correlation_id
 from factorix.platform.settings import Settings
 from factorix.platform.tdengine import TDEngineClient, TDEngineConfig
+
+logger = logging.getLogger(__name__)
 
 _td_singleton: TDEngineClient | None = None
 
@@ -721,14 +725,38 @@ def build_router(
     # Physical-First TDengine & PostgreSQL Storage APIs
     # ==========================================================================
 
+    async def _assert_tenant_database_access(
+        sess: AsyncSession | None, tenant_id: UUID, db_name: str
+    ) -> bool:
+        canonical_tenant_db = f"fx_t_{tenant_id.hex}"
+        if db_name.lower() == canonical_tenant_db.lower():
+            return True
+        if sess is not None:
+            row = await fetch_one(
+                sess,
+                "SELECT 1 FROM storage_objects WHERE tenant_id = :tenant_id AND physical_db = :db LIMIT 1",
+                {"tenant_id": tenant_id, "db": db_name},
+            )
+            if row:
+                return True
+        return False
+
     @router.get("/api/v1/storage/engines", tags=["storage"])
     async def get_storage_engines(
         principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
-        info = await topology_inspector.get_engines_info()
+        info = await topology_inspector.get_engines_info(session)
         now_iso = iso_ms(utcnow())
         td_healthy = info["tdengine"]["healthy"]
         td_version = info["tdengine"]["version"]
+        pg_healthy = info.get("postgresql", {}).get("healthy", True)
+        pg_raw_ver = info.get("postgresql", {}).get("version", "PostgreSQL (unknown)")
+        pg_version = (
+            f"PostgreSQL {pg_raw_ver}"
+            if pg_raw_ver and not str(pg_raw_ver).lower().startswith("postgresql")
+            else str(pg_raw_ver or "PostgreSQL")
+        )
         return {
             "tdengine": {
                 "reachable": td_healthy,
@@ -737,8 +765,8 @@ def build_router(
                 "features": info["tdengine"]["features"],
             },
             "postgresql": {
-                "reachable": True,
-                "version": "PostgreSQL 16",
+                "reachable": pg_healthy,
+                "version": pg_version,
                 "last_checked_at": now_iso,
             },
         }
@@ -764,15 +792,41 @@ def build_router(
         session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
         tenant_id, _actor = ids(principal)
-        snap = await topology_inspector.get_topology(tenant_id, depth=2)
+        dbs = await topology_inspector.list_databases(tenant_id)
+        db_count = len(dbs)
+        total_stables = sum(d.stable_count for d in dbs)
+        total_subtables = sum(d.ntables for d in dbs)
+
+        rows = await fetch_all(
+            session,
+            """
+            SELECT status, COUNT(*) AS cnt
+            FROM storage_objects
+            WHERE tenant_id = :tenant_id AND object_type = 'subtable'
+            GROUP BY status
+            """,
+            {"tenant_id": tenant_id},
+        )
+        status_map = {r["status"]: int(r["cnt"]) for r in rows}
+        active_cnt = status_map.get("ACTIVE", 0)
+        paused_cnt = status_map.get("PAUSED", 0)
+        error_cnt = status_map.get("ERROR", 0)
+
+        if not status_map:
+            active_cnt = total_subtables
+            paused_cnt = 0
+            error_cnt = 0
+        else:
+            total_subtables = max(total_subtables, sum(status_map.values()))
+
         return {
-            "database_count": len(snap.databases),
-            "stable_count": len(snap.stables),
-            "subtable_count": len(snap.subtables),
-            "recording_active": len(snap.subtables),
-            "recording_paused": 0,
-            "recording_error": 0,
-            "observed_at": snap.observed_at.isoformat(),
+            "database_count": db_count,
+            "stable_count": total_stables,
+            "subtable_count": total_subtables,
+            "recording_active": active_cnt,
+            "recording_paused": paused_cnt,
+            "recording_error": error_cnt,
+            "observed_at": iso_ms(utcnow()),
         }
 
     @router.get("/api/v1/storage/td/databases", tags=["storage"])
@@ -808,8 +862,11 @@ def build_router(
     async def get_td_database(
         name: str,
         principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
         tenant_id, _actor = ids(principal)
+        if not await _assert_tenant_database_access(session, tenant_id, name):
+            raise AppError(404, "NOT_FOUND", f"Database '{name}' not found")
         d = await topology_inspector.get_database(name)
         if not d:
             raise AppError(404, "NOT_FOUND", f"Database '{name}' not found")
@@ -904,6 +961,7 @@ def build_router(
     async def get_td_stable(
         stable_id: str,
         principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
         tenant_id, _actor = ids(principal)
         if "." in stable_id:
@@ -911,6 +969,8 @@ def build_router(
         else:
             db_name = f"fx_t_{tenant_id.hex}"
             sname = stable_id
+        if not await _assert_tenant_database_access(session, tenant_id, db_name):
+            raise AppError(404, "NOT_FOUND", f"Supertable '{stable_id}' not found")
         st = await topology_inspector.get_stable(db_name, sname)
         if not st:
             raise AppError(404, "NOT_FOUND", f"Supertable '{stable_id}' not found")
@@ -1033,6 +1093,7 @@ def build_router(
     async def get_td_subtable(
         subtable_id: str,
         principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
         tenant_id, _actor = ids(principal)
         if "." in subtable_id:
@@ -1040,6 +1101,8 @@ def build_router(
         else:
             db_name = f"fx_t_{tenant_id.hex}"
             tname = subtable_id
+        if not await _assert_tenant_database_access(session, tenant_id, db_name):
+            raise AppError(404, "NOT_FOUND", f"Subtable '{subtable_id}' not found")
         sub = await topology_inspector.get_subtable(db_name, tname)
         if not sub:
             raise AppError(404, "NOT_FOUND", f"Subtable '{subtable_id}' not found")
@@ -1100,31 +1163,35 @@ def build_router(
     async def get_td_object(
         object_id: str,
         principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
         tenant_id, _actor = ids(principal)
         now_iso = iso_ms(utcnow())
-        # 1. Database
-        d = await topology_inspector.get_database(object_id)
-        if d:
-            return {
-                "id": d.name,
-                "object_type": "database",
-                "physical_name": d.name,
-                "display_name": d.name,
-                "precision": d.precision,
-                "status": "ACTIVE",
-                "stable_count": d.stable_count,
-                "subtable_count": d.ntables,
-                "tenant_id": str(tenant_id),
-                "observed_at": now_iso,
-            }
-        # 2. Supertable or Subtable
-        db_name = f"fx_t_{tenant_id.hex}"
-        obj_name = object_id
-        if "." in object_id:
-            db_name, obj_name = object_id.split(".", 1)
 
-        st = await topology_inspector.get_stable(db_name, obj_name)
+        obj_kind, parsed_db, parsed_name = ST.parse_canonical_object_id(object_id)
+        target_db = parsed_db or (parsed_name if obj_kind == "database" else f"fx_t_{tenant_id.hex}")
+        if not await _assert_tenant_database_access(session, tenant_id, target_db):
+            raise AppError(404, "NOT_FOUND", f"Storage object '{object_id}' not found")
+
+        # 1. Database
+        if obj_kind == "database" or "." not in object_id:
+            d = await topology_inspector.get_database(parsed_name)
+            if d:
+                return {
+                    "id": d.name,
+                    "object_type": "database",
+                    "physical_name": d.name,
+                    "display_name": d.name,
+                    "precision": d.precision,
+                    "status": "ACTIVE",
+                    "stable_count": d.stable_count,
+                    "subtable_count": d.ntables,
+                    "tenant_id": str(tenant_id),
+                    "observed_at": now_iso,
+                }
+
+        # 2. Supertable or Subtable
+        st = await topology_inspector.get_stable(target_db, parsed_name)
         if st:
             return {
                 "id": f"{st.database}.{st.name}",
@@ -1140,7 +1207,7 @@ def build_router(
                 "observed_at": now_iso,
             }
 
-        sub = await topology_inspector.get_subtable(db_name, obj_name)
+        sub = await topology_inspector.get_subtable(target_db, parsed_name)
         if sub:
             return {
                 "id": f"{sub.database}.{sub.name}",
@@ -1156,6 +1223,348 @@ def build_router(
             }
 
         raise AppError(404, "NOT_FOUND", f"Storage object '{object_id}' not found")
+
+    @router.patch("/api/v1/storage/td/objects/{object_id:path}", tags=["storage"])
+    async def patch_td_object(
+        object_id: str,
+        body: dict[str, Any] = Body(...),
+        if_match: str | None = Header(None, alias="If-Match"),
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Update storage object metadata, tags, columns, or retention with revision concurrency check."""
+        tenant_id, actor_id = ids(principal)
+        now_iso = iso_ms(utcnow())
+
+        obj_kind, db_name, name = ST.parse_canonical_object_id(object_id)
+        if not db_name:
+            db_name = name if obj_kind == "database" else f"fx_t_{tenant_id.hex}"
+
+        if not await _assert_tenant_database_access(session, tenant_id, db_name):
+            raise AppError(404, "NOT_FOUND", f"Storage object '{object_id}' not found")
+
+        existing_obj = await fetch_one(
+            session,
+            """
+            SELECT id, object_type, physical_db, physical_name, display_name, description,
+                   status, schema_json, tags_json, revision, updated_at
+            FROM storage_objects
+            WHERE tenant_id = :tenant_id AND physical_db = :db AND physical_name = :name
+            LIMIT 1
+            """,
+            {"tenant_id": tenant_id, "db": db_name, "name": name},
+        )
+
+        current_rev = int(existing_obj["revision"]) if existing_obj else 1
+
+        client_rev = body.get("revision") or body.get("expected_revision")
+        if if_match:
+            try:
+                client_rev = int(if_match.strip('"'))
+            except (ValueError, TypeError):
+                pass
+
+        if client_rev is not None and int(client_rev) != current_rev:
+            raise AppError(
+                409,
+                "VERSION_CONFLICT",
+                f"Object revision conflict: server has revision {current_rev}, request specified {client_rev}",
+                extra={"server_revision": current_rev, "client_revision": client_rev},
+            )
+
+        schema_changing_keys = {
+            "columns", "tags", "tag_values", "precision", "retention_days",
+            "source_mapping_template", "bindings"
+        }
+        is_metadata_only = not any(k in body and body[k] is not None for k in schema_changing_keys)
+
+        if is_metadata_only and existing_obj:
+            new_disp = body.get("display_name", existing_obj.get("display_name") or "")
+            new_desc = body.get("description", existing_obj.get("description") or "")
+            new_rev = current_rev + 1
+            await execute(
+                session,
+                """
+                UPDATE storage_objects
+                SET display_name = :disp, description = :desc, revision = :rev, updated_at = :now
+                WHERE id = :id AND tenant_id = :tenant_id
+                """,
+                {
+                    "disp": new_disp,
+                    "desc": new_desc,
+                    "rev": new_rev,
+                    "now": utcnow(),
+                    "id": existing_obj["id"],
+                    "tenant_id": tenant_id,
+                },
+            )
+            return {
+                "id": object_id,
+                "object_type": existing_obj["object_type"],
+                "physical_name": existing_obj["physical_name"],
+                "display_name": new_disp,
+                "description": new_desc,
+                "revision": new_rev,
+                "status": existing_obj["status"],
+                "observed_at": now_iso,
+            }
+
+        draft_body = {
+            "kind": obj_kind,
+            "name": name,
+            "spec": {
+                **body,
+                "database": db_name,
+                "physical_name": name,
+            },
+        }
+        draft = await revision_service.create_draft(session, tenant_id, actor_id, draft_body)
+        res = await revision_service.publish_draft(session, tenant_id, UUID(draft["id"]), actor_id)
+
+        return {
+            "id": res["operation_id"],
+            "operation_id": res["operation_id"],
+            "operation_kind": "ALTER",
+            "status": res["status"],
+            "object_type": obj_kind,
+            "object_name": name,
+            "created_at": now_iso,
+        }
+
+    @router.post("/api/v1/storage/td/objects/{object_id:path}/pause", tags=["storage"])
+    async def pause_td_object(
+        object_id: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Pause data recording on a storage object."""
+        tenant_id, actor_id = ids(principal)
+        obj_kind, db_name, name = ST.parse_canonical_object_id(object_id)
+        if not db_name:
+            db_name = name if obj_kind == "database" else f"fx_t_{tenant_id.hex}"
+
+        if not await _assert_tenant_database_access(session, tenant_id, db_name):
+            raise AppError(404, "NOT_FOUND", f"Storage object '{object_id}' not found")
+
+        op_id = uuid4()
+        now = utcnow()
+        await execute(
+            session,
+            """
+            UPDATE storage_objects
+            SET status = 'PAUSED', updated_at = :now
+            WHERE tenant_id = :tenant_id AND physical_db = :db
+              AND (physical_name = :name OR :obj_kind = 'database' OR parent_name = :name)
+            """,
+            {"now": now, "tenant_id": tenant_id, "db": db_name, "name": name, "obj_kind": obj_kind},
+        )
+        await execute(
+            session,
+            """
+            INSERT INTO storage_operations (
+                id, tenant_id, operation_type, target_type, target_name, actor_id,
+                status, requested_at, completed_at, step_state_json
+            ) VALUES (
+                :id, :tenant_id, 'PAUSE', :target_type, :target_name, :actor_id,
+                'APPLIED', :now, :now, :state
+            )
+            """,
+            {
+                "id": op_id,
+                "tenant_id": tenant_id,
+                "target_type": obj_kind,
+                "target_name": name,
+                "actor_id": actor_id,
+                "now": now,
+                "state": json.dumps({"action": "pause", "object_id": object_id}),
+            },
+        )
+        return {
+            "id": object_id,
+            "operation_id": str(op_id),
+            "status": "PAUSED",
+            "write_active": False,
+            "updated_at": iso_ms(now),
+        }
+
+    @router.post("/api/v1/storage/td/objects/{object_id:path}/resume", tags=["storage"])
+    async def resume_td_object(
+        object_id: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Resume data recording on a storage object."""
+        tenant_id, actor_id = ids(principal)
+        obj_kind, db_name, name = ST.parse_canonical_object_id(object_id)
+        if not db_name:
+            db_name = name if obj_kind == "database" else f"fx_t_{tenant_id.hex}"
+
+        if not await _assert_tenant_database_access(session, tenant_id, db_name):
+            raise AppError(404, "NOT_FOUND", f"Storage object '{object_id}' not found")
+
+        op_id = uuid4()
+        now = utcnow()
+        await execute(
+            session,
+            """
+            UPDATE storage_objects
+            SET status = 'ACTIVE', updated_at = :now
+            WHERE tenant_id = :tenant_id AND physical_db = :db
+              AND (physical_name = :name OR :obj_kind = 'database' OR parent_name = :name)
+            """,
+            {"now": now, "tenant_id": tenant_id, "db": db_name, "name": name, "obj_kind": obj_kind},
+        )
+        await execute(
+            session,
+            """
+            INSERT INTO storage_operations (
+                id, tenant_id, operation_type, target_type, target_name, actor_id,
+                status, requested_at, completed_at, step_state_json
+            ) VALUES (
+                :id, :tenant_id, 'RESUME', :target_type, :target_name, :actor_id,
+                'APPLIED', :now, :now, :state
+            )
+            """,
+            {
+                "id": op_id,
+                "tenant_id": tenant_id,
+                "target_type": obj_kind,
+                "target_name": name,
+                "actor_id": actor_id,
+                "now": now,
+                "state": json.dumps({"action": "resume", "object_id": object_id}),
+            },
+        )
+        return {
+            "id": object_id,
+            "operation_id": str(op_id),
+            "status": "ACTIVE",
+            "write_active": True,
+            "updated_at": iso_ms(now),
+        }
+
+    @router.post("/api/v1/storage/td/objects/{object_id:path}/retire", tags=["storage"])
+    async def retire_td_object(
+        object_id: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Soft-retire a storage object, halting new writes while preserving historical data."""
+        tenant_id, actor_id = ids(principal)
+        obj_kind, db_name, name = ST.parse_canonical_object_id(object_id)
+        if not db_name:
+            db_name = name if obj_kind == "database" else f"fx_t_{tenant_id.hex}"
+
+        if not await _assert_tenant_database_access(session, tenant_id, db_name):
+            raise AppError(404, "NOT_FOUND", f"Storage object '{object_id}' not found")
+
+        op_id = uuid4()
+        now = utcnow()
+        await execute(
+            session,
+            """
+            UPDATE storage_objects
+            SET status = 'RETIRED', updated_at = :now
+            WHERE tenant_id = :tenant_id AND physical_db = :db
+              AND (physical_name = :name OR :obj_kind = 'database' OR parent_name = :name)
+            """,
+            {"now": now, "tenant_id": tenant_id, "db": db_name, "name": name, "obj_kind": obj_kind},
+        )
+        await execute(
+            session,
+            """
+            INSERT INTO storage_operations (
+                id, tenant_id, operation_type, target_type, target_name, actor_id,
+                status, requested_at, completed_at, step_state_json
+            ) VALUES (
+                :id, :tenant_id, 'RETIRE', :target_type, :target_name, :actor_id,
+                'APPLIED', :now, :now, :state
+            )
+            """,
+            {
+                "id": op_id,
+                "tenant_id": tenant_id,
+                "target_type": obj_kind,
+                "target_name": name,
+                "actor_id": actor_id,
+                "now": now,
+                "state": json.dumps({"action": "retire", "object_id": object_id}),
+            },
+        )
+        return {
+            "id": object_id,
+            "operation_id": str(op_id),
+            "status": "RETIRED",
+            "write_active": False,
+            "updated_at": iso_ms(now),
+        }
+
+    @router.delete("/api/v1/storage/td/objects/{object_id:path}", tags=["storage"])
+    async def delete_td_object(
+        object_id: str,
+        confirm_name: str | None = Query(None),
+        force: bool = Query(False),
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Destructively drop a storage object with safety confirmation and dependency validation."""
+        tenant_id, actor_id = ids(principal)
+        obj_kind, db_name, name = ST.parse_canonical_object_id(object_id)
+        if not db_name:
+            db_name = name if obj_kind == "database" else f"fx_t_{tenant_id.hex}"
+
+        if not await _assert_tenant_database_access(session, tenant_id, db_name):
+            raise AppError(404, "NOT_FOUND", f"Storage object '{object_id}' not found")
+
+        if confirm_name != name and not force:
+            raise AppError(
+                400,
+                "CONFIRMATION_REQUIRED",
+                f"Destructive purge requires explicit confirmation. Pass confirm_name='{name}' to confirm.",
+            )
+
+        if not force:
+            dep_views = await fetch_all(
+                session,
+                "SELECT id, name FROM saved_views WHERE tenant_id = :tenant_id AND query_params_json::text LIKE :pat LIMIT 5",
+                {"tenant_id": tenant_id, "pat": f"%{name}%"},
+            )
+            if dep_views:
+                raise AppError(
+                    409,
+                    "DEPENDENCY_EXISTS",
+                    f"Cannot purge object '{name}': dependent views exist ({[v['name'] for v in dep_views]}).",
+                )
+
+        if td is not None:
+            try:
+                exec_fn = getattr(td, "execute_sql", None) or getattr(td, "run_write", None)
+                if exec_fn is not None:
+                    if obj_kind in ("subtable", "table"):
+                        await exec_fn(f"DROP TABLE IF EXISTS `{db_name}`.`{name}`")
+                    elif obj_kind == "stable":
+                        await exec_fn(f"DROP STABLE IF EXISTS `{db_name}`.`{name}`")
+                    elif obj_kind == "database":
+                        await exec_fn(f"DROP DATABASE IF EXISTS `{name}`")
+            except Exception as exc:
+                logger.warning("TDengine DROP failed during purge of %s: %s", object_id, exc)
+
+        now = utcnow()
+        await execute(
+            session,
+            """
+            UPDATE storage_objects
+            SET status = 'PURGED', updated_at = :now
+            WHERE tenant_id = :tenant_id AND physical_db = :db AND physical_name = :name
+            """,
+            {"now": now, "tenant_id": tenant_id, "db": db_name, "name": name},
+        )
+        return {
+            "id": object_id,
+            "status": "PURGED",
+            "dropped": True,
+            "purged_at": iso_ms(now),
+        }
 
     @router.get("/api/v1/storage/td/bindings", tags=["storage"])
     async def list_td_bindings(
@@ -1409,10 +1818,11 @@ def build_router(
         principal: dict[str, Any] = Depends(admin_dep),
         session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
+        tenant_id, _actor = ids(principal)
         if not table:
             raise AppError(400, "MISSING_TABLE", "Query parameter 'table' is required.")
         return await pg_explorer.preview_data(
-            session, table=table, schema=schema, limit=limit, offset=offset
+            session, table=table, schema=schema, limit=limit, offset=offset, tenant_id=tenant_id
         )
 
     return router

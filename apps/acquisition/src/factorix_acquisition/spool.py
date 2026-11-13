@@ -57,6 +57,7 @@ class AcquisitionSpool:
         )
         self.connection.commit()
         self._pending = 0
+        self.overflow_dropped_count = 0
         self._newest: dict[str, int] = {}
         self._rebuild_counters()
         self._compact_if_bloated()
@@ -297,6 +298,12 @@ class AcquisitionSpool:
                 )
             dropped = max(0, cursor.rowcount)
             self._pending = max(0, self._pending - dropped)
+            self.overflow_dropped_count += dropped
+            if dropped > 0:
+                logger.warning(
+                    "Spool capacity exceeded (pending=%d > max=%d): %d pending rows transitioned to DEAD state (overflow). Total overflow dropped: %d",
+                    count, max_pending, dropped, self.overflow_dropped_count
+                )
             return dropped
 
     def db_bytes(self) -> int:
@@ -345,6 +352,7 @@ class AcquisitionSpool:
                         if cur.rowcount <= 0:
                             break
                         removed += cur.rowcount
+                        self.overflow_dropped_count += cur.rowcount
                     try:
                         self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     except sqlite3.Error:
@@ -356,6 +364,11 @@ class AcquisitionSpool:
                         self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     except sqlite3.Error:
                         pass
+            if removed > 0:
+                logger.warning(
+                    "Spool byte cap exceeded (%d bytes > %d bytes): deleted %d rows to protect disk (overflow). Total overflow dropped: %d",
+                    self.db_bytes(), max_bytes, removed, self.overflow_dropped_count
+                )
         return removed
 
     def pending_count(self) -> int:

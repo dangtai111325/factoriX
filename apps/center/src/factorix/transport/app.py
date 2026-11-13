@@ -905,35 +905,12 @@ class RevertIn(BaseModel):
 
 @app.post("/api/v1/admin/revert-to-zero")
 async def revert_zero(body: RevertIn, response: Response, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, str]:
-    del principal
-    if body.confirm != "REVERT":
-        raise AppError(422, "CONFIRM", "Type REVERT exactly to wipe this installation.")
-    cfg = _settings()
-    await identity.revert_to_zero(session)
-    await _commit_now(session)
-    if cfg.data_dir:
-        root = Path(cfg.data_dir)
-        for name in (
-            "enrollment",
-            "edge-credential",
-            "outbox.sqlite",
-            "outbox.sqlite-wal",
-            "outbox.sqlite-shm",
-            "active-config.json",
-            "edge-health.json",
-        ):
-            target = root / name
-            try:
-                if target.is_file():
-                    target.unlink()
-            except OSError:
-                logger.warning("Revert-To-Zero could not remove %s", target, exc_info=True)
-    # The running edge now gets 401, discards its credential and waits for a token file. A token
-    # is written as soon as an edge exists again (first connection) by the appliance enrollment
-    # step, which also runs here for completeness.
-    await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
-    clear_cookies(response, cfg)
-    return {"status": "empty"}
+    del body, response, principal, session
+    raise AppError(
+        410,
+        "ENDPOINT_GONE",
+        "Destructive revert-to-zero is permanently disabled to prevent loss of configuration, accounts, and physical schemas. Use selective Clear Telemetry (/api/v1/admin/telemetry-reset) instead.",
+    )
 
 
 @app.get("/api/v1/auth/status")

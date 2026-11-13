@@ -1,0 +1,47 @@
+{
+  "audit_timestamp_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "clean_room_status": "CLEAN",
+  "dead_code_audit": {
+    "pruned_legacy_page_directories": [
+      "apps/web/src/pages/10_StorageDesigner",
+      "apps/web/src/pages/11_StorageCatalog",
+      "apps/web/src/pages/11_HistorianExplorer",
+      "apps/web/src/pages/07_ProtocolStudioOPC",
+      "apps/web/src/pages/14_ProtocolStudioMQTT",
+      "apps/web/src/pages/15_ProtocolStudioHTTP",
+      "apps/web/src/pages/09_CalculatedSignals",
+      "apps/web/src/pages/10_LiveOperations",
+      "apps/web/src/pages/12_ActivityLog"
+    ],
+    "zero_import_verification_method": "git grep & AST import dependency scan",
+    "verified_unreferenced": true,
+    "legacy_historian_components_migrated": [
+      "HistorianTrendChart.tsx -> apps/web/src/pages/historian/HistorianTrendChart.tsx",
+      "types.ts -> apps/web/src/pages/historian/types.ts"
+    ]
+  },
+  "stale_reports_archived": [
+    {
+      "original_path": "reports/test-results.json",
+      "archived_destination": "docs/release/superseded/test-results-stale-264pass.json",
+      "reason": "Generic duplicate pass claims from unverified historical commit"
+    },
+    {
+      "original_path": "reports/cpu-before-after.csv",
+      "archived_destination": "docs/release/superseded/cpu-before-after-unattributed.csv",
+      "reason": "Unattributed CPU reduction percentages without hardware run attribution"
+    }
+  ],
+  "superseded_docs_annotated": [
+    "docs/release/storage-rework-acceptance.md",
+    "docs/release/acceptance-matrix.md"
+  ],
+  "runtime_data_leakage_checks": {
+    "sqlite_files_tracked": 0,
+    "runtime_csv_files_tracked": 0,
+    "database_dumps_tracked": 0,
+    "credentials_or_private_keys_tracked": 0
+  },
+  "synthetic_fallback_branches_in_production": 0
+}

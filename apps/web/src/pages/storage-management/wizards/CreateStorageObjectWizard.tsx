@@ -121,7 +121,7 @@ async function pollOperationUntilTerminal(
     const op = await getOperation(operationId);
     onStatusChange(op);
 
-    if (op.status === 'APPLIED' || op.status === 'FAILED' || op.status === 'CANCELLED') {
+    if (op.status === 'APPLIED' || (op.status as any) === 'COMPLETED' || op.status === 'FAILED' || op.status === 'CANCELLED') {
       return op;
     }
 
