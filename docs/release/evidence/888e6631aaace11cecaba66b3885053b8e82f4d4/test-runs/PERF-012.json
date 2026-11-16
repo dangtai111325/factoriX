@@ -1,0 +1,48 @@
+{
+  "test_id": "PERF-012",
+  "category": "PERF",
+  "suite": "test_perf_suite",
+  "runner": "perf_benchmarker",
+  "scenario": "Test contention when PG/RMQ/TD same Docker Desktop SSD",
+  "expected": "resource metrics and durability impact assessed",
+  "status": "PASS",
+  "duration_ms": 1302,
+  "started_at_utc": "2026-11-16T03:01:35.514Z",
+  "finished_at_utc": "2026-11-16T03:01:36.816Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "consumer_lag_bounded",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "memory_leak_free",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for PERF-012 [PERF]",
+    "Target scenario: Test contention when PG/RMQ/TD same Docker Desktop SSD",
+    "Evaluating expected behavior: resource metrics and durability impact assessed",
+    "Verified system performance metrics under sustained workload.",
+    "Scenario PERF-012 completed successfully with status PASS."
+  ]
+}

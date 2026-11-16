@@ -1,0 +1,53 @@
+{
+  "test_id": "ACQ-003",
+  "category": "ACQ",
+  "suite": "test_acq_suite",
+  "runner": "pytest",
+  "scenario": "OPC UA subscription value changes and reconnect",
+  "expected": "no silent gap hidden as GOOD; reconnect/backoff and revision valid",
+  "status": "PASS",
+  "duration_ms": 590,
+  "started_at_utc": "2026-11-16T03:00:06.582Z",
+  "finished_at_utc": "2026-11-16T03:00:07.172Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "protocol_frame_decoded",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "quorum_publisher_confirmed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "offline_spool_consistent",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for ACQ-003 [ACQ]",
+    "Target scenario: OPC UA subscription value changes and reconnect",
+    "Evaluating expected behavior: no silent gap hidden as GOOD; reconnect/backoff and revision valid",
+    "Verified OT connector frame decode, RabbitMQ quorum publisher confirm, and spool persistence.",
+    "Scenario ACQ-003 completed successfully with status PASS."
+  ]
+}

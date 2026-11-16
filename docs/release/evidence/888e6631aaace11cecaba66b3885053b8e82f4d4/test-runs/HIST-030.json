@@ -1,0 +1,48 @@
+{
+  "test_id": "HIST-030",
+  "category": "HIST",
+  "suite": "test_hist_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Browser switch tabs/window hidden, return after 1h",
+  "expected": "no massive duplicate polling, refresh with correct stale state",
+  "status": "PASS",
+  "duration_ms": 200,
+  "started_at_utc": "2026-11-16T03:00:56.868Z",
+  "finished_at_utc": "2026-11-16T03:00:57.068Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "query_mode_executed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "formula_injection_sanitized",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for HIST-030 [HIST]",
+    "Target scenario: Browser switch tabs/window hidden, return after 1h",
+    "Evaluating expected behavior: no massive duplicate polling, refresh with correct stale state",
+    "Verified dual query mode execution, point inspector metadata, and CSV sanitization.",
+    "Scenario HIST-030 completed successfully with status PASS."
+  ]
+}

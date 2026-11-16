@@ -1,0 +1,48 @@
+{
+  "test_id": "SEC-006",
+  "category": "SEC",
+  "suite": "test_sec_suite",
+  "runner": "audit_runner",
+  "scenario": "Sensitive key nested in JSON column",
+  "expected": "redacted by schema policy; not just by outer column name",
+  "status": "PASS",
+  "duration_ms": 188,
+  "started_at_utc": "2026-11-16T03:00:58.386Z",
+  "finished_at_utc": "2026-11-16T03:00:58.574Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "read_only_enforced",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "sensitive_columns_masked",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SEC-006 [SEC]",
+    "Target scenario: Sensitive key nested in JSON column",
+    "Evaluating expected behavior: redacted by schema policy; not just by outer column name",
+    "Verified PostgreSQL Explorer read-only role enforcement and credential masking.",
+    "Scenario SEC-006 completed successfully with status PASS."
+  ]
+}

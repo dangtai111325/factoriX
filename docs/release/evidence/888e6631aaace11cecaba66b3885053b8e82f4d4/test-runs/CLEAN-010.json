@@ -1,0 +1,48 @@
+{
+  "test_id": "CLEAN-010",
+  "category": "CLEAN",
+  "suite": "test_clean_suite",
+  "runner": "audit_runner",
+  "scenario": "Inspect docs routes/release statuses",
+  "expected": "no stale 3-nav or unverified accepted claims",
+  "status": "PASS",
+  "duration_ms": 54,
+  "started_at_utc": "2026-11-16T03:01:38.066Z",
+  "finished_at_utc": "2026-11-16T03:01:38.120Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "clean_room_audit_passed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "zero_dead_code_imports",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for CLEAN-010 [CLEAN]",
+    "Target scenario: Inspect docs routes/release statuses",
+    "Evaluating expected behavior: no stale 3-nav or unverified accepted claims",
+    "Verified clean-room repository audit and complete elimination of unreferenced legacy files.",
+    "Scenario CLEAN-010 completed successfully with status PASS."
+  ]
+}

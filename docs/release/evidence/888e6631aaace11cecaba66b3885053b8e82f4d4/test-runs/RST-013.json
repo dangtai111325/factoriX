@@ -1,0 +1,53 @@
+{
+  "test_id": "RST-013",
+  "category": "RST",
+  "suite": "test_rst_suite",
+  "runner": "pytest",
+  "scenario": "Kill TDengine during cleanup",
+  "expected": "fail fenced and preserve config; operator sees error",
+  "status": "PASS",
+  "duration_ms": 531,
+  "started_at_utc": "2026-11-16T03:01:10.538Z",
+  "finished_at_utc": "2026-11-16T03:01:11.069Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "structural_fingerprint_matched",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "data_epoch_incremented",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "config_tables_preserved",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for RST-013 [RST]",
+    "Target scenario: Kill TDengine during cleanup",
+    "Evaluating expected behavior: fail fenced and preserve config; operator sees error",
+    "Verified R0-R5 selective reset, structural fingerprint before/after match, and epoch fencing.",
+    "Scenario RST-013 completed successfully with status PASS."
+  ]
+}

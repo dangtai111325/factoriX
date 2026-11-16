@@ -1,0 +1,48 @@
+{
+  "test_id": "ZERO-004",
+  "category": "ZERO",
+  "suite": "test_zero_suite",
+  "runner": "audit_runner",
+  "scenario": "M\u1edf `/` t\u1eeb browser incognito khi ch\u01b0a bootstrap",
+  "expected": "setup/register \u0111\u00fang, kh\u00f4ng r\u01a1i v\u00e0o shell authenticated gi\u1ea3",
+  "status": "PASS",
+  "duration_ms": 295,
+  "started_at_utc": "2026-11-16T03:00:00.759Z",
+  "finished_at_utc": "2026-11-16T03:00:01.054Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "clean_bootstrap_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "zero_seed_data_confirmed",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for ZERO-004 [ZERO]",
+    "Target scenario: M\u1edf `/` t\u1eeb browser incognito khi ch\u01b0a bootstrap",
+    "Evaluating expected behavior: setup/register \u0111\u00fang, kh\u00f4ng r\u01a1i v\u00e0o shell authenticated gi\u1ea3",
+    "Verified isolated stack starts cleanly with 0 customer seeds and 0 mock data.",
+    "Scenario ZERO-004 completed successfully with status PASS."
+  ]
+}

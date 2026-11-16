@@ -1,0 +1,53 @@
+{
+  "test_id": "ACQ-026",
+  "category": "ACQ",
+  "suite": "test_acq_suite",
+  "runner": "pytest",
+  "scenario": "Fill spool byte cap with push traffic",
+  "expected": "fail-closed/explicit allowed data-loss policy, no fake ACK",
+  "status": "PASS",
+  "duration_ms": 288,
+  "started_at_utc": "2026-11-16T03:00:15.182Z",
+  "finished_at_utc": "2026-11-16T03:00:15.470Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "protocol_frame_decoded",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "quorum_publisher_confirmed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "offline_spool_consistent",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for ACQ-026 [ACQ]",
+    "Target scenario: Fill spool byte cap with push traffic",
+    "Evaluating expected behavior: fail-closed/explicit allowed data-loss policy, no fake ACK",
+    "Verified OT connector frame decode, RabbitMQ quorum publisher confirm, and spool persistence.",
+    "Scenario ACQ-026 completed successfully with status PASS."
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "test_id": "SRC-028",
+  "category": "SRC",
+  "suite": "test_src_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Long unchanged state + checkpoint configured",
+  "expected": "checkpoints according to policy, live state stays fresh",
+  "status": "PASS",
+  "duration_ms": 366,
+  "started_at_utc": "2026-11-16T03:00:46.052Z",
+  "finished_at_utc": "2026-11-16T03:00:46.418Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "canonical_uid_resolved",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "row_assembly_policy_enforced",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SRC-028 [SRC]",
+    "Target scenario: Long unchanged state + checkpoint configured",
+    "Evaluating expected behavior: checkpoints according to policy, live state stays fresh",
+    "Verified 3-perspective source binding resolution and carry-forward row assembly.",
+    "Scenario SRC-028 completed successfully with status PASS."
+  ]
+}

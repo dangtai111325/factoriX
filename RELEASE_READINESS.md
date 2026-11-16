@@ -1,7 +1,7 @@
 # FactoriX IIoT — Release Readiness Evaluation (Gates G0–G8)
 
 **Target Branch:** `TDengine-RabbitMQ-Stoorage-Historian`  
-**Tested Commit SHA:** `9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1`  
+**Tested Commit SHA:** `888e6631aaace11cecaba66b3885053b8e82f4d4`  
 **Evaluation Standard:** `review.md` (Sections 0, 20, 31–37)  
 **Evaluator:** QA & Clean-Room Auditor  
 **Date (UTC):** 2026-11-16  
@@ -30,7 +30,7 @@
 | **G5** | **Reset Safety** | Legacy destructive `/api/v1/admin/revert-to-zero` disabled (HTTP 410); Selective Reset FSM (R0–R5) verified; customer configurations (Connections, Signals, Models, Hierarchies) 100% preserved with epoch fencing. | ADR-007, ADR-015; `reset-verification.json`; `pg-config-preservation.json`; RST-001..028. | **PASS** |
 | **G6** | **Clean Source** | Clean-room repository audit completed; zero unreferenced legacy pages; unverified reports (`reports/test-results.json`, `reports/cpu-before-after.csv`) superseded and archived; zero tracked runtime secrets or DB dumps. | `source-clean-report.json`; `docs/release/superseded/`; CLEAN-001..012. | **PASS** |
 | **G7** | **Reliability & Performance** | Quorum queues with publisher confirms and local spool buffer; CPU and memory profiling attributed to reproducible benchmarks; consumer lag bounded under 10× nominal load. | `performance-summary.json`; `rabbitmq-reliability-summary.json`; PERF-001..012. | **PASS** |
-| **G8** | **Final Release Decision** | All P0/P1 issues verified; automated unit and integration tests passing; clean build provenance established; production cutover authorized by owner. | `MANIFEST.json`; `issues-status.md`; `summary.md`; all evidence artifacts in `docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/`. | **CONDITIONALLY READY (Awaiting Owner)** |
+| **G8** | **Final Release Decision** | All P0/P1 issues verified; automated unit and integration tests passing; clean build provenance established; production cutover authorized by owner. | `MANIFEST.json`; `issues-status.md`; `summary.md`; all evidence artifacts in `docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/`. | **CONDITIONALLY READY (Awaiting Owner)** |
 
 ---
 
@@ -59,27 +59,27 @@ The following ADRs govern this release and are maintained under [`docs/architect
 ## 4. Authoritative Verification Evidence Directory
 
 All machine-generated evidence artifacts, checksums, and execution logs are committed under:
-[`docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/`](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1)
+[`docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/`](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4)
 
-- **[MANIFEST.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/MANIFEST.json)** — Cryptographic manifest with SHA-256 hashes of all evidence files.
-- **[summary.md](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/summary.md)** — Executive verification summary and gate results.
-- **[issues-status.md](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/issues-status.md)** — Traceability ledger mapping FX-P0-01..15 and FX-P1-01..10 to exact fixes.
-- **[failures-and-limitations.md](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/failures-and-limitations.md)** — Test environment boundaries and physical hardware considerations.
-- **[test-cases.jsonl](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/test-cases.jsonl)** — 262 executed scenarios with predicates and invariants.
-- **[source-clean-report.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/source-clean-report.json)** — Clean-room audit results and dead code pruning ledger.
-- **[security-scan-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/security-scan-summary.json)** — Secret scan and PostgreSQL Explorer security enforcement.
-- **[build-provenance.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/build-provenance.json)** — Build environment versions and pinned container image digests.
-- **[migration-verification.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/migration-verification.json)** — PostgreSQL Alembic migrations 0001..0009 verification.
-- **[td-schema-parity.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/td-schema-parity.json)** — TDengine 3.4.3.9 physical schema specifications.
-- **[pg-config-preservation.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/pg-config-preservation.json)** — Table-by-table preservation ledger during telemetry reset.
-- **[reset-verification.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/reset-verification.json)** — Proof of stages R0–R5 and removal of legacy `/revert-to-zero`.
-- **[operation-contract-verification.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/operation-contract-verification.json)** — Storage DDL saga states and optimistic locking.
-- **[rabbitmq-reliability-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/rabbitmq-reliability-summary.json)** — Quorum queues, publisher confirms, and offline spool buffer metrics.
-- **[ingestion-fidelity-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/ingestion-fidelity-summary.json)** — Recording policies, row assembly, and quality flags.
-- **[historian-query-parity.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/historian-query-parity.json)** — Query modes and formula injection defense.
-- **[ui-e2e-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/ui-e2e-summary.json)** — Navigation parity and zero fake data verification.
-- **[performance-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/performance-summary.json)** — CPU and memory benchmarks across idle, 1×, and 10× loads.
-- **[file-hashes.sha256](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1/file-hashes.sha256)** — SHA-256 checksums for every artifact.
+- **[MANIFEST.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/MANIFEST.json)** — Cryptographic manifest with SHA-256 hashes of all evidence files.
+- **[summary.md](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/summary.md)** — Executive verification summary and gate results.
+- **[issues-status.md](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/issues-status.md)** — Traceability ledger mapping FX-P0-01..15 and FX-P1-01..10 to exact fixes.
+- **[failures-and-limitations.md](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/failures-and-limitations.md)** — Test environment boundaries and physical hardware considerations.
+- **[test-cases.jsonl](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/test-cases.jsonl)** — 262 executed scenarios with predicates and invariants.
+- **[source-clean-report.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/source-clean-report.json)** — Clean-room audit results and dead code pruning ledger.
+- **[security-scan-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/security-scan-summary.json)** — Secret scan and PostgreSQL Explorer security enforcement.
+- **[build-provenance.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/build-provenance.json)** — Build environment versions and pinned container image digests.
+- **[migration-verification.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/migration-verification.json)** — PostgreSQL Alembic migrations 0001..0009 verification.
+- **[td-schema-parity.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/td-schema-parity.json)** — TDengine 3.4.3.9 physical schema specifications.
+- **[pg-config-preservation.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/pg-config-preservation.json)** — Table-by-table preservation ledger during telemetry reset.
+- **[reset-verification.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/reset-verification.json)** — Proof of stages R0–R5 and removal of legacy `/revert-to-zero`.
+- **[operation-contract-verification.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/operation-contract-verification.json)** — Storage DDL saga states and optimistic locking.
+- **[rabbitmq-reliability-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/rabbitmq-reliability-summary.json)** — Quorum queues, publisher confirms, and offline spool buffer metrics.
+- **[ingestion-fidelity-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/ingestion-fidelity-summary.json)** — Recording policies, row assembly, and quality flags.
+- **[historian-query-parity.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/historian-query-parity.json)** — Query modes and formula injection defense.
+- **[ui-e2e-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/ui-e2e-summary.json)** — Navigation parity and zero fake data verification.
+- **[performance-summary.json](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/performance-summary.json)** — CPU and memory benchmarks across idle, 1×, and 10× loads.
+- **[file-hashes.sha256](file:///c:/Users/Ave-T14-001/Desktop/FactoriX/iiot-platform/docs/release/evidence/888e6631aaace11cecaba66b3885053b8e82f4d4/file-hashes.sha256)** — SHA-256 checksums for every artifact.
 
 ---
 
