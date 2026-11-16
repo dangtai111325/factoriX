@@ -215,7 +215,9 @@ export const HistorianExplorerPage: React.FC = () => {
               : null;
 
           // Parse actual quality from record
-          const rawQualStr = r.quality ? String(r.quality.value || Object.values(r.quality)[0] || 'GOOD').toUpperCase() : 'GOOD';
+          const rawQualStr = r.quality
+            ? String(typeof r.quality === 'object' && r.quality !== null ? ((r.quality as Record<string, string>).value || Object.values(r.quality)[0] || 'GOOD') : r.quality).toUpperCase()
+            : 'GOOD';
           const pointQuality: 'GOOD' | 'BAD' | 'UNCERTAIN' | 'STALE' =
             rawQualStr.includes('BAD')
               ? 'BAD'
@@ -225,24 +227,31 @@ export const HistorianExplorerPage: React.FC = () => {
               ? 'STALE'
               : 'GOOD';
 
+          const eventUid = r.event_uid || r.eventUid || `uid-${src.id}-${tMs}`;
+          const dataEpoch = Number(r.data_epoch ?? r.dataEpoch ?? 1);
+          const reasonCode = r.reason_code ?? r.reasonCode ?? null;
+          const recordKind = String(r.record_kind || r.recordKind || (mode === 'reconstructed' ? 'RECONSTRUCTED_STEP' : 'POLICY_RECORDED'));
+          const isVirtual = r.virtual !== undefined ? Boolean(r.virtual) : (mode === 'reconstructed');
+          const acquiredAt = String(r.acquired_at || r.acquiredAt || r.ts);
+
           return {
             id: `${src.id}-${tMs}-${pIdx}`,
-            eventUid: `uid-${src.id}-${tMs}`,
+            eventUid,
             signalId: src.id,
             signalName: src.display_name,
             timestampMs: tMs,
             eventTime: r.ts,
-            acquiredAt: r.ts,
-            sourceTime: r.source_times ? String(Object.values(r.source_times)[0]) : r.ts,
+            acquiredAt,
+            sourceTime: r.source_times ? String(Object.values(r.source_times)[0]) : (r.source_time || r.ts),
             valueType: src.data_type || 'FLOAT64',
             value: parsedValue,
             numericValue: numVal,
             unit: src.unit || '',
             quality: pointQuality,
-            reasonCode: null,
-            recordKind: mode === 'reconstructed' ? 'RECONSTRUCTED_STEP' : 'POLICY_RECORDED',
-            virtual: mode === 'reconstructed',
-            dataEpoch: 1,
+            reasonCode,
+            recordKind,
+            virtual: isVirtual,
+            dataEpoch,
           };
         });
 
@@ -789,7 +798,7 @@ export const HistorianExplorerPage: React.FC = () => {
                         ) : (
                           recordsRows.map((row, idx) => {
                             const rawQual = row.quality
-                              ? String(row.quality.value || Object.values(row.quality)[0] || 'GOOD').toUpperCase()
+                              ? String(typeof row.quality === 'object' && row.quality !== null ? ((row.quality as Record<string, string>).value || Object.values(row.quality)[0] || 'GOOD') : row.quality).toUpperCase()
                               : 'GOOD';
                             const isGood = rawQual.includes('GOOD');
                             const isBad = rawQual.includes('BAD');

@@ -562,7 +562,7 @@ export const Sidebar: React.FC = () => {
             type="button"
             onClick={() => setRevertModalOpen(true)}
             className="w-full mb-2 flex items-center justify-center gap-2 py-1.5 px-3 rounded-lg text-[12px] font-medium text-[#EF1B24] border border-[#FAC6C9] hover:bg-white transition-colors"
-            title="Deletes the installation, including all configurations and data."
+            title="Clears operational telemetry and historian observations while preserving all physical schemas, connections, data models, and configurations."
           >
             <RotateCcw className="w-3.5 h-3.5" />
             <span>Revert To Zero</span>

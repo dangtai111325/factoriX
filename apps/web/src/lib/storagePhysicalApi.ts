@@ -581,10 +581,24 @@ export interface HistorianQueryParams {
 
 export interface HistorianRow {
   ts: string;
-  values: Record<string, unknown>;
-  quality?: Record<string, string> | null;
+  values?: Record<string, unknown>;
+  quality?: Record<string, string> | string | null;
   source_times?: Record<string, string> | null;
   carry_forward_flags?: Record<string, boolean> | null;
+  event_uid?: string | null;
+  eventUid?: string | null;
+  data_epoch?: number | null;
+  dataEpoch?: number | null;
+  reason_code?: string | null;
+  reasonCode?: string | null;
+  record_kind?: string | null;
+  recordKind?: string | null;
+  virtual?: boolean | null;
+  acquired_at?: string | null;
+  acquiredAt?: string | null;
+  source_time?: string | null;
+  sourceTime?: string | null;
+  [key: string]: unknown;
 }
 
 export async function queryHistorian(params: HistorianQueryParams): Promise<{

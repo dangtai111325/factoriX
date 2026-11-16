@@ -194,6 +194,9 @@ async def _run_step(name: str, step: Any) -> None:
 
 async def _evaluate_edges(session: AsyncSession) -> None:
     """Edge OFFLINE comes only from heartbeat age (> 3 heartbeat periods)."""
+    cfg = _settings()
+    if cfg.collector_mode == "acquisition":
+        return
     now = utcnow()
     stale = await fetch_all(
         session,
@@ -1412,6 +1415,42 @@ def _normalize_edge(row: dict[str, Any], now: datetime | None = None) -> dict[st
 @app.get("/api/v1/edges")
 async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, _actor = _ids(principal)
+    cfg = _settings()
+    if cfg.collector_mode == "acquisition":
+        run_status = await fetch_all(
+            session,
+            """
+            SELECT instance_id, role, health, software_version, config_revision,
+                   spool_pending, fast_buffered, broker_ok, last_heartbeat
+            FROM collector_runtime_status
+            WHERE role = 'acquisition'
+            ORDER BY last_heartbeat DESC NULLS LAST
+            """,
+            {},
+        )
+        if run_status:
+            items = []
+            now = utcnow()
+            for r in run_status:
+                last_hb = r.get("last_heartbeat")
+                is_fresh = last_hb and (now - last_hb).total_seconds() < 30
+                items.append({
+                    "id": str(r["instance_id"]),
+                    "name": "Data Collector (Acquisition Runtime)",
+                    "site_id": None,
+                    "enrollment_status": "ENROLLED",
+                    "desired_revision": int(r.get("config_revision") or 1),
+                    "active_revision": int(r.get("config_revision") or 1),
+                    "last_heartbeat": iso_ms(last_hb),
+                    "health": "ONLINE" if is_fresh else "OFFLINE",
+                    "effective_health": "ONLINE" if is_fresh else "OFFLINE",
+                    "health_raw": str(r.get("health") or "HEALTHY"),
+                    "software_version": str(r.get("software_version") or "1.0.0"),
+                    "outbox_pending": int(r.get("spool_pending") or 0),
+                    "queues": {},
+                    "config_state": "IN_SYNC",
+                })
+            return {"items": items}
     items = await fetch_all(session, "SELECT id, name, site_id, enrollment_status, desired_revision, active_revision, last_heartbeat, health, software_version, outbox_pending, queues_json FROM edge_nodes WHERE tenant_id = :tenant_id ORDER BY name", {"tenant_id": tenant_id})
     return {"items": [_normalize_edge(item) for item in items]}
 
