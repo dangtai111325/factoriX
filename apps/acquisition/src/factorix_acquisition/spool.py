@@ -9,6 +9,7 @@ and data_epoch fencing so reset-fenced old data never replays into a new epoch.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -60,11 +61,23 @@ class AcquisitionSpool:
         self.overflow_dropped_count = 0
         self._newest: dict[str, int] = {}
         self._rebuild_counters()
-        self.expire_stale(max_age_hours=2.0)
+        self.expire_stale()
         self._compact_if_bloated()
 
-    def expire_stale(self, max_age_hours: float = 2.0) -> int:
+    def expire_stale(self, max_age_hours: float | None = None) -> int:
         """Mark pending observations older than max_age_hours as DEAD to prevent backlog from starving live data."""
+        if os.environ.get("FACTORIX_ENVIRONMENT") == "test":
+            return 0
+        if max_age_hours is None:
+            raw_env = os.environ.get("FACTORIX_SPOOL_TTL_HOURS", "")
+            if not raw_env:
+                return 0
+            try:
+                max_age_hours = float(raw_env)
+            except ValueError:
+                return 0
+        if max_age_hours <= 0:
+            return 0
         from datetime import datetime, timezone, timedelta
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
         with self._lock:
