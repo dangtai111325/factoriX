@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import {
   Plus,
@@ -16,7 +16,7 @@ import {
 import { StorageEngineSwitcher, StorageEngine } from './StorageEngineSwitcher';
 import { StorageHealthStrip } from './StorageHealthStrip';
 import { StorageObjectGraph } from './StorageObjectGraph';
-import { StorageObjectsTable, StorageObjectRow } from './StorageObjectsTable';
+import { StorageObjectsTable } from './StorageObjectsTable';
 import { StorageObjectDrawer } from './StorageObjectDrawer';
 import { PostgresExplorerView } from './PostgresExplorerView';
 import {
@@ -29,9 +29,6 @@ import {
   TopologyEdge,
   getTDTopology,
   getStorageStats,
-  listDatabases,
-  listStables,
-  listSubtables,
   getStorageObject,
   TDDatabase,
   TDStable,
@@ -59,18 +56,11 @@ export const StorageManagementPage: React.FC = () => {
   const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [nodes, setNodes] = useState<TopologyNode[]>([]);
   const [edges, setEdges] = useState<TopologyEdge[]>([]);
-  const [stats, setStats] = useState({
-    databaseCount: 0,
-    stableCount: 0,
-    subtableCount: 0,
-    recordingActive: 0,
-    recordingPaused: 0,
-    recordingError: 0,
-    lastObservedAt: '',
-  });
-
-  // Flat objects for table view
-  const [tableObjects, setTableObjects] = useState<StorageObjectRow[]>([]);
+  const [stats, setStats] = useState<Awaited<ReturnType<typeof getStorageStats>> | null>(null);
+  const [statsError, setStatsError] = useState<unknown>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const loadController = useRef<AbortController>();
 
   // Selected object for drawer
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
@@ -83,11 +73,26 @@ export const StorageManagementPage: React.FC = () => {
 
   // Load TDengine data - strictly real data, no synthetic fallbacks
   const loadTDengineData = useCallback(async () => {
+    loadController.current?.abort();
+    const controller = new AbortController();
+    loadController.current = controller;
     setLoading(true);
     setTopoError(null);
+    setStatsError(null);
+    const [statsResult, topologyResult] = await Promise.allSettled([
+      getStorageStats(controller.signal),
+      activeTab === 'topology' ? getTDTopology({ include_subtable_tags: false }, controller.signal) : Promise.resolve(null),
+    ]);
+    if (controller.signal.aborted) return;
+    if (statsResult.status === 'fulfilled') setStats(statsResult.value);
+    else {
+      setStats(null);
+      setStatsError(statsResult.reason);
+    }
     try {
-      // 1. Fetch topology from TDengine
-      const topo = await getTDTopology();
+      if (topologyResult.status === 'rejected') throw topologyResult.reason;
+      const topo = topologyResult.value;
+      if (!topo) return;
 
       const safeNodes: TopologyNode[] = Array.isArray(topo?.nodes)
         ? topo.nodes.map((n: any) => {
@@ -121,63 +126,26 @@ export const StorageManagementPage: React.FC = () => {
 
       setNodes(safeNodes);
       setEdges(safeEdges);
-
-      // 2. Fetch real stats independent of pagination
-      try {
-        const st = await getStorageStats();
-        setStats({
-          databaseCount: st?.database_count ?? 0,
-          stableCount: st?.stable_count ?? 0,
-          subtableCount: st?.subtable_count ?? 0,
-          recordingActive: st?.recording_active ?? 0,
-          recordingPaused: st?.recording_paused ?? 0,
-          recordingError: st?.recording_error ?? 0,
-          lastObservedAt: st?.observed_at || topo?.observed_at || new Date().toISOString(),
-        });
-      } catch (stErr) {
-        console.warn('Real stats endpoint failed, using counted topology values', stErr);
-        setStats({
-          databaseCount: safeNodes.filter((n) => n.object_type === 'database').length,
-          stableCount: safeNodes.filter((n) => n.object_type === 'stable').length,
-          subtableCount: safeNodes.filter((n) => n.object_type === 'subtable').length,
-          recordingActive: 0,
-          recordingPaused: 0,
-          recordingError: 0,
-          lastObservedAt: topo?.observed_at || new Date().toISOString(),
-        });
-      }
-
-      // 3. Flatten objects for table view
-      const rows: StorageObjectRow[] = safeNodes.map((n) => ({
-        id: n.node_id,
-        physical_name: n.physical_name,
-        display_name: n.display_name || null,
-        object_type: (n.object_type === 'engine' ? 'database' : n.object_type) as 'database' | 'stable' | 'subtable',
-        parent_name: (n.metadata?.database_name as string) || (n.metadata?.stable_name as string) || null,
-        parent_id: n.parent_id,
-        column_count: n.metadata?.column_count as number | undefined,
-        tag_count: n.metadata?.tag_count as number | undefined,
-        subtable_count: (n.metadata?.subtable_count as number | undefined) || (n.metadata?.stable_count as number | undefined),
-        binding_count: (n.metadata?.binding_count as number | undefined) || 0,
-        last_verified_at: topo?.observed_at || new Date().toISOString(),
-        status: n.status,
-      }));
-      setTableObjects(rows);
     } catch (err: unknown) {
       console.error('Failed to load TDengine topology:', err);
       setTopoError(err);
       setNodes([]);
       setEdges([]);
-      setTableObjects([]);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [activeTab]);
+
+  const refreshTDengine = () => {
+    setRefreshVersion((previous) => previous + 1);
+    void loadTDengineData();
+  };
 
   useEffect(() => {
     if (engine === 'tdengine') {
       void loadTDengineData();
     }
+    return () => loadController.current?.abort();
   }, [engine, loadTDengineData]);
 
   // Load detailed object for drawer when selected - strictly real data
@@ -188,8 +156,12 @@ export const StorageManagementPage: React.FC = () => {
       return;
     }
 
+    let active = true;
+    setSelectedObjectData(null);
+    setDrawerError(null);
     getStorageObject(selectedObjectId)
       .then((obj) => {
+        if (!active) return;
         const isDb = selectedObjectId.startsWith('db:') || selectedObjectId.startsWith('db/');
         const isStable = selectedObjectId.startsWith('stable:') || selectedObjectId.startsWith('stable/');
         const type: 'database' | 'stable' | 'subtable' = isDb ? 'database' : isStable ? 'stable' : 'subtable';
@@ -197,10 +169,12 @@ export const StorageManagementPage: React.FC = () => {
         setDrawerError(null);
       })
       .catch((err) => {
+        if (!active) return;
         console.error('Failed to load storage object detail:', err);
         setSelectedObjectData(null);
         setDrawerError(err);
       });
+    return () => { active = false; };
   }, [selectedObjectId]);
 
   return (
@@ -229,8 +203,8 @@ export const StorageManagementPage: React.FC = () => {
               {/* Refresh button */}
               <button
                 type="button"
-                onClick={loadTDengineData}
-                disabled={loading}
+                onClick={refreshTDengine}
+                disabled={loading || catalogLoading}
                 className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC] shadow-xs transition-colors"
                 title="Refresh physical metadata"
               >
@@ -305,15 +279,17 @@ export const StorageManagementPage: React.FC = () => {
         <div className="space-y-3">
           {/* KPI Strip & View Mode Switcher */}
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <StorageHealthStrip
-              databaseCount={stats.databaseCount}
-              stableCount={stats.stableCount}
-              subtableCount={stats.subtableCount}
-              recordingActive={stats.recordingActive}
-              recordingPaused={stats.recordingPaused}
-              recordingError={stats.recordingError}
-              lastObservedAt={stats.lastObservedAt}
-            />
+            {stats && (
+              <StorageHealthStrip
+                databaseCount={stats.database_count}
+                stableCount={stats.stable_count}
+                subtableCount={stats.subtable_count}
+                recordingActive={stats.recording_active}
+                recordingPaused={stats.recording_paused}
+                recordingError={stats.recording_error}
+                lastObservedAt={stats.observed_at}
+              />
+            )}
 
             {/* View Mode Switcher: Topology / Objects */}
             <div className="flex items-center gap-1 bg-[#EEF2F6] p-1 rounded-lg">
@@ -346,7 +322,16 @@ export const StorageManagementPage: React.FC = () => {
           </div>
 
           {/* Active view */}
-          {topoError != null ? (
+          {statsError != null && <RemoteErrorState error={statsError} subject="Storage totals" onRetry={refreshTDengine} />}
+          {activeTab === 'objects' ? (
+            <StorageObjectsTable
+              selectedObjectId={selectedObjectId}
+              onSelectObject={setSelectedObjectId}
+              onRefresh={refreshTDengine}
+              refreshVersion={refreshVersion}
+              onLoadingChange={setCatalogLoading}
+            />
+          ) : topoError != null ? (
             <RemoteErrorState
               error={topoError}
               subject="TDengine Storage Topology"
@@ -362,18 +347,10 @@ export const StorageManagementPage: React.FC = () => {
               onAction={() => navigate('/historian/storage/create?kind=database')}
               icon={Database}
             />
-          ) : activeTab === 'topology' ? (
+          ) : (
             <StorageObjectGraph
               nodes={nodes}
               edges={edges}
-              selectedObjectId={selectedObjectId}
-              onSelectObject={setSelectedObjectId}
-              onRefresh={loadTDengineData}
-              loading={loading}
-            />
-          ) : (
-            <StorageObjectsTable
-              objects={tableObjects}
               selectedObjectId={selectedObjectId}
               onSelectObject={setSelectedObjectId}
               onRefresh={loadTDengineData}
@@ -386,7 +363,7 @@ export const StorageManagementPage: React.FC = () => {
             <StorageObjectDrawer
               object={selectedObjectData}
               onClose={() => setSelectedObjectId(null)}
-              onRefresh={loadTDengineData}
+              onRefresh={refreshTDengine}
             />
           )}
 

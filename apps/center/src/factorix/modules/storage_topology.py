@@ -79,6 +79,7 @@ class DatabaseInfo:
     cache_model: str | None
     is_tenant: bool
     stable_count: int = 0
+    subtable_count: int = 0
 
 
 @dataclass
@@ -205,14 +206,7 @@ class StorageTopologyInspector:
         If *tenant_id* is given only the matching ``fx_t_<hex>`` database is
         returned.
         """
-        try:
-            rows = await self._td_query(
-                "SELECT name, ntables, vgroups, replica, quorum, precision, "
-                "keep, cache_model FROM information_schema.ins_databases"
-            )
-        except Exception:
-            # Fallback: SHOW DATABASES (older schema)
-            rows = await self._td_query("SHOW DATABASES")
+        rows = await self._td_query("SELECT * FROM information_schema.ins_databases")
 
         dbs: list[DatabaseInfo] = []
         for r in rows:
@@ -224,16 +218,24 @@ class StorageTopologyInspector:
                 expected = f"fx_t_{UUID(str(tenant_id)).hex}"
                 if name != expected:
                     continue
+            _safe_ident(name)
+            stable_counts = await self._td_query(
+                "SELECT COUNT(*) AS stable_count FROM information_schema.ins_stables "
+                f"WHERE db_name = '{name}'"
+            )
+            subtables = await self._subtable_counts(name)
             dbs.append(DatabaseInfo(
                 name=name,
-                precision=_safe_str(r, "precision", 5, "ms"),
-                replica=_safe_int(r, "replica", 3, 1) or 1,
-                quorum=_safe_int(r, "quorum", 4, None),
-                keep=_safe_str(r, "keep", 6, "3650d"),
+                precision=_safe_str(r, "precision", 14, "ms"),
+                replica=_safe_int(r, "replica", 4, 1) or 1,
+                quorum=_safe_int(r, "quorum", None),
+                keep=_safe_str(r, "keep", 7, "3650d"),
                 vgroups=_safe_int(r, "vgroups", 2, 0) or 0,
-                ntables=_safe_int(r, "ntables", 1, 0) or 0,
-                cache_model=_safe_str(r, "cache_model", 7, None),
+                ntables=_safe_int(r, "ntables", 3, 0) or 0,
+                cache_model=_row_val(r, ("cachemodel", "cache_model"), 18, None),
                 is_tenant=is_tenant,
+                stable_count=(_safe_int(stable_counts[0], "stable_count", 0, 0) or 0) if stable_counts else 0,
+                subtable_count=sum(subtables.values()),
             ))
         return dbs
 
@@ -247,13 +249,14 @@ class StorageTopologyInspector:
         _safe_ident(database)
         try:
             rows = await self._td_query(
-                f"SELECT stable_name, columns, tags, ntables "
+                f"SELECT stable_name "
                 f"FROM information_schema.ins_stables "
                 f"WHERE db_name = '{database}'"
             )
         except Exception:
             rows = await self._td_query(f"SHOW {_safe_ident(database)}.STABLES")
 
+        subtable_counts = await self._subtable_counts(database)
         stables: list[StableInfo] = []
         for r in rows:
             sname = _safe_str(r, ("stable_name", "name"), 0)
@@ -266,7 +269,7 @@ class StorageTopologyInspector:
                 database=database,
                 columns=cols,
                 tags=tags,
-                subtable_count=_safe_int(r, "ntables", 3, 0) or 0,
+                subtable_count=subtable_counts.get(sname, 0),
             ))
         return stables
 
@@ -275,21 +278,25 @@ class StorageTopologyInspector:
         _safe_ident(database)
         _safe_ident(stable_name)
         cols, tags = await self._describe_stable(database, stable_name)
-        try:
-            rows = await self._td_query(
-                f"SELECT ntables FROM information_schema.ins_stables "
-                f"WHERE db_name = '{database}' AND stable_name = '{stable_name}'"
-            )
-            count = _safe_int(rows[0], "ntables", 0, 0) if rows else 0
-        except Exception:
-            count = 0
+        counts = await self._subtable_counts(database)
         return StableInfo(
             name=stable_name,
             database=database,
             columns=cols,
             tags=tags,
-            subtable_count=count or 0,
+            subtable_count=counts.get(stable_name, 0),
         )
+
+    async def _subtable_counts(self, database: str) -> dict[str, int]:
+        _safe_ident(database)
+        rows = await self._td_query(
+            "SELECT stable_name, COUNT(*) AS subtable_count FROM information_schema.ins_tables "
+            f"WHERE db_name = '{database}' AND type = 'CHILD_TABLE' GROUP BY stable_name"
+        )
+        return {
+            _safe_str(row, "stable_name", 0): _safe_int(row, "subtable_count", 1, 0) or 0
+            for row in rows
+        }
 
     async def list_subtables(
         self,
@@ -297,6 +304,8 @@ class StorageTopologyInspector:
         stable_name: str | None = None,
         cursor: str | None = None,
         limit: int = 200,
+        *,
+        include_tags: bool = True,
     ) -> tuple[list[SubtableInfo], str | None]:
         """Return subtables with tag values, optionally filtered by stable.
 
@@ -330,7 +339,7 @@ class StorageTopologyInspector:
         for r in rows:
             tname = _safe_str(r, ("table_name", "name"), 0)
             sname = _safe_str(r, "stable_name", 1, "")
-            tags = await self._get_subtable_tags(database, tname)
+            tags = await self._get_subtable_tags(database, tname) if include_tags else {}
             items.append(SubtableInfo(
                 name=tname,
                 stable_name=sname,
@@ -361,6 +370,81 @@ class StorageTopologyInspector:
             tags=tags,
         )
 
+    async def list_catalog(
+        self,
+        tenant_id: UUID,
+        session: Any,
+        *,
+        object_type: str | None,
+        status: str | None,
+        search: str,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Page through tenant physical metadata without graph limits or per-object tag reads."""
+        from factorix.modules.common import fetch_all
+
+        labels = await self._load_storage_labels(tenant_id, session)
+        registry = await fetch_all(
+            session,
+            "SELECT object_type, physical_db, physical_name, status FROM storage_objects "
+            "WHERE tenant_id = :tenant_id AND status != 'PURGED'",
+            {"tenant_id": tenant_id},
+        )
+        statuses = {
+            f"db:{entry['physical_name']}" if entry["object_type"] == "database"
+            else f"{entry['object_type']}:{entry['physical_db']}.{entry['physical_name']}": entry["status"]
+            for entry in registry
+        }
+        rows: list[dict[str, Any]] = []
+        for db in await self.list_databases(tenant_id):
+            db_label = labels.get(db.name, db.name)
+            if object_type in (None, "database"):
+                rows.append({
+                    "id": f"db:{db.name}", "object_type": "database",
+                    "physical_name": db.name, "display_name": db_label,
+                    "subtable_count": db.subtable_count,
+                })
+            if object_type in (None, "stable"):
+                counts = await self._subtable_counts(db.name)
+                stables = await self._td_query(
+                    f"SELECT * FROM information_schema.ins_stables WHERE db_name = '{db.name}' ORDER BY stable_name"
+                )
+                for stable in stables:
+                    name = _safe_str(stable, "stable_name", 0)
+                    rows.append({
+                        "id": f"stable:{db.name}.{name}", "object_type": "stable",
+                        "physical_name": name, "display_name": labels.get(name, name), "parent_name": db_label,
+                        "column_count": _safe_int(stable, "columns", 3, 0),
+                        "tag_count": _safe_int(stable, "tags", 4, 0),
+                        "subtable_count": counts.get(name, 0),
+                    })
+            if object_type in (None, "subtable"):
+                subtables = await self._td_query(
+                    "SELECT table_name, stable_name FROM information_schema.ins_tables "
+                    f"WHERE db_name = '{db.name}' AND type = 'CHILD_TABLE' ORDER BY table_name"
+                )
+                for subtable in subtables:
+                    name = _safe_str(subtable, "table_name", 0)
+                    parent = _safe_str(subtable, "stable_name", 1, "")
+                    rows.append({
+                        "id": f"subtable:{db.name}.{name}", "object_type": "subtable",
+                        "physical_name": name, "display_name": labels.get(name, name),
+                        "parent_name": labels.get(parent, parent),
+                    })
+
+        for row in rows:
+            row["status"] = statuses.get(row["id"], "ACTIVE")
+        if status is not None:
+            rows = [row for row in rows if row["status"] == status]
+        query = search.strip().casefold()
+        if query:
+            rows = [row for row in rows if any(
+                query in row.get(field, "").casefold() for field in ("physical_name", "display_name", "parent_name")
+            )]
+        start = (page - 1) * page_size
+        return rows[start:start + page_size], len(rows)
+
     async def get_topology(
         self,
         tenant_id: UUID,
@@ -368,6 +452,8 @@ class StorageTopologyInspector:
         depth: int = 2,
         cursor: str | None = None,
         session: Any | None = None,
+        *,
+        include_subtable_tags: bool = True,
     ) -> TopologySnapshot:
         """Return full or filtered topology snapshot for the UI canvas."""
         observed_at = datetime.now(timezone.utc)
@@ -375,6 +461,78 @@ class StorageTopologyInspector:
         if database:
             dbs = [d for d in dbs if d.name == database]
 
+        label_map = await self._load_storage_labels(tenant_id, session)
+
+        all_stables: list[StableInfo] = []
+        all_subtables: list[SubtableInfo] = []
+        nodes: list[TopologyNode] = []
+
+        for db in dbs:
+            nodes.append(TopologyNode(
+                node_id=f"db:{db.name}",
+                kind="database",
+                label=db.name,
+                parent_id=None,
+                metadata={
+                    "precision": db.precision,
+                    "stable_count": db.stable_count,
+                    "keep": db.keep,
+                    "vgroups": db.vgroups,
+                    "ntables": db.ntables,
+                    "replica": db.replica,
+                    "is_tenant": db.is_tenant,
+                },
+            ))
+            if depth >= 1:
+                stables = await self.list_stables(db.name)
+                all_stables.extend(stables)
+                for st in stables:
+                    nodes.append(TopologyNode(
+                        node_id=f"stable:{db.name}.{st.name}",
+                        kind="stable",
+                        label=st.name,
+                        parent_id=f"db:{db.name}",
+                        metadata={
+                            "column_count": len(st.columns),
+                            "tag_count": len(st.tags),
+                            "subtable_count": st.subtable_count,
+                        },
+                    ))
+                    if depth >= 2:
+                        subs, _nc = await self.list_subtables(
+                            db.name, st.name, cursor=cursor, limit=50, include_tags=include_subtable_tags,
+                        )
+                        all_subtables.extend(subs)
+                        for sub in subs:
+                            display_label = label_map.get(sub.name, sub.name)
+                            nodes.append(TopologyNode(
+                                node_id=f"subtable:{db.name}.{sub.name}",
+                                kind="subtable",
+                                label=display_label,
+                                parent_id=f"stable:{db.name}.{st.name}",
+                                metadata={
+                                    "tags": sub.tags,
+                                    "physical_name": sub.name,
+                                    "display_name": display_label,
+                                },
+                            ))
+
+        drift = await self._compute_drift(tenant_id, all_stables, all_subtables)
+
+        return TopologySnapshot(
+            databases=dbs,
+            stables=all_stables,
+            subtables=all_subtables,
+            nodes=nodes,
+            drift=drift,
+            observed_at=observed_at,
+        )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    async def _load_storage_labels(self, tenant_id: UUID, session: Any | None) -> dict[str, str]:
         label_map: dict[str, str] = {}
         if session is not None and tenant_id:
             from factorix.modules.common import fetch_all
@@ -424,74 +582,7 @@ class StorageTopologyInspector:
                         label_map[pname] = dname
             except Exception as exc:
                 logger.debug("Failed loading storage_objects for topology label map: %s", exc)
-
-        all_stables: list[StableInfo] = []
-        all_subtables: list[SubtableInfo] = []
-        nodes: list[TopologyNode] = []
-
-        for db in dbs:
-            nodes.append(TopologyNode(
-                node_id=f"db:{db.name}",
-                kind="database",
-                label=db.name,
-                parent_id=None,
-                metadata={
-                    "precision": db.precision,
-                    "keep": db.keep,
-                    "vgroups": db.vgroups,
-                    "ntables": db.ntables,
-                    "replica": db.replica,
-                    "is_tenant": db.is_tenant,
-                },
-            ))
-            if depth >= 1:
-                stables = await self.list_stables(db.name)
-                all_stables.extend(stables)
-                for st in stables:
-                    nodes.append(TopologyNode(
-                        node_id=f"stable:{db.name}.{st.name}",
-                        kind="stable",
-                        label=st.name,
-                        parent_id=f"db:{db.name}",
-                        metadata={
-                            "column_count": len(st.columns),
-                            "tag_count": len(st.tags),
-                            "subtable_count": st.subtable_count,
-                        },
-                    ))
-                    if depth >= 2:
-                        subs, _nc = await self.list_subtables(
-                            db.name, st.name, cursor=cursor, limit=50
-                        )
-                        all_subtables.extend(subs)
-                        for sub in subs:
-                            display_label = label_map.get(sub.name, sub.name)
-                            nodes.append(TopologyNode(
-                                node_id=f"subtable:{db.name}.{sub.name}",
-                                kind="subtable",
-                                label=display_label,
-                                parent_id=f"stable:{db.name}.{st.name}",
-                                metadata={
-                                    "tags": sub.tags,
-                                    "physical_name": sub.name,
-                                    "display_name": display_label,
-                                },
-                            ))
-
-        drift = await self._compute_drift(tenant_id, all_stables, all_subtables)
-
-        return TopologySnapshot(
-            databases=dbs,
-            stables=all_stables,
-            subtables=all_subtables,
-            nodes=nodes,
-            drift=drift,
-            observed_at=observed_at,
-        )
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
+        return label_map
 
     async def _td_query(self, sql: str) -> list[Any]:
         """Execute a read SQL against TDengine and return rows."""

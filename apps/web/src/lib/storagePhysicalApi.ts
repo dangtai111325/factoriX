@@ -191,6 +191,24 @@ export interface PaginatedList<T> {
   observed_at?: string;
 }
 
+export interface StorageCatalogRow {
+  id: string;
+  physical_name: string;
+  display_name: string;
+  object_type: TDObjectType;
+  parent_name?: string;
+  column_count?: number;
+  tag_count?: number;
+  subtable_count?: number;
+  binding_count?: number;
+  last_verified_at: string;
+  status: StorageObjectStatus;
+}
+
+export function getTDStorageCatalog(params: URLSearchParams, signal: AbortSignal): Promise<PaginatedList<StorageCatalogRow>> {
+  return api(`/api/v1/storage/td/catalog?${params}`, { signal });
+}
+
 // ============================================================================
 // Storage operations / journal
 // ============================================================================
@@ -390,13 +408,15 @@ export async function getTDTopology(params?: {
   depth?: number;
   cursor?: string;
   show_bindings?: boolean;
-}): Promise<TopologyResponse> {
+  include_subtable_tags?: boolean;
+}, signal?: AbortSignal): Promise<TopologyResponse> {
   const qs = new URLSearchParams();
   if (params?.database) qs.set('database', params.database);
   if (params?.depth != null) qs.set('depth', String(params.depth));
   if (params?.cursor) qs.set('cursor', params.cursor);
   if (params?.show_bindings) qs.set('show_bindings', '1');
-  return api(`/api/v1/storage/td/topology${qs.size ? '?' + qs : ''}`);
+  if (params?.include_subtable_tags != null) qs.set('include_subtable_tags', String(params.include_subtable_tags));
+  return api(`/api/v1/storage/td/topology${qs.size ? '?' + qs : ''}`, { signal });
 }
 
 // --- Databases ---
@@ -676,7 +696,7 @@ export async function listExportJobs(): Promise<ExportJob[]> {
 
 // --- KPI stats ---
 
-export async function getStorageStats(): Promise<{
+export async function getStorageStats(signal?: AbortSignal): Promise<{
   database_count: number;
   stable_count: number;
   subtable_count: number;
@@ -685,5 +705,5 @@ export async function getStorageStats(): Promise<{
   recording_error: number;
   observed_at: string;
 }> {
-  return api('/api/v1/storage/td/stats');
+  return api('/api/v1/storage/td/stats', { signal });
 }

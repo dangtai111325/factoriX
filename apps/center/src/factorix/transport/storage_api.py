@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response
@@ -794,14 +794,40 @@ def build_router(
         depth: int = 2,
         cursor: str | None = None,
         show_bindings: bool = False,
+        include_subtable_tags: bool = True,
         principal: dict[str, Any] = Depends(admin_dep),
         session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
         tenant_id, _actor = ids(principal)
         snap = await topology_inspector.get_topology(
-            tenant_id, database=database, depth=depth, cursor=cursor, session=session
+            tenant_id,
+            database=database,
+            depth=depth,
+            cursor=cursor,
+            session=session,
+            include_subtable_tags=include_subtable_tags,
         )
         return ST.topology_snapshot_to_dict(snap)
+
+    @router.get("/api/v1/storage/td/catalog", tags=["storage"])
+    async def get_td_catalog(
+        object_type: Literal["database", "stable", "subtable"] | None = None,
+        status: Literal["ACTIVE", "DRAFT", "OUT_OF_SYNC", "ERROR"] | None = None,
+        search: str = Query("", max_length=200),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(15, ge=1, le=100),
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        tenant_id, _actor = ids(principal)
+        rows, total = await topology_inspector.list_catalog(
+            tenant_id, session, object_type=object_type, status=status, search=search, page=page, page_size=page_size,
+        )
+        observed_at = iso_ms(utcnow())
+        return {
+            "items": [{**row, "last_verified_at": observed_at} for row in rows],
+            "total": total,
+        }
 
     @router.get("/api/v1/storage/td/stats", tags=["storage"])
     async def get_td_stats(
@@ -812,7 +838,7 @@ def build_router(
         dbs = await topology_inspector.list_databases(tenant_id)
         db_count = len(dbs)
         total_stables = sum(d.stable_count for d in dbs)
-        total_subtables = sum(d.ntables for d in dbs)
+        total_subtables = sum(d.subtable_count for d in dbs)
 
         rows = await fetch_all(
             session,
@@ -828,13 +854,6 @@ def build_router(
         active_cnt = status_map.get("ACTIVE", 0)
         paused_cnt = status_map.get("PAUSED", 0)
         error_cnt = status_map.get("ERROR", 0)
-
-        if not status_map:
-            active_cnt = total_subtables
-            paused_cnt = 0
-            error_cnt = 0
-        else:
-            total_subtables = max(total_subtables, sum(status_map.values()))
 
         return {
             "database_count": db_count,

@@ -192,6 +192,70 @@ def test_sensitive_table_blocking():
 # 4. Storage Topology Serialization Tests
 # ============================================================================
 
+@pytest.mark.asyncio
+async def test_topology_counts_physical_children_from_tdengine_catalog():
+    tenant = UUID("9ed2d4e8-1f0c-46f9-a9e0-d25a18492265")
+    database = f"fx_t_{tenant.hex}"
+
+    async def catalog_query(sql):
+        if "ins_databases" in sql:
+            return [{"name": database, "ntables": 40, "precision": "us", "cachemodel": "last_row"}]
+        if "ins_stables" in sql:
+            assert "ntables" not in sql
+            if "COUNT(*)" in sql:
+                return [{"stable_count": 2}]
+            return [{"stable_name": "model_snapshots"}, {"stable_name": "op_bool"}]
+        if "ins_tables" in sql:
+            assert "type = 'CHILD_TABLE'" in sql
+            return [{"stable_name": "model_snapshots", "subtable_count": 36}]
+        assert sql.startswith("DESCRIBE ")
+        return []
+
+    td_client = MagicMock(query_rows=AsyncMock(side_effect=catalog_query))
+    inspector = ST.StorageTopologyInspector(td_client)
+
+    (db,) = await inspector.list_databases(tenant)
+    assert (db.stable_count, db.subtable_count, db.ntables) == (2, 36, 40)
+    assert (db.precision, db.cache_model) == ("us", "last_row")
+    assert {stable.name: stable.subtable_count for stable in await inspector.list_stables(database)} == {
+        "model_snapshots": 36,
+        "op_bool": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_storage_catalog_filters_beyond_topology_limit():
+    tenant = UUID("00000000-0000-0000-0000-000000000001")
+    database = f"fx_t_{tenant.hex}"
+    names = [f"subtable_{number:03}" for number in range(73)]
+    td_client = MagicMock(query_rows=AsyncMock(return_value=[
+        {"table_name": name, "stable_name": "measurements"} for name in names
+    ]))
+    inspector = ST.StorageTopologyInspector(td_client)
+    db = ST.DatabaseInfo(database, "ms", 1, None, "30d", 1, 73, None, True)
+    registry = [{"object_type": "subtable", "physical_db": database, "physical_name": names[-1], "status": "OUT_OF_SYNC"}]
+
+    with (
+        patch.object(inspector, "list_databases", AsyncMock(return_value=[db])),
+        patch.object(inspector, "_load_storage_labels", AsyncMock(return_value={names[-1]: "Machine 73"})),
+        patch("factorix.modules.common.fetch_all", AsyncMock(return_value=registry)),
+    ):
+        pages, total = await inspector.list_catalog(
+            tenant, object(), object_type="subtable", status=None, search="", page=5, page_size=15,
+        )
+        match, filtered_total = await inspector.list_catalog(
+            tenant, object(), object_type="subtable", status="OUT_OF_SYNC", search="machine 73", page=1, page_size=15,
+        )
+
+    assert total == 73
+    assert [row["physical_name"] for row in pages] == names[60:]
+    assert filtered_total == 1
+    assert match[0]["display_name"] == "Machine 73"
+    assert match[0]["parent_name"] == "measurements"
+    for call in td_client.query_rows.await_args_list:
+        assert "FROM information_schema.ins_tables" in call.args[0]
+
+
 def test_topology_serialization():
     now = datetime.now(timezone.utc)
     snap = ST.TopologySnapshot(

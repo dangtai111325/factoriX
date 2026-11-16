@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Database,
@@ -20,71 +20,73 @@ import {
   CheckCircle2,
   AlertCircle,
 } from 'lucide-react';
-import { TDDatabase, TDStable, TDSubtable, StorageObjectStatus } from '../../lib/storagePhysicalApi';
+import { getTDStorageCatalog, StorageCatalogRow, StorageObjectStatus } from '../../lib/storagePhysicalApi';
+import { RemoteErrorState, RemoteLoadingState } from '../../components/common/RemoteResourceState';
 
-export interface StorageObjectRow {
-  id: string;
-  physical_name: string;
-  display_name?: string | null;
-  object_type: 'database' | 'stable' | 'subtable';
-  parent_name?: string | null;
-  parent_id?: string | null;
-  column_count?: number;
-  tag_count?: number;
-  subtable_count?: number;
-  binding_count?: number;
-  last_verified_at?: string | null;
-  status: StorageObjectStatus;
-  write_active?: boolean;
-}
+const PAGE_SIZE = 15;
 
 interface StorageObjectsTableProps {
-  objects: StorageObjectRow[];
   selectedObjectId?: string | null;
   onSelectObject: (objectId: string) => void;
   onRefresh: () => void;
-  loading?: boolean;
+  refreshVersion: number;
+  onLoadingChange: (loading: boolean) => void;
 }
 
 export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
-  objects,
   selectedObjectId,
   onSelectObject,
   onRefresh,
-  loading = false,
+  refreshVersion,
+  onLoadingChange,
 }) => {
   const navigate = useNavigate();
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [page, setPage] = useState(1);
-  const pageSize = 15;
+  const [items, setItems] = useState<StorageCatalogRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<unknown>(null);
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
 
-  // Filter
-  const filtered = useMemo(() => {
-    return objects.filter((obj) => {
-      if (typeFilter !== 'all' && obj.object_type !== typeFilter) return false;
-      if (statusFilter !== 'all' && obj.status !== statusFilter) return false;
-      if (search) {
-        const q = search.toLowerCase();
-        return (
-          obj.physical_name.toLowerCase().includes(q) ||
-          (obj.display_name && obj.display_name.toLowerCase().includes(q)) ||
-          (obj.parent_name && obj.parent_name.toLowerCase().includes(q))
-        );
-      }
-      return true;
-    });
-  }, [objects, typeFilter, statusFilter, search]);
+  useEffect(() => {
+    const controller = new AbortController();
+    const params = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE), search });
+    if (typeFilter !== 'all') params.set('object_type', typeFilter);
+    if (statusFilter !== 'all') params.set('status', statusFilter);
+    setLoading(true);
+    setError(null);
+    onLoadingChange(true);
+    const timer = window.setTimeout(() => {
+      getTDStorageCatalog(params, controller.signal)
+        .then((result) => {
+          if (controller.signal.aborted) return;
+          const lastPage = Math.max(1, Math.ceil(result.total / PAGE_SIZE));
+          if (page > lastPage) setPage(lastPage);
+          setItems(result.items);
+          setTotal(result.total);
+        })
+        .catch((err) => {
+          if (!controller.signal.aborted) setError(err);
+        })
+        .finally(() => {
+          if (controller.signal.aborted) return;
+          setLoading(false);
+          onLoadingChange(false);
+        });
+    }, 180);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+      onLoadingChange(false);
+    };
+  }, [search, typeFilter, statusFilter, page, refreshVersion, onLoadingChange]);
 
-  const totalPages = Math.ceil(filtered.length / pageSize) || 1;
-  const pagedItems = useMemo(() => {
-    const start = (page - 1) * pageSize;
-    return filtered.slice(start, start + pageSize);
-  }, [filtered, page]);
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
-  const getStatusBadge = (status: StorageObjectStatus, writeActive?: boolean) => {
+  const getStatusBadge = (status: StorageObjectStatus) => {
     switch (status) {
       case 'ACTIVE':
         return (
@@ -146,6 +148,7 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
             <input
               type="text"
               placeholder="Search table objects..."
+              maxLength={200}
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value);
@@ -157,6 +160,7 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
 
           {/* Type filter */}
           <select
+            aria-label="Object type"
             value={typeFilter}
             onChange={(e) => {
               setTypeFilter(e.target.value);
@@ -172,6 +176,7 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
 
           {/* Status filter */}
           <select
+            aria-label="Object status"
             value={statusFilter}
             onChange={(e) => {
               setStatusFilter(e.target.value);
@@ -187,9 +192,11 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
           </select>
         </div>
 
-        <div className="text-[12px] text-[#657794]">
-          Showing <span className="font-semibold text-[#111B37]">{filtered.length}</span> objects
-        </div>
+        {!loading && !error && (
+          <div className="text-[12px] text-[#657794]" role="status">
+            <span className="font-semibold text-[#111B37]">{total}</span> matching objects
+          </div>
+        )}
       </div>
 
       {/* Table view */}
@@ -210,14 +217,16 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
             </tr>
           </thead>
           <tbody className="divide-y divide-[#F1F5FA] text-[13px]">
-            {pagedItems.length === 0 ? (
+            {loading || error || items.length === 0 ? (
               <tr>
                 <td colSpan={10} className="py-12 text-center text-[#657794]">
-                  No storage objects matching filter.
+                  {loading ? <RemoteLoadingState subject="storage objects" /> : error ? (
+                    <RemoteErrorState error={error} subject="Storage objects" onRetry={onRefresh} />
+                  ) : 'No storage objects match these filters.'}
                 </td>
               </tr>
             ) : (
-              pagedItems.map((obj) => (
+              items.map((obj) => (
                 <tr
                   key={obj.id}
                   onClick={() => onSelectObject(obj.id)}
@@ -228,10 +237,14 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
                   <td className="py-3 px-4 font-semibold text-[#111B37]">
                     <div className="flex items-center gap-2">
                       {getTypeIcon(obj.object_type)}
-                      <span className="hover:text-[#EF1B24] transition-colors">{obj.physical_name}</span>
+                      <span className="hover:text-[#EF1B24] transition-colors" title={obj.physical_name}>
+                        {obj.display_name || obj.physical_name}
+                      </span>
                     </div>
                   </td>
-                  <td className="py-3 px-3 text-[#657794] capitalize">{obj.object_type}</td>
+                  <td className="py-3 px-3 text-[#657794] capitalize">
+                    {obj.object_type === 'stable' ? 'Supertable' : obj.object_type}
+                  </td>
                   <td className="py-3 px-3 text-[#657794]">{obj.parent_name || '—'}</td>
                   <td className="py-3 px-3 text-right font-medium text-[#111B37]">
                     {obj.column_count != null ? obj.column_count : '—'}
@@ -245,7 +258,7 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
                   <td className="py-3 px-3 text-right font-medium text-[#111B37]">
                     {obj.binding_count != null ? obj.binding_count : '—'}
                   </td>
-                  <td className="py-3 px-3">{getStatusBadge(obj.status, obj.write_active)}</td>
+                  <td className="py-3 px-3">{getStatusBadge(obj.status)}</td>
                   <td className="py-3 px-3 text-[12px] text-[#94A3B8]">
                     {obj.last_verified_at ? new Date(obj.last_verified_at).toLocaleTimeString() : '—'}
                   </td>
@@ -346,7 +359,7 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
       </div>
 
       {/* Pagination */}
-      {totalPages > 1 && (
+      {!loading && !error && totalPages > 1 && (
         <div className="p-3 border-t border-[#E3EAF3] flex items-center justify-between text-[12px] text-[#657794]">
           <span>
             Page {page} of {totalPages}
@@ -354,6 +367,7 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
           <div className="flex items-center gap-1">
             <button
               type="button"
+              aria-label="Previous page"
               disabled={page <= 1}
               onClick={() => setPage((p) => Math.max(1, p - 1))}
               className="p-1 rounded border border-[#E3EAF3] hover:bg-[#F8FAFC] disabled:opacity-40 disabled:cursor-not-allowed"
@@ -362,6 +376,7 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
             </button>
             <button
               type="button"
+              aria-label="Next page"
               disabled={page >= totalPages}
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
               className="p-1 rounded border border-[#E3EAF3] hover:bg-[#F8FAFC] disabled:opacity-40 disabled:cursor-not-allowed"

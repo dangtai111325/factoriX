@@ -84,16 +84,6 @@ export const SubtableIdentityStep: React.FC<SubtableStepProps> = ({
         if (active) {
           setStables(res.items || []);
           setLoadingStables(false);
-          // If no stable is selected yet and items exist, select first
-          if (!data.stable_id && res.items && res.items.length > 0) {
-            const first = res.items[0];
-            onChange({
-              stable_id: first.id,
-              stable_name: first.physical_name,
-              database_name: first.database_name,
-            });
-            onSelectStable?.(first);
-          }
         }
       })
       .catch(() => {

@@ -158,28 +158,34 @@ export const CreateStorageObjectWizard: React.FC = () => {
   // Subtable wizard state
   const subtableDraft = useWizardDraft<SubtableWizardData>('fx_wizard_draft_subtable', INITIAL_SUBTABLE_DATA);
   const [parentStable, setParentStable] = useState<TDStable | null>(null);
+  const stableId = subtableDraft.data.stable_id;
+  const updateSubtableDraft = subtableDraft.updateData;
 
   // When subtable parent STable changes, load its full details
   useEffect(() => {
-    if (kind === 'subtable' && subtableDraft.data.stable_id) {
-      getStable(subtableDraft.data.stable_id)
-        .then((st) => {
-          setParentStable(st);
-          // Initialize tag_values if not set
-          if (st.tags && st.tags.length > 0) {
-            const currentTagNames = new Set(subtableDraft.data.tag_values.map((tv) => tv.tag_name));
-            const newTags = [...subtableDraft.data.tag_values];
-            st.tags.forEach((t) => {
-              if (!currentTagNames.has(t.name)) {
-                newTags.push({ tag_name: t.name, value: '' });
-              }
-            });
-            subtableDraft.updateField('tag_values', newTags);
-          }
-        })
-        .catch(() => {});
+    if (kind !== 'subtable' || !stableId) {
+      setParentStable(null);
+      return;
     }
-  }, [kind, subtableDraft.data.stable_id]);
+
+    let active = true;
+    getStable(stableId)
+      .then((stable) => {
+        if (!active) return;
+        setParentStable(stable);
+        updateSubtableDraft((draft) => {
+          if (draft.stable_id !== stableId) return draft;
+          const previousValues = new Map(draft.tag_values.map((tag) => [tag.tag_name, tag.value]));
+          return {
+            ...draft,
+            tag_values: stable.tags.map((tag) => ({ tag_name: tag.name, value: previousValues.get(tag.name) ?? '' })),
+          };
+        });
+      })
+      .catch(() => {});
+
+    return () => { active = false; };
+  }, [kind, stableId, updateSubtableDraft]);
 
   // Reset step index when kind changes
   useEffect(() => {
