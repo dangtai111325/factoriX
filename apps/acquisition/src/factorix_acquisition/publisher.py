@@ -362,6 +362,7 @@ class ObservationPublisher:
 
             # 3. Replay outage spool if pending rows exist: latest-per-signal lane first, then history.
             if self.spool.pending_count() > 0:
+                self.spool.expire_stale(max_age_hours=2.0)
                 self.spool.purge_old_epochs(self._tenant_epochs)
                 latest_rows = self.spool.latest_pending(BATCH_ROWS)
                 if latest_rows:

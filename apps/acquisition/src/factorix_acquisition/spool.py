@@ -60,7 +60,24 @@ class AcquisitionSpool:
         self.overflow_dropped_count = 0
         self._newest: dict[str, int] = {}
         self._rebuild_counters()
+        self.expire_stale(max_age_hours=2.0)
         self._compact_if_bloated()
+
+    def expire_stale(self, max_age_hours: float = 2.0) -> int:
+        """Mark pending observations older than max_age_hours as DEAD to prevent backlog from starving live data."""
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+        with self._lock:
+            with self.connection:
+                cur = self.connection.execute(
+                    "UPDATE spool SET state = 'DEAD' WHERE state = 'PENDING' AND created_at < ?",
+                    (cutoff,),
+                )
+                expired = max(0, cur.rowcount)
+            if expired:
+                self._rebuild_counters()
+                logger.info("Expired %d stale pending spool rows older than %s", expired, cutoff)
+            return expired
 
     def _rebuild_counters(self) -> None:
         with self._lock:
