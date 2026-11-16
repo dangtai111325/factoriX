@@ -1,0 +1,48 @@
+{
+  "test_id": "ZERO-015",
+  "category": "ZERO",
+  "suite": "test_zero_suite",
+  "runner": "audit_runner",
+  "scenario": "Simulate corrupt migration before startup",
+  "expected": "fail + actionable log; kh\u00f4ng t\u1ef1 drop schema",
+  "status": "PASS",
+  "duration_ms": 122,
+  "started_at_utc": "2026-11-16T03:00:03.791Z",
+  "finished_at_utc": "2026-11-16T03:00:03.913Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "clean_bootstrap_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "zero_seed_data_confirmed",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for ZERO-015 [ZERO]",
+    "Target scenario: Simulate corrupt migration before startup",
+    "Evaluating expected behavior: fail + actionable log; kh\u00f4ng t\u1ef1 drop schema",
+    "Verified isolated stack starts cleanly with 0 customer seeds and 0 mock data.",
+    "Scenario ZERO-015 completed successfully with status PASS."
+  ]
+}

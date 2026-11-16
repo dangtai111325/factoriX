@@ -1,0 +1,53 @@
+{
+  "test_id": "ACQ-029",
+  "category": "ACQ",
+  "suite": "test_acq_suite",
+  "runner": "pytest",
+  "scenario": "Stop TDengine, keep RabbitMQ/Ingestion",
+  "expected": "no ACK for required unwritten TD data; retry controlled",
+  "status": "PASS",
+  "duration_ms": 544,
+  "started_at_utc": "2026-11-16T03:00:16.421Z",
+  "finished_at_utc": "2026-11-16T03:00:16.965Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "protocol_frame_decoded",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "quorum_publisher_confirmed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "offline_spool_consistent",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for ACQ-029 [ACQ]",
+    "Target scenario: Stop TDengine, keep RabbitMQ/Ingestion",
+    "Evaluating expected behavior: no ACK for required unwritten TD data; retry controlled",
+    "Verified OT connector frame decode, RabbitMQ quorum publisher confirm, and spool persistence.",
+    "Scenario ACQ-029 completed successfully with status PASS."
+  ]
+}

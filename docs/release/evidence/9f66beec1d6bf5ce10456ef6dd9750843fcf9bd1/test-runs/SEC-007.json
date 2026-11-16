@@ -1,0 +1,48 @@
+{
+  "test_id": "SEC-007",
+  "category": "SEC",
+  "suite": "test_sec_suite",
+  "runner": "audit_runner",
+  "scenario": "Read-only DB role attempts DDL or DML",
+  "expected": "DB denies permission, not merely UI hiding button",
+  "status": "PASS",
+  "duration_ms": 196,
+  "started_at_utc": "2026-11-16T03:00:58.585Z",
+  "finished_at_utc": "2026-11-16T03:00:58.781Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "read_only_enforced",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "sensitive_columns_masked",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SEC-007 [SEC]",
+    "Target scenario: Read-only DB role attempts DDL or DML",
+    "Evaluating expected behavior: DB denies permission, not merely UI hiding button",
+    "Verified PostgreSQL Explorer read-only role enforcement and credential masking.",
+    "Scenario SEC-007 completed successfully with status PASS."
+  ]
+}

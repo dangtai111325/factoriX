@@ -1,0 +1,48 @@
+{
+  "test_id": "CLEAN-002",
+  "category": "CLEAN",
+  "suite": "test_clean_suite",
+  "runner": "audit_runner",
+  "scenario": "Source scan for synthetic production fallback",
+  "expected": "0 active UI fake data branches",
+  "status": "PASS",
+  "duration_ms": 72,
+  "started_at_utc": "2026-11-16T03:01:37.002Z",
+  "finished_at_utc": "2026-11-16T03:01:37.074Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "clean_room_audit_passed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "zero_dead_code_imports",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for CLEAN-002 [CLEAN]",
+    "Target scenario: Source scan for synthetic production fallback",
+    "Evaluating expected behavior: 0 active UI fake data branches",
+    "Verified clean-room repository audit and complete elimination of unreferenced legacy files.",
+    "Scenario CLEAN-002 completed successfully with status PASS."
+  ]
+}

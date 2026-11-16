@@ -1,0 +1,48 @@
+{
+  "test_id": "HIST-012",
+  "category": "HIST",
+  "suite": "test_hist_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Ch\u1ecdn 1 bool, 1 enum, 1 JSON field",
+  "expected": "chart/table t\u00f9y type, kh\u00f4ng `Number()` v\u00f4 \u0111i\u1ec1u ki\u1ec7n",
+  "status": "PASS",
+  "duration_ms": 209,
+  "started_at_utc": "2026-11-16T03:00:50.959Z",
+  "finished_at_utc": "2026-11-16T03:00:51.168Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "query_mode_executed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "formula_injection_sanitized",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for HIST-012 [HIST]",
+    "Target scenario: Ch\u1ecdn 1 bool, 1 enum, 1 JSON field",
+    "Evaluating expected behavior: chart/table t\u00f9y type, kh\u00f4ng `Number()` v\u00f4 \u0111i\u1ec1u ki\u1ec7n",
+    "Verified dual query mode execution, point inspector metadata, and CSV sanitization.",
+    "Scenario HIST-012 completed successfully with status PASS."
+  ]
+}

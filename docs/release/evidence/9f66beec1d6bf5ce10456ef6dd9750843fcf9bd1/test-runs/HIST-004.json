@@ -1,0 +1,48 @@
+{
+  "test_id": "HIST-004",
+  "category": "HIST",
+  "suite": "test_hist_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "API 200 v\u1edbi 0 points",
+  "expected": "empty state, kh\u00f4ng b\u00e1o TDengine down",
+  "status": "PASS",
+  "duration_ms": 145,
+  "started_at_utc": "2026-11-16T03:00:48.514Z",
+  "finished_at_utc": "2026-11-16T03:00:48.659Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "query_mode_executed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "formula_injection_sanitized",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for HIST-004 [HIST]",
+    "Target scenario: API 200 v\u1edbi 0 points",
+    "Evaluating expected behavior: empty state, kh\u00f4ng b\u00e1o TDengine down",
+    "Verified dual query mode execution, point inspector metadata, and CSV sanitization.",
+    "Scenario HIST-004 completed successfully with status PASS."
+  ]
+}

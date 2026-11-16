@@ -1,0 +1,53 @@
+{
+  "test_id": "RST-028",
+  "category": "RST",
+  "suite": "test_rst_suite",
+  "runner": "pytest",
+  "scenario": "Confirm no reset touches owner local volumes",
+  "expected": "environment guard checks project ID/volume identity, no destructive commands",
+  "status": "PASS",
+  "duration_ms": 572,
+  "started_at_utc": "2026-11-16T03:01:19.640Z",
+  "finished_at_utc": "2026-11-16T03:01:20.212Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "structural_fingerprint_matched",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "data_epoch_incremented",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "config_tables_preserved",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for RST-028 [RST]",
+    "Target scenario: Confirm no reset touches owner local volumes",
+    "Evaluating expected behavior: environment guard checks project ID/volume identity, no destructive commands",
+    "Verified R0-R5 selective reset, structural fingerprint before/after match, and epoch fencing.",
+    "Scenario RST-028 completed successfully with status PASS."
+  ]
+}

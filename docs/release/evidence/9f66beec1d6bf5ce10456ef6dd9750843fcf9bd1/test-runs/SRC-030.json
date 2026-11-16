@@ -1,0 +1,48 @@
+{
+  "test_id": "SRC-030",
+  "category": "SRC",
+  "suite": "test_src_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Epoch reset with buffered row assembly state",
+  "expected": "old aggregates fenced, no cross-epoch row assembled",
+  "status": "PASS",
+  "duration_ms": 240,
+  "started_at_utc": "2026-11-16T03:00:46.615Z",
+  "finished_at_utc": "2026-11-16T03:00:46.855Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "canonical_uid_resolved",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "row_assembly_policy_enforced",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SRC-030 [SRC]",
+    "Target scenario: Epoch reset with buffered row assembly state",
+    "Evaluating expected behavior: old aggregates fenced, no cross-epoch row assembled",
+    "Verified 3-perspective source binding resolution and carry-forward row assembly.",
+    "Scenario SRC-030 completed successfully with status PASS."
+  ]
+}

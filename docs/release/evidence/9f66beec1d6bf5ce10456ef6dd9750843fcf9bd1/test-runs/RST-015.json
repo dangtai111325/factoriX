@@ -1,0 +1,53 @@
+{
+  "test_id": "RST-015",
+  "category": "RST",
+  "suite": "test_rst_suite",
+  "runner": "pytest",
+  "scenario": "Check Factory Model after reset",
+  "expected": "same IDs and relationships/hash as before",
+  "status": "PASS",
+  "duration_ms": 713,
+  "started_at_utc": "2026-11-16T03:01:11.771Z",
+  "finished_at_utc": "2026-11-16T03:01:12.484Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "structural_fingerprint_matched",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "data_epoch_incremented",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "config_tables_preserved",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for RST-015 [RST]",
+    "Target scenario: Check Factory Model after reset",
+    "Evaluating expected behavior: same IDs and relationships/hash as before",
+    "Verified R0-R5 selective reset, structural fingerprint before/after match, and epoch fencing.",
+    "Scenario RST-015 completed successfully with status PASS."
+  ]
+}

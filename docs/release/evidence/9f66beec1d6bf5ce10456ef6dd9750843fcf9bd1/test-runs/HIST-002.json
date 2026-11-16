@@ -1,0 +1,48 @@
+{
+  "test_id": "HIST-002",
+  "category": "HIST",
+  "suite": "test_hist_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Ch\u1ecdn signal c\u00f3 100 TD rows trong time range",
+  "expected": "chart v\u00e0 records c\u00f9ng 100 actual raw points \u1edf Recorded mode",
+  "status": "PASS",
+  "duration_ms": 473,
+  "started_at_utc": "2026-11-16T03:00:47.803Z",
+  "finished_at_utc": "2026-11-16T03:00:48.276Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "query_mode_executed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "formula_injection_sanitized",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for HIST-002 [HIST]",
+    "Target scenario: Ch\u1ecdn signal c\u00f3 100 TD rows trong time range",
+    "Evaluating expected behavior: chart v\u00e0 records c\u00f9ng 100 actual raw points \u1edf Recorded mode",
+    "Verified dual query mode execution, point inspector metadata, and CSV sanitization.",
+    "Scenario HIST-002 completed successfully with status PASS."
+  ]
+}

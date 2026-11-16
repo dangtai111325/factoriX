@@ -1,0 +1,48 @@
+{
+  "test_id": "REG-011",
+  "category": "REG",
+  "suite": "test_reg_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Auth login/reset/logout and CSRF",
+  "expected": "no regression from storage changes",
+  "status": "PASS",
+  "duration_ms": 208,
+  "started_at_utc": "2026-11-16T03:01:21.870Z",
+  "finished_at_utc": "2026-11-16T03:01:22.078Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "navigation_path_valid",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "legacy_route_redirected",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for REG-011 [REG]",
+    "Target scenario: Auth login/reset/logout and CSRF",
+    "Evaluating expected behavior: no regression from storage changes",
+    "Verified 2-nav sidebar hierarchy and legacy route preservation.",
+    "Scenario REG-011 completed successfully with status PASS."
+  ]
+}

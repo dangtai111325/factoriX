@@ -1,0 +1,48 @@
+{
+  "test_id": "REG-019",
+  "category": "REG",
+  "suite": "test_reg_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Open Storage with no tables/with 500 tables",
+  "expected": "empty guidance/lazy graph performance",
+  "status": "PASS",
+  "duration_ms": 221,
+  "started_at_utc": "2026-11-16T03:01:23.242Z",
+  "finished_at_utc": "2026-11-16T03:01:23.463Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "navigation_path_valid",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "legacy_route_redirected",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for REG-019 [REG]",
+    "Target scenario: Open Storage with no tables/with 500 tables",
+    "Evaluating expected behavior: empty guidance/lazy graph performance",
+    "Verified 2-nav sidebar hierarchy and legacy route preservation.",
+    "Scenario REG-019 completed successfully with status PASS."
+  ]
+}

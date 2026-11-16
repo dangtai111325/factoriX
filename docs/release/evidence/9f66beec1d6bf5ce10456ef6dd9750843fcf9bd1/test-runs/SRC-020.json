@@ -1,0 +1,48 @@
+{
+  "test_id": "SRC-020",
+  "category": "SRC",
+  "suite": "test_src_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "`EXACT_TIMESTAMP` with time precision us",
+  "expected": "only exact-match events merged as permitted",
+  "status": "PASS",
+  "duration_ms": 131,
+  "started_at_utc": "2026-11-16T03:00:43.686Z",
+  "finished_at_utc": "2026-11-16T03:00:43.817Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "canonical_uid_resolved",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "row_assembly_policy_enforced",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SRC-020 [SRC]",
+    "Target scenario: `EXACT_TIMESTAMP` with time precision us",
+    "Evaluating expected behavior: only exact-match events merged as permitted",
+    "Verified 3-perspective source binding resolution and carry-forward row assembly.",
+    "Scenario SRC-020 completed successfully with status PASS."
+  ]
+}

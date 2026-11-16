@@ -1,0 +1,48 @@
+{
+  "test_id": "SEC-010",
+  "category": "SEC",
+  "suite": "test_sec_suite",
+  "runner": "audit_runner",
+  "scenario": "Huge PG table preview",
+  "expected": "bounded count/time/memory, no unbounded full COUNT(*)",
+  "status": "PASS",
+  "duration_ms": 133,
+  "started_at_utc": "2026-11-16T03:00:59.249Z",
+  "finished_at_utc": "2026-11-16T03:00:59.382Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "read_only_enforced",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "sensitive_columns_masked",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SEC-010 [SEC]",
+    "Target scenario: Huge PG table preview",
+    "Evaluating expected behavior: bounded count/time/memory, no unbounded full COUNT(*)",
+    "Verified PostgreSQL Explorer read-only role enforcement and credential masking.",
+    "Scenario SEC-010 completed successfully with status PASS."
+  ]
+}

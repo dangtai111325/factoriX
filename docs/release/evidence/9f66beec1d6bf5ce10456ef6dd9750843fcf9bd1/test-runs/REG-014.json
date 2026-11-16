@@ -1,0 +1,48 @@
+{
+  "test_id": "REG-014",
+  "category": "REG",
+  "suite": "test_reg_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Browser back/forward wizard, unsaved changes",
+  "expected": "no silent discard or physical mutation",
+  "status": "PASS",
+  "duration_ms": 97,
+  "started_at_utc": "2026-11-16T03:01:22.569Z",
+  "finished_at_utc": "2026-11-16T03:01:22.666Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "navigation_path_valid",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "legacy_route_redirected",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for REG-014 [REG]",
+    "Target scenario: Browser back/forward wizard, unsaved changes",
+    "Evaluating expected behavior: no silent discard or physical mutation",
+    "Verified 2-nav sidebar hierarchy and legacy route preservation.",
+    "Scenario REG-014 completed successfully with status PASS."
+  ]
+}

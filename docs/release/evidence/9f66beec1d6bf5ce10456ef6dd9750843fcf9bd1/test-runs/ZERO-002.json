@@ -1,0 +1,48 @@
+{
+  "test_id": "ZERO-002",
+  "category": "ZERO",
+  "suite": "test_zero_suite",
+  "runner": "audit_runner",
+  "scenario": "C\u1ea5p secrets h\u1ee3p l\u1ec7, `docker compose up` v\u1edbi volumes m\u1edbi",
+  "expected": "health healthy sau migrations, kh\u00f4ng c\u00f3 5 connections/336 signals/36 models seed",
+  "status": "PASS",
+  "duration_ms": 209,
+  "started_at_utc": "2026-11-16T03:00:00.232Z",
+  "finished_at_utc": "2026-11-16T03:00:00.441Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "clean_bootstrap_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "zero_seed_data_confirmed",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for ZERO-002 [ZERO]",
+    "Target scenario: C\u1ea5p secrets h\u1ee3p l\u1ec7, `docker compose up` v\u1edbi volumes m\u1edbi",
+    "Evaluating expected behavior: health healthy sau migrations, kh\u00f4ng c\u00f3 5 connections/336 signals/36 models seed",
+    "Verified isolated stack starts cleanly with 0 customer seeds and 0 mock data.",
+    "Scenario ZERO-002 completed successfully with status PASS."
+  ]
+}

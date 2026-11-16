@@ -1,0 +1,48 @@
+{
+  "test_id": "SRC-027",
+  "category": "SRC",
+  "suite": "test_src_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Configure absolute/percent deadband boundary",
+  "expected": "exact threshold behavior, negative/zero values handled",
+  "status": "PASS",
+  "duration_ms": 190,
+  "started_at_utc": "2026-11-16T03:00:45.847Z",
+  "finished_at_utc": "2026-11-16T03:00:46.037Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "canonical_uid_resolved",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "row_assembly_policy_enforced",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SRC-027 [SRC]",
+    "Target scenario: Configure absolute/percent deadband boundary",
+    "Evaluating expected behavior: exact threshold behavior, negative/zero values handled",
+    "Verified 3-perspective source binding resolution and carry-forward row assembly.",
+    "Scenario SRC-027 completed successfully with status PASS."
+  ]
+}

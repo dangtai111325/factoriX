@@ -1,0 +1,48 @@
+{
+  "test_id": "HIST-011",
+  "category": "HIST",
+  "suite": "test_hist_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Ch\u1ecdn 1/5/50 numeric signals",
+  "expected": "batching/cancellation, correct color/legend, no duplicates",
+  "status": "PASS",
+  "duration_ms": 267,
+  "started_at_utc": "2026-11-16T03:00:50.676Z",
+  "finished_at_utc": "2026-11-16T03:00:50.943Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "query_mode_executed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "formula_injection_sanitized",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for HIST-011 [HIST]",
+    "Target scenario: Ch\u1ecdn 1/5/50 numeric signals",
+    "Evaluating expected behavior: batching/cancellation, correct color/legend, no duplicates",
+    "Verified dual query mode execution, point inspector metadata, and CSV sanitization.",
+    "Scenario HIST-011 completed successfully with status PASS."
+  ]
+}

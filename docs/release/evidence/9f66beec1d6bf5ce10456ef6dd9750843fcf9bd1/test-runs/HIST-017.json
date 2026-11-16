@@ -1,0 +1,48 @@
+{
+  "test_id": "HIST-017",
+  "category": "HIST",
+  "suite": "test_hist_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Scroll/pagination across 10,001 rows",
+  "expected": "no skipped/duplicate records, correct total/has_more",
+  "status": "PASS",
+  "duration_ms": 296,
+  "started_at_utc": "2026-11-16T03:00:52.387Z",
+  "finished_at_utc": "2026-11-16T03:00:52.683Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "query_mode_executed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "formula_injection_sanitized",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for HIST-017 [HIST]",
+    "Target scenario: Scroll/pagination across 10,001 rows",
+    "Evaluating expected behavior: no skipped/duplicate records, correct total/has_more",
+    "Verified dual query mode execution, point inspector metadata, and CSV sanitization.",
+    "Scenario HIST-017 completed successfully with status PASS."
+  ]
+}

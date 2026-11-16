@@ -1,0 +1,48 @@
+{
+  "test_id": "PERF-011",
+  "category": "PERF",
+  "suite": "test_perf_suite",
+  "runner": "perf_benchmarker",
+  "scenario": "Compare before/after CPU with matched hardware and workload",
+  "expected": "actual evidence, no unsupported improvement claim",
+  "status": "PASS",
+  "duration_ms": 1213,
+  "started_at_utc": "2026-11-16T03:01:34.288Z",
+  "finished_at_utc": "2026-11-16T03:01:35.501Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "consumer_lag_bounded",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "memory_leak_free",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for PERF-011 [PERF]",
+    "Target scenario: Compare before/after CPU with matched hardware and workload",
+    "Evaluating expected behavior: actual evidence, no unsupported improvement claim",
+    "Verified system performance metrics under sustained workload.",
+    "Scenario PERF-011 completed successfully with status PASS."
+  ]
+}

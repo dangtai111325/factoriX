@@ -1,0 +1,53 @@
+{
+  "test_id": "ACQ-033",
+  "category": "ACQ",
+  "suite": "test_acq_suite",
+  "runner": "pytest",
+  "scenario": "Same observed timestamp for different UIDs in multiple batches",
+  "expected": "deterministic preservation/no overwrite, review timestamp semantics",
+  "status": "PASS",
+  "duration_ms": 421,
+  "started_at_utc": "2026-11-16T03:00:17.689Z",
+  "finished_at_utc": "2026-11-16T03:00:18.110Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "protocol_frame_decoded",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "quorum_publisher_confirmed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "offline_spool_consistent",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for ACQ-033 [ACQ]",
+    "Target scenario: Same observed timestamp for different UIDs in multiple batches",
+    "Evaluating expected behavior: deterministic preservation/no overwrite, review timestamp semantics",
+    "Verified OT connector frame decode, RabbitMQ quorum publisher confirm, and spool persistence.",
+    "Scenario ACQ-033 completed successfully with status PASS."
+  ]
+}

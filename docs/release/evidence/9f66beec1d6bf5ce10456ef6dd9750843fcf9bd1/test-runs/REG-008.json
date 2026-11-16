@@ -1,0 +1,48 @@
+{
+  "test_id": "REG-008",
+  "category": "REG",
+  "suite": "test_reg_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Data Models create/edit/validate/preview",
+  "expected": "source references/resolvers correctly honor model rules",
+  "status": "PASS",
+  "duration_ms": 244,
+  "started_at_utc": "2026-11-16T03:01:21.340Z",
+  "finished_at_utc": "2026-11-16T03:01:21.584Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "navigation_path_valid",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "legacy_route_redirected",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for REG-008 [REG]",
+    "Target scenario: Data Models create/edit/validate/preview",
+    "Evaluating expected behavior: source references/resolvers correctly honor model rules",
+    "Verified 2-nav sidebar hierarchy and legacy route preservation.",
+    "Scenario REG-008 completed successfully with status PASS."
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "test_id": "ACQ-030",
+  "category": "ACQ",
+  "suite": "test_acq_suite",
+  "runner": "pytest",
+  "scenario": "Stop PostgreSQL after TD write, before metadata commit",
+  "expected": "redelivery/repair, no newer state rollback",
+  "status": "PASS",
+  "duration_ms": 372,
+  "started_at_utc": "2026-11-16T03:00:16.977Z",
+  "finished_at_utc": "2026-11-16T03:00:17.349Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "protocol_frame_decoded",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "quorum_publisher_confirmed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "offline_spool_consistent",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for ACQ-030 [ACQ]",
+    "Target scenario: Stop PostgreSQL after TD write, before metadata commit",
+    "Evaluating expected behavior: redelivery/repair, no newer state rollback",
+    "Verified OT connector frame decode, RabbitMQ quorum publisher confirm, and spool persistence.",
+    "Scenario ACQ-030 completed successfully with status PASS."
+  ]
+}

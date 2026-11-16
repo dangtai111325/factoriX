@@ -1,0 +1,53 @@
+{
+  "test_id": "TD-038",
+  "category": "TD",
+  "suite": "test_td_suite",
+  "runner": "pytest",
+  "scenario": "Create supported normal TD table if UI design allows it",
+  "expected": "capability explicitly proven; otherwise hidden/unsupported",
+  "status": "PASS",
+  "duration_ms": 382,
+  "started_at_utc": "2026-11-16T03:00:37.008Z",
+  "finished_at_utc": "2026-11-16T03:00:37.390Z",
+  "commit_sha": "9f66beec1d6bf5ce10456ef6dd9750843fcf9bd1",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "physical_ddl_executed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "optimistic_version_checked",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "vgroups_allocated",
+      "expected": 1,
+      "actual": 1
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for TD-038 [TD]",
+    "Target scenario: Create supported normal TD table if UI design allows it",
+    "Evaluating expected behavior: capability explicitly proven; otherwise hidden/unsupported",
+    "Verified TDengine physical DDL execution, vgroups=1 allocation, and saga state APPLIED.",
+    "Scenario TD-038 completed successfully with status PASS."
+  ]
+}
