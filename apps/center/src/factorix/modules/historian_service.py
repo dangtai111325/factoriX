@@ -379,10 +379,22 @@ async def query_historian(
 ) -> dict[str, Any]:
     """Execute multi-series Historian query supporting operational, recorded, and reconstructed modes."""
     payload_dict = dict(payload)
-    raw_sig_ids = payload_dict.get("signal_ids") or payload_dict.get("signals") or []
+    raw_sig_ids = (
+        payload_dict.get("signal_ids")
+        or payload_dict.get("signals")
+        or ([payload_dict["signal_id"]] if payload_dict.get("signal_id") else None)
+        or ([payload_dict["source_id"]] if payload_dict.get("source_id") else None)
+        or []
+    )
     if isinstance(raw_sig_ids, str):
         raw_sig_ids = [s.strip() for s in raw_sig_ids.split(",") if s.strip()]
-    signal_ids = [_safe_uuid(s) for s in raw_sig_ids if _safe_uuid(s) is not None]
+    cleaned_sigs: list[str] = []
+    for s in raw_sig_ids:
+        s_str = str(s).strip()
+        if s_str.startswith("sig:"):
+            s_str = s_str[4:]
+        cleaned_sigs.append(s_str)
+    signal_ids = [_safe_uuid(s) for s in cleaned_sigs if _safe_uuid(s) is not None]
 
     design_id = _safe_uuid(payload_dict.get("design_id"))
     dataset_id = _safe_uuid(payload_dict.get("dataset_id"))
@@ -393,9 +405,11 @@ async def query_historian(
         mode = "operational"
 
     time_axis = str(payload_dict.get("time_axis") or "acquired_at").lower()
+    start_val = payload_dict.get("start") or payload_dict.get("from_ts") or payload_dict.get("from")
+    end_val = payload_dict.get("end") or payload_dict.get("to_ts") or payload_dict.get("to")
     start_dt, end_dt = _parse_time_bounds(
-        payload_dict.get("start"),
-        payload_dict.get("end"),
+        start_val,
+        end_val,
         payload_dict.get("range"),
     )
 
@@ -644,6 +658,7 @@ async def query_historian(
         "series": series_map,
         "series_list": series_results,
         "points": all_points,
+        "rows": all_points,
         "items": all_points,  # For backward-compatible flat client consumers
         "stats": flat_stats,
         "quality_segments": flat_segments,

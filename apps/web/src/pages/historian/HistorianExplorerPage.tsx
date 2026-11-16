@@ -17,6 +17,8 @@ import {
   ExternalLink,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
+  Check,
   Info,
   Shield,
   Layers,
@@ -78,9 +80,25 @@ export const HistorianExplorerPage: React.FC = () => {
   const [pickerView, setPickerView] = useState<SourceView | 'tables'>('hierarchy');
   const [searchQuery, setSearchQuery] = useState('');
   const [sourcesList, setSourcesList] = useState<SourceRef[]>([]);
+  const [groupsList, setGroupsList] = useState<
+    { id: string; name: string; protocol?: string; signals: SourceRef[]; signals_count: number }[]
+  >([]);
+  const [expandedGroupIds, setExpandedGroupIds] = useState<Set<string>>(new Set());
   const [tablesList, setTablesList] = useState<TDSubtable[]>([]);
   const [loadingSources, setLoadingSources] = useState(false);
   const [sourcesError, setSourcesError] = useState<unknown | null>(null);
+
+  const toggleGroupExpand = (groupId: string) => {
+    setExpandedGroupIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
+      }
+      return next;
+    });
+  };
 
   // Selected series (up to 8)
   const [selectedSeries, setSelectedSeries] = useState<SourceRef[]>([]);
@@ -127,21 +145,47 @@ export const HistorianExplorerPage: React.FC = () => {
       listSubtables({ search: searchQuery || undefined })
         .then((res) => {
           setTablesList(res?.items || []);
+          setGroupsList([]);
+          setSourcesList([]);
         })
         .catch((err) => {
           console.error('Failed to list subtables for Historian:', err);
           setSourcesError(err);
           setTablesList([]);
+          setGroupsList([]);
+          setSourcesList([]);
         })
         .finally(() => setLoadingSources(false));
     } else {
       getSources({ view: pickerView, search: searchQuery || undefined })
-        .then((res) => {
-          setSourcesList(res?.items || []);
+        .then((res: any) => {
+          const rawItems = res?.items || [];
+          const leaves: SourceRef[] = res?.leaves || res?.sources || [];
+          if (rawItems.length > 0 && (rawItems[0].signals || rawItems[0].fields)) {
+            const normalizedGroups = rawItems.map((g: any) => ({
+              id: String(g.id),
+              name: String(g.display_name || g.name || 'Unnamed Group'),
+              protocol: g.protocol,
+              signals: (g.signals || g.fields || []) as SourceRef[],
+              signals_count: (g.signals || g.fields || []).length,
+            }));
+            setGroupsList(normalizedGroups);
+            const autoExpand = new Set<string>(
+              searchQuery
+                ? normalizedGroups.map((g: any) => g.id)
+                : normalizedGroups.slice(0, 4).map((g: any) => g.id)
+            );
+            setExpandedGroupIds(autoExpand);
+          } else {
+            setGroupsList([]);
+          }
+          setSourcesList(leaves.length > 0 ? leaves : rawItems);
+          setTablesList([]);
         })
         .catch((err) => {
           console.error('Failed to get sources for Historian:', err);
           setSourcesError(err);
+          setGroupsList([]);
           setSourcesList([]);
         })
         .finally(() => setLoadingSources(false));
@@ -529,36 +573,40 @@ export const HistorianExplorerPage: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setPickerView('hierarchy')}
-                className={`py-1 rounded text-center transition-all ${
-                  pickerView === 'hierarchy' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794]'
+                className={`py-1 px-1 rounded text-center truncate whitespace-nowrap transition-all ${
+                  pickerView === 'hierarchy' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794] hover:text-[#111B37]'
                 }`}
+                title="Hierarchy Tree"
               >
                 Tree
               </button>
               <button
                 type="button"
                 onClick={() => setPickerView('collector')}
-                className={`py-1 rounded text-center transition-all ${
-                  pickerView === 'collector' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794]'
+                className={`py-1 px-1 rounded text-center truncate whitespace-nowrap transition-all ${
+                  pickerView === 'collector' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794] hover:text-[#111B37]'
                 }`}
+                title="Collector Connections"
               >
                 Conn
               </button>
               <button
                 type="button"
                 onClick={() => setPickerView('models')}
-                className={`py-1 rounded text-center transition-all ${
-                  pickerView === 'models' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794]'
+                className={`py-1 px-1 rounded text-center truncate whitespace-nowrap transition-all ${
+                  pickerView === 'models' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794] hover:text-[#111B37]'
                 }`}
+                title="Data Models"
               >
                 Models
               </button>
               <button
                 type="button"
                 onClick={() => setPickerView('tables')}
-                className={`py-1 rounded text-center transition-all ${
-                  pickerView === 'tables' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794]'
+                className={`py-1 px-1 rounded text-center truncate whitespace-nowrap transition-all ${
+                  pickerView === 'tables' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794] hover:text-[#111B37]'
                 }`}
+                title="Physical Subtables"
               >
                 Tables
               </button>
@@ -622,6 +670,84 @@ export const HistorianExplorerPage: React.FC = () => {
                   );
                 })
               )
+            ) : groupsList.length > 0 ? (
+              groupsList.map((grp) => {
+                const isExpanded = expandedGroupIds.has(grp.id);
+                return (
+                  <div key={grp.id} className="border border-[#E3EAF3] rounded-lg overflow-hidden bg-white mb-1.5 shadow-2xs">
+                    <button
+                      type="button"
+                      onClick={() => toggleGroupExpand(grp.id)}
+                      className="w-full px-2.5 py-1.5 flex items-center justify-between bg-[#F8FAFC] hover:bg-[#F1F5FA] text-left transition-colors"
+                    >
+                      <div className="flex items-center gap-1.5 min-w-0 pr-1">
+                        {isExpanded ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-[#657794] shrink-0" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-[#657794] shrink-0" />
+                        )}
+                        <span className="text-[12px] font-semibold text-[#111B37] truncate" title={grp.name}>
+                          {grp.name}
+                        </span>
+                        {grp.protocol && (
+                          <span className="text-[9px] uppercase px-1 py-0.2 bg-[#E2E8F0] text-[#475569] rounded font-mono">
+                            {grp.protocol}
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[10px] font-semibold text-[#657794] bg-white px-1.5 py-0.5 rounded border border-[#E3EAF3] shrink-0">
+                        {grp.signals_count}
+                      </span>
+                    </button>
+                    {isExpanded && (
+                      <div className="p-1 space-y-1 divide-y divide-[#F8FAFC]">
+                        {grp.signals.length === 0 ? (
+                          <div className="py-2 text-center text-[#94A3B8] text-[11px] italic">
+                            No signals in this group
+                          </div>
+                        ) : (
+                          grp.signals.map((sig: SourceRef) => {
+                            const isSelected = selectedSeries.some((s) => s.id === sig.id);
+                            return (
+                              <div
+                                key={sig.id}
+                                onClick={() => handleToggleSource(sig)}
+                                className={`p-1.5 rounded-md text-[11px] cursor-pointer transition-all flex items-center justify-between gap-1.5 ${
+                                  isSelected
+                                    ? 'border border-[#EF1B24] bg-[#FEF2F2] font-semibold text-[#EF1B24]'
+                                    : 'hover:bg-[#F8FAFC] text-[#334155]'
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="truncate font-medium" title={sig.display_name || sig.path}>
+                                    {(sig as any).key || (sig as any).name || sig.display_name?.split('/').pop()?.trim() || sig.display_name}
+                                  </div>
+                                  <div className="text-[9px] text-[#94A3B8] font-mono truncate">
+                                    {sig.data_type || 'float64'}{sig.unit ? ` · ${sig.unit}` : ''}
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <span
+                                    className={`w-1.5 h-1.5 rounded-full ${
+                                      (sig.quality || '').includes('GOOD')
+                                        ? 'bg-[#0DBA67]'
+                                        : (sig.quality || '').includes('BAD')
+                                        ? 'bg-[#EF1B24]'
+                                        : 'bg-[#F59E0B]'
+                                    }`}
+                                    title={sig.quality || 'UNKNOWN'}
+                                  />
+                                  {isSelected && <Check className="w-3.5 h-3.5 text-[#EF1B24]" />}
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
             ) : sourcesList.length === 0 ? (
               <div className="py-8 text-center text-[#8C9BAE] text-[12px] italic">
                 No sources found.
@@ -633,16 +759,17 @@ export const HistorianExplorerPage: React.FC = () => {
                   <div
                     key={src.id}
                     onClick={() => handleToggleSource(src)}
-                    className={`p-2.5 rounded-lg border text-[12px] cursor-pointer transition-all ${
+                    className={`p-2 rounded-lg border text-[12px] cursor-pointer transition-all ${
                       isSelected
                         ? 'border-[#EF1B24] bg-[#FEF2F2] font-semibold text-[#EF1B24]'
                         : 'border-[#E3EAF3] bg-white hover:border-[#CBD5E1] text-[#334155]'
                     }`}
                   >
                     <div className="flex items-center justify-between">
-                      <span className="truncate">{src.display_name}</span>
+                      <span className="truncate">{src.display_name || (src as any).name}</span>
+                      {isSelected && <Check className="w-3.5 h-3.5 text-[#EF1B24] shrink-0" />}
                     </div>
-                    <div className="text-[10px] text-[#94A3B8] truncate mt-0.5">{src.path}</div>
+                    <div className="text-[10px] text-[#94A3B8] truncate mt-0.5">{src.path || src.display_name}</div>
                   </div>
                 );
               })

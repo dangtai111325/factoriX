@@ -151,6 +151,7 @@ class StorageBindingService:
                 "name": str(s["key"]),
                 "display_name": f"{r_name} / {s['key']}",
                 "display_path": f"{r_name} / {s['key']}",
+                "path": f"{r_name} / {s['key']}",
                 "data_type": str(s["data_type"]),
                 "unit": s.get("unit"),
                 "status": str(s["status"]),
@@ -257,6 +258,7 @@ class StorageBindingService:
                 "name": str(s["key"]),
                 "display_name": f"{c_name} / {s['key']}",
                 "display_path": f"Connections / {c_name} / {s['key']}",
+                "path": f"Connections / {c_name} / {s['key']}",
                 "data_type": str(s["data_type"]),
                 "unit": s.get("unit"),
                 "status": str(s["status"]),
@@ -378,6 +380,7 @@ class StorageBindingService:
                     "name": f"{dname} -> {f_path}",
                     "display_name": f"{dname} -> {f_path}",
                     "display_path": f"Models / {dname} / {f_path}",
+                    "path": f"Models / {dname} / {f_path}",
                     "data_type": f_type,
                     "unit": f.get("unit"),
                     "status": "ACTIVE",
@@ -396,7 +399,9 @@ class StorageBindingService:
                     "display_name": dname,
                     "status": str(r["status"]),
                     "fields": field_items,
+                    "signals": field_items,
                     "fields_count": len(field_items),
+                    "signals_count": len(field_items),
                 })
 
         return {
