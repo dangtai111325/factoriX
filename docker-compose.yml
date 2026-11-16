@@ -8,7 +8,7 @@ services:
     hostname: factorix-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-factorix}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-8DXYA3LKOZmsg-wg0C0mkdX7XFio183L}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-factorix}
     ports:
       - "127.0.0.1:5432:5432"
@@ -29,7 +29,7 @@ services:
     hostname: factorix-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: ${FACTORIX_RABBITMQ_USER:-factorix_mq}
-      RABBITMQ_DEFAULT_PASS: ${FACTORIX_RABBITMQ_PASSWORD:-factorix-mq-pw}
+      RABBITMQ_DEFAULT_PASS: ${FACTORIX_RABBITMQ_PASSWORD}
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
@@ -75,10 +75,10 @@ services:
       - .env
     environment:
       - FACTORIX_COLLECTOR_MODE=acquisition
-      - FACTORIX_DATABASE_URL=postgresql+asyncpg://factorix:8DXYA3LKOZmsg-wg0C0mkdX7XFio183L@factorix-postgres:5432/factorix
-      - FACTORIX_RABBITMQ_URL=amqp://factorix_mq:factorix-mq-pw@factorix-rabbitmq:5672/
-      - FACTORIX_RABBITMQ_MGMT_URL=http://factorix-rabbitmq:15672
-      - FACTORIX_TDENGINE_DSN=ws://root:taosdata@factorix-tdengine:6041
+      - FACTORIX_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-factorix}:${POSTGRES_PASSWORD}@factorix-postgres:5432/${POSTGRES_DB:-factorix}
+      - FACTORIX_RABBITMQ_URL=${FACTORIX_RABBITMQ_URL:-amqp://${FACTORIX_RABBITMQ_USER:-factorix_mq}:${FACTORIX_RABBITMQ_PASSWORD}@factorix-rabbitmq:5672/}
+      - FACTORIX_RABBITMQ_MGMT_URL=${FACTORIX_RABBITMQ_MGMT_URL:-http://factorix-rabbitmq:15672}
+      - FACTORIX_TDENGINE_DSN=${FACTORIX_TDENGINE_DSN}
       - FACTORIX_RECORD_OPERATIONAL=true
     depends_on:
       factorix-postgres:

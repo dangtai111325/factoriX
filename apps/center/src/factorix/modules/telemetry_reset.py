@@ -134,12 +134,93 @@ def _tenant_advisory_lock_key(tenant_id: UUID) -> int:
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 
-def _compute_manifest_hash(tenant_id: UUID, active_epoch: int, preserved: Mapping[str, int]) -> str:
+async def _collect_structural_fingerprint(session: AsyncSession, tenant_id: UUID) -> str:
+    """Compute a deterministic cryptographic fingerprint of structural configurations."""
+    p = {"tenant_id": tenant_id}
+    parts: list[str] = []
+
+    try:
+        conn_rows = await fetch_all(
+            session,
+            "SELECT id, name, protocol FROM connections WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
+            p,
+        )
+        parts.append(",".join(f"{r['id']}:{r['name']}:{r['protocol']}" for r in conn_rows))
+    except Exception:
+        pass
+
+    try:
+        sig_rows = await fetch_all(
+            session,
+            "SELECT id, key, data_type FROM signal_definitions WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
+            p,
+        )
+        parts.append(",".join(f"{r['id']}:{r['key']}:{r['data_type']}" for r in sig_rows))
+    except Exception:
+        pass
+
+    try:
+        mod_rows = await fetch_all(
+            session,
+            "SELECT id, name FROM output_groups WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
+            p,
+        )
+        parts.append(",".join(f"{r['id']}:{r['name']}" for r in mod_rows))
+    except Exception:
+        pass
+
+    try:
+        so_rows = await fetch_all(
+            session,
+            "SELECT id, physical_name, object_type FROM storage_objects WHERE tenant_id = CAST(:tenant_id AS uuid) AND status != 'PURGED' ORDER BY id",
+            p,
+        )
+        parts.append(",".join(f"{r['id']}:{r['physical_name']}:{r['object_type']}" for r in so_rows))
+    except Exception:
+        pass
+
+    try:
+        res_rows = await fetch_all(
+            session,
+            "SELECT id, code FROM resources WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
+            p,
+        )
+        parts.append(",".join(f"{r['id']}:{r['code']}" for r in res_rows))
+    except Exception:
+        pass
+
+    try:
+        f_rows = await fetch_all(
+            session,
+            """
+            SELECT f.id, f.expression
+            FROM formula_definitions f
+            JOIN signal_definitions s ON s.id = f.signal_id
+            WHERE s.tenant_id = CAST(:tenant_id AS uuid)
+            ORDER BY f.id
+            """,
+            p,
+        )
+        parts.append(",".join(f"{r['id']}:{r.get('expression') or ''}" for r in f_rows))
+    except Exception:
+        pass
+
+    raw_payload = "|".join(parts)
+    return hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
+
+
+def _compute_manifest_hash(
+    tenant_id: UUID,
+    active_epoch: int,
+    preserved: Mapping[str, int],
+    structural_fingerprint: str = "",
+) -> str:
     canonical = json.dumps(
         {
             "tenant_id": str(tenant_id),
             "active_epoch": int(active_epoch),
             "preserved": {k: int(preserved[k]) for k in sorted(preserved)},
+            "structural_fingerprint": structural_fingerprint,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -441,7 +522,8 @@ class TelemetryResetService:
             "tdengine_managed_subtables": len(managed_subs),
             "tdengine_subtables_total": len(op_subs) + len(managed_subs),
         }
-        manifest_hash = _compute_manifest_hash(tid, active_epoch, preserved)
+        fingerprint = await _collect_structural_fingerprint(session, tid)
+        manifest_hash = _compute_manifest_hash(tid, active_epoch, preserved, structural_fingerprint=fingerprint)
 
         return {
             "tenant_id": str(tid),
@@ -452,6 +534,7 @@ class TelemetryResetService:
             "lifecycle_state": lifecycle_state,
             "confirm_phrase_required": CONFIRM_PHRASE,
             "config_manifest_hash": manifest_hash,
+            "structural_fingerprint": fingerprint,
             "cleared": cleared,
             "will_be_cleared": dict(cleared),
             "preserved": preserved,
@@ -635,7 +718,8 @@ class TelemetryResetService:
         preserved_before = await _collect_preserved_counts(session, tid)
         pg_before = await _collect_pg_cleared_counts(session, tid)
         op_subs_before, managed_subs_before = await _inspect_tdengine_subtables(session, tid, eff_td)
-        manifest_hash = _compute_manifest_hash(tid, previous_epoch, preserved_before)
+        fingerprint_before = await _collect_structural_fingerprint(session, tid)
+        manifest_hash = _compute_manifest_hash(tid, previous_epoch, preserved_before, structural_fingerprint=fingerprint_before)
 
         operation_id = uuid4()
         trace_id = f"reset-{operation_id.hex[:12]}"
@@ -808,6 +892,51 @@ class TelemetryResetService:
                     if not _is_missing_td_error(exc):
                         logger.warning("Re-ensuring operational schema after reset returned warning: %s", exc)
 
+                # Re-create / ensure all active managed supertables and subtables
+                recreated_managed = 0
+                try:
+                    active_objects = await fetch_all(
+                        session,
+                        """
+                        SELECT physical_name, object_type, parent_name, schema_json, tags_json
+                        FROM storage_objects
+                        WHERE tenant_id = CAST(:tenant_id AS uuid) AND status != 'PURGED'
+                        ORDER BY CASE object_type WHEN 'database' THEN 1 WHEN 'supertable' THEN 2 WHEN 'subtable' THEN 3 ELSE 4 END
+                        """,
+                        {"tenant_id": tid},
+                    )
+                    for obj in active_objects:
+                        obj_type = str(obj.get("object_type") or "").lower()
+                        pname = str(obj.get("physical_name") or "")
+                        if not pname:
+                            continue
+                        if obj_type == "supertable":
+                            cols = obj.get("schema_json") or []
+                            tags = obj.get("tags_json") or []
+                            cols_sql = ", ".join(f"`{c['name']}` {c.get('type') or c.get('td_type', 'FLOAT')}" for c in cols if isinstance(c, dict) and "name" in c) or "`ts` TIMESTAMP, `value` DOUBLE"
+                            tags_sql = ", ".join(f"`{t['name']}` {t.get('type') or t.get('td_type', 'VARCHAR(64)')}" for t in tags if isinstance(t, dict) and "name" in t)
+                            tag_clause = f"TAGS ({tags_sql})" if tags_sql else "TAGS ()"
+                            st_sql = f"CREATE STABLE IF NOT EXISTS `{td_db}`.`{pname}` ({cols_sql}) {tag_clause}"
+                            await eff_td.execute_sql(st_sql)
+                        elif obj_type == "subtable":
+                            parent = str(obj.get("parent_name") or "st_default")
+                            tags = obj.get("tags_json") or {}
+                            tag_vals: list[str] = []
+                            if isinstance(tags, dict):
+                                for v in tags.values():
+                                    tag_vals.append(f"'{v}'" if isinstance(v, str) else str(v))
+                            elif isinstance(tags, list):
+                                for item in tags:
+                                    if isinstance(item, dict) and "value" in item:
+                                        v = item["value"]
+                                        tag_vals.append(f"'{v}'" if isinstance(v, str) else str(v))
+                            tag_clause = f"TAGS ({', '.join(tag_vals)})" if tag_vals else "TAGS ()"
+                            sub_sql = f"CREATE TABLE IF NOT EXISTS `{td_db}`.`{pname}` USING `{td_db}`.`{parent}` {tag_clause}"
+                            await eff_td.execute_sql(sub_sql)
+                            recreated_managed += 1
+                except Exception as rec_exc:
+                    logger.warning("Re-ensuring managed storage objects returned warning: %s", rec_exc)
+
             stages_completed.append("R3")
             stage_details["stages_completed"] = list(stages_completed)
             stage_details["R3"] = {
@@ -817,6 +946,8 @@ class TelemetryResetService:
                 "dropped_operational_subtables": dropped_op,
                 "dropped_managed_subtables": dropped_managed,
                 "dropped_subtables_total": len(dropped_subtables),
+                "recreated_managed_subtables": recreated_managed,
+                "preserved_managed_subtables": len(managed_subs_before),
             }
 
             # ------------------------------------------------------------------
@@ -890,6 +1021,14 @@ class TelemetryResetService:
                         "PRESERVATION_INVARIANT_VIOLATED",
                         f"Protected configuration count for '{key}' changed during reset ({before_val} -> {after_val}).",
                     )
+
+            fingerprint_after = await _collect_structural_fingerprint(session, tid)
+            if fingerprint_after != fingerprint_before:
+                raise AppError(
+                    500,
+                    "PRESERVATION_INVARIANT_VIOLATED",
+                    "Protected configuration structural fingerprint changed during reset.",
+                )
 
             # ------------------------------------------------------------------
             # R5 (RESUME & AUDIT): Mark ACTIVE, invalidate LiveState, audit
