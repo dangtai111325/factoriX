@@ -367,12 +367,56 @@ class StorageTopologyInspector:
         database: str | None = None,
         depth: int = 2,
         cursor: str | None = None,
+        session: Any | None = None,
     ) -> TopologySnapshot:
         """Return full or filtered topology snapshot for the UI canvas."""
         observed_at = datetime.now(timezone.utc)
         dbs = await self.list_databases(tenant_id if not database else None)
         if database:
             dbs = [d for d in dbs if d.name == database]
+
+        label_map: dict[str, str] = {}
+        if session is not None:
+            try:
+                from factorix.modules.common import fetch_all
+                # 1. output_groups for ms_<hex>
+                m_rows = await fetch_all(
+                    session,
+                    "SELECT id, name, display_name FROM output_groups WHERE tenant_id = :tenant_id",
+                    {"tenant_id": tenant_id},
+                )
+                for r in m_rows:
+                    m_id_hex = UUID(str(r["id"])).hex
+                    m_label = str(r.get("display_name") or r.get("name") or "")
+                    if m_label:
+                        label_map[f"ms_{m_id_hex}"] = f"{m_label} (Snapshot)"
+
+                # 2. signal_definitions for op_*_<hex>
+                s_rows = await fetch_all(
+                    session,
+                    "SELECT id, key FROM signal_definitions WHERE tenant_id = :tenant_id",
+                    {"tenant_id": tenant_id},
+                )
+                for r in s_rows:
+                    s_id_hex = UUID(str(r["id"])).hex
+                    s_label = str(r.get("key") or "")
+                    if s_label:
+                        for pfx in ("op_float64_", "op_int64_", "op_bool_", "op_binary_"):
+                            label_map[f"{pfx}{s_id_hex}"] = f"{s_label} (Telemetry)"
+
+                # 3. storage_objects for managed subtables
+                so_rows = await fetch_all(
+                    session,
+                    "SELECT physical_name, display_name FROM storage_objects WHERE tenant_id = :tenant_id AND status != 'PURGED'",
+                    {"tenant_id": tenant_id},
+                )
+                for r in so_rows:
+                    pname = str(r.get("physical_name") or "")
+                    dname = str(r.get("display_name") or "")
+                    if pname and dname:
+                        label_map[pname] = dname
+            except Exception as exc:
+                logger.debug("Failed building topology label map: %s", exc)
 
         all_stables: list[StableInfo] = []
         all_subtables: list[SubtableInfo] = []
@@ -414,12 +458,17 @@ class StorageTopologyInspector:
                         )
                         all_subtables.extend(subs)
                         for sub in subs:
+                            display_label = label_map.get(sub.name, sub.name)
                             nodes.append(TopologyNode(
                                 node_id=f"subtable:{db.name}.{sub.name}",
                                 kind="subtable",
-                                label=sub.name,
+                                label=display_label,
                                 parent_id=f"stable:{db.name}.{st.name}",
-                                metadata={"tags": sub.tags},
+                                metadata={
+                                    "tags": sub.tags,
+                                    "physical_name": sub.name,
+                                    "display_name": display_label,
+                                },
                             ))
 
         drift = await self._compute_drift(tenant_id, all_stables, all_subtables)

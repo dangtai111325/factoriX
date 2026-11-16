@@ -19,7 +19,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factorix.modules.common import fetch_all, fetch_one
+from factorix.modules.common import fetch_all, fetch_one, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +115,9 @@ class StorageBindingService:
             session,
             """
             SELECT s.id, s.resource_id, s.key, s.data_type, s.unit, s.status,
-                   s.expected_interval_ms
+                   s.expected_interval_ms, l.quality, l.last_acquired_at
             FROM signal_definitions s
+            LEFT JOIN latest_signal_state l ON l.tenant_id = s.tenant_id AND l.signal_id = s.id
             WHERE s.tenant_id = :tenant_id AND s.status = 'ACTIVE'
             ORDER BY s.key
             LIMIT 1000
@@ -124,6 +125,7 @@ class StorageBindingService:
             {"tenant_id": tenant_id},
         )
 
+        now = utcnow()
         flat_leaves: list[dict[str, Any]] = []
         sigs_by_resource: dict[str, list[dict[str, Any]]] = {}
         for s in sig_rows:
@@ -131,6 +133,14 @@ class StorageBindingService:
             r_name = res_name_map.get(rid, "Unassigned")
             sig_id = str(s["id"])
             can_id = f"sig:{sig_id}"
+            raw_qual = str(s.get("quality") or "UNKNOWN").upper()
+            last_acq = s.get("last_acquired_at")
+            exp_intv_ms = int(s.get("expected_interval_ms") or 1000)
+            if last_acq is not None:
+                diff_s = (now - last_acq).total_seconds()
+                fresh = "FRESH" if diff_s <= max(exp_intv_ms * 3 / 1000.0, 15.0) else "STALE"
+            else:
+                fresh = "UNKNOWN"
             item = {
                 "kind": "signal",
                 "id": can_id,
@@ -144,8 +154,8 @@ class StorageBindingService:
                 "data_type": str(s["data_type"]),
                 "unit": s.get("unit"),
                 "status": str(s["status"]),
-                "quality": "GOOD",
-                "freshness": "FRESH",
+                "quality": raw_qual,
+                "freshness": fresh,
                 "resource_id": rid if rid != "unassigned" else None,
                 "resource_name": r_name,
                 "expected_interval_ms": s.get("expected_interval_ms"),
@@ -195,7 +205,7 @@ class StorageBindingService:
         conn_rows = await fetch_all(
             session,
             """
-            SELECT id, name, protocol, status, connection_type
+            SELECT id, name, protocol, status
             FROM connections
             WHERE tenant_id = :tenant_id
             ORDER BY name
@@ -207,23 +217,36 @@ class StorageBindingService:
             session,
             """
             SELECT s.id, s.key, s.data_type, s.unit, s.status, s.expected_interval_ms,
-                   b.connection_id, c.name AS connection_name, c.protocol
+                   j.connection_id, c.name AS connection_name, c.protocol,
+                   l.quality, l.last_acquired_at
             FROM signal_definitions s
-            JOIN signal_bindings b ON b.signal_id = s.id AND b.valid_to IS NULL
-            JOIN connections c ON c.id = b.connection_id
+            LEFT JOIN signal_bindings b ON b.signal_id = s.id AND b.valid_to IS NULL
+            LEFT JOIN source_fields sf ON sf.id = b.source_field_id
+            LEFT JOIN acquisition_jobs j ON j.id = sf.acquisition_job_id
+            LEFT JOIN connections c ON c.id = j.connection_id
+            LEFT JOIN latest_signal_state l ON l.tenant_id = s.tenant_id AND l.signal_id = s.id
             WHERE s.tenant_id = :tenant_id AND s.status = 'ACTIVE'
             ORDER BY s.key
             """,
             {"tenant_id": tenant_id},
         )
 
+        now = utcnow()
         flat_leaves: list[dict[str, Any]] = []
         signals_by_conn: dict[str, list[dict[str, Any]]] = {}
         for s in sig_rows:
-            cid = str(s["connection_id"])
-            c_name = str(s["connection_name"])
+            cid = str(s["connection_id"]) if s.get("connection_id") else "unassigned"
+            c_name = str(s.get("connection_name") or "Unassigned Connections")
             sig_id = str(s["id"])
             can_id = f"sig:{sig_id}"
+            raw_qual = str(s.get("quality") or "UNKNOWN").upper()
+            last_acq = s.get("last_acquired_at")
+            exp_intv_ms = int(s.get("expected_interval_ms") or 1000)
+            if last_acq is not None:
+                diff_s = (now - last_acq).total_seconds()
+                fresh = "FRESH" if diff_s <= max(exp_intv_ms * 3 / 1000.0, 15.0) else "STALE"
+            else:
+                fresh = "UNKNOWN"
             item = {
                 "kind": "signal",
                 "id": can_id,
@@ -237,8 +260,8 @@ class StorageBindingService:
                 "data_type": str(s["data_type"]),
                 "unit": s.get("unit"),
                 "status": str(s["status"]),
-                "quality": "GOOD",
-                "freshness": "FRESH",
+                "quality": raw_qual,
+                "freshness": fresh,
                 "connection_id": cid,
                 "connection_name": c_name,
                 "protocol": str(s["protocol"]),
@@ -259,10 +282,23 @@ class StorageBindingService:
                 "name": str(c["name"]),
                 "protocol": str(c["protocol"]),
                 "status": str(c["status"]),
-                "connection_type": str(c["connection_type"]),
+                "connection_type": str(c.get("protocol") or "connection"),
                 "signals": signals,
                 "signals_count": len(signals),
             })
+
+        if "unassigned" in signals_by_conn and signals_by_conn["unassigned"]:
+            unassigned_signals = signals_by_conn["unassigned"]
+            if not search or any(search.lower() in s["name"].lower() for s in unassigned_signals):
+                connections.append({
+                    "id": "unassigned",
+                    "name": "Unassigned Signals",
+                    "protocol": "other",
+                    "status": "ACTIVE",
+                    "connection_type": "other",
+                    "signals": unassigned_signals,
+                    "signals_count": len(unassigned_signals),
+                })
 
         return {
             "view": "collector",
@@ -288,19 +324,31 @@ class StorageBindingService:
         rows = await fetch_all(
             session,
             """
-            SELECT id, display_name, status, spec_json
-            FROM output_groups
-            WHERE tenant_id = :tenant_id AND status = 'ACTIVE'
-            ORDER BY display_name
+            SELECT m.id, m.display_name, m.status, m.spec_json,
+                   s.sampled_at, s.errors_json
+            FROM output_groups m
+            LEFT JOIN model_state s ON s.group_id = m.id
+            WHERE m.tenant_id = :tenant_id AND m.status = 'ACTIVE'
+            ORDER BY m.display_name
             """,
             {"tenant_id": tenant_id},
         )
 
+        now = utcnow()
         flat_leaves: list[dict[str, Any]] = []
         models: list[dict[str, Any]] = []
         for r in rows:
             mid = str(r["id"])
             dname = str(r["display_name"])
+            sample_t = r.get("sampled_at")
+            errs = r.get("errors_json") or []
+            if sample_t is not None:
+                diff_s = (now - sample_t).total_seconds()
+                m_fresh = "FRESH" if diff_s <= 30.0 else "STALE"
+                m_qual = "BAD" if errs else "GOOD"
+            else:
+                m_fresh = "UNKNOWN"
+                m_qual = "UNKNOWN"
             spec = r["spec_json"]
             if isinstance(spec, str):
                 try:
@@ -310,11 +358,13 @@ class StorageBindingService:
             elif not isinstance(spec, dict):
                 spec = {}
 
-            fields = spec.get("fields", [])
+            fields = spec.get("fields") or (spec.get("root", {}).get("children", []) if isinstance(spec.get("root"), dict) else [])
             field_items = []
             for f in fields:
-                f_path = f.get("path") or f.get("name") or "output"
-                f_type = f.get("type", "float64")
+                if not isinstance(f, dict):
+                    continue
+                f_path = f.get("key") or f.get("path") or f.get("name") or "output"
+                f_type = f.get("value_type") or f.get("type", "float64")
                 can_id = f"mod:{mid}:{f_path}"
                 leaf_item = {
                     "kind": "model_field",
@@ -331,8 +381,8 @@ class StorageBindingService:
                     "data_type": f_type,
                     "unit": f.get("unit"),
                     "status": "ACTIVE",
-                    "quality": "GOOD",
-                    "freshness": "FRESH",
+                    "quality": m_qual,
+                    "freshness": m_fresh,
                     "calculation_cycle": spec.get("calculation_cycle_ms", 5000),
                 }
                 if not search or search.lower() in f_path.lower() or search.lower() in dname.lower():

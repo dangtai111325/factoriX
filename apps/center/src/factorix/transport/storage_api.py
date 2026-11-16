@@ -51,6 +51,23 @@ def _get_td_client() -> TDEngineClient | None:
     return _td_singleton
 
 
+def _is_missing_td_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "not exist",
+            "doesn't exist",
+            "does not exist",
+            "unknown database",
+            "database not specified",
+            "0x0362",
+            "table does not exist",
+            "stable does not exist",
+        )
+    )
+
+
 async def _default_admin() -> dict[str, Any]:
     return {
         "tenant_id": "00000000-0000-0000-0000-000000000001",
@@ -782,7 +799,7 @@ def build_router(
     ) -> dict[str, Any]:
         tenant_id, _actor = ids(principal)
         snap = await topology_inspector.get_topology(
-            tenant_id, database=database, depth=depth, cursor=cursor
+            tenant_id, database=database, depth=depth, cursor=cursor, session=session
         )
         return ST.topology_snapshot_to_dict(snap)
 
@@ -1547,7 +1564,15 @@ def build_router(
                     elif obj_kind == "database":
                         await exec_fn(f"DROP DATABASE IF EXISTS `{name}`")
             except Exception as exc:
-                logger.warning("TDengine DROP failed during purge of %s: %s", object_id, exc)
+                if not _is_missing_td_error(exc):
+                    logger.error("TDengine DROP failed during purge of %s: %s", object_id, exc)
+                    raise AppError(
+                        503,
+                        "TDENGINE_DROP_FAILED",
+                        f"Failed to drop storage object in TDengine: {exc}",
+                        retryable=True,
+                    ) from exc
+                logger.warning("TDengine DROP notice for %s (already missing): %s", object_id, exc)
 
         now = utcnow()
         await execute(
