@@ -154,6 +154,7 @@ export interface TopologyNode {
   object_type: TDObjectType | 'engine';
   physical_name: string;
   display_name?: string | null;
+  label?: string | null;
   status: StorageObjectStatus;
   parent_id?: string | null;
   metadata: Record<string, unknown>;

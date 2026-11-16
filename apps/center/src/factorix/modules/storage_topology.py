@@ -376,22 +376,26 @@ class StorageTopologyInspector:
             dbs = [d for d in dbs if d.name == database]
 
         label_map: dict[str, str] = {}
-        if session is not None:
+        if session is not None and tenant_id:
+            from factorix.modules.common import fetch_all
+
+            # 1. output_groups for ms_<hex>
             try:
-                from factorix.modules.common import fetch_all
-                # 1. output_groups for ms_<hex>
                 m_rows = await fetch_all(
                     session,
-                    "SELECT id, name, display_name FROM output_groups WHERE tenant_id = :tenant_id",
+                    "SELECT id, key, display_name FROM output_groups WHERE tenant_id = :tenant_id",
                     {"tenant_id": tenant_id},
                 )
                 for r in m_rows:
                     m_id_hex = UUID(str(r["id"])).hex
-                    m_label = str(r.get("display_name") or r.get("name") or "")
+                    m_label = str(r.get("display_name") or r.get("key") or "")
                     if m_label:
                         label_map[f"ms_{m_id_hex}"] = f"{m_label} (Snapshot)"
+            except Exception as exc:
+                logger.debug("Failed loading output_groups for topology label map: %s", exc)
 
-                # 2. signal_definitions for op_*_<hex>
+            # 2. signal_definitions for op_*_<hex>
+            try:
                 s_rows = await fetch_all(
                     session,
                     "SELECT id, key FROM signal_definitions WHERE tenant_id = :tenant_id",
@@ -401,10 +405,13 @@ class StorageTopologyInspector:
                     s_id_hex = UUID(str(r["id"])).hex
                     s_label = str(r.get("key") or "")
                     if s_label:
-                        for pfx in ("op_float64_", "op_int64_", "op_bool_", "op_binary_"):
+                        for pfx in ("op_float64_", "op_int64_", "op_bool_", "op_binary_", "op_string_", "op_json_"):
                             label_map[f"{pfx}{s_id_hex}"] = f"{s_label} (Telemetry)"
+            except Exception as exc:
+                logger.debug("Failed loading signal_definitions for topology label map: %s", exc)
 
-                # 3. storage_objects for managed subtables
+            # 3. storage_objects for managed subtables
+            try:
                 so_rows = await fetch_all(
                     session,
                     "SELECT physical_name, display_name FROM storage_objects WHERE tenant_id = :tenant_id AND status != 'PURGED'",
@@ -416,7 +423,7 @@ class StorageTopologyInspector:
                     if pname and dname:
                         label_map[pname] = dname
             except Exception as exc:
-                logger.debug("Failed building topology label map: %s", exc)
+                logger.debug("Failed loading storage_objects for topology label map: %s", exc)
 
         all_stables: list[StableInfo] = []
         all_subtables: list[SubtableInfo] = []
@@ -706,7 +713,7 @@ def topology_snapshot_to_dict(snap: TopologySnapshot) -> dict[str, Any]:
                 "kind": n.kind,
                 "object_type": n.kind,
                 "label": n.label,
-                "physical_name": n.label,
+                "physical_name": (n.metadata.get("physical_name") or n.label) if n.metadata else n.label,
                 "display_name": n.label,
                 "parent_id": n.parent_id,
                 "status": "ACTIVE",

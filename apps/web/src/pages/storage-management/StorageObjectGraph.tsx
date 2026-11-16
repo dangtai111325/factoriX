@@ -118,10 +118,12 @@ const StableNodeComponent: React.FC<{ data: NodeDataProps }> = ({ data }) => {
 };
 
 const SubtableNodeComponent: React.FC<{ data: NodeDataProps }> = ({ data }) => {
+  const displayLabel = data.label || data.physicalName;
+  const isDifferent = data.physicalName && data.physicalName !== displayLabel;
   return (
     <div
       onClick={data.onSelect}
-      className={`px-3 py-2 bg-white border-2 rounded-lg shadow-xs min-w-[180px] cursor-pointer transition-all hover:shadow-sm ${
+      className={`px-3 py-2 bg-white border-2 rounded-lg shadow-xs min-w-[200px] max-w-[280px] cursor-pointer transition-all hover:shadow-sm ${
         data.selected ? 'border-[#7C3AED] ring-2 ring-[#7C3AED]/20' : 'border-[#E3EAF3] hover:border-[#CBD5E1]'
       }`}
     >
@@ -129,9 +131,14 @@ const SubtableNodeComponent: React.FC<{ data: NodeDataProps }> = ({ data }) => {
       <div className="flex items-center gap-2">
         <Table className="w-3.5 h-3.5 text-[#7C3AED] shrink-0" />
         <div className="min-w-0 flex-1">
-          <div className="text-[12px] font-semibold text-[#111B37] truncate" title={data.physicalName}>
-            {data.physicalName}
+          <div className="text-[12px] font-semibold text-[#111B37] truncate" title={displayLabel}>
+            {displayLabel}
           </div>
+          {isDifferent && (
+            <div className="text-[10px] text-[#657794] font-mono truncate" title={data.physicalName}>
+              {data.physicalName}
+            </div>
+          )}
         </div>
         <span
           className={`w-2 h-2 rounded-full shrink-0 ${
@@ -271,8 +278,14 @@ export const StorageObjectGraph: React.FC<StorageObjectGraphProps> = ({
             type: 'subtable',
             position: sub.position || { x: subX, y: subY },
             data: {
-              label: sub.physical_name,
-              physicalName: sub.physical_name,
+              label:
+                sub.label ||
+                sub.display_name ||
+                (sub.metadata?.display_name as string) ||
+                sub.physical_name,
+              physicalName:
+                (sub.metadata?.physical_name as string) ||
+                sub.physical_name,
               status: sub.status,
               selected: sub.node_id === selectedObjectId,
               onSelect: () => onSelectObject(sub.node_id),
