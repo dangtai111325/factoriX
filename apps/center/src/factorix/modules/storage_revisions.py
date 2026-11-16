@@ -803,7 +803,7 @@ class StorageRevisionService:
                 bindings_list = spec_data.get("bindings", [])
                 for b in bindings_list:
                     can_id = b.get("canonical_id") or b.get("source_id") or ""
-                    tgt_col = b.get("target_column") or b.get("destination_column") or ""
+                    tgt_col = b.get("target_column") or b.get("destination_column") or b.get("column_name") or ""
                     skind = b.get("kind") or b.get("source_kind") or "signal"
                     row_pol = b.get("row_assembly_policy") or "INDEPENDENT_EVENTS"
                     sig_uuid = None

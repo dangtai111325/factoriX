@@ -40,6 +40,7 @@ from factorix.modules.recording_policy import (
     ManagedBindingTarget,
     ManagedSubtableWrite,
     build_managed_target_from_row,
+    build_managed_target_from_storage_binding,
 )
 from factorix.modules.telemetry import RejectionThrottle, connection_health_payload, latest_stream_payload, select_binding
 from factorix.platform.broker import BrokerConfig, ConsumeOutcome, RabbitMQConsumer
@@ -477,6 +478,46 @@ class PgIngestionStore:
                 all_managed: list[ManagedBindingTarget] = []
                 for r in managed_rows:
                     target = build_managed_target_from_row(dict(r))
+                    all_managed.append(target)
+                    if target.signal_id is not None:
+                        managed_by_signal.setdefault(target.signal_id, []).append(target)
+                    if target.model_id is not None and target.model_field_path:
+                        managed_by_model.setdefault((target.model_id, target.model_field_path), []).append(target)
+
+                # Modern storage_bindings metadata
+                sb_rows = await conn.fetch(
+                    """
+                    SELECT sb.id AS binding_id,
+                           sb.tenant_id,
+                           sb.physical_db,
+                           sb.physical_subtable,
+                           sb.target_column,
+                           sb.signal_id,
+                           sb.model_id,
+                           sb.model_field_path,
+                           sb.row_assembly_policy,
+                           sb.policy_config_json,
+                           sb.binding_revision,
+                           sb.status AS binding_status,
+                           COALESCE(so.parent_name, pr.td_stable, '') AS td_stable,
+                           s.data_type,
+                           s.resource_id
+                    FROM storage_bindings sb
+                    LEFT JOIN storage_objects so
+                      ON so.tenant_id = sb.tenant_id
+                     AND so.physical_db = sb.physical_db
+                     AND so.physical_name = sb.physical_subtable
+                    LEFT JOIN storage_physical_registry pr
+                      ON pr.tenant_id = sb.tenant_id
+                     AND pr.td_database = sb.physical_db
+                     AND pr.td_subtable = sb.physical_subtable
+                    LEFT JOIN signal_definitions s ON s.id = sb.signal_id
+                    WHERE sb.tenant_id = $1 AND sb.status = 'ACTIVE'
+                    """,
+                    tenant_id,
+                )
+                for r in sb_rows:
+                    target = build_managed_target_from_storage_binding(dict(r))
                     all_managed.append(target)
                     if target.signal_id is not None:
                         managed_by_signal.setdefault(target.signal_id, []).append(target)

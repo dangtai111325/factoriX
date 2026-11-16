@@ -282,6 +282,59 @@ def build_managed_target_from_row(row: Mapping[str, Any]) -> ManagedBindingTarge
     )
 
 
+def build_managed_target_from_storage_binding(row: Mapping[str, Any]) -> ManagedBindingTarget:
+    """Construct a validated ``ManagedBindingTarget`` from a ``storage_bindings`` catalog row."""
+    bid = UUID(str(row["binding_id"]))
+    sig_id = UUID(str(row["signal_id"])) if row.get("signal_id") else None
+    mod_id = UUID(str(row["model_id"])) if row.get("model_id") else None
+    res_id = UUID(str(row["resource_id"])) if row.get("resource_id") else None
+    p_db = str(row.get("physical_db") or "")
+    p_stable = str(row.get("td_stable") or "")
+    p_sub = str(row.get("physical_subtable") or "")
+    col = str(row.get("target_column") or "")
+    pol_cfg = _json_obj(row.get("policy_config_json"))
+    if not isinstance(pol_cfg, Mapping):
+        pol_cfg = {}
+    mode_str = str(pol_cfg.get("mode") or "ON_CHANGE").upper()
+    try:
+        mode = RecordingMode(mode_str)
+    except ValueError:
+        mode = RecordingMode.ON_CHANGE
+    v_type = str(row.get("data_type") or "FLOAT64").upper()
+    series_k = f"{p_sub}:{col}"
+    return ManagedBindingTarget(
+        design_id=bid,
+        design_version_id=None,
+        dataset_id=bid,
+        tag_dataset_id=str(bid),
+        dataset_key=p_sub,
+        design_status="RUNNING",
+        dataset_status="RUNNING",
+        registry_status=str(row.get("binding_status") or "ACTIVE"),
+        semantics="TIMESERIES",
+        time_axis="acquired_at",
+        td_database=p_db,
+        td_stable=p_stable,
+        td_subtable=p_sub,
+        series_key=series_k,
+        field_key=col,
+        value_type=v_type,
+        max_length=None,
+        nullable=True,
+        required=False,
+        signal_id=sig_id,
+        model_id=mod_id,
+        model_field_path=str(row.get("model_field_path")) if row.get("model_field_path") else None,
+        resource_id=res_id,
+        source_revision=int(row.get("binding_revision") or 1),
+        transform_expr=None,
+        transform_ast=None,
+        mode=mode,
+        policy_enabled=True,
+    )
+
+
+
 @dataclass(slots=True)
 class ManagedSeriesState:
     last_recorded_value: Any = None
