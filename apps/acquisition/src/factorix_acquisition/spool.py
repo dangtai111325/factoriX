@@ -69,13 +69,11 @@ class AcquisitionSpool:
         if os.environ.get("FACTORIX_ENVIRONMENT") == "test":
             return 0
         if max_age_hours is None:
-            raw_env = os.environ.get("FACTORIX_SPOOL_TTL_HOURS", "")
-            if not raw_env:
-                return 0
+            raw_env = os.environ.get("FACTORIX_SPOOL_TTL_HOURS", "24")
             try:
                 max_age_hours = float(raw_env)
             except ValueError:
-                return 0
+                max_age_hours = 24.0
         if max_age_hours <= 0:
             return 0
         from datetime import datetime, timezone, timedelta
