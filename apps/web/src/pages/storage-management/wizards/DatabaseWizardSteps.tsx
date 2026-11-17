@@ -216,12 +216,23 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
                 })
               }
               placeholder="e.g. 365 (blank = unlimited)"
-              className="w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] transition-colors focus:outline-none focus:border-[#EF1B24] focus:ring-2 focus:ring-[#EF1B24]/10"
+              className={`w-full h-9 px-3 rounded-lg border text-[13px] transition-colors focus:outline-none focus:ring-2 ${
+                errors.retention_days
+                  ? 'border-[#EF1B24] focus:ring-[#EF1B24]/20'
+                  : 'border-[#D4DFEC] focus:border-[#EF1B24] focus:ring-[#EF1B24]/10'
+              }`}
             />
           </div>
-          <p className="text-[11px] text-[#8C9BAE] mt-1">
-            Corresponds to TDengine <code className="font-mono text-[#334568]">KEEP</code> option. Data older than this threshold will be pruned automatically.
-          </p>
+          {errors.retention_days ? (
+            <p className="text-[12px] text-[#EF1B24] mt-1 flex items-center gap-1">
+              <AlertTriangle className="w-3.5 h-3.5" />
+              <span>{errors.retention_days}</span>
+            </p>
+          ) : (
+            <p className="text-[11px] text-[#8C9BAE] mt-1">
+              Corresponds to TDengine <code className="font-mono text-[#334568]">KEEP</code> option. Minimum 30 days (KEEP &gt;= 3 × DURATION). Data older than this threshold will be pruned automatically.
+            </p>
+          )}
         </div>
 
         {/* Advanced Scaling Parameters */}

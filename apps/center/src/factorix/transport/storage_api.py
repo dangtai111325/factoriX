@@ -932,12 +932,22 @@ def build_router(
         session: AsyncSession = Depends(db_dep),
     ) -> dict[str, Any]:
         tenant_id, actor_id = ids(principal)
+        v_res = await revision_service.validate_draft(
+            session, tenant_id, None, custom_spec={"kind": "database", "spec": body}
+        )
+        if not v_res["valid"]:
+            err_msg = v_res["errors"][0]["message"] if v_res["errors"] else "Validation failed"
+            raise AppError(422, "VALIDATION_FAILED", err_msg, field_errors=v_res["errors"])
+
         draft = await revision_service.create_draft(
             session, tenant_id, actor_id, {"kind": "database", "spec": body}
         )
-        res = await revision_service.publish_draft(
-            session, tenant_id, UUID(draft["id"]), actor_id
-        )
+        try:
+            res = await revision_service.publish_draft(
+                session, tenant_id, UUID(draft["id"]), actor_id
+            )
+        except StorageObjectError as exc:
+            raise AppError(422, exc.code or "STORAGE_OPERATION_FAILED", str(exc), field_errors=getattr(exc, "field_errors", []))
         return {
             "id": res["operation_id"],
             "operation_id": res["operation_id"],

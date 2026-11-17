@@ -259,8 +259,13 @@ export const CreateStorageObjectWizard: React.FC = () => {
       if (!dbDraft.data.precision) {
         errs.precision = 'Timestamp precision is required.';
       }
-      if (dbDraft.data.retention_days != null && dbDraft.data.retention_days < 1) {
-        errs.retention_days = 'Retention days must be at least 1 day.';
+      if (dbDraft.data.retention_days != null) {
+        if (dbDraft.data.retention_days < 1) {
+          errs.retention_days = 'Retention days must be at least 1 day.';
+        } else if (dbDraft.data.retention_days < 30) {
+          errs.retention_days =
+            'Retention days must be at least 30 days (TDengine requires KEEP >= 3 × DURATION).';
+        }
       }
     } else if (step === 2) {
       if (!dbDraft.data.confirmed) {

@@ -54,6 +54,12 @@ def test_database_validation_and_ddl():
     assert res_prec.valid is False
     assert any(e["code"] == "UNSUPPORTED_PRECISION" for e in res_prec.errors)
 
+    # Retention < 30 days rejection (TDengine KEEP >= 3 * DURATION constraint)
+    short_keep = SO.DatabaseSpec(name="mydb", keep="7d")
+    res_short = SO.validate_database_spec(short_keep)
+    assert res_short.valid is False
+    assert any(e["code"] == "RETENTION_TOO_SHORT" for e in res_short.errors)
+
 
 def test_stable_validation_and_ddl():
     # Valid stable with ts first, columns, and tags

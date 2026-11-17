@@ -214,6 +214,25 @@ def validate_database_spec(spec: DatabaseSpec) -> ValidationResult:
             "message": f"Cache model '{spec.cache_model}' not supported. Use one of: {_SUPPORTED_CACHE_MODELS}",
         })
 
+    # Retention (KEEP >= 3 * DURATION constraint)
+    if spec.keep:
+        keep_str = str(spec.keep).strip().lower()
+        days: int | None = None
+        if keep_str.endswith("d"):
+            try:
+                days = int(keep_str[:-1])
+            except ValueError:
+                pass
+        elif keep_str.isdigit():
+            days = int(keep_str)
+
+        if days is not None and days < 30:
+            errors.append({
+                "field": "retention_days",
+                "code": "RETENTION_TOO_SHORT",
+                "message": f"Retention {days} days is less than the minimum required by TDengine (KEEP >= 3 * DURATION, minimum 30 days with default 10-day duration).",
+            })
+
     return ValidationResult(valid=not errors, errors=errors, warnings=warnings)
 
 
