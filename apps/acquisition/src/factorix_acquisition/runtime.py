@@ -417,11 +417,12 @@ class AcquisitionRuntime:
         if not self._is_leader:
             return
         pending = self.publisher.spool.pending_count()
-        queues = {
+        queues: dict[str, Any] = {
             cid: {"pending": connector.queue_length, "dropped": connector.dropped}
             for cid, (_, connector) in self.connectors.items()
             if isinstance(connector, MqttConnector)
         }
+        queues["publisher"] = self.publisher.publish_metrics()
         degraded = not self.config_ok or self.activation_error is not None or self.publisher.storage_error is not None or not self.publisher.broker_ok
         diag = self.activation_error or self.publisher.storage_error or ("RabbitMQ broker unavailable." if not self.publisher.broker_ok else None)
         reports = self.connection_report(reset=True)

@@ -1124,9 +1124,9 @@ class IngestionWorker:
         self._legacy_consumer: RabbitMQConsumer | None = None
         self._live_consumer: RabbitMQConsumer | None = None
 
-        self._pending: list[_PendingEnvelope] = []
         self._pending_live: deque[_PendingEnvelope] = deque()
         self._pending_legacy: deque[_PendingEnvelope] = deque()
+        self._serve_legacy_next = False
         self._pending_lock = asyncio.Lock()
         self._wake_batcher = asyncio.Event()
         self._stop_event = asyncio.Event()
@@ -1228,7 +1228,7 @@ class IngestionWorker:
     async def handle_message(self, message: AbstractIncomingMessage) -> ConsumeOutcome:
         """RabbitMQConsumer message handler. Resolves only after durable storage or permanent quarantine."""
         rkey = str(getattr(message, "routing_key", "") or "")
-        lane = "live" if "live" in rkey else "legacy"
+        lane = "live" if rkey.startswith("telemetry.live.v1.") else "legacy"
         return await self._enqueue_incoming_message(message, lane=lane)
 
     async def _enqueue_incoming_message(self, message: AbstractIncomingMessage, lane: str = "live") -> ConsumeOutcome:
@@ -1261,7 +1261,7 @@ class IngestionWorker:
                 self._pending_live.append(env)
             else:
                 self._pending_legacy.append(env)
-            total_pending = len(self._pending_live) + len(self._pending_legacy) + len(self._pending)
+            total_pending = len(self._pending_live) + len(self._pending_legacy)
             should_wake = total_pending >= self._batch_wake_size
         if should_wake:
             self._wake_batcher.set()
@@ -1338,40 +1338,33 @@ class IngestionWorker:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to record quarantine entry (%s): %s", event_uid, exc)
 
+    def _take_pending_batch(self) -> list[_PendingEnvelope]:
+        live_count = min(len(self._pending_live), self.batch_size)
+        legacy_count = min(len(self._pending_legacy), self.batch_size)
+        if live_count and legacy_count:
+            if self.batch_size == 1:
+                live_count = int(not self._serve_legacy_next)
+                legacy_count = 1 - live_count
+                self._serve_legacy_next = not self._serve_legacy_next
+            else:
+                live_quota = max(1, self.batch_size * 3 // 4)
+                live_count = min(live_count, max(live_quota, self.batch_size - legacy_count))
+                legacy_count = min(legacy_count, self.batch_size - live_count)
+        batch = [self._pending_live.popleft() for _ in range(live_count)]
+        batch.extend(self._pending_legacy.popleft() for _ in range(legacy_count))
+        return batch
+
     async def _batcher_loop(self) -> None:
-        while not self._stop_event.is_set() or self._pending_live or self._pending_legacy or self._pending:
+        while not self._stop_event.is_set() or self._pending_live or self._pending_legacy:
             try:
                 await asyncio.wait_for(self._wake_batcher.wait(), timeout=self.flush_interval_s)
             except asyncio.TimeoutError:
                 pass
             self._wake_batcher.clear()
 
-            batch: list[_PendingEnvelope] = []
             async with self._pending_lock:
-                while self._pending:
-                    self._pending_legacy.append(self._pending.pop(0))
-
-                live_len = len(self._pending_live)
-                legacy_len = len(self._pending_legacy)
-
-                if live_len > 0 and legacy_len > 0:
-                    # Fair quota: 75% Live (up to 192 for batch size 256) : 25% Legacy (up to 64)
-                    live_quota = min(max(1, int(self.batch_size * 0.75)), live_len)
-                    legacy_quota = min(self.batch_size - live_quota, legacy_len)
-                    for _ in range(live_quota):
-                        batch.append(self._pending_live.popleft())
-                    for _ in range(legacy_quota):
-                        batch.append(self._pending_legacy.popleft())
-                elif live_len > 0:
-                    take = min(self.batch_size, live_len)
-                    for _ in range(take):
-                        batch.append(self._pending_live.popleft())
-                elif legacy_len > 0:
-                    take = min(self.batch_size, legacy_len)
-                    for _ in range(take):
-                        batch.append(self._pending_legacy.popleft())
-
-                if len(self._pending_live) > 0 or len(self._pending_legacy) > 0:
+                batch = self._take_pending_batch()
+                if self._pending_live or self._pending_legacy:
                     self._wake_batcher.set()
             if batch:
                 batch_started_at = time.monotonic()

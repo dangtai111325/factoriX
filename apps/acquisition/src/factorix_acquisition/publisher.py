@@ -139,6 +139,8 @@ class ObservationPublisher:
         self.published_fast = 0
         self.published_replay = 0
         self.spilled = 0
+        self.publish_failed = 0
+        self.last_publish_failure: str | None = None
 
     def set_broker(self, broker: BrokerPublisherProtocol | None) -> None:
         was_down = self._broker_down or not self.broker_ok
@@ -179,6 +181,26 @@ class ObservationPublisher:
     @property
     def fast_buffered(self) -> int:
         return len(self._fast_queue)
+
+    def publish_metrics(self) -> dict[str, int | float | str | None]:
+        queue_age = None
+        if self._fast_queue:
+            queue_age = round(max(0.0, (datetime.now(timezone.utc) - self._fast_queue[0].acquired_at).total_seconds()), 3)
+        return {
+            "published_fast": self.published_fast,
+            "published_replay": self.published_replay,
+            "spilled": self.spilled,
+            "overflow_dropped": self.spool.overflow_dropped_count,
+            "publish_failed": self.publish_failed,
+            "last_publish_failure": self.last_publish_failure,
+            "fast_head_age_s": queue_age,
+        }
+
+    def _note_publish_failures(self, failed: list[tuple[CanonicalObservation, BrokerError]]) -> None:
+        if failed:
+            self.publish_failed += len(failed)
+            error = failed[-1][1]
+            self.last_publish_failure = type(error.__cause__ or error).__name__
 
     def _next_sequence(self, connection_id: str, field_id: str) -> int:
         key = (connection_id, field_id)
@@ -487,6 +509,7 @@ class ObservationPublisher:
             self.broker_ok = False
             return 0, True
         confirmed, failed = await broker.publish_observations_partial(batch)
+        self._note_publish_failures(failed)
         self.published_fast += len(confirmed)
         same_gen = gen == self._broker_gen
         if not failed:
@@ -533,6 +556,7 @@ class ObservationPublisher:
             return 0, True
 
         confirmed, failed = await broker.publish_observations_partial(valid_obs)
+        self._note_publish_failures(failed)
         if confirmed:
             self.spool.mark_sent(confirmed)
             self.published_replay += len(confirmed)

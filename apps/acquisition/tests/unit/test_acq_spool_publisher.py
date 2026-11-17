@@ -150,6 +150,10 @@ async def test_broker_down_does_not_count_attempts(spool: AcquisitionSpool) -> N
         _, failed = await pub.flush_once(budget_s=1)
         assert failed
     assert spool.count_by_state() == {"PENDING": 1}
+    metrics = pub.publish_metrics()
+    assert metrics["publish_failed"] == 3
+    assert metrics["last_publish_failure"] == "BrokerUnavailableError"
+    assert metrics["published_replay"] == 0
 
 
 def test_pending_count_and_latest_index_stay_exact(tmp_path: Path) -> None:

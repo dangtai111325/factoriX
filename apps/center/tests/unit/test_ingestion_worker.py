@@ -901,6 +901,34 @@ async def test_dual_consumers_start_and_stop(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("batch_size", "live_count", "legacy_count", "expected"),
+    [
+        (8, 10, 1, [("live", 7), ("legacy", 1)]),
+        (8, 1, 10, [("live", 1), ("legacy", 7)]),
+        (1, 3, 3, [("live", 1), ("legacy", 1)]),
+    ],
+)
+async def test_batch_capacity_and_single_slot_fairness(batch_size, live_count, legacy_count, expected) -> None:
+    from factorix.modules.ingestion_worker import _PendingEnvelope
+
+    worker = IngestionWorker(pg_store=MagicMock(), tdengine=MagicMock(), batch_size=batch_size)
+    loop = asyncio.get_running_loop()
+    for name, queue, count in (
+        ("live", worker._pending_live, live_count), ("legacy", worker._pending_legacy, legacy_count),
+    ):
+        for _ in range(count):
+            queue.append(_PendingEnvelope(b"{}", name, {}, False, _now(), loop.create_future()))
+
+    if batch_size == 1:
+        ids = [worker._take_pending_batch()[0].message_id for _ in range(6)]
+        assert ids == [name for name, _ in expected] * 3
+    else:
+        ids = [envelope.message_id for envelope in worker._take_pending_batch()]
+        assert ids == [name for name, count in expected for _ in range(count)]
+
+
+@pytest.mark.asyncio
 async def test_mixed_batch_anti_rewind_ensures_live_sample_wins_in_newest_map() -> None:
     tid = uuid4()
     rid = uuid4()
