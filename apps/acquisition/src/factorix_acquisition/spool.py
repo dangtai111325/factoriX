@@ -51,6 +51,9 @@ class AcquisitionSpool:
             """
         )
         self.connection.execute("CREATE INDEX IF NOT EXISTS spool_pending_seq_idx ON spool(seq) WHERE state = 'PENDING'")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS spool_pending_created_idx ON spool(created_at) WHERE state = 'PENDING'"
+        )
         self.connection.execute("CREATE INDEX IF NOT EXISTS spool_pending_signal_idx ON spool(signal_id, seq) WHERE state = 'PENDING'")
         self.connection.execute("CREATE INDEX IF NOT EXISTS spool_epoch_idx ON spool(tenant_id, data_epoch, seq) WHERE state = 'PENDING'")
         self.connection.execute(

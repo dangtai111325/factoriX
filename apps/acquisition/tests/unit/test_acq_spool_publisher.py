@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -94,6 +94,19 @@ def test_cap_drops_oldest_pending(spool: AcquisitionSpool) -> None:
     spool.add_many([_row(f"r{i}", "A") for i in range(10)])
     assert spool.enforce_cap(4) == 6
     assert [r["event_uid"] for r in spool.pending(10)] == ["r6", "r7", "r8", "r9"]
+
+
+def test_expiry_updates_pending_index_and_keeps_terminal_rows(spool: AcquisitionSpool, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FACTORIX_ENVIRONMENT", raising=False)
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(hours=3)).isoformat()
+    spool.add_many([_row("expired", "A", old), _row("acked", "B", old), _row("current", "A", now.isoformat())])
+    spool.mark_sent(["acked"])
+    assert spool.expire_stale(max_age_hours=2) == 1
+    assert spool.expire_stale(max_age_hours=2) == 0
+    assert spool.count_by_state() == {"ACKED": 1, "DEAD": 1, "PENDING": 1}
+    assert spool.pending_count() == 1
+    assert [row["event_uid"] for row in spool.latest_pending(10)] == ["current"]
 
 
 @pytest.mark.asyncio
