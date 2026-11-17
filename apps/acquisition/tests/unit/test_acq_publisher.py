@@ -377,4 +377,8 @@ async def test_fair_flushing_interleaves_ram_and_spool(tmp_path: Path) -> None:
     assert sent == 70
     assert pub.fast_buffered == 0
     assert spool.pending_count() == 0
+    metrics = pub.publish_metrics()
+    assert metrics["emitted_by_protocol"] == {"mqtt": 70}
+    assert {"fast_publish", "replay_publish", "spool_read", "spool_mark_sent"} <= metrics["stage_calls"].keys()
+    assert all(elapsed >= 0 for elapsed in metrics["stage_seconds"].values())
     spool.close()

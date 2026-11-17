@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import UUID, uuid5, NAMESPACE_URL
@@ -142,6 +142,9 @@ class ObservationPublisher:
         self.spilled = 0
         self.publish_failed = 0
         self.last_publish_failure: str | None = None
+        self._emitted_by_protocol: Counter[str] = Counter()
+        self._stage_calls: Counter[str] = Counter()
+        self._stage_seconds: Counter[str] = Counter()
 
     def set_broker(self, broker: BrokerPublisherProtocol | None) -> None:
         was_down = self._broker_down or not self.broker_ok
@@ -182,7 +185,7 @@ class ObservationPublisher:
     def fast_buffered(self) -> int:
         return len(self._fast_queue)
 
-    def publish_metrics(self) -> dict[str, int | float | str | None]:
+    def publish_metrics(self) -> dict[str, Any]:
         queue_age = None
         if self._fast_queue:
             queue_age = round(max(0.0, (datetime.now(timezone.utc) - self._fast_queue[0].acquired_at).total_seconds()), 3)
@@ -194,7 +197,14 @@ class ObservationPublisher:
             "publish_failed": self.publish_failed,
             "last_publish_failure": self.last_publish_failure,
             "fast_head_age_s": queue_age,
+            "emitted_by_protocol": dict(self._emitted_by_protocol),
+            "stage_calls": dict(self._stage_calls),
+            "stage_seconds": {stage: round(seconds, 4) for stage, seconds in self._stage_seconds.items()},
         }
+
+    def _record_stage(self, stage: str, started: float) -> None:
+        self._stage_calls[stage] += 1
+        self._stage_seconds[stage] += time.monotonic() - started
 
     def _note_publish_failures(self, failed: list[tuple[CanonicalObservation, BrokerError]]) -> None:
         if failed:
@@ -357,7 +367,10 @@ class ObservationPublisher:
             raise
 
     async def emit(self, spec: JobSpec, samples: list[Sample], *, revision: int = 1) -> int:
+        started = time.monotonic()
         observations = self.build_observations(spec, samples, revision=revision)
+        self._record_stage("canonicalize", started)
+        self._emitted_by_protocol[spec.protocol] += len(observations)
         if not observations:
             return 0
         if self._broker_down or len(self._fast_queue) >= self.max_memory_queue:
@@ -451,6 +464,7 @@ class ObservationPublisher:
 
         Returns ``(published_count, failed_or_broker_unavailable)``.
         """
+        flush_started = time.monotonic()
         self._inflight_flushes += 1
         try:
             published = 0
@@ -484,11 +498,13 @@ class ObservationPublisher:
 
                     # Followed by 1 Spool batch
                     if self.spool.pending_count() > 0 and not self._broker_down:
+                        read_started = time.monotonic()
                         await asyncio.to_thread(self.spool.expire_stale)
                         await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
                         rows = await asyncio.to_thread(self.spool.latest_pending, BATCH_ROWS)
                         if not rows:
                             rows = await asyncio.to_thread(self.spool.pending, BATCH_ROWS)
+                        self._record_stage("spool_read", read_started)
                         if rows:
                             count, ok = await self._replay_rows(rows)
                             published += count
@@ -515,9 +531,11 @@ class ObservationPublisher:
                 return published, False
 
             # 4. Only Spool pending: latest-per-signal lane first, then history slices
+            read_started = time.monotonic()
             await asyncio.to_thread(self.spool.expire_stale)
             await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
             latest_rows = await asyncio.to_thread(self.spool.latest_pending, BATCH_ROWS)
+            self._record_stage("spool_read", read_started)
             if latest_rows:
                 count, ok = await self._replay_rows(latest_rows)
                 published += count
@@ -525,7 +543,9 @@ class ObservationPublisher:
                     return published, True
 
             while True:
+                read_started = time.monotonic()
                 rows = await asyncio.to_thread(self.spool.pending, BATCH_ROWS)
+                self._record_stage("spool_read", read_started)
                 if not rows:
                     break
                 count, ok = await self._replay_rows(rows)
@@ -538,6 +558,7 @@ class ObservationPublisher:
             return published, False
         finally:
             self._inflight_flushes = max(0, self._inflight_flushes - 1)
+            self._record_stage("flush", flush_started)
 
     async def _publish_or_spill(self, batch: list[CanonicalObservation]) -> tuple[int, bool]:
         broker = self.broker
@@ -547,11 +568,13 @@ class ObservationPublisher:
             self._broker_down = True
             self.broker_ok = False
             return 0, True
+        publish_started = time.monotonic()
         try:
             confirmed, failed = await broker.publish_observations_partial(batch)
         except asyncio.CancelledError:
             await self._spill_or_restore(batch)
             raise
+        self._record_stage("fast_publish", publish_started)
         self._note_publish_failures(failed)
         self.published_fast += len(confirmed)
         same_gen = gen == self._broker_gen
@@ -576,6 +599,7 @@ class ObservationPublisher:
         valid_obs: list[CanonicalObservation] = []
         corrupt_uids: list[str] = []
         stale_epochs: set[str] = set()
+        decode_started = time.monotonic()
         for row in rows:
             uid = str(row["event_uid"])
             tid = str(row["tenant_id"])
@@ -591,6 +615,7 @@ class ObservationPublisher:
                 stale_epochs.add(str(obs.tenant_id))
                 continue
             valid_obs.append(obs)
+        self._record_stage("replay_decode", decode_started)
         if corrupt_uids:
             await asyncio.to_thread(self.spool.mark_state, corrupt_uids, "QUARANTINED")
         if stale_epochs:
@@ -598,10 +623,14 @@ class ObservationPublisher:
         if not valid_obs:
             return 0, True
 
+        publish_started = time.monotonic()
         confirmed, failed = await broker.publish_observations_partial(valid_obs)
+        self._record_stage("replay_publish", publish_started)
         self._note_publish_failures(failed)
         if confirmed:
+            mark_started = time.monotonic()
             await asyncio.to_thread(self.spool.mark_sent, confirmed)
+            self._record_stage("spool_mark_sent", mark_started)
             self.published_replay += len(confirmed)
         same_gen = gen == self._broker_gen
         if not failed:
