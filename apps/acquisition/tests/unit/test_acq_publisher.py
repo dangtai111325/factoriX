@@ -382,3 +382,27 @@ async def test_fair_flushing_interleaves_ram_and_spool(tmp_path: Path) -> None:
     assert {"fast_publish", "replay_publish", "spool_read", "spool_mark_sent"} <= metrics["stage_calls"].keys()
     assert all(elapsed >= 0 for elapsed in metrics["stage_seconds"].values())
     spool.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_uses_a_smaller_slice_while_ram_stays_busy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("factorix_acquisition.publisher.BATCH_ROWS", 4)
+    monkeypatch.setattr("factorix_acquisition.publisher.CONTENDED_REPLAY_ROWS", 1)
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    broker = RecordingBroker()
+    publisher = ObservationPublisher(None, spool)
+    try:
+        for i in range(3):
+            spec, _, _ = _spec()
+            await publisher.emit(spec, [Sample(spec.fields[0]["id"], float(i), "GOOD")])
+        publisher.set_broker(broker)
+        spec, _, _ = _spec()
+        await publisher.emit(spec, [Sample(spec.fields[0]["id"], float(i + 10), "GOOD") for i in range(9)])
+
+        assert await publisher.flush_once(budget_s=0) == (9, False)
+        assert publisher.fast_buffered == 1
+        assert spool.pending_count() == 2
+        assert await publisher.flush_once(budget_s=0) == (3, False)
+        assert spool.pending_count() == 0
+    finally:
+        spool.close()

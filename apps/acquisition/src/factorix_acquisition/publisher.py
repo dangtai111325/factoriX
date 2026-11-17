@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FRESHNESS_WINDOW_S = 12.0
 BATCH_ROWS = 500
+CONTENDED_REPLAY_ROWS = BATCH_ROWS // 4
 HISTORY_SLICE_S = 0.25
 FLUSH_BUDGET_S = 1.0
 MAX_MEMORY_QUEUE = 50_000
@@ -458,9 +459,8 @@ class ObservationPublisher:
     async def flush_once(self, budget_s: float = FLUSH_BUDGET_S) -> tuple[int, bool]:
         """Publish buffered fast-path observations and replay bounded spool slices.
 
-        Interleaves quotas between RAM fast-path and SQLite spool replay
-        (2 RAM batches : 1 spool batch when both pending) with a monotonic
-        deadline to avoid starvation and CPU hogging.
+        Interleaves RAM publishes with smaller spool slices while both have
+        work. When RAM is empty replay can use the full batch size.
 
         Returns ``(published_count, failed_or_broker_unavailable)``.
         """
@@ -499,11 +499,12 @@ class ObservationPublisher:
                     # Followed by 1 Spool batch
                     if self.spool.pending_count() > 0 and not self._broker_down:
                         read_started = time.monotonic()
+                        replay_limit = CONTENDED_REPLAY_ROWS if self._fast_queue else BATCH_ROWS
                         await asyncio.to_thread(self.spool.expire_stale)
                         await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
-                        rows = await asyncio.to_thread(self.spool.latest_pending, BATCH_ROWS)
+                        rows = await asyncio.to_thread(self.spool.latest_pending, replay_limit)
                         if not rows:
-                            rows = await asyncio.to_thread(self.spool.pending, BATCH_ROWS)
+                            rows = await asyncio.to_thread(self.spool.pending, replay_limit)
                         self._record_stage("spool_read", read_started)
                         if rows:
                             count, ok = await self._replay_rows(rows)
