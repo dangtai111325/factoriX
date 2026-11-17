@@ -65,11 +65,12 @@ class BrokerConfig:
     max_length: int | None = None
     delivery_limit: int = 5
     prefetch_count: int = 128
-    live_prefetch_count: int = 128
+    live_prefetch_count: int = 256
     freshness_window_s: float = 12.0
     max_inflight_publishes: int = 64
     confirm_timeout_s: float = 10.0
     consumer_concurrency: int = 32
+    live_consumer_concurrency: int = 256
     reconnect_interval_s: float = 2.0
 
     @classmethod
@@ -90,11 +91,12 @@ class BrokerConfig:
             live_max_length_bytes=int(getattr(settings, "rabbitmq_live_max_length_bytes", 256 * 1024 * 1024) or 256 * 1024 * 1024),
             delivery_limit=int(settings.rabbitmq_delivery_limit),
             prefetch_count=int(settings.rabbitmq_prefetch),
-            live_prefetch_count=int(getattr(settings, "rabbitmq_live_prefetch", 128) or 128),
+            live_prefetch_count=int(settings.rabbitmq_live_prefetch),
             freshness_window_s=float(getattr(settings, "rabbitmq_freshness_window_s", 12.0) or 12.0),
             max_inflight_publishes=int(settings.rabbitmq_publisher_max_inflight),
             confirm_timeout_s=float(settings.rabbitmq_confirm_timeout_s),
             consumer_concurrency=int(getattr(settings, "ingestion_consumer_concurrency", 32) or 32),
+            live_consumer_concurrency=int(settings.ingestion_live_consumer_concurrency),
         )
 
 

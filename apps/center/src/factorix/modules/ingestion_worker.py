@@ -1089,13 +1089,19 @@ class IngestionWorker:
         self.broker_cfg = broker_cfg
         self.instance_id = instance_id
         self.batch_size = max(1, min(1000, int(batch_size)))
-        self._batch_wake_size = self.batch_size
+        self._legacy_wake_size = self.batch_size
+        self._live_wake_size = self.batch_size
         if broker_cfg is not None:
             # Delivery slots stay occupied until the batch commits and its messages are acknowledged.
-            self._batch_wake_size = min(
+            self._legacy_wake_size = min(
                 self.batch_size,
                 broker_cfg.prefetch_count or self.batch_size,
                 broker_cfg.consumer_concurrency,
+            )
+            self._live_wake_size = min(
+                self.batch_size,
+                broker_cfg.live_prefetch_count or self.batch_size,
+                broker_cfg.live_consumer_concurrency,
             )
         self.flush_interval_s = max(0.002, int(flush_ms) / 1000.0)
         self.shadow_pg = bool(shadow_pg)
@@ -1171,6 +1177,7 @@ class IngestionWorker:
                 self.broker_cfg,
                 queue_name=self.broker_cfg.live_queue_name,
                 prefetch_count=self.broker_cfg.live_prefetch_count,
+                consumer_concurrency=self.broker_cfg.live_consumer_concurrency,
                 max_length_bytes=self.broker_cfg.live_max_length_bytes,
                 binding_pattern=self.broker_cfg.live_binding_pattern,
             )
@@ -1261,8 +1268,12 @@ class IngestionWorker:
                 self._pending_live.append(env)
             else:
                 self._pending_legacy.append(env)
-            total_pending = len(self._pending_live) + len(self._pending_legacy)
-            should_wake = total_pending >= self._batch_wake_size
+            live_count, legacy_count = len(self._pending_live), len(self._pending_legacy)
+            available_slots = (
+                (self._live_wake_size if live_count else 0)
+                + (self._legacy_wake_size if legacy_count else 0)
+            )
+            should_wake = live_count + legacy_count >= min(self.batch_size, available_slots)
         if should_wake:
             self._wake_batcher.set()
         return await fut

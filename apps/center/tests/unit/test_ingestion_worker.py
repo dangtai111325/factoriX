@@ -53,6 +53,31 @@ async def test_ingestion_flushes_a_full_delivery_window_without_waiting_for_time
         await batcher
 
 
+@pytest.mark.asyncio
+async def test_dual_lane_delivery_windows_do_not_flush_at_legacy_limit():
+    worker = IngestionWorker(
+        pg_store=MagicMock(), tdengine=MagicMock(), batch_size=8, flush_ms=5_000,
+        broker_cfg=BrokerConfig(
+            amqp_url="amqp://localhost/", prefetch_count=2, consumer_concurrency=2,
+            live_prefetch_count=4, live_consumer_concurrency=3,
+        ),
+    )
+    message = MagicMock(body=b"{}", message_id="message", headers={}, redelivered=False)
+    handlers = [worker.handle_live_message, worker.handle_legacy_message,
+                worker.handle_live_message, worker.handle_live_message, worker.handle_legacy_message]
+    tasks = []
+    try:
+        for index, handle in enumerate(handlers):
+            tasks.append(asyncio.create_task(handle(message)))
+            await asyncio.sleep(0)
+            assert worker._wake_batcher.is_set() == (index == len(handlers) - 1)
+        assert len(worker._take_pending_batch()) == 5
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def _make_obs(
     *,
     tenant_id: UUID,

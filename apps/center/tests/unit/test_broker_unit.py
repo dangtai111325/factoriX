@@ -89,7 +89,8 @@ def test_two_lane_broker_config_and_routing_keys() -> None:
     assert cfg.binding_pattern == "telemetry.v1.*"
     assert cfg.live_binding_pattern == "telemetry.live.v1.*"
     assert cfg.live_max_length_bytes == 256 * 1024 * 1024
-    assert cfg.live_prefetch_count == 128
+    assert cfg.live_prefetch_count == 256
+    assert cfg.live_consumer_concurrency == 256
 
     tid = UUID("11111111-2222-3333-4444-555555555555")
     legacy_key = tenant_routing_key(tid)
