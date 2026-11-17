@@ -261,7 +261,6 @@ class _PreparedObs:
     reason_code: str | None
     owned: dict[str, Any]
     ingested_at: datetime
-    provenance_dict: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -1490,7 +1489,6 @@ class IngestionWorker:
         for env in batch:
             try:
                 obs = CanonicalObservation.from_json_bytes(env.raw_body)
-                obs.validate()
             except (ObservationError, ValueError, TypeError, KeyError) as exc:
                 tid = self._header_tenant_uuid(env.headers)
                 uid = str(env.message_id or "invalid")[:256]
@@ -1598,13 +1596,14 @@ class IngestionWorker:
                     env.future.set_result(ConsumeOutcome.ACK)
                 continue
 
-            try:
-                cat = await self._get_catalog(obs.tenant_id, need_signal=obs.signal_id)
-            except _WorkerStoppingRetry:
-                if not env.future.done():
-                    env.future.set_result(ConsumeOutcome.RETRY)
-                    self.metrics.retried_total += 1
-                continue
+            if obs.signal_id not in cat.bindings:
+                try:
+                    cat = await self._get_catalog(obs.tenant_id, need_signal=obs.signal_id)
+                except _WorkerStoppingRetry:
+                    if not env.future.done():
+                        env.future.set_result(ConsumeOutcome.RETRY)
+                        self.metrics.retried_total += 1
+                    continue
 
             owned = _default_owned_check(cat, obs, rx_time)
             if owned is None:
@@ -1637,9 +1636,6 @@ class IngestionWorker:
                 continue
 
             batch_seen_uids.add(uid_key)
-            prov_dict = obs.provenance.to_dict() if obs.provenance else {}
-            if reason_code:
-                prov_dict["reason"] = reason_code
             prep = _PreparedObs(
                 obs=obs,
                 event_time=ev_time,
@@ -1649,7 +1645,6 @@ class IngestionWorker:
                 reason_code=reason_code,
                 owned=owned,
                 ingested_at=env.ingested_at,
-                provenance_dict=prov_dict,
             )
             parsed_per_tenant.setdefault(obs.tenant_id, []).append((env, prep))
 
@@ -2113,6 +2108,9 @@ class IngestionWorker:
                 if previous_sample is None or prep.received_time > previous_sample:
                     connection_sample_times[connection_id] = prep.received_time
             if self.shadow_pg:
+                provenance = obs.provenance.to_dict() if obs.provenance else {}
+                if prep.reason_code:
+                    provenance["reason"] = prep.reason_code
                 shadow_rows.append(
                     {
                         "observation_id": obs_id,
@@ -2130,7 +2128,7 @@ class IngestionWorker:
                         "quality": prep.norm_quality,
                         "origin": obs.origin.value,
                         "config_revision": obs.config_revision,
-                        "provenance": prep.provenance_dict,
+                        "provenance": provenance,
                     }
                 )
             if obs.signal_id in cat.formula_inputs:
