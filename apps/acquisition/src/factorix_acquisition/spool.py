@@ -349,58 +349,86 @@ class AcquisitionSpool:
         return total
 
     def enforce_byte_cap(self, max_bytes: int) -> int:
-        """Ensure spool files do not exceed ``max_bytes`` by pruning terminal then dropping oldest pending rows."""
+        """Reclaim space before evicting pending observations that exceed the spool budget."""
         if max_bytes <= 0:
             return 0
-        removed = 0
         with self._lock:
             if self.db_bytes() <= max_bytes:
                 return 0
-            # Delete oldest terminal rows first
-            with self.connection:
-                cur = self.connection.execute(
-                    """
-                    DELETE FROM spool WHERE seq IN (
-                        SELECT seq FROM spool WHERE state IN ('ACKED', 'QUARANTINED', 'DEAD')
-                        ORDER BY created_at ASC, seq ASC LIMIT 5000
-                    )
-                    """
-                )
-                removed += max(0, cur.rowcount)
-            if self.db_bytes() > max_bytes:
-                max_iterations = 10
-                iterations = 0
-                while self.pending_count() > 0 and self.db_bytes() > max_bytes and iterations < max_iterations:
-                    iterations += 1
-                    with self.connection:
-                        cur = self.connection.execute(
-                            """
-                            DELETE FROM spool WHERE seq IN (
-                                SELECT seq FROM spool WHERE state = 'PENDING' ORDER BY seq ASC LIMIT 5000
-                            )
-                            """
+            # Once WAL is checkpointed, the shared-memory sidecar should not
+            # trigger compaction when the database itself fits the budget.
+            if not self._reclaim_for_byte_cap(compact=False) or self.path.stat().st_size <= max_bytes:
+                return 0
+
+            terminal_removed = 0
+            for _ in range(10):
+                if self._occupied_bytes() <= max_bytes:
+                    break
+                with self.connection:
+                    cur = self.connection.execute(
+                        """
+                        DELETE FROM spool WHERE seq IN (
+                            SELECT seq FROM spool WHERE state IN ('ACKED', 'QUARANTINED', 'DEAD')
+                            ORDER BY created_at, seq LIMIT 5000
                         )
-                        if cur.rowcount <= 0:
-                            break
-                        removed += cur.rowcount
-                        self.overflow_dropped_count += cur.rowcount
-                    try:
-                        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    except sqlite3.Error:
-                        break
+                        """
+                    )
+                terminal_removed += cur.rowcount
+                if cur.rowcount == 0:
+                    break
+
+            # DELETE can leave freed pages allocated to the file. Compact before
+            # deciding whether pending observations themselves exceed the budget.
+            if not self._reclaim_for_byte_cap(compact=True):
+                return terminal_removed
+
+            pending_removed = 0
+            for _ in range(10):
+                occupied = self._occupied_bytes()
+                if occupied <= max_bytes or self._pending == 0:
+                    break
+                excess = occupied - max_bytes
+                # Estimate an eviction batch from the excess, then remeasure.
+                limit = min(5000, max(1, (self._pending * excess + occupied - 1) // occupied))
+                with self.connection:
+                    cur = self.connection.execute(
+                        """
+                        DELETE FROM spool WHERE seq IN (
+                            SELECT seq FROM spool WHERE state = 'PENDING' ORDER BY seq LIMIT ?
+                        )
+                        """,
+                        (limit,),
+                    )
+                if cur.rowcount == 0:
+                    break
+                self._pending -= cur.rowcount
+                pending_removed += cur.rowcount
+
+            if pending_removed:
+                self.overflow_dropped_count += pending_removed
                 self._rebuild_counters()
-                if removed > 0 or self.db_bytes() > max_bytes:
-                    try:
-                        self.connection.execute("VACUUM")
-                        self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    except sqlite3.Error:
-                        pass
-            if removed > 0:
+                self._reclaim_for_byte_cap(compact=True)
                 logger.warning(
-                    "Spool byte cap exceeded (%d bytes > %d bytes): deleted %d rows to protect disk (overflow). Total overflow dropped: %d",
-                    self.db_bytes(), max_bytes, removed, self.overflow_dropped_count
+                    "Spool byte cap %d: removed %d pending and %d terminal rows. Total overflow dropped: %d",
+                    max_bytes, pending_removed, terminal_removed, self.overflow_dropped_count,
                 )
-        return removed
+            return terminal_removed + pending_removed
+
+    def _occupied_bytes(self) -> int:
+        page_size = int(self.connection.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(self.connection.execute("PRAGMA page_count").fetchone()[0])
+        free_pages = int(self.connection.execute("PRAGMA freelist_count").fetchone()[0])
+        return page_size * (page_count - free_pages)
+
+    def _reclaim_for_byte_cap(self, *, compact: bool) -> bool:
+        try:
+            if compact:
+                self.connection.execute("VACUUM")
+            busy = self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        except sqlite3.Error:
+            logger.warning("Spool space reclamation failed during byte cap maintenance", exc_info=True)
+            return False
+        return not busy
 
     def pending_count(self) -> int:
         return self._pending

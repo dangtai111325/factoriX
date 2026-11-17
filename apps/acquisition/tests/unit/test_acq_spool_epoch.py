@@ -48,3 +48,20 @@ def test_enforce_byte_cap_prunes_terminal_then_oldest_pending(tmp_path: Path) ->
     assert spool.pending_count() < 80
     assert spool.pending_count() == spool.count_by_state().get("PENDING", 0)
     spool.close()
+
+
+def test_enforce_byte_cap_keeps_pending_when_terminal_pages_can_be_reclaimed(tmp_path: Path) -> None:
+    spool = AcquisitionSpool(tmp_path / "cap.sqlite")
+    try:
+        spool.add_many([_row(f"u-{i}", "t1", 1, f"s-{i % 5}", payload_size=4000) for i in range(100)])
+        spool.mark_sent([f"u-{i}" for i in range(90)])
+        spool.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        cap = 128 * 1024
+        assert spool.db_bytes() > cap
+        assert spool.enforce_byte_cap(cap) == 90
+        assert spool.overflow_dropped_count == 0
+        assert [row["event_uid"] for row in spool.pending(10)] == [f"u-{i}" for i in range(90, 100)]
+        assert spool.pending_count() == 10
+        assert spool.db_bytes() <= cap
+    finally:
+        spool.close()
