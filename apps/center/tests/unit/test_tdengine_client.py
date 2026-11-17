@@ -6,11 +6,12 @@ import asyncio
 from datetime import datetime, timezone
 import threading
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
-from factorix.platform.tdengine import TDEngineClient, TDEngineConfig, TDEngineError
+from factorix.platform.tdengine import SubtableWriteItem, TDEngineClient, TDEngineConfig, TDEngineError
 
 
 class _FakeCursor:
@@ -50,6 +51,25 @@ class _FakeConn:
 
     def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_retryable_batch_write_does_not_fan_out_to_single_row_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = TDEngineClient(TDEngineConfig(dsn="ws://localhost:6041", batch_chunk_rows=2))
+    execute = AsyncMock(side_effect=[0, TDEngineError("TIMEOUT", "Connection timed out", retryable=True)])
+    monkeypatch.setattr(client, "execute_sql", execute)
+    try:
+        items = [
+            SubtableWriteItem(str(i), "sensors", "motor", ("north",), ("ts", "val"), (i, 1.0))
+            for i in range(7)
+        ]
+        result = await client.write_batch("plant", items)
+        assert execute.await_count == 2
+        assert result.succeeded_ids == ("0", "1")
+        assert [failure.item_id for failure in result.failures] == ["2", "3", "4", "5", "6"]
+        assert all(failure.retryable for failure in result.failures)
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

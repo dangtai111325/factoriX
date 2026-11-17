@@ -581,13 +581,22 @@ class TDEngineClient:
         if cur_items:
             chunks.append((cur_items, cur_groups, cur_flat))
 
-        for chunk_items, grouped, flat_chunk in chunks:
+        for index, (chunk_items, grouped, flat_chunk) in enumerate(chunks):
             stmt = "INSERT INTO " + " ".join(f"{hdr} VALUES {', '.join(vals)}" for hdr, vals in grouped.items())
 
             try:
                 await self.execute_sql(stmt)
                 succeeded.extend(it.item_id for it in chunk_items)
             except TDEngineError as exc:
+                if exc.retryable:
+                    # Let the caller back off and retry, instead of sending a separate
+                    # request for every row while the database is unavailable.
+                    failures.extend(
+                        BatchWriteFailure(item.item_id, item.subtable, exc.code, exc.message, retryable=True)
+                        for remaining_items, _, _ in chunks[index:]
+                        for item in remaining_items
+                    )
+                    break
                 if len(flat_chunk) == 1:
                     only_item = flat_chunk[0][0]
                     failures.append(
