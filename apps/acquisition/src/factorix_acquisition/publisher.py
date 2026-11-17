@@ -25,7 +25,13 @@ from factorix.domain.canonical import (
 )
 from factorix.domain.observation import ObservationError
 from factorix.domain.quality import Origin, Quality
-from factorix.platform.broker import BrokerBackpressureError, BrokerError, BrokerUnavailableError
+from factorix.platform.broker import (
+    BrokerBackpressureError,
+    BrokerError,
+    BrokerUnavailableError,
+    tenant_live_routing_key,
+    tenant_routing_key,
+)
 from factorix_acquisition.jobs import JobSpec
 from factorix_acquisition.mapping import Sample, coerce, field_address
 from factorix_acquisition.spool import AcquisitionSpool, SpoolRow
@@ -33,6 +39,7 @@ from factorix_acquisition.timeutil import iso_ms, now_iso
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_FRESHNESS_WINDOW_S = 12.0
 BATCH_ROWS = 500
 HISTORY_SLICE_S = 0.25
 FLUSH_BUDGET_S = 1.0
@@ -107,6 +114,7 @@ class ObservationPublisher:
         max_pending: int = 1_000_000,
         max_spool_bytes: int = 512 * 1024 * 1024,
         max_memory_queue: int = MAX_MEMORY_QUEUE,
+        freshness_window_s: float = DEFAULT_FRESHNESS_WINDOW_S,
         on_wake: Any = None,
         on_broker_restored: Any = None,
     ) -> None:
@@ -116,6 +124,7 @@ class ObservationPublisher:
         self.max_pending = max(100, int(max_pending))
         self.max_spool_bytes = max(0, int(max_spool_bytes))
         self.max_memory_queue = max(100, int(max_memory_queue))
+        self.freshness_window_s = float(freshness_window_s)
         self._on_wake = on_wake
         self._on_broker_restored = on_broker_restored
 
@@ -329,8 +338,50 @@ class ObservationPublisher:
             self._on_wake()
         return count
 
+    def _pop_fast_batch(self, max_items: int) -> list[CanonicalObservation]:
+        batch: list[CanonicalObservation] = []
+        while self._fast_queue and len(batch) < max_items:
+            obs = self._fast_queue.popleft()
+            if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
+                batch.append(obs)
+        return batch
+
+    def route_for_observation(self, obs: CanonicalObservation) -> str:
+        """Route to live lane if within freshness window, else legacy lane."""
+        now = datetime.now(timezone.utc)
+        acq_at = obs.acquired_at if obs.acquired_at.tzinfo else obs.acquired_at.replace(tzinfo=timezone.utc)
+        age_s = (now - acq_at).total_seconds()
+        if 0.0 <= age_s <= self.freshness_window_s:
+            return tenant_live_routing_key(obs.tenant_id)
+        return tenant_routing_key(obs.tenant_id)
+
+    async def publish_observation(self, obs: CanonicalObservation) -> tuple[bool, str]:
+        """Route and publish a single observation, returning (success, routing_key)."""
+        rkey = self.route_for_observation(obs)
+        if self.broker is None or self._broker_down:
+            self._spill([obs])
+            return False, rkey
+        try:
+            if hasattr(self.broker, "publish_observation"):
+                await self.broker.publish_observation(obs, routing_key=rkey)
+                self.published_fast += 1
+                return True, rkey
+            confirmed, failed = await self.broker.publish_observations_partial([obs])
+            if confirmed:
+                self.published_fast += 1
+                return True, rkey
+            self._spill([obs])
+            return False, rkey
+        except Exception:
+            self._spill([obs])
+            return False, rkey
+
     async def flush_once(self, budget_s: float = FLUSH_BUDGET_S) -> tuple[int, bool]:
         """Publish buffered fast-path observations and replay bounded spool slices.
+
+        Interleaves quotas between RAM fast-path and SQLite spool replay
+        (2 RAM batches : 1 spool batch when both pending) with a monotonic
+        deadline to avoid starvation and CPU hogging.
 
         Returns ``(published_count, failed_or_broker_unavailable)``.
         """
@@ -343,45 +394,86 @@ class ObservationPublisher:
                 self._spill(list(self._fast_queue))
                 self._fast_queue.clear()
 
-            # 2. When healthy, drain fast-queue items directly to RabbitMQ without hitting SQLite.
-            while self._fast_queue and not self._broker_down:
-                batch: list[CanonicalObservation] = []
-                while self._fast_queue and len(batch) < BATCH_ROWS:
-                    obs = self._fast_queue.popleft()
-                    if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
-                        batch.append(obs)
-                if not batch:
-                    continue
-                ok_count, failed = await self._publish_or_spill(batch)
-                published += ok_count
-                if failed:
-                    if self._fast_queue:
-                        self._spill(list(self._fast_queue))
-                        self._fast_queue.clear()
+            has_ram = bool(self._fast_queue)
+            has_spool = self.spool.pending_count() > 0
+
+            if not has_ram and not has_spool:
+                return 0, False
+
+            deadline = time.monotonic() + max(0.0, budget_s)
+
+            # 2. Fair flushing when both RAM and Spool are pending
+            if has_ram and has_spool:
+                while (self._fast_queue or self.spool.pending_count() > 0) and not self._broker_down:
+                    # Fair quota: up to 2 RAM batches
+                    for _ in range(2):
+                        if not self._fast_queue or self._broker_down:
+                            break
+                        batch = self._pop_fast_batch(BATCH_ROWS)
+                        if batch:
+                            ok_count, failed = await self._publish_or_spill(batch)
+                            published += ok_count
+                            if failed:
+                                if self._fast_queue:
+                                    self._spill(list(self._fast_queue))
+                                    self._fast_queue.clear()
+                                return published, True
+
+                    # Followed by 1 Spool batch
+                    if self.spool.pending_count() > 0 and not self._broker_down:
+                        self.spool.expire_stale()
+                        self.spool.purge_old_epochs(self._tenant_epochs)
+                        rows = self.spool.latest_pending(BATCH_ROWS)
+                        if not rows:
+                            rows = self.spool.pending(BATCH_ROWS)
+                        if rows:
+                            count, ok = await self._replay_rows(rows)
+                            published += count
+                            if not ok:
+                                return published, True
+
+                    if time.monotonic() >= deadline:
+                        break
+                return published, False
+
+            # 3. Only RAM pending: drain fast-queue directly
+            if has_ram:
+                while self._fast_queue and not self._broker_down:
+                    batch = self._pop_fast_batch(BATCH_ROWS)
+                    if not batch:
+                        break
+                    ok_count, failed = await self._publish_or_spill(batch)
+                    published += ok_count
+                    if failed:
+                        if self._fast_queue:
+                            self._spill(list(self._fast_queue))
+                            self._fast_queue.clear()
+                        return published, True
+                    if time.monotonic() >= deadline:
+                        break
+                return published, False
+
+            # 4. Only Spool pending: latest-per-signal lane first, then history slices
+            self.spool.expire_stale()
+            self.spool.purge_old_epochs(self._tenant_epochs)
+            latest_rows = self.spool.latest_pending(BATCH_ROWS)
+            if latest_rows:
+                count, ok = await self._replay_rows(latest_rows)
+                published += count
+                if not ok:
                     return published, True
 
-            # 3. Replay outage spool if pending rows exist: latest-per-signal lane first, then history.
-            if self.spool.pending_count() > 0:
-                self.spool.expire_stale()
-                self.spool.purge_old_epochs(self._tenant_epochs)
-                latest_rows = self.spool.latest_pending(BATCH_ROWS)
-                if latest_rows:
-                    count, ok = await self._replay_rows(latest_rows)
-                    published += count
-                    if not ok:
-                        return published, True
+            while True:
+                rows = self.spool.pending(BATCH_ROWS)
+                if not rows:
+                    break
+                count, ok = await self._replay_rows(rows)
+                published += count
+                if not ok:
+                    return published, True
+                if len(rows) < BATCH_ROWS or time.monotonic() >= deadline:
+                    break
 
-                deadline = time.monotonic() + max(0.0, budget_s)
-                while True:
-                    rows = self.spool.pending(BATCH_ROWS)
-                    if not rows:
-                        break
-                    count, ok = await self._replay_rows(rows)
-                    published += count
-                    if not ok:
-                        return published, True
-                    if len(rows) < BATCH_ROWS or time.monotonic() >= deadline:
-                        break
             return published, False
         finally:
             self._inflight_flushes = max(0, self._inflight_flushes - 1)

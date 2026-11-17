@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
@@ -829,4 +830,139 @@ async def test_formula_seed_requires_causal_active_epoch_sample(alias_epoch: int
         assert td.writes[1][0]["value"] == 7.0
     else:
         assert len(td.writes) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_lane_fair_batching_ratio() -> None:
+    worker = IngestionWorker(
+        pg_store=MagicMock(), tdengine=MagicMock(), batch_size=8, flush_ms=5_000,
+    )
+    # Populate 10 live and 10 legacy pending envelopes
+    loop = asyncio.get_running_loop()
+    from factorix.modules.ingestion_worker import _PendingEnvelope
+
+    for i in range(10):
+        worker._pending_live.append(_PendingEnvelope(
+            raw_body=b"{}", message_id=f"live-{i}", headers={}, redelivered=False,
+            ingested_at=_now(), future=loop.create_future(),
+        ))
+        worker._pending_legacy.append(_PendingEnvelope(
+            raw_body=b"{}", message_id=f"legacy-{i}", headers={}, redelivered=False,
+            ingested_at=_now(), future=loop.create_future(),
+        ))
+
+    batches: list[list[_PendingEnvelope]] = []
+    async def capture_batch(batch):
+        batches.append(list(batch))
+        for env in batch:
+            env.future.set_result(ConsumeOutcome.ACK)
+
+    worker._process_batch = capture_batch
+    batcher = asyncio.create_task(worker._batcher_loop())
+    worker._wake_batcher.set()
+
+    try:
+        await asyncio.sleep(0.1)
+        # Total batch size 8: 75% Live (6) : 25% Legacy (2)
+        assert len(batches) >= 1
+        first_batch = batches[0]
+        assert len(first_batch) == 8
+        live_count = sum(1 for e in first_batch if str(e.message_id).startswith("live-"))
+        legacy_count = sum(1 for e in first_batch if str(e.message_id).startswith("legacy-"))
+        assert live_count == 6
+        assert legacy_count == 2
+    finally:
+        worker._stop_event.set()
+        worker._wake_batcher.set()
+        await batcher
+
+
+@pytest.mark.asyncio
+async def test_dual_consumers_start_and_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_start = AsyncMock()
+    mock_stop = AsyncMock()
+    mock_consumer_cls = MagicMock()
+    mock_consumer_cls.return_value.start = mock_start
+    mock_consumer_cls.return_value.stop = mock_stop
+    monkeypatch.setattr("factorix.modules.ingestion_worker.RabbitMQConsumer", mock_consumer_cls)
+
+    cfg = BrokerConfig(amqp_url="amqp://localhost/")
+    pg = MagicMock(start=AsyncMock(), close=AsyncMock())
+    td = MagicMock()
+    worker = IngestionWorker(pg_store=pg, tdengine=td, broker_cfg=cfg)
+    await worker.start()
+
+    assert worker._legacy_consumer is not None
+    assert worker._live_consumer is not None
+    assert mock_start.await_count == 2
+
+    await worker.stop()
+    assert mock_stop.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_anti_rewind_ensures_live_sample_wins_in_newest_map() -> None:
+    tid = uuid4()
+    rid = uuid4()
+    cid = uuid4()
+    fid = uuid4()
+    sig_id = uuid4()
+    stid = uuid4()
+    now = _now()
+
+    cat = TenantCatalog(
+        tenant_id=tid,
+        loaded_at=time.monotonic(),
+        active_epoch=1,
+        epoch_loaded_at=time.monotonic(),
+        lifecycle_state="ACTIVE",
+        bindings={
+            sig_id: [
+                {
+                    "signal_id": sig_id,
+                    "valid_from": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "valid_to": None,
+                    "resource_id": rid,
+                    "expected_interval_ms": 1000,
+                    "site_id": stid,
+                    "connection_id": cid,
+                    "source_field_id": fid,
+                    "nullable": False,
+                }
+            ]
+        },
+    )
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)
+
+    # Legacy replay: older timestamp, seq=1
+    legacy_obs = _make_obs(
+        tenant_id=tid, signal_id=sig_id, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid,
+        value=10.0, acquired_at=now - timedelta(hours=1), data_epoch=1, seq=1,
+    )
+    # Live sample: fresh timestamp, seq=2
+    live_obs = _make_obs(
+        tenant_id=tid, signal_id=sig_id, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid,
+        value=99.0, acquired_at=now, data_epoch=1, seq=2,
+    )
+
+    # Ingest in out-of-order sequence: live first, then legacy
+    outcomes = await w.ingest_direct_bytes([
+        (live_obs.to_json_bytes(), {}, live_obs.event_uid, False),
+        (legacy_obs.to_json_bytes(), {}, legacy_obs.event_uid, False),
+    ])
+    assert outcomes == [ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+
+    # In PostgreSQL latest_rows passed to commit_batch_metadata, the state should be the live sample (value 99.0)
+    assert len(pg.commits) == 1
+    latest_rows = pg.commits[0]["latest_rows"]
+    assert len(latest_rows) == 1
+    assert latest_rows[0]["signal_id"] == sig_id
+    assert latest_rows[0]["value"] == 99.0
+    assert latest_rows[0]["event_uid"] == live_obs.event_uid
+
+    # In worker live cache, the state should also be the live sample
+    assert w._live_cache[tid][sig_id].value == 99.0
+    assert w._live_cache[tid][sig_id].event_uid == live_obs.event_uid
 

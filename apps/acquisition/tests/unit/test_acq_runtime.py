@@ -351,7 +351,7 @@ async def test_leader_lock_demotion_stops_all_jobs_and_prevents_standby_polling(
     # Demote to standby (F-26 failover simulation)
     lock.should_lead = False
     deadline = asyncio.get_running_loop().time() + 2.0
-    while asyncio.get_running_loop().time() < deadline and runtime._is_leader:
+    while asyncio.get_running_loop().time() < deadline and (runtime._is_leader or runtime.job_tasks):
         await asyncio.sleep(0.05)
     assert runtime._is_leader is False
     assert runtime.job_tasks == {}

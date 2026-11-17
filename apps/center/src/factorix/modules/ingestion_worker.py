@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -1121,8 +1121,12 @@ class IngestionWorker:
         self._live_cache: dict[UUID, dict[UUID, LiveSignalRecord]] = {}
         self._ensured_tenants: set[UUID] = set()
         self._consumer: RabbitMQConsumer | None = None
+        self._legacy_consumer: RabbitMQConsumer | None = None
+        self._live_consumer: RabbitMQConsumer | None = None
 
         self._pending: list[_PendingEnvelope] = []
+        self._pending_live: deque[_PendingEnvelope] = deque()
+        self._pending_legacy: deque[_PendingEnvelope] = deque()
         self._pending_lock = asyncio.Lock()
         self._wake_batcher = asyncio.Event()
         self._stop_event = asyncio.Event()
@@ -1162,13 +1166,36 @@ class IngestionWorker:
         if self._notify_dsn:
             self._notify_task = asyncio.create_task(self._notify_loop(), name="ingestion-pg-notify")
         if self.broker_cfg is not None:
-            self._consumer = RabbitMQConsumer(self.broker_cfg, self.handle_message)
-            await self._consumer.start()
+            legacy_cfg = self.broker_cfg
+            live_cfg = replace(
+                self.broker_cfg,
+                queue_name=self.broker_cfg.live_queue_name,
+                prefetch_count=self.broker_cfg.live_prefetch_count,
+                max_length_bytes=self.broker_cfg.live_max_length_bytes,
+                binding_pattern=self.broker_cfg.live_binding_pattern,
+            )
+            self._legacy_consumer = RabbitMQConsumer(
+                legacy_cfg,
+                self.handle_legacy_message,
+                queue_name=self.broker_cfg.queue_name,
+            )
+            self._live_consumer = RabbitMQConsumer(
+                live_cfg,
+                self.handle_live_message,
+                queue_name=self.broker_cfg.live_queue_name,
+            )
+            self._consumer = self._legacy_consumer
+            await self._legacy_consumer.start()
+            await self._live_consumer.start()
 
     async def stop(self, *, drain_timeout_s: float = 15.0) -> None:
         self._stopping = True
         self._stop_event.set()
-        if self._consumer is not None:
+        if self._live_consumer is not None:
+            await self._live_consumer.stop(drain_timeout_s=drain_timeout_s)
+        if self._legacy_consumer is not None:
+            await self._legacy_consumer.stop(drain_timeout_s=drain_timeout_s)
+        elif self._consumer is not None:
             await self._consumer.stop(drain_timeout_s=drain_timeout_s)
         self._wake_batcher.set()
         if self._batcher_task is not None:
@@ -1192,8 +1219,19 @@ class IngestionWorker:
             self._notify_conn = None
         await self.pg.close()
 
+    async def handle_live_message(self, message: AbstractIncomingMessage) -> ConsumeOutcome:
+        return await self._enqueue_incoming_message(message, lane="live")
+
+    async def handle_legacy_message(self, message: AbstractIncomingMessage) -> ConsumeOutcome:
+        return await self._enqueue_incoming_message(message, lane="legacy")
+
     async def handle_message(self, message: AbstractIncomingMessage) -> ConsumeOutcome:
         """RabbitMQConsumer message handler. Resolves only after durable storage or permanent quarantine."""
+        rkey = str(getattr(message, "routing_key", "") or "")
+        lane = "live" if "live" in rkey else "legacy"
+        return await self._enqueue_incoming_message(message, lane=lane)
+
+    async def _enqueue_incoming_message(self, message: AbstractIncomingMessage, lane: str = "live") -> ConsumeOutcome:
         self.metrics.received_total += 1
         raw_body = bytes(message.body)
         if len(raw_body) > MAX_MESSAGE_BYTES:
@@ -1219,8 +1257,12 @@ class IngestionWorker:
             future=fut,
         )
         async with self._pending_lock:
-            self._pending.append(env)
-            should_wake = len(self._pending) >= self._batch_wake_size
+            if lane == "live":
+                self._pending_live.append(env)
+            else:
+                self._pending_legacy.append(env)
+            total_pending = len(self._pending_live) + len(self._pending_legacy) + len(self._pending)
+            should_wake = total_pending >= self._batch_wake_size
         if should_wake:
             self._wake_batcher.set()
         return await fut
@@ -1297,7 +1339,7 @@ class IngestionWorker:
             logger.warning("Failed to record quarantine entry (%s): %s", event_uid, exc)
 
     async def _batcher_loop(self) -> None:
-        while not self._stop_event.is_set() or self._pending:
+        while not self._stop_event.is_set() or self._pending_live or self._pending_legacy or self._pending:
             try:
                 await asyncio.wait_for(self._wake_batcher.wait(), timeout=self.flush_interval_s)
             except asyncio.TimeoutError:
@@ -1306,11 +1348,31 @@ class IngestionWorker:
 
             batch: list[_PendingEnvelope] = []
             async with self._pending_lock:
-                if self._pending:
-                    batch = self._pending[: self.batch_size]
-                    del self._pending[: self.batch_size]
-                    if self._pending:
-                        self._wake_batcher.set()
+                while self._pending:
+                    self._pending_legacy.append(self._pending.pop(0))
+
+                live_len = len(self._pending_live)
+                legacy_len = len(self._pending_legacy)
+
+                if live_len > 0 and legacy_len > 0:
+                    # Fair quota: 75% Live (up to 192 for batch size 256) : 25% Legacy (up to 64)
+                    live_quota = min(max(1, int(self.batch_size * 0.75)), live_len)
+                    legacy_quota = min(self.batch_size - live_quota, legacy_len)
+                    for _ in range(live_quota):
+                        batch.append(self._pending_live.popleft())
+                    for _ in range(legacy_quota):
+                        batch.append(self._pending_legacy.popleft())
+                elif live_len > 0:
+                    take = min(self.batch_size, live_len)
+                    for _ in range(take):
+                        batch.append(self._pending_live.popleft())
+                elif legacy_len > 0:
+                    take = min(self.batch_size, legacy_len)
+                    for _ in range(take):
+                        batch.append(self._pending_legacy.popleft())
+
+                if len(self._pending_live) > 0 or len(self._pending_legacy) > 0:
+                    self._wake_batcher.set()
             if batch:
                 batch_started_at = time.monotonic()
                 try:
@@ -1994,6 +2056,15 @@ class IngestionWorker:
         if not committed_items:
             return
         self.metrics.tdengine_writes += sum(1 for _env, p in committed_items if p.obs.event_uid in op_written_uids)
+
+        committed_items.sort(
+            key=lambda pair: (
+                pair[1].obs.data_epoch,
+                pair[1].received_time,
+                pair[1].obs.source_sequence if pair[1].obs.source_sequence is not None else -1,
+                pair[1].obs.event_uid,
+            )
+        )
 
         # Build newest candidate per signal for PG latest_signal_state + stream notification
         newest_map: dict[UUID, dict[str, Any]] = {}

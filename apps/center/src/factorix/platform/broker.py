@@ -38,7 +38,7 @@ class BrokerUnavailableError(BrokerError):
 
 
 class BrokerBackpressureError(BrokerError):
-    """Broker rejected a publish via ``reject-publish`` overflow or unroutable mandatory flag."""
+    """Broker rejected a publish, for example because a queue reached its limit."""
 
 
 class ConsumeOutcome(StrEnum):
@@ -53,15 +53,20 @@ class BrokerConfig:
     mgmt_url: str = ""
     exchange_name: str = "factorix.telemetry.ingress"
     queue_name: str = "factorix.telemetry.ingest.q"
+    live_queue_name: str = "factorix.telemetry.live.q"
     dlx_name: str = "factorix.telemetry.dlx"
     dlq_name: str = "factorix.telemetry.dlq"
     binding_pattern: str = "telemetry.v1.*"
+    live_binding_pattern: str = "telemetry.live.v1.*"
     dlq_routing_key: str = "dlq"
     max_length_bytes: int = 512 * 1024 * 1024
+    live_max_length_bytes: int = 256 * 1024 * 1024
     dlq_max_length_bytes: int = 256 * 1024 * 1024
     max_length: int | None = None
     delivery_limit: int = 5
     prefetch_count: int = 128
+    live_prefetch_count: int = 128
+    freshness_window_s: float = 12.0
     max_inflight_publishes: int = 64
     confirm_timeout_s: float = 10.0
     consumer_concurrency: int = 32
@@ -76,11 +81,17 @@ class BrokerConfig:
             mgmt_url=str(getattr(settings, "rabbitmq_mgmt_url", "") or ""),
             exchange_name=str(settings.rabbitmq_exchange),
             queue_name=str(settings.rabbitmq_queue),
+            live_queue_name=str(getattr(settings, "rabbitmq_live_queue", "factorix.telemetry.live.q") or "factorix.telemetry.live.q"),
             dlx_name=str(settings.rabbitmq_dlx),
             dlq_name=str(settings.rabbitmq_dlq),
+            binding_pattern=str(getattr(settings, "rabbitmq_binding_pattern", "telemetry.v1.*") or "telemetry.v1.*"),
+            live_binding_pattern=str(getattr(settings, "rabbitmq_live_binding_pattern", "telemetry.live.v1.*") or "telemetry.live.v1.*"),
             max_length_bytes=int(settings.rabbitmq_max_length_bytes),
+            live_max_length_bytes=int(getattr(settings, "rabbitmq_live_max_length_bytes", 256 * 1024 * 1024) or 256 * 1024 * 1024),
             delivery_limit=int(settings.rabbitmq_delivery_limit),
             prefetch_count=int(settings.rabbitmq_prefetch),
+            live_prefetch_count=int(getattr(settings, "rabbitmq_live_prefetch", 128) or 128),
+            freshness_window_s=float(getattr(settings, "rabbitmq_freshness_window_s", 12.0) or 12.0),
             max_inflight_publishes=int(settings.rabbitmq_publisher_max_inflight),
             confirm_timeout_s=float(settings.rabbitmq_confirm_timeout_s),
             consumer_concurrency=int(getattr(settings, "ingestion_consumer_concurrency", 32) or 32),
@@ -89,6 +100,10 @@ class BrokerConfig:
 
 def tenant_routing_key(tenant_id: UUID) -> str:
     return f"telemetry.v1.{tenant_id.hex}"
+
+
+def tenant_live_routing_key(tenant_id: UUID) -> str:
+    return f"telemetry.live.v1.{tenant_id.hex}"
 
 
 def redact_amqp_url(url: str) -> str:
@@ -122,13 +137,48 @@ class BrokerHealthSnapshot:
     checked_at: datetime
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
+    live_ready_count: int | None = None
+    live_unacked_count: int | None = None
+    legacy_ready_count: int | None = None
+    legacy_unacked_count: int | None = None
+
+
+class TelemetryTopology(tuple):
+    """3-tuple (ingress, queue, dlq) with live_queue property for two-lane topology."""
+
+    def __new__(
+        cls,
+        ingress: AbstractRobustExchange,
+        queue: AbstractRobustQueue,
+        dlq: AbstractRobustQueue,
+        live_queue: AbstractRobustQueue | None = None,
+    ) -> "TelemetryTopology":
+        instance = super().__new__(cls, (ingress, queue, dlq))
+        instance._live_queue = live_queue
+        return instance
+
+    @property
+    def ingress(self) -> AbstractRobustExchange:
+        return self[0]
+
+    @property
+    def queue(self) -> AbstractRobustQueue:
+        return self[1]
+
+    @property
+    def dlq(self) -> AbstractRobustQueue:
+        return self[2]
+
+    @property
+    def live_queue(self) -> AbstractRobustQueue | None:
+        return self._live_queue
 
 
 async def declare_telemetry_topology(
     channel: AbstractRobustChannel,
     cfg: BrokerConfig,
-) -> tuple[AbstractRobustExchange, AbstractRobustQueue, AbstractRobustQueue]:
-    """Declare durable topic ingress, Quorum ingest queue, and at-least-once Quorum DLX/DLQ."""
+) -> TelemetryTopology:
+    """Declare durable topic ingress, legacy + live Quorum queues, and at-least-once Quorum DLX/DLQ."""
     dlx = await channel.declare_exchange(
         cfg.dlx_name,
         aio_pika.ExchangeType.DIRECT,
@@ -162,20 +212,39 @@ async def declare_telemetry_topology(
         aio_pika.ExchangeType.TOPIC,
         durable=True,
     )
-    queue_args: dict[str, Any] = {
+    queue: Any = None
+    if cfg.queue_name != cfg.live_queue_name:
+        queue_args: dict[str, Any] = {
+            "x-queue-type": "quorum",
+            "x-dead-letter-exchange": cfg.dlx_name,
+            "x-dead-letter-routing-key": cfg.dlq_routing_key,
+            "x-dead-letter-strategy": "at-least-once",
+            "x-overflow": "reject-publish",
+            "x-max-length-bytes": int(cfg.max_length_bytes),
+            "x-delivery-limit": int(cfg.delivery_limit),
+        }
+        if cfg.max_length is not None:
+            queue_args["x-max-length"] = int(cfg.max_length)
+        queue = await _declare_quorum_queue(cfg.queue_name, queue_args)
+        await queue.bind(ingress, routing_key=cfg.binding_pattern)
+
+    # Two-lane architecture: declare and bind live quorum queue
+    live_queue_args: dict[str, Any] = {
         "x-queue-type": "quorum",
         "x-dead-letter-exchange": cfg.dlx_name,
         "x-dead-letter-routing-key": cfg.dlq_routing_key,
         "x-dead-letter-strategy": "at-least-once",
         "x-overflow": "reject-publish",
-        "x-max-length-bytes": int(cfg.max_length_bytes),
+        "x-max-length-bytes": int(cfg.live_max_length_bytes),
         "x-delivery-limit": int(cfg.delivery_limit),
     }
-    if cfg.max_length is not None:
-        queue_args["x-max-length"] = int(cfg.max_length)
-    queue = await _declare_quorum_queue(cfg.queue_name, queue_args)
-    await queue.bind(ingress, routing_key=cfg.binding_pattern)
-    return ingress, queue, dlq
+    live_queue = await _declare_quorum_queue(cfg.live_queue_name, live_queue_args)
+    await live_queue.bind(ingress, routing_key=cfg.live_binding_pattern)
+
+    if queue is None:
+        queue = live_queue
+
+    return TelemetryTopology(ingress, queue, dlq, live_queue)
 
 
 async def connect_with_backoff(
@@ -227,7 +296,7 @@ class RabbitMQPublisher:
                 max_attempts=3,
                 connect_timeout_s=self.cfg.confirm_timeout_s,
             )
-            self._channel = await self._conn.channel(publisher_confirms=True)  # type: ignore[assignment]
+            self._channel = await self._conn.channel(publisher_confirms=True, on_return_raises=True)  # type: ignore[assignment]
             self._exchange, _, _ = await declare_telemetry_topology(self._channel, self.cfg)
 
     async def close(self) -> None:
@@ -259,7 +328,7 @@ class RabbitMQPublisher:
         assert self._exchange is not None
         return self._exchange
 
-    async def publish_observation(self, obs: CanonicalObservation) -> None:
+    async def publish_observation(self, obs: CanonicalObservation, routing_key: str | None = None) -> None:
         headers: dict[str, Any] = {
             "x-schema-version": int(obs.schema_version),
             "x-data-epoch": int(obs.data_epoch),
@@ -270,9 +339,20 @@ class RabbitMQPublisher:
         }
         if obs.source_sequence is not None:
             headers["x-source-sequence"] = int(obs.source_sequence)
+
+        if routing_key is None:
+            now = datetime.now(timezone.utc)
+            acq_at = obs.acquired_at if obs.acquired_at.tzinfo else obs.acquired_at.replace(tzinfo=timezone.utc)
+            age_s = (now - acq_at).total_seconds()
+            freshness_window = getattr(self.cfg, "freshness_window_s", 12.0)
+            if 0.0 <= age_s <= freshness_window:
+                routing_key = tenant_live_routing_key(obs.tenant_id)
+            else:
+                routing_key = tenant_routing_key(obs.tenant_id)
+
         await self.publish_bytes(
             payload=obs.to_json_bytes(),
-            routing_key=tenant_routing_key(obs.tenant_id),
+            routing_key=routing_key,
             message_id=obs.event_uid,
             correlation_id=obs.correlation_id,
             headers=headers,
@@ -333,7 +413,10 @@ class RabbitMQPublisher:
                     mandatory=True,
                     timeout=self.cfg.confirm_timeout_s,
                 )
-            except (aiormq.exceptions.DeliveryError, aiormq.exceptions.PublishError) as exc:
+            except aiormq.exceptions.PublishError as exc:
+                self.metrics.publish_errors += 1
+                raise BrokerUnavailableError(f"RabbitMQ could not route message {message_id}: {exc}") from exc
+            except aiormq.exceptions.DeliveryError as exc:
                 self.metrics.publish_backpressure += 1
                 raise BrokerBackpressureError(f"RabbitMQ rejected message {message_id}: {exc}") from exc
             except (TimeoutError, aio_pika.exceptions.AMQPError, aiormq.exceptions.AMQPException, OSError) as exc:
@@ -349,9 +432,16 @@ MessageHandler = Callable[[AbstractIncomingMessage], Awaitable[ConsumeOutcome]]
 class RabbitMQConsumer:
     """Manual-ACK Quorum Queue consumer with bounded QoS/concurrency and graceful drain."""
 
-    def __init__(self, cfg: BrokerConfig, handler: MessageHandler) -> None:
+    def __init__(
+        self,
+        cfg: BrokerConfig,
+        handler: MessageHandler,
+        *,
+        queue_name: str | None = None,
+    ) -> None:
         self.cfg = cfg
         self.handler = handler
+        self.target_queue_name = queue_name or cfg.queue_name
         self.metrics = BrokerMetrics()
         self._conn: AbstractRobustConnection | None = None
         self._channel: AbstractRobustChannel | None = None
@@ -371,7 +461,16 @@ class RabbitMQConsumer:
         )
         self._channel = await self._conn.channel()  # type: ignore[assignment]
         await self._channel.set_qos(prefetch_count=self.cfg.prefetch_count)
-        _, self._queue, _ = await declare_telemetry_topology(self._channel, self.cfg)
+        topology = await declare_telemetry_topology(self._channel, self.cfg)
+        live_q = getattr(topology, "live_queue", None)
+        if live_q is None and len(topology) >= 4:
+            live_q = topology[3]
+        legacy_q = getattr(topology, "queue", topology[1])
+
+        if (self.target_queue_name == self.cfg.live_queue_name or self.cfg.queue_name == self.cfg.live_queue_name) and live_q is not None:
+            self._queue = live_q
+        else:
+            self._queue = legacy_q
         self._consumer_tag = await self._queue.consume(self._on_message, no_ack=False)
 
     async def _on_message(self, message: AbstractIncomingMessage) -> None:
@@ -449,10 +548,12 @@ class RabbitMQConsumer:
 
 
 async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
-    """Measure AMQP reachability and inspect ready/unacked/DLQ counts + oldest age when available."""
+    """Measure AMQP reachability and inspect ready/unacked/DLQ counts + oldest age for both live & legacy queues."""
     checked_at = datetime.now(timezone.utc)
-    ready_count: int | None = None
-    unacked_count: int | None = None
+    legacy_ready: int | None = None
+    live_ready: int | None = None
+    legacy_unacked: int | None = None
+    live_unacked: int | None = None
     dlq_count: int | None = None
     oldest_age_s: float | None = None
     warnings: list[str] = []
@@ -463,9 +564,14 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
             channel = await conn.channel()
             try:
                 q_res = await channel.declare_queue(cfg.queue_name, passive=True)
-                ready_count = int(q_res.declaration_result.message_count or 0)
+                legacy_ready = int(q_res.declaration_result.message_count or 0)
             except Exception as exc:  # noqa: BLE001
-                warnings.append(f"Primary queue {cfg.queue_name} unavailable: {exc}")
+                warnings.append(f"Legacy queue {cfg.queue_name} unavailable: {exc}")
+            try:
+                live_res = await channel.declare_queue(cfg.live_queue_name, passive=True)
+                live_ready = int(live_res.declaration_result.message_count or 0)
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"Live queue {cfg.live_queue_name} unavailable: {exc}")
             try:
                 dlq_res = await channel.declare_queue(cfg.dlq_name, passive=True)
                 dlq_count = int(dlq_res.declaration_result.message_count or 0)
@@ -483,6 +589,10 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
             checked_at=checked_at,
             error=str(exc),
             warnings=warnings,
+            live_ready_count=None,
+            live_unacked_count=None,
+            legacy_ready_count=None,
+            legacy_unacked_count=None,
         )
 
     if cfg.mgmt_url:
@@ -492,19 +602,32 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
         base = cfg.mgmt_url.rstrip("/")
         try:
             async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
+                # Query legacy queue
                 resp = await client.get(f"{base}/api/queues/{vhost}/{quote(cfg.queue_name, safe='')}", auth=auth)
                 if resp.status_code == 200:
                     data = resp.json()
-                    # Keep synchronous AMQP queue.declare_ok message_count authoritative when
-                    # available; Management HTTP stats lag up to ~5s behind real-time ACKs.
-                    if ready_count is None:
-                        ready_count = int(data.get("messages_ready", 0))
-                    unacked_count = int(data.get("messages_unacknowledged", 0))
+                    if legacy_ready is None:
+                        legacy_ready = int(data.get("messages_ready", 0))
+                    legacy_unacked = int(data.get("messages_unacknowledged", 0))
                     head_ts = data.get("head_message_timestamp")
-                    if isinstance(head_ts, (int, float)) and head_ts > 0 and (ready_count or 0) > 0:
+                    if isinstance(head_ts, (int, float)) and head_ts > 0 and (legacy_ready or 0) > 0:
                         oldest_age_s = max(0.0, round(time.time() - float(head_ts), 3))
-                    else:
-                        oldest_age_s = 0.0 if ready_count == 0 else None
+                    elif legacy_ready == 0 and oldest_age_s is None:
+                        oldest_age_s = 0.0
+
+                # Query live queue
+                live_resp = await client.get(f"{base}/api/queues/{vhost}/{quote(cfg.live_queue_name, safe='')}", auth=auth)
+                if live_resp.status_code == 200:
+                    live_data = live_resp.json()
+                    if live_ready is None:
+                        live_ready = int(live_data.get("messages_ready", 0))
+                    live_unacked = int(live_data.get("messages_unacknowledged", 0))
+                    live_head_ts = live_data.get("head_message_timestamp")
+                    if isinstance(live_head_ts, (int, float)) and live_head_ts > 0 and (live_ready or 0) > 0:
+                        live_age = max(0.0, round(time.time() - float(live_head_ts), 3))
+                        oldest_age_s = max(oldest_age_s or 0.0, live_age)
+
+                # Query DLQ
                 dlq_resp = await client.get(f"{base}/api/queues/{vhost}/{quote(cfg.dlq_name, safe='')}", auth=auth)
                 if dlq_resp.status_code == 200:
                     dlq_data = dlq_resp.json()
@@ -513,12 +636,25 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"Management HTTP probe unavailable: {exc}")
 
+    # Total combined ready and unacked for backwards compatibility
+    total_ready = None
+    if legacy_ready is not None or live_ready is not None:
+        total_ready = (legacy_ready or 0) + (live_ready or 0)
+
+    total_unacked = None
+    if legacy_unacked is not None or live_unacked is not None:
+        total_unacked = (legacy_unacked or 0) + (live_unacked or 0)
+
     return BrokerHealthSnapshot(
         broker_ok=True,
-        ready_count=ready_count,
-        unacked_count=unacked_count,
+        ready_count=total_ready,
+        unacked_count=total_unacked,
         dlq_count=dlq_count,
         oldest_queued_age_s=oldest_age_s,
         checked_at=checked_at,
         warnings=warnings,
+        live_ready_count=live_ready,
+        live_unacked_count=live_unacked,
+        legacy_ready_count=legacy_ready,
+        legacy_unacked_count=legacy_unacked,
     )

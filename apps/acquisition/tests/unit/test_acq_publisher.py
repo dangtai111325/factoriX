@@ -254,3 +254,67 @@ async def test_set_broker_generation_prevents_inflight_flush_from_clobbering_out
     assert pub2._broker_down is False
     assert spool.pending_count() == 1
     spool.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_sample_routes_to_live_lane(tmp_path: Path) -> None:
+    spec, tenant_id, sig_id = _spec()
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    pub = ObservationPublisher(RecordingBroker(), spool)
+    field_id = spec.fields[0]["id"]
+    obs_list = pub.build_observations(spec, [Sample(field_id, 25.0, "GOOD")])
+    obs = obs_list[0]
+    rkey = pub.route_for_observation(obs)
+    assert "telemetry.live.v1." in rkey
+    assert tenant_id.replace("-", "") in rkey
+    spool.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_sample_routes_to_legacy_lane(tmp_path: Path) -> None:
+    from datetime import timedelta, timezone, datetime
+    spec, tenant_id, sig_id = _spec()
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    pub = ObservationPublisher(RecordingBroker(), spool)
+    field_id = spec.fields[0]["id"]
+    stale_time = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    obs_list = pub.build_observations(spec, [Sample(field_id, 25.0, "GOOD", received_time=stale_time)])
+    obs = obs_list[0]
+    rkey = pub.route_for_observation(obs)
+    assert rkey.startswith("telemetry.v1.")
+    assert "live" not in rkey
+    assert tenant_id.replace("-", "") in rkey
+    spool.close()
+
+
+@pytest.mark.asyncio
+async def test_fair_flushing_interleaves_ram_and_spool(tmp_path: Path) -> None:
+    spec, tenant_id, _ = _spec()
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    broker = RecordingBroker()
+    pub = ObservationPublisher(broker, spool)
+    field_id = spec.fields[0]["id"]
+
+    # Fill spool with 50 items
+    broker.down = True
+    pub._broker_down = True
+    for i in range(50):
+        pub.emit(spec, [Sample(field_id, float(i), "GOOD")])
+    assert spool.pending_count() == 50
+    assert pub.fast_buffered == 0
+
+    # Broker restores and RAM gets 20 items
+    broker.down = False
+    pub.set_broker(broker)
+    for i in range(20):
+        pub.emit(spec, [Sample(field_id, 1000.0 + i, "GOOD")])
+    assert pub.fast_buffered == 20
+    assert spool.pending_count() == 50
+
+    # Flush once: should process RAM (20) and Spool (50)
+    sent, failed = await pub.flush_once(budget_s=5.0)
+    assert failed is False
+    assert sent == 70
+    assert pub.fast_buffered == 0
+    assert spool.pending_count() == 0
+    spool.close()
