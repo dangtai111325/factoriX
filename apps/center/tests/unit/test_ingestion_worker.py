@@ -777,3 +777,56 @@ async def test_multi_sample_formula_batch_evaluates_chronologically() -> None:
     latest_s1 = next(r for r in pg.commits[-1]["latest_rows"] if r["signal_id"] == s1)
     assert latest_s1["value"] == 24.0 and latest_s1["quality"] == "BAD"
 
+    late = _make_obs(tenant_id=tid, signal_id=s0, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=9.0, acquired_at=t0 - timedelta(seconds=1))
+    assert await w.ingest_direct_bytes([(late.to_json_bytes(), {}, late.event_uid, False)]) == [ConsumeOutcome.ACK]
+    assert len(td.writes) == 3
+    assert td.writes[-1][0]["event_uid"] == late.event_uid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("alias_epoch", "alias_offset", "should_calculate"), [(2, 1, False), (1, -1, False), (2, -1, True)])
+async def test_formula_seed_requires_causal_active_epoch_sample(alias_epoch: int, alias_offset: int, should_calculate: bool) -> None:
+    tid, rid, cid, fid, stid = uuid4(), uuid4(), uuid4(), uuid4(), uuid4()
+    trigger, other_input, output, formula = uuid4(), uuid4(), uuid4(), uuid4()
+    now = _now()
+    cat = TenantCatalog(
+        tenant_id=tid,
+        active_epoch=2,
+        lifecycle_state="ACTIVE",
+        bindings={
+            trigger: [{
+                "signal_id": trigger, "valid_from": now - timedelta(days=1), "valid_to": None,
+                "resource_id": rid, "site_id": stid, "connection_id": cid, "source_field_id": fid,
+            }]
+        },
+        formula_inputs={trigger, other_input},
+        formulas_by_dep={
+            trigger: [{
+                "formula_id": formula, "output_id": output, "expression_source": "x + y",
+                "revision": 1, "resource_id": rid, "data_type": "float64", "site_id": stid,
+            }]
+        },
+        formula_aliases={
+            formula: [
+                {"variable_alias": "x", "dependency_signal_id": trigger},
+                {"variable_alias": "y", "dependency_signal_id": other_input},
+            ]
+        },
+    )
+    pg = _FakePgStore(cat)
+    pg.latest_values[other_input] = {
+        "value": 5.0, "quality": "GOOD", "received_time": now + timedelta(seconds=alias_offset),
+        "data_epoch": alias_epoch,
+    }
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)
+    obs = _make_obs(tenant_id=tid, signal_id=trigger, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=2.0, acquired_at=now, data_epoch=2)
+
+    assert await w.ingest_direct_bytes([(obs.to_json_bytes(), {}, obs.event_uid, False)]) == [ConsumeOutcome.ACK]
+    assert td.writes[0][0]["event_uid"] == obs.event_uid
+    if should_calculate:
+        assert td.writes[1][0]["signal_id"] == output
+        assert td.writes[1][0]["value"] == 7.0
+    else:
+        assert len(td.writes) == 1
+

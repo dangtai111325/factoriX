@@ -617,7 +617,7 @@ class PgIngestionStore:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT signal_id, value_json, quality, received_time
+                SELECT signal_id, value_json, quality, received_time, data_epoch
                 FROM latest_signal_state
                 WHERE tenant_id = $1 AND signal_id = ANY($2::uuid[])
                 """,
@@ -632,6 +632,7 @@ class PgIngestionStore:
                 "value": vj.get("v") if isinstance(vj, dict) else None,
                 "quality": str(r["quality"]),
                 "received_time": r["received_time"],
+                "data_epoch": r["data_epoch"],
             }
         return out
 
@@ -2359,7 +2360,8 @@ class IngestionWorker:
             except _WorkerStoppingRetry:
                 return [], {}, [], True
             for sid, data in pg_latest.items():
-                state_cache[sid] = (data["value"], data["quality"], data["received_time"])
+                if data["data_epoch"] == cat.active_epoch:
+                    state_cache[sid] = (data["value"], data["quality"], data["received_time"])
 
         for sid, row in overlay_latest.items():
             if sid not in trigger_sigs and sid not in state_cache:
@@ -2380,6 +2382,11 @@ class IngestionWorker:
         )
         visited_evals: set[tuple[UUID, str]] = set()
         for trig_prep in ordered_triggers:
+            # Raw history has already accepted this sample. A late delivery
+            # cannot rewind the state used by subsequent formula triggers.
+            previous_input = state_cache.get(trig_prep.obs.signal_id)
+            if previous_input is not None and previous_input[2] > trig_prep.received_time:
+                continue
             state_cache[trig_prep.obs.signal_id] = (
                 trig_prep.obs.value,
                 trig_prep.norm_quality,
@@ -2414,7 +2421,7 @@ class IngestionWorker:
                     for al in aliases:
                         dep_id = UUID(str(al["dependency_signal_id"]))
                         dep_state = state_cache.get(dep_id)
-                        if dep_state is None:
+                        if dep_state is None or dep_state[2] > rx_time:
                             ready = False
                             break
                         values[str(al["variable_alias"])] = dep_state[0]
@@ -2464,7 +2471,9 @@ class IngestionWorker:
                             "source_seq": None,
                         }
                     )
-                    state_cache[output_id] = (val, qual, rx_time)
+                    previous_output = state_cache.get(output_id)
+                    if previous_output is None or previous_output[2] <= rx_time:
+                        state_cache[output_id] = (val, qual, rx_time)
                     cand_sort_key = (data_epoch, rx_time, -1, calc_uid)
                     prev_latest = calc_latest_rows.get(output_id)
                     if prev_latest is None or cand_sort_key > prev_latest["_sort_key"]:
