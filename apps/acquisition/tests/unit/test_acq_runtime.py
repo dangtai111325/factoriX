@@ -373,7 +373,7 @@ async def test_publisher_loop_interrupts_outage_backoff_immediately_on_broker_re
 
     # Force long backoff scenario: broker starts as None, samples spill -> _publisher_loop enters backoff sleep
     pub.set_broker(None)
-    pub.emit(spec, [Sample(spec.fields[0]["id"], 42, "GOOD")])
+    await pub.emit(spec, [Sample(spec.fields[0]["id"], 42, "GOOD")])
     loop_task = asyncio.create_task(runtime._publisher_loop())
     await asyncio.sleep(0.25)  # Allow loop to attempt flush, fail, and enter >= 1.0s backoff wait
     assert pub.spool.pending_count() == 1

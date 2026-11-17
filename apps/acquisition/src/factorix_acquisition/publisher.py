@@ -9,6 +9,7 @@ outage or reject-publish backpressure, and replays newest-per-signal before hist
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import deque
@@ -154,7 +155,7 @@ class ObservationPublisher:
             elif self._on_wake is not None and (was_down or self.has_pending()):
                 self._on_wake()
 
-    def set_tenant_epochs(self, epochs: dict[str, int]) -> int:
+    async def set_tenant_epochs(self, epochs: dict[str, int]) -> int:
         changed = False
         cleaned: dict[str, int] = {}
         for k, v in epochs.items():
@@ -172,8 +173,7 @@ class ObservationPublisher:
                 if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
                     kept.append(obs)
             self._fast_queue = kept
-        purged = self.spool.purge_old_epochs(self._tenant_epochs)
-        return purged
+        return await asyncio.to_thread(self.spool.purge_old_epochs, cleaned)
 
     def active_epoch(self, tenant_id: str) -> int:
         return max(1, int(self._tenant_epochs.get(str(tenant_id), 1)))
@@ -325,7 +325,7 @@ class ObservationPublisher:
             str(obs.signal_id),
         )
 
-    def _spill(self, observations: list[CanonicalObservation]) -> int:
+    async def _spill(self, observations: list[CanonicalObservation]) -> int | None:
         if not observations:
             return 0
         created = now_iso()
@@ -336,29 +336,49 @@ class ObservationPublisher:
         ]
         if not rows:
             return 0
-        try:
-            written = self.spool.add_many(rows)
+        async def write_rows() -> int | None:
+            try:
+                written = await asyncio.to_thread(self.spool.add_many, rows)
+            except Exception as exc:  # noqa: BLE001
+                if self.storage_error is None:
+                    logger.error("Cannot spill observations to SQLite spool: %r", exc)
+                self.storage_error = f"Spool write failed: {exc}"[:240]
+                return None
             self.storage_error = None
             self.spilled += written
             return written
-        except Exception as exc:  # noqa: BLE001
-            if self.storage_error is None:
-                logger.error("Cannot spill observations to SQLite spool: %r", exc)
-            self.storage_error = f"Spool write failed: {exc}"[:240]
-            return 0
 
-    def emit(self, spec: JobSpec, samples: list[Sample], *, revision: int = 1) -> int:
+        # Keep the write alive if a job stops while waiting for SQLite.
+        write = asyncio.create_task(write_rows())
+        try:
+            return await asyncio.shield(write)
+        except asyncio.CancelledError:
+            await write
+            raise
+
+    async def emit(self, spec: JobSpec, samples: list[Sample], *, revision: int = 1) -> int:
         observations = self.build_observations(spec, samples, revision=revision)
         if not observations:
             return 0
         if self._broker_down or len(self._fast_queue) >= self.max_memory_queue:
-            count = self._spill(observations)
+            count = await self._spill(observations) or 0
         else:
             self._fast_queue.extend(observations)
             count = len(observations)
         if self._on_wake is not None:
             self._on_wake()
         return count
+
+    async def _spill_buffered(self) -> None:
+        if not self._fast_queue:
+            return
+        buffered = list(self._fast_queue)
+        self._fast_queue.clear()
+        await self._spill_or_restore(buffered)
+
+    async def _spill_or_restore(self, observations: list[CanonicalObservation]) -> None:
+        if await self._spill(observations) is None:
+            self._fast_queue.extendleft(reversed(observations))
 
     def _pop_fast_batch(self, max_items: int) -> list[CanonicalObservation]:
         batch: list[CanonicalObservation] = []
@@ -381,7 +401,7 @@ class ObservationPublisher:
         """Route and publish a single observation, returning (success, routing_key)."""
         rkey = self.route_for_observation(obs)
         if self.broker is None or self._broker_down:
-            self._spill([obs])
+            await self._spill([obs])
             return False, rkey
         try:
             if hasattr(self.broker, "publish_observation"):
@@ -392,10 +412,10 @@ class ObservationPublisher:
             if confirmed:
                 self.published_fast += 1
                 return True, rkey
-            self._spill([obs])
+            await self._spill([obs])
             return False, rkey
         except Exception:
-            self._spill([obs])
+            await self._spill([obs])
             return False, rkey
 
     async def flush_once(self, budget_s: float = FLUSH_BUDGET_S) -> tuple[int, bool]:
@@ -412,9 +432,8 @@ class ObservationPublisher:
             published = 0
             # 1. If recovering from broker outage, move any residual RAM fast-queue items into the
             # spool first so latest-per-signal ordering stays monotonic across disk + RAM.
-            if self._broker_down and self._fast_queue:
-                self._spill(list(self._fast_queue))
-                self._fast_queue.clear()
+            if self._broker_down:
+                await self._spill_buffered()
 
             has_ram = bool(self._fast_queue)
             has_spool = self.spool.pending_count() > 0
@@ -436,18 +455,16 @@ class ObservationPublisher:
                             ok_count, failed = await self._publish_or_spill(batch)
                             published += ok_count
                             if failed:
-                                if self._fast_queue:
-                                    self._spill(list(self._fast_queue))
-                                    self._fast_queue.clear()
+                                await self._spill_buffered()
                                 return published, True
 
                     # Followed by 1 Spool batch
                     if self.spool.pending_count() > 0 and not self._broker_down:
-                        self.spool.expire_stale()
-                        self.spool.purge_old_epochs(self._tenant_epochs)
-                        rows = self.spool.latest_pending(BATCH_ROWS)
+                        await asyncio.to_thread(self.spool.expire_stale)
+                        await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
+                        rows = await asyncio.to_thread(self.spool.latest_pending, BATCH_ROWS)
                         if not rows:
-                            rows = self.spool.pending(BATCH_ROWS)
+                            rows = await asyncio.to_thread(self.spool.pending, BATCH_ROWS)
                         if rows:
                             count, ok = await self._replay_rows(rows)
                             published += count
@@ -467,18 +484,16 @@ class ObservationPublisher:
                     ok_count, failed = await self._publish_or_spill(batch)
                     published += ok_count
                     if failed:
-                        if self._fast_queue:
-                            self._spill(list(self._fast_queue))
-                            self._fast_queue.clear()
+                        await self._spill_buffered()
                         return published, True
                     if time.monotonic() >= deadline:
                         break
                 return published, False
 
             # 4. Only Spool pending: latest-per-signal lane first, then history slices
-            self.spool.expire_stale()
-            self.spool.purge_old_epochs(self._tenant_epochs)
-            latest_rows = self.spool.latest_pending(BATCH_ROWS)
+            await asyncio.to_thread(self.spool.expire_stale)
+            await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
+            latest_rows = await asyncio.to_thread(self.spool.latest_pending, BATCH_ROWS)
             if latest_rows:
                 count, ok = await self._replay_rows(latest_rows)
                 published += count
@@ -486,7 +501,7 @@ class ObservationPublisher:
                     return published, True
 
             while True:
-                rows = self.spool.pending(BATCH_ROWS)
+                rows = await asyncio.to_thread(self.spool.pending, BATCH_ROWS)
                 if not rows:
                     break
                 count, ok = await self._replay_rows(rows)
@@ -504,11 +519,15 @@ class ObservationPublisher:
         broker = self.broker
         gen = self._broker_gen
         if broker is None:
-            self._spill(batch)
+            await self._spill_or_restore(batch)
             self._broker_down = True
             self.broker_ok = False
             return 0, True
-        confirmed, failed = await broker.publish_observations_partial(batch)
+        try:
+            confirmed, failed = await broker.publish_observations_partial(batch)
+        except asyncio.CancelledError:
+            await self._spill_or_restore(batch)
+            raise
         self._note_publish_failures(failed)
         self.published_fast += len(confirmed)
         same_gen = gen == self._broker_gen
@@ -520,7 +539,7 @@ class ObservationPublisher:
         if same_gen:
             self._broker_down = True
             self.broker_ok = False
-        self._spill([obs for obs, _err in failed])
+        await self._spill_or_restore([obs for obs, _err in failed])
         return len(confirmed), True
 
     async def _replay_rows(self, rows: list[Any]) -> tuple[int, bool]:
@@ -549,16 +568,16 @@ class ObservationPublisher:
                 continue
             valid_obs.append(obs)
         if corrupt_uids:
-            self.spool.mark_state(corrupt_uids, "QUARANTINED")
+            await asyncio.to_thread(self.spool.mark_state, corrupt_uids, "QUARANTINED")
         if stale_epochs:
-            self.spool.purge_old_epochs(self._tenant_epochs)
+            await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
         if not valid_obs:
             return 0, True
 
         confirmed, failed = await broker.publish_observations_partial(valid_obs)
         self._note_publish_failures(failed)
         if confirmed:
-            self.spool.mark_sent(confirmed)
+            await asyncio.to_thread(self.spool.mark_sent, confirmed)
             self.published_replay += len(confirmed)
         same_gen = gen == self._broker_gen
         if not failed:
@@ -572,7 +591,7 @@ class ObservationPublisher:
             self.broker_ok = False
         backpressure_uids = [obs.event_uid for obs, err in failed if isinstance(err, BrokerBackpressureError)]
         if backpressure_uids:
-            self.spool.note_attempt(backpressure_uids, self.max_attempts)
+            await asyncio.to_thread(self.spool.note_attempt, backpressure_uids, self.max_attempts)
         # BrokerUnavailableError items remain PENDING without counting against max_attempts
         return len(confirmed), False
 
@@ -591,7 +610,5 @@ class ObservationPublisher:
             if not batch:
                 break
             await self._publish_or_spill(batch)
-        if self._fast_queue:
-            self._spill(list(self._fast_queue))
-            self._fast_queue.clear()
-        self.spool.close()
+        await self._spill_buffered()
+        await asyncio.to_thread(self.spool.close)

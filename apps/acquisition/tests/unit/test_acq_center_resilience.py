@@ -98,7 +98,7 @@ class _Host:
     async def secret(self, secret_ref: str) -> str:
         return ""
 
-    def emit(self, spec, samples) -> int:  # noqa: ANN001
+    async def emit(self, spec, samples) -> int:  # noqa: ANN001
         self.emitted.extend(samples)
         return len(samples)
 

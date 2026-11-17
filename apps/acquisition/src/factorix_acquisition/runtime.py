@@ -220,8 +220,8 @@ class AcquisitionRuntime:
 
     # ------------------------------------------------------------------ samples & states
 
-    def emit(self, spec: JobSpec, samples: list[Sample]) -> int:
-        return self.publisher.emit(spec, samples, revision=self.revision)
+    async def emit(self, spec: JobSpec, samples: list[Sample]) -> int:
+        return await self.publisher.emit(spec, samples, revision=self.revision)
 
     def _state(self, connection_id: str) -> dict[str, Any]:
         return self.conn_states.setdefault(
@@ -305,7 +305,7 @@ class AcquisitionRuntime:
         # Update tenant epochs immediately (fences/purges old-epoch spool rows after reset)
         raw_epochs = snapshot.get("tenant_epochs") or {}
         if isinstance(raw_epochs, dict):
-            self.publisher.set_tenant_epochs({str(k): int(v) for k, v in raw_epochs.items()})
+            await self.publisher.set_tenant_epochs({str(k): int(v) for k, v in raw_epochs.items()})
 
         # Reconcile secrets in RAM & detect rotated credentials
         rotated: set[str] = set()

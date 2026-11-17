@@ -168,7 +168,7 @@ class Host(Protocol):
 
     async def secret(self, secret_ref: str) -> str: ...
 
-    def emit(self, spec: JobSpec, samples: list[Sample]) -> int: ...
+    async def emit(self, spec: JobSpec, samples: list[Sample]) -> int: ...
 
     def record_ok(self, connection_id: str, read_ms: int | None, samples: int, at: str | None = None) -> None: ...
 
@@ -588,7 +588,7 @@ class JobRunner:
             elapsed_ms = int((time.monotonic() - started) * 1000)
             self.stats.failures = 0
             self.stats.reads += 1
-            emitted = self.host.emit(spec, samples)
+            emitted = await self.host.emit(spec, samples)
             self.host.record_ok(spec.connection_id, elapsed_ms, emitted)
             if self.partial_error is not None:
                 self.host.record_failure(spec.connection_id, self.partial_error)
@@ -612,7 +612,7 @@ class JobRunner:
             logger.warning("Job %s (%s) failed: %s %s", self.spec.job_id, self.spec.protocol, error.code, error)
         if transition and error.code != "RATE_LIMITED":
             received = now_iso()
-            self.host.emit(self.spec, [Sample(str(f["id"]), None, "BAD", None, error.code, received) for f in self.spec.fields])
+            await self.host.emit(self.spec, [Sample(str(f["id"]), None, "BAD", None, error.code, received) for f in self.spec.fields])
 
     # ---- push
 
@@ -657,19 +657,19 @@ class JobRunner:
                     events, latest = map_mqtt_messages(spec.fields, spec.config, batch)
                     throttle.offer(latest)
                     if events:
-                        self._emit_push(events)
+                        await self._emit_push(events)
                 elif held is None:
                     self._push_state(connector)
                 ready = throttle.due(time.monotonic())
                 if ready:
-                    self._emit_push(ready)
+                    await self._emit_push(ready)
         finally:
             connector.set_topics(spec.job_id, [])
             connector.remove_listener(listener)
 
-    def _emit_push(self, samples: list[Sample]) -> None:
+    async def _emit_push(self, samples: list[Sample]) -> None:
         self.stats.failures = 0
-        emitted = self.host.emit(self.spec, samples)
+        emitted = await self.host.emit(self.spec, samples)
         self.host.record_ok(self.spec.connection_id, None, emitted, samples[-1].received_time if samples else None)
 
     async def _consume_ws(self, connector: WebSocketConnector) -> None:
@@ -687,13 +687,13 @@ class JobRunner:
                 frame = connector.latest or frame
             last_seq = frame.seq
             last_emit = time.monotonic()
-            self._emit_push(project_json(spec.fields, frame.document, frame.received_time))
+            await self._emit_push(project_json(spec.fields, frame.document, frame.received_time))
 
     async def _consume_opc(self, connector: OpcUaConnector) -> None:
         spec = self.spec
         nodes, bad = opc_nodes(spec.fields, key_by=lambda f: str(f["id"]))
         if bad:
-            self.host.emit(spec, bad)
+            await self.host.emit(spec, bad)
         if not nodes:
             raise ConnectorError("ADDRESS", "No OPC UA NodeId to subscribe.")
         fields_by_node: dict[str, list[tuple[str, str | None]]] = {}
@@ -716,7 +716,7 @@ class JobRunner:
         try:
             refused_fields = [Sample(fid, None, "BAD", None, "OPC_MONITOR_FAILED", now_iso()) for node in refused for fid, _ in fields_by_node.get(node, [])]
             if refused_fields:
-                self.host.emit(spec, refused_fields)
+                await self.host.emit(spec, refused_fields)
             next_tick = time.monotonic() + self.interval_s
             while connector.connected and connector.generation == generation:
                 nodes_changed: set[str] = set()
@@ -738,7 +738,7 @@ class JobRunner:
                     for field_id, ts_node in fields_by_node[node_id]:
                         samples.append(opc_sample(field_id, row, latest_rows.get(ts_node) if ts_node else None, received or now_iso()))
                 if samples:
-                    self._emit_push(samples)
+                    await self._emit_push(samples)
             raise ConnectorError("NETWORK", "OPC UA session lost; re-subscribing.")
         finally:
             await connector.unsubscribe(subscription)

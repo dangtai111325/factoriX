@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+import threading
 from typing import Any
 from uuid import uuid4
 
@@ -68,10 +70,10 @@ async def test_fast_path_publishes_directly_without_writing_sqlite_and_redacts_p
     spool = AcquisitionSpool(tmp_path / "spool.sqlite")
     broker = RecordingBroker()
     pub = ObservationPublisher(broker, spool)
-    pub.set_tenant_epochs({tenant_id: 2})
+    await pub.set_tenant_epochs({tenant_id: 2})
 
     field_id = spec.fields[0]["id"]
-    pub.emit(spec, [Sample(field_id, 21.5, "GOOD"), Sample(field_id, 22.0, "GOOD")])
+    await pub.emit(spec, [Sample(field_id, 21.5, "GOOD"), Sample(field_id, 22.0, "GOOD")])
     sent, failed = await pub.flush_once()
 
     assert sent == 2 and failed is False
@@ -96,7 +98,7 @@ async def test_partial_failure_spills_remaining_fast_queue_to_preserve_ordering(
 
     # Emit 600 samples (> BATCH_ROWS=500) so second batch of 100 remains in RAM when first batch partially fails
     for i in range(600):
-        pub.emit(spec, [Sample(field_id, float(i), "GOOD")])
+        await pub.emit(spec, [Sample(field_id, float(i), "GOOD")])
     sent, failed = await pub.flush_once()
 
     assert sent == 2 and failed is True
@@ -125,20 +127,20 @@ async def test_set_tenant_epochs_purges_old_epoch_in_ram_and_spool(tmp_path: Pat
     pub = ObservationPublisher(broker, spool)
     field_id = spec.fields[0]["id"]
 
-    pub.emit(spec, [Sample(field_id, 10.0, "GOOD")])  # stays in _fast_queue epoch=1
+    await pub.emit(spec, [Sample(field_id, 10.0, "GOOD")])  # stays in _fast_queue epoch=1
     broker.down = True
     pub._broker_down = True
-    pub.emit(spec, [Sample(field_id, 11.0, "GOOD")])  # spills to SQLite epoch=1
+    await pub.emit(spec, [Sample(field_id, 11.0, "GOOD")])  # spills to SQLite epoch=1
     assert pub.fast_buffered == 1 and spool.pending_count() == 1
 
-    purged = pub.set_tenant_epochs({tenant_id: 2})
+    purged = await pub.set_tenant_epochs({tenant_id: 2})
     assert purged == 1
     assert pub.fast_buffered == 0
     assert spool.pending_count() == 0
 
     broker.down = False
     pub._broker_down = False
-    pub.emit(spec, [Sample(field_id, 12.0, "GOOD")])  # epoch=2
+    await pub.emit(spec, [Sample(field_id, 12.0, "GOOD")])  # epoch=2
     sent, failed = await pub.flush_once()
     assert sent == 1 and failed is False
     assert [o.value for o in broker.published] == [12.0]
@@ -147,9 +149,8 @@ async def test_set_tenant_epochs_purges_old_epoch_in_ram_and_spool(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_has_pending_stays_true_while_flush_awaiting_broker_confirm(tmp_path: Path) -> None:
-    import asyncio
-
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_has_pending_stays_true_while_flush_awaiting_broker_confirm(tmp_path: Path, cancel: bool) -> None:
     spec, _, _ = _spec()
     spool = AcquisitionSpool(tmp_path / "spool.sqlite")
     entered = asyncio.Event()
@@ -165,17 +166,58 @@ async def test_has_pending_stays_true_while_flush_awaiting_broker_confirm(tmp_pa
 
     pub = ObservationPublisher(SlowBroker(), spool)
     field_id = spec.fields[0]["id"]
-    pub.emit(spec, [Sample(field_id, 1.0, "GOOD")])
+    await pub.emit(spec, [Sample(field_id, 1.0, "GOOD")])
     task = asyncio.create_task(pub.flush_once())
     await entered.wait()
     # _fast_queue is already empty, yet publish is still in-flight awaiting confirm!
     assert pub.fast_buffered == 0
     assert pub.has_pending() is True
-    release.set()
-    sent, failed = await task
-    assert sent == 1 and failed is False
-    assert pub.has_pending() is False
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert spool.pending_count() == 1
+    else:
+        release.set()
+        sent, failed = await task
+        assert sent == 1 and failed is False
+        assert pub.has_pending() is False
     spool.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_emit_waits_for_spool_write_without_blocking_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, _, _ = _spec()
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    publisher = ObservationPublisher(None, spool)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    add_many = spool.add_many
+
+    def wait_then_write(rows):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(timeout=5)
+        return add_many(rows)
+
+    monkeypatch.setattr(spool, "add_many", wait_then_write)
+    emission = asyncio.create_task(publisher.emit(spec, [Sample(spec.fields[0]["id"], 20.0, "GOOD")]))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=3)
+        emission.cancel()
+        await asyncio.sleep(0)
+        assert not emission.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await emission
+        assert spool.pending_count() == 1
+        assert publisher.spilled == 1
+    finally:
+        release.set()
+        await asyncio.gather(emission, return_exceptions=True)
+        spool.close()
 
 
 def test_set_broker_triggers_wake_and_recovery_callbacks(tmp_path: Path) -> None:
@@ -220,7 +262,7 @@ async def test_set_broker_generation_prevents_inflight_flush_from_clobbering_out
             return [o.event_uid for o in observations], []
 
     pub = ObservationPublisher(HangingOkBroker(), spool)
-    pub.emit(spec, [Sample(field_id, 1.0, "GOOD")])
+    await pub.emit(spec, [Sample(field_id, 1.0, "GOOD")])
     task = asyncio.create_task(pub.flush_once())
     await entered.wait()
 
@@ -243,7 +285,7 @@ async def test_set_broker_generation_prevents_inflight_flush_from_clobbering_out
             return [], [(o, BrokerUnavailableError("late fail")) for o in observations]
 
     pub2 = ObservationPublisher(FailingLateBroker(), spool)
-    pub2.emit(spec, [Sample(field_id, 2.0, "GOOD")])
+    await pub2.emit(spec, [Sample(field_id, 2.0, "GOOD")])
     task2 = asyncio.create_task(pub2.flush_once())
     await entered2.wait()
     pub2.set_broker(RecordingBroker())
@@ -299,7 +341,7 @@ async def test_fair_flushing_interleaves_ram_and_spool(tmp_path: Path) -> None:
     broker.down = True
     pub._broker_down = True
     for i in range(50):
-        pub.emit(spec, [Sample(field_id, float(i), "GOOD")])
+        await pub.emit(spec, [Sample(field_id, float(i), "GOOD")])
     assert spool.pending_count() == 50
     assert pub.fast_buffered == 0
 
@@ -307,7 +349,7 @@ async def test_fair_flushing_interleaves_ram_and_spool(tmp_path: Path) -> None:
     broker.down = False
     pub.set_broker(broker)
     for i in range(20):
-        pub.emit(spec, [Sample(field_id, 1000.0 + i, "GOOD")])
+        await pub.emit(spec, [Sample(field_id, 1000.0 + i, "GOOD")])
     assert pub.fast_buffered == 20
     assert spool.pending_count() == 50
 
