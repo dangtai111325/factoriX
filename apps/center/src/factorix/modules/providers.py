@@ -56,6 +56,7 @@ class LiveSignalRecord:
     last_good_value: Any = None
     last_good_at: datetime | None = None
     updated_at: datetime | None = None
+    received_time: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

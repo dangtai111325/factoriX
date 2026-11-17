@@ -681,6 +681,7 @@ class PgIngestionStore:
                 last_good_value=gv.get("v") if isinstance(gv, dict) else None,
                 last_good_at=r.get("last_good_event_time"),
                 updated_at=r.get("updated_at"),
+                received_time=r["received_time"],
             )
         return out
 
@@ -698,6 +699,8 @@ class PgIngestionStore:
         assert self._pool is not None
         replaced_signals: set[UUID] = set()
         health_events: list[dict[str, Any]] = []
+        if not (latest_rows or connection_sample_times or stream_events or shadow_pg_rows):
+            return replaced_signals, health_events
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -2240,11 +2243,20 @@ class IngestionWorker:
                 self.hist.record_batch_stage("managed_evaluation_and_write", managed_started_at)
 
         now_commit = _utcnow()
-        latest_list = list(newest_map.values())
+        latest_list = []
         t_cache_preview = self._live_cache.get(tenant_id, {})
         stream_events = []
-        for r in latest_list:
+        for r in newest_map.values():
             prev_rec_preview = t_cache_preview.get(r["signal_id"])
+            # The raw and managed history writes have already run. A strictly
+            # older candidate cannot pass PostgreSQL's latest-state guard.
+            if (
+                prev_rec_preview is not None
+                and prev_rec_preview.received_time is not None
+                and (r["data_epoch"], r["received_time"]) < (prev_rec_preview.data_epoch, prev_rec_preview.received_time)
+            ):
+                continue
+            latest_list.append(r)
             preview_changed = (
                 prev_rec_preview is None
                 or prev_rec_preview.data_epoch != int(r["data_epoch"])
@@ -2339,6 +2351,7 @@ class IngestionWorker:
                 reason_code=row["reason_code"],
                 event_time=row["event_time"],
                 last_acquired_at=row["last_acquired_at"],
+                received_time=row["received_time"],
                 last_value_changed_at=(
                     row["event_time"]
                     if val_changed

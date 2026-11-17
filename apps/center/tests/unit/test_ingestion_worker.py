@@ -807,6 +807,9 @@ async def test_multi_sample_formula_batch_evaluates_chronologically() -> None:
     assert await w.ingest_direct_bytes([(late.to_json_bytes(), {}, late.event_uid, False)]) == [ConsumeOutcome.ACK]
     assert len(td.writes) == 3
     assert td.writes[-1][0]["event_uid"] == late.event_uid
+    assert pg.commits[-1]["latest_rows"] == []
+    assert pg.commits[-1]["stream_events"] == []
+    assert w._live_cache[tid][s0].last_acquired_at == b2.acquired_at
 
 
 @pytest.mark.asyncio
