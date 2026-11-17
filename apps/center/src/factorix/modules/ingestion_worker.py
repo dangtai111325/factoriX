@@ -1036,34 +1036,32 @@ class PgIngestionStore:
 async def _emit_chunked_notify(conn: asyncpg.Connection, channel: str, events: Sequence[dict[str, Any]]) -> None:
     if not events:
         return
-    chunk: list[dict[str, Any]] = []
+    prefix, suffix = '{"events":[', ']}'
+    wrapper_size = len(prefix) + len(suffix)
+    payloads: list[str] = []
+    chunk: list[str] = []
+    chunk_size = wrapper_size
     for ev in events:
-        candidate = chunk + [ev]
-        encoded = json.dumps({"events": candidate}, separators=(",", ":"), default=str)
-        if chunk and (len(candidate) > NOTIFY_CHUNK_MAX_EVENTS or len(encoded.encode("utf-8")) > NOTIFY_CHUNK_MAX_BYTES):
-            await conn.execute(
-                "SELECT pg_notify($1, $2)",
-                channel,
-                json.dumps({"events": chunk}, separators=(",", ":"), default=str),
-            )
-            chunk = [ev]
-        else:
-            chunk = candidate
-    if chunk:
-        payload = json.dumps({"events": chunk}, separators=(",", ":"), default=str)
-        if len(payload.encode("utf-8")) > 7900:
-            # Extremely wide JSON payload: strip large payload values from stream push; UI fetches via REST
-            shrunk = [
-                {
-                    **ev,
-                    "payload": {k: v for k, v in (ev.get("payload") or {}).items() if k != "value"}
-                    if isinstance(ev.get("payload"), dict)
-                    else ev.get("payload"),
-                }
-                for ev in chunk
-            ]
-            payload = json.dumps({"events": shrunk}, separators=(",", ":"), default=str)
-        await conn.execute("SELECT pg_notify($1, $2)", channel, payload)
+        encoded = json.dumps(ev, separators=(",", ":"), default=str)
+        # json.dumps escapes non-ASCII characters, so character and byte counts agree.
+        if wrapper_size + len(encoded) > 7900 and isinstance(ev.get("payload"), dict):
+            # Large values remain available through the read API.
+            compact = {**ev, "payload": {k: v for k, v in ev["payload"].items() if k != "value"}}
+            encoded = json.dumps(compact, separators=(",", ":"), default=str)
+        if chunk and (
+            len(chunk) >= NOTIFY_CHUNK_MAX_EVENTS or chunk_size + 1 + len(encoded) > NOTIFY_CHUNK_MAX_BYTES
+        ):
+            payloads.append(prefix + ",".join(chunk) + suffix)
+            chunk.clear()
+            chunk_size = wrapper_size
+        chunk_size += bool(chunk) + len(encoded)
+        chunk.append(encoded)
+    payloads.append(prefix + ",".join(chunk) + suffix)
+    await conn.execute(
+        "SELECT pg_notify($1, payload) FROM unnest($2::text[]) WITH ORDINALITY AS chunks(payload, position) ORDER BY position",
+        channel,
+        payloads,
+    )
 
 
 class IngestionWorker:

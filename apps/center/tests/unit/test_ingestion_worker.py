@@ -620,35 +620,33 @@ async def test_synchronous_formula_cascade_bounded_to_depth_4() -> None:
 
 @pytest.mark.asyncio
 async def test_emit_chunked_notify_respects_count_and_8kb_limit() -> None:
-    calls: list[tuple[str, str]] = []
-
-    class _Conn:
-        async def execute(self, _sql: str, channel: str, payload: str) -> None:
-            calls.append((channel, payload))
-
-    conn = _Conn()
+    conn = MagicMock(execute=AsyncMock())
     events = [
         {"kind": "latest", "tenant_id": "t1", "signal_id": f"s{i}", "payload": {"value": i}}
         for i in range(45)
     ]
-    await _emit_chunked_notify(conn, "factorix_stream_events", events)  # type: ignore[arg-type]
-    assert len(calls) == 3
-    counts = [len(json.loads(p)["events"]) for _, p in calls]
-    assert counts == [20, 20, 5]
-    assert all(len(p.encode("utf-8")) < 8000 for _, p in calls)
+    await _emit_chunked_notify(conn, "factorix_stream_events", events)
+    conn.execute.assert_awaited_once()
+    _, channel, payloads = conn.execute.await_args.args
+    assert channel == "factorix_stream_events"
+    batches = [json.loads(payload)["events"] for payload in payloads]
+    assert [len(batch) for batch in batches] == [20, 20, 5]
+    assert [event for batch in batches for event in batch] == events
+    assert all(len(payload.encode("utf-8")) < 8000 for payload in payloads)
 
     # Wide single event shrinks payload value field automatically if > 7900 bytes
-    calls.clear()
+    conn.execute.reset_mock()
     huge_event = {
         "kind": "latest",
         "tenant_id": "t1",
         "signal_id": "s-big",
         "payload": {"type": "latest", "signal_id": "s-big", "value": "A" * 9000},
     }
-    await _emit_chunked_notify(conn, "factorix_stream_events", [huge_event])  # type: ignore[arg-type]
-    assert len(calls) == 1
-    assert len(calls[0][1].encode("utf-8")) < 8000
-    assert "value" not in json.loads(calls[0][1])["events"][0]["payload"]
+    await _emit_chunked_notify(conn, "factorix_stream_events", [huge_event, *events])
+    conn.execute.assert_awaited_once()
+    _, _, payloads = conn.execute.await_args.args
+    assert all(len(payload.encode("utf-8")) < 8000 for payload in payloads)
+    assert "value" not in json.loads(payloads[0])["events"][0]["payload"]
 
 
 @pytest.mark.asyncio
