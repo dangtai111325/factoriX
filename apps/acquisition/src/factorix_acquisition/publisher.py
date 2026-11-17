@@ -493,7 +493,8 @@ class ObservationPublisher:
                             ok_count, failed = await self._publish_or_spill(batch)
                             published += ok_count
                             if failed:
-                                await self._spill_buffered()
+                                if self._broker_down:
+                                    await self._spill_buffered()
                                 return published, True
 
                     # Followed by 1 Spool batch
@@ -525,7 +526,8 @@ class ObservationPublisher:
                     ok_count, failed = await self._publish_or_spill(batch)
                     published += ok_count
                     if failed:
-                        await self._spill_buffered()
+                        if self._broker_down:
+                            await self._spill_buffered()
                         return published, True
                     if time.monotonic() >= deadline:
                         break
@@ -585,8 +587,10 @@ class ObservationPublisher:
                 self.broker_ok = True
             return len(confirmed), (not same_gen and self.broker is None)
         if same_gen:
-            self._broker_down = True
-            self.broker_ok = False
+            # Confirmed deliveries show the broker accepted work. Keep the
+            # unattempted RAM queue available for the next live flush.
+            self.broker_ok = bool(confirmed)
+            self._broker_down = not self.broker_ok
         await self._spill_or_restore([obs for obs, _err in failed])
         return len(confirmed), True
 
@@ -641,8 +645,8 @@ class ObservationPublisher:
             return len(confirmed), (same_gen or self.broker is not None)
 
         if same_gen:
-            self._broker_down = True
-            self.broker_ok = False
+            self.broker_ok = bool(confirmed)
+            self._broker_down = not self.broker_ok
         backpressure_uids = [obs.event_uid for obs, err in failed if isinstance(err, BrokerBackpressureError)]
         if backpressure_uids:
             await asyncio.to_thread(self.spool.note_attempt, backpressure_uids, self.max_attempts)

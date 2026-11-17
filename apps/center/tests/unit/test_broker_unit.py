@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -80,6 +81,30 @@ async def test_publisher_keeps_unroutable_delivery_distinct_from_broker_nack(mon
     assert publisher.metrics.publish_errors == 1
     assert publisher.metrics.publish_backpressure == 1
     assert publisher.metrics.published_ok == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_batch_deadline_keeps_prior_confirms_and_cleans_up_pending_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    publisher = RabbitMQPublisher(BrokerConfig(amqp_url="amqp://localhost/", confirm_timeout_s=0.05))
+    items = [SimpleNamespace(event_uid=f"msg-{i}") for i in range(4)]
+    slot = asyncio.Semaphore(1)
+    finished = []
+
+    async def publish(obs):
+        try:
+            async with slot:
+                if obs is not items[0]:
+                    await asyncio.Event().wait()
+        finally:
+            finished.append(obs.event_uid)
+
+    monkeypatch.setattr(publisher, "publish_observation", publish)
+    confirmed, failed = await asyncio.wait_for(publisher.publish_observations_partial(items), timeout=1)
+    assert confirmed == ["msg-0"]
+    assert [obs.event_uid for obs, _ in failed] == ["msg-1", "msg-2", "msg-3"]
+    assert all(isinstance(error, BrokerUnavailableError) and isinstance(error.__cause__, TimeoutError) for _, error in failed)
+    assert sorted(finished) == ["msg-0", "msg-1", "msg-2", "msg-3"]
+    assert publisher.metrics.publish_errors == 3
 
 
 def test_two_lane_broker_config_and_routing_keys() -> None:

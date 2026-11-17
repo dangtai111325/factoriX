@@ -89,7 +89,7 @@ async def test_fast_path_publishes_directly_without_writing_sqlite_and_redacts_p
 
 
 @pytest.mark.asyncio
-async def test_partial_failure_spills_remaining_fast_queue_to_preserve_ordering(tmp_path: Path) -> None:
+async def test_partial_failure_spills_unconfirmed_items_and_keeps_unattempted_ram(tmp_path: Path) -> None:
     spec, _, _ = _spec()
     spool = AcquisitionSpool(tmp_path / "spool.sqlite")
     broker = RecordingBroker()
@@ -103,20 +103,19 @@ async def test_partial_failure_spills_remaining_fast_queue_to_preserve_ordering(
     sent, failed = await pub.flush_once()
 
     assert sent == 2 and failed is True
-    assert pub.fast_buffered == 0  # Remainder flushed cleanly to spool to keep ordering!
-    assert spool.pending_count() == 598
+    assert pub.broker_ok is True
+    assert pub.fast_buffered == 100
+    assert spool.pending_count() == 498
 
-    # Recover broker -> latest sample (#600) published first via latest lane, then remaining 597 chronologically
     broker.down = False
     broker.fail_after = None
     sent2, failed2 = await pub.flush_once(budget_s=5.0)
     assert failed2 is False
     assert sent2 == 598
     assert spool.pending_count() == 0
-    # Wait: seq=1,2 published initially, seq=600 published on latest_pending lane, then 3..599
     seqs = [o.source_sequence for o in broker.published]
-    assert seqs[:3] == [1, 2, 600]
-    assert seqs[3:] == list(range(3, 600))
+    assert seqs[:102] == [1, 2, *range(501, 601)]
+    assert sorted(seqs) == list(range(1, 601))
     spool.close()
 
 

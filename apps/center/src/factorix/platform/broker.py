@@ -371,10 +371,16 @@ class RabbitMQPublisher:
         """
         if not observations:
             return [], []
-        results = await asyncio.gather(
-            *(self.publish_observation(obs) for obs in observations),
-            return_exceptions=True,
-        )
+        tasks = [asyncio.create_task(self.publish_observation(obs)) for obs in observations]
+        try:
+            # Include waiting for an in-flight slot in the batch deadline.
+            # A stalled connection must not consume one timeout per wave.
+            await asyncio.wait(tasks, timeout=self.cfg.confirm_timeout_s)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
         confirmed: list[str] = []
         failed: list[tuple[CanonicalObservation, BrokerError]] = []
         for obs, outcome in zip(observations, results):
@@ -382,6 +388,11 @@ class RabbitMQPublisher:
                 confirmed.append(obs.event_uid)
             elif isinstance(outcome, BrokerError):
                 failed.append((obs, outcome))
+            elif isinstance(outcome, asyncio.CancelledError):
+                self.metrics.publish_errors += 1
+                error = BrokerUnavailableError(f"RabbitMQ batch deadline reached for {obs.event_uid}")
+                error.__cause__ = TimeoutError()
+                failed.append((obs, error))
             elif isinstance(outcome, BaseException):
                 failed.append((obs, BrokerUnavailableError(f"RabbitMQ publish failed for {obs.event_uid}: {outcome}")))
         return confirmed, failed
