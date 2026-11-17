@@ -382,6 +382,30 @@ class ObservationPublisher:
 
     def _pop_fast_batch(self, max_items: int) -> list[CanonicalObservation]:
         batch: list[CanonicalObservation] = []
+        now = datetime.now(timezone.utc).timestamp()
+        cutoff = now - self.freshness_window_s
+        if (
+            max_items > 1
+            and len(self._fast_queue) > max_items
+            and self._fast_queue[0].acquired_at.timestamp() < cutoff
+        ):
+            # During a RAM backlog, observations near the tail have the best
+            # chance of reaching the live lane. Keep a share of each batch
+            # for the head so older observations still leave in FIFO order.
+            live_quota = max(1, max_items * 3 // 4)
+            deferred: list[CanonicalObservation] = []
+            for _ in range(max_items):
+                obs = self._fast_queue.pop()
+                if obs.data_epoch < self.active_epoch(str(obs.tenant_id)):
+                    continue
+                if not cutoff <= obs.acquired_at.timestamp() <= now:
+                    deferred.append(obs)
+                    continue
+                batch.append(obs)
+                if len(batch) == live_quota:
+                    break
+            self._fast_queue.extend(reversed(deferred))
+            batch.reverse()
         while self._fast_queue and len(batch) < max_items:
             obs = self._fast_queue.popleft()
             if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
@@ -602,11 +626,7 @@ class ObservationPublisher:
         """Flush buffered observations on shutdown; spill any unconfirmed items cleanly."""
         deadline = time.monotonic() + timeout_s
         while self._fast_queue and time.monotonic() < deadline and not self._broker_down:
-            batch: list[CanonicalObservation] = []
-            while self._fast_queue and len(batch) < BATCH_ROWS:
-                obs = self._fast_queue.popleft()
-                if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
-                    batch.append(obs)
+            batch = self._pop_fast_batch(BATCH_ROWS)
             if not batch:
                 break
             await self._publish_or_spill(batch)

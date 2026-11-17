@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import threading
 from typing import Any
@@ -314,7 +315,6 @@ async def test_fresh_sample_routes_to_live_lane(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_stale_sample_routes_to_legacy_lane(tmp_path: Path) -> None:
-    from datetime import timedelta, timezone, datetime
     spec, tenant_id, sig_id = _spec()
     spool = AcquisitionSpool(tmp_path / "spool.sqlite")
     pub = ObservationPublisher(RecordingBroker(), spool)
@@ -327,6 +327,24 @@ async def test_stale_sample_routes_to_legacy_lane(tmp_path: Path) -> None:
     assert "live" not in rkey
     assert tenant_id.replace("-", "") in rkey
     spool.close()
+
+
+@pytest.mark.asyncio
+async def test_ram_backlog_gives_fresh_samples_slots_and_preserves_older_observations(tmp_path: Path) -> None:
+    spec, _, _ = _spec()
+    field = spec.fields[0]["id"]
+    old = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    publisher = ObservationPublisher(RecordingBroker(), spool)
+    try:
+        await publisher.emit(spec, [Sample(field, float(i), "GOOD", received_time=old) for i in range(6)])
+        await publisher.emit(spec, [Sample(field, 10.0, "GOOD"), Sample(field, 11.0, "GOOD")])
+        await publisher.emit(spec, [Sample(field, 6.0, "GOOD", received_time=old)])
+        assert [obs.value for obs in publisher._pop_fast_batch(4)] == [10.0, 11.0, 0.0, 1.0]
+        assert [obs.value for obs in publisher._pop_fast_batch(4)] == [2.0, 3.0, 4.0, 5.0]
+        assert [obs.value for obs in publisher._pop_fast_batch(4)] == [6.0]
+    finally:
+        spool.close()
 
 
 @pytest.mark.asyncio
