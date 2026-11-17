@@ -61,6 +61,19 @@ def _compute_spec_hash(spec_dict: dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:32]
 
 
+def _database_spec(data: dict[str, Any]) -> DatabaseSpec:
+    retention_days = data.get("retention_days")
+    return DatabaseSpec(
+        name=data.get("name") or data.get("physical_name") or "",
+        precision=data.get("precision", "ms"),
+        keep=data.get("keep") or ("3650d" if retention_days is None else f"{retention_days}d"),
+        vgroups=int(data.get("vgroups", 1)),
+        replica=int(data.get("replica", 1)),
+        cache_model=data.get("cache_model"),
+        description=data.get("description", ""),
+    )
+
+
 class StorageRevisionService:
     """Service for handling physical object drafts, validation, planning, and publishing."""
 
@@ -343,16 +356,7 @@ class StorageRevisionService:
             spec_data = draft["spec"]
 
         if kind == "database":
-            db_spec = DatabaseSpec(
-                name=spec_data.get("name") or spec_data.get("physical_name") or "",
-                precision=spec_data.get("precision", "ms"),
-                keep=spec_data.get("keep") or f"{spec_data.get('retention_days', 3650)}d",
-                vgroups=int(spec_data.get("vgroups", 1)),
-                replica=int(spec_data.get("replica", 1)),
-                cache_model=spec_data.get("cache_model"),
-                description=spec_data.get("description", ""),
-            )
-            v_res = validate_database_spec(db_spec)
+            v_res = validate_database_spec(_database_spec(spec_data))
         elif kind == "stable":
             cols: list[ColumnSpec] = []
             for c in spec_data.get("columns", []):
@@ -423,15 +427,7 @@ class StorageRevisionService:
 
         steps: list[DdlStep] = []
         if kind == "database":
-            db_spec = DatabaseSpec(
-                name=spec_data.get("name") or spec_data.get("physical_name", ""),
-                precision=spec_data.get("precision", "ms"),
-                keep=spec_data.get("keep") or f"{spec_data.get('retention_days', 3650)}d",
-                vgroups=int(spec_data.get("vgroups", 1)),
-                replica=int(spec_data.get("replica", 1)),
-                cache_model=spec_data.get("cache_model"),
-            )
-            steps = build_create_database_plan(db_spec)
+            steps = build_create_database_plan(_database_spec(spec_data))
         elif kind == "stable":
             cols = [
                 ColumnSpec(

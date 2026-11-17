@@ -26,6 +26,8 @@ _RESERVED_DB_PREFIXES = {"information_schema", "performance_schema", "log", "sys
 _MAX_COLUMNS = 4096
 _MAX_TAGS = 128
 _MAX_ROW_BYTES = 65_535  # TDengine hard limit
+_KEEP_VALUE_RE = re.compile(r"([0-9]{1,9})\s*([mhd]?)", re.IGNORECASE)
+_MINUTES_PER_KEEP_UNIT = {"m": 1, "h": 60, "d": 1440}
 
 # TDengine 3.4.3.9 — supported types
 _SUPPORTED_COLUMN_TYPES: dict[str, int | None] = {
@@ -214,24 +216,28 @@ def validate_database_spec(spec: DatabaseSpec) -> ValidationResult:
             "message": f"Cache model '{spec.cache_model}' not supported. Use one of: {_SUPPORTED_CACHE_MODELS}",
         })
 
-    # Retention (KEEP >= 3 * DURATION constraint)
     if spec.keep:
-        keep_str = str(spec.keep).strip().lower()
-        days: int | None = None
-        if keep_str.endswith("d"):
-            try:
-                days = int(keep_str[:-1])
-            except ValueError:
-                pass
-        elif keep_str.isdigit():
-            days = int(keep_str)
-
-        if days is not None and days < 30:
+        periods = [_KEEP_VALUE_RE.fullmatch(period.strip()) for period in str(spec.keep).split(",")]
+        if len(periods) > 3 or any(period is None for period in periods):
             errors.append({
-                "field": "retention_days",
-                "code": "RETENTION_TOO_SHORT",
-                "message": f"Retention {days} days is less than the minimum required by TDengine (KEEP >= 3 * DURATION, minimum 30 days with default 10-day duration).",
+                "field": "retention_days", "code": "INVALID_RETENTION",
+                "message": "Use up to three retention periods in days, hours (h), or minutes (m).",
             })
+        else:
+            minutes = [
+                int(period[1]) * _MINUTES_PER_KEEP_UNIT[period[2].lower() or "d"]
+                for period in periods if period is not None
+            ]
+            if min(minutes) < 30 * 1440:
+                errors.append({
+                    "field": "retention_days", "code": "RETENTION_TOO_SHORT",
+                    "message": "Retention must be at least 30 days with the default 10-day file duration.",
+                })
+            elif max(minutes) > 365_000 * 1440 or minutes != sorted(minutes):
+                errors.append({
+                    "field": "retention_days", "code": "INVALID_RETENTION",
+                    "message": "Retention periods must be in ascending order and at most 365,000 days.",
+                })
 
     return ValidationResult(valid=not errors, errors=errors, warnings=warnings)
 

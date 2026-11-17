@@ -207,15 +207,15 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
           <div className="relative max-w-xs">
             <input
               type="number"
-              min="1"
-              max="36500"
+              min="30"
+              max="365000"
               value={data.retention_days ?? ''}
               onChange={(e) =>
                 onChange({
-                  retention_days: e.target.value === '' ? null : parseInt(e.target.value, 10),
+                  retention_days: e.target.value === '' ? null : e.target.valueAsNumber,
                 })
               }
-              placeholder="e.g. 365 (blank = unlimited)"
+              placeholder="Default: 3650 days"
               className={`w-full h-9 px-3 rounded-lg border text-[13px] transition-colors focus:outline-none focus:ring-2 ${
                 errors.retention_days
                   ? 'border-[#EF1B24] focus:ring-[#EF1B24]/20'

@@ -61,6 +61,31 @@ def test_database_validation_and_ddl():
     assert any(e["code"] == "RETENTION_TOO_SHORT" for e in res_short.errors)
 
 
+@pytest.mark.parametrize(
+    ("keep", "error_code"),
+    [
+        ("30d", None), ("720 hours", "INVALID_RETENTION"), ("719h", "RETENTION_TOO_SHORT"),
+        ("720h,45d,86400m", None), ("45d,30d", "INVALID_RETENTION"),
+        ("365001d", "INVALID_RETENTION"), ("Noned", "INVALID_RETENTION"),
+    ],
+)
+def test_database_retention_validates_units_and_limits(keep, error_code):
+    result = SO.validate_database_spec(SO.DatabaseSpec(name="fx_test", keep=keep))
+    assert result.valid == (error_code is None)
+    if error_code:
+        assert result.errors[0]["code"] == error_code
+
+
+@pytest.mark.asyncio
+async def test_database_retention_default_is_shared_by_validation_and_plan():
+    service = SR.StorageRevisionService()
+    session, tenant, draft = AsyncMock(), uuid4(), uuid4()
+    spec = {"kind": "database", "spec": {"name": "fx_test", "retention_days": None}}
+    assert (await service.validate_draft(session, tenant, draft, custom_spec=spec))["valid"]
+    plan = await service.plan_draft(session, tenant, draft, custom_spec=spec)
+    assert "KEEP 3650d" in plan["steps"][0]["sql"]
+
+
 def test_stable_validation_and_ddl():
     # Valid stable with ts first, columns, and tags
     cols = [
