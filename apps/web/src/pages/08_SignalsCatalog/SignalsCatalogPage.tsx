@@ -39,7 +39,7 @@ import { sortBySourceOrder } from './signalOrder';
 import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { api } from '../../api/client';
 import { PROTOCOL_LABEL } from '../../lib/protocols';
-import { formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { formatCurrentSignalValue, formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
 import { fetchSignalUsage, fetchSignalsUsage } from '../../lib/impactApi';
 import { indeterminateRef, useRangeSelection } from './useRangeSelection';
 import { useSubmit } from '../../lib/useSubmit';
@@ -907,7 +907,7 @@ export const SignalsCatalogPage: React.FC = () => {
                 {filteredSignals.map((sig) => {
                   const res = resources.find((r) => r.id === sig.resourceId);
                   const isSelectedForTrend = trendSignals.some((s) => s.id === sig.id);
-                  const formattedVal = formatValue(sig.value);
+                  const formattedVal = formatCurrentSignalValue(sig.value, sig.quality, sig.enabled !== false);
 
                   return (
                     <div
@@ -1010,7 +1010,7 @@ export const SignalsCatalogPage: React.FC = () => {
                       {filteredSignals.map((sig) => {
                         const res = resources.find((r) => r.id === sig.resourceId);
                         const isChecked = selection.isSelected(sig.id);
-                        const formattedVal = formatValue(sig.value);
+                        const formattedVal = formatCurrentSignalValue(sig.value, sig.quality, sig.enabled !== false);
 
                         return (
                           <tr

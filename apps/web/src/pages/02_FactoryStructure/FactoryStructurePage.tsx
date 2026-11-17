@@ -35,7 +35,7 @@ import { ImportTopicsModal } from '../../components/modals/ImportTopicsModal';
 import { ArchiveResourceModal } from '../../components/modals/ArchiveResourceModal';
 import { translateApiError } from '../../utils/apiErrors';
 import { AuditRow, describeAudit } from '../../utils/auditText';
-import { formatTimestamp, formatValue, normalizeQuality, QUALITY_HINT, QUALITY_LABEL, timeAgo } from '../../lib/format';
+import { formatTimestamp, formatCurrentSignalValue, normalizeQuality, QUALITY_HINT, QUALITY_LABEL, timeAgo } from '../../lib/format';
 import { ActionToast, ToastSpec, useActionToast } from '../../components/common/ActionToast';
 import { ImpactModel, archiveResourceWithModels } from '../../lib/impactApi';
 import { useConnectivity } from '../../lib/connectivity';
@@ -1121,8 +1121,8 @@ export const FactoryStructurePage: React.FC = () => {
                             </span>
                           </div>
                           <div className="flex items-baseline justify-between gap-2 mt-1">
-                            <span className="text-base font-bold font-mono text-[#0B2545] truncate" title={formatValue(sig.value)}>
-                              {formatValue(sig.value)}
+                            <span className="text-base font-bold font-mono text-[#0B2545] truncate" title={formatCurrentSignalValue(sig.value, sig.quality)}>
+                              {formatCurrentSignalValue(sig.value, sig.quality)}
                             </span>
                             <span className="text-[10px] text-[#94A3B8] shrink-0" title={sig.lastUpdated ? formatTimestamp(sig.lastUpdated) : undefined}>
                               {sig.lastUpdated ? timeAgo(sig.lastUpdated) : '—'}

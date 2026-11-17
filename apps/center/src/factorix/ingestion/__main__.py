@@ -58,6 +58,8 @@ async def run_forever() -> None:
         shadow_pg=settings.ingestion_shadow_pg,
         live_provider=live_provider,
         db_dsn_for_notify=settings.database_url,
+        # Acquisition owns source health through its direct connection reports.
+        update_connection_liveness=settings.collector_mode != "acquisition",
     )
 
     stop_ev = asyncio.Event()

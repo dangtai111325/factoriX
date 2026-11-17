@@ -620,7 +620,11 @@ def evaluate_detailed(
         else:
             assert item.program is not None
             try:
-                value = R.evaluate_rule(item.program, eval_ctx, scope=item.path)
+                if not item.program.stateful_calls or all(
+                    (sample := values.get(sid)) is not None and sample.value is not None
+                    for sid in item.program.signal_ids
+                ):
+                    value = R.evaluate_rule(item.program, eval_ctx, scope=item.path)
             except R.LookupPending as wait:
                 pending.append((wait.signal_id, wait.at))
                 value = None

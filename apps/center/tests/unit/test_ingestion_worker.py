@@ -19,13 +19,37 @@ from factorix.modules.ingestion_worker import (
     TenantCatalog,
     _emit_chunked_notify,
 )
-from factorix.platform.broker import ConsumeOutcome
+from factorix.platform.broker import BrokerConfig, ConsumeOutcome
 from factorix.platform.tdengine import BatchWriteFailure, BatchWriteResult, TDEngineError, TDEngineHealth
 from factorix.transport.app import _parse_pg_notify_events
 
 
 def _now() -> datetime:
     return datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(("prefetch", "concurrency"), [(2, 4), (4, 2), (0, 2)])
+async def test_ingestion_flushes_a_full_delivery_window_without_waiting_for_timer(prefetch, concurrency):
+    worker = IngestionWorker(
+        pg_store=MagicMock(), tdengine=MagicMock(), batch_size=8, flush_ms=5_000,
+        broker_cfg=BrokerConfig(amqp_url="amqp://localhost/", prefetch_count=prefetch, consumer_concurrency=concurrency),
+    )
+
+    async def commit_batch(batch):
+        assert len(batch) == 2
+        for envelope in batch:
+            envelope.future.set_result(ConsumeOutcome.ACK)
+
+    worker._process_batch = commit_batch
+    batcher = asyncio.create_task(worker._batcher_loop())
+    messages = [MagicMock(body=b"{}", message_id=str(index), headers={}, redelivered=False) for index in range(2)]
+    try:
+        outcomes = await asyncio.wait_for(asyncio.gather(*(worker.handle_message(message) for message in messages)), 1)
+        assert outcomes == [ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+    finally:
+        worker._stop_event.set()
+        worker._wake_batcher.set()
+        await batcher
 
 
 def _make_obs(
@@ -441,6 +465,37 @@ async def test_tdengine_schema_missing_retryable_hold_and_partial_isolation() ->
     assert res3 == [ConsumeOutcome.ACK, ConsumeOutcome.DEAD_LETTER]
     assert len(pg.quarantined) == 1 and pg.quarantined[0]["event_uid"] == bad.event_uid
     assert pg.commits[-1]["latest_rows"][0]["event_uid"] == good.event_uid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("update_connection_liveness", [True, False])
+async def test_connection_freshness_respects_source_health_ownership(update_connection_liveness: bool) -> None:
+    catalog, ids = _catalog_with_signal()
+    pg = _FakePgStore(catalog)
+    worker = IngestionWorker(
+        pg_store=pg, tdengine=_FakeTDEngine(), update_connection_liveness=update_connection_liveness,
+    )
+    newest = datetime.now(timezone.utc) - timedelta(minutes=10)
+    observations = [
+        _make_obs(
+            tenant_id=ids["tenant_id"], signal_id=ids["signal_id"], resource_id=ids["resource_id"],
+            connection_id=ids["connection_id"], source_field_id=ids["field_id"], site_id=ids["site_id"],
+            acquired_at=sample_time, quality=quality,
+        )
+        for sample_time, quality in (
+            (newest, Quality.GOOD),
+            (newest - timedelta(minutes=2), Quality.UNCERTAIN),
+            (newest + timedelta(minutes=1), Quality.BAD),
+        )
+    ]
+
+    outcomes = await worker.ingest_direct_bytes([
+        (obs.to_json_bytes(), {}, obs.event_uid, False) for obs in observations
+    ])
+
+    assert outcomes == [ConsumeOutcome.ACK] * len(observations)
+    expected = {ids["connection_id"]: newest} if update_connection_liveness else {}
+    assert pg.commits[0]["connection_sample_times"] == expected
 
 
 @pytest.mark.asyncio

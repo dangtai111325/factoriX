@@ -30,7 +30,7 @@ export const QUALITY_LABEL: Record<QualityCode, string> = {
 /** Tooltip / helper text for the two neutral states that are not data problems. */
 export const QUALITY_HINT: Partial<Record<QualityCode, string>> = {
   PAUSED: 'The connection of this signal is paused. Resume it to collect again.',
-  NO_CONNECTION: 'Unknown: no connection to the appliance. The last known value is shown.',
+  NO_CONNECTION: 'The browser cannot reach the appliance. The current value is unavailable.',
   DISABLED: 'This signal is disabled and does not collect.',
 }
 
@@ -60,6 +60,11 @@ export function formatValue(value: unknown): string {
   } catch {
     return String(value)
   }
+}
+
+export function formatCurrentSignalValue(value: unknown, quality: unknown, enabled = true): string {
+  const status = normalizeQuality(quality)
+  return formatValue(enabled && (status === 'GOOD' || status === 'UNCERTAIN') ? value : null)
 }
 
 export function timeAgo(iso: string | null | undefined): string {

@@ -17,7 +17,7 @@ import {
 import { SignalItem } from '../../types';
 import { Button } from '../../components/common/Button';
 import { StatusBadge } from '../../components/common/StatusBadge';
-import { QUALITY_HINT, QUALITY_LABEL, formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { QUALITY_HINT, QUALITY_LABEL, formatCurrentSignalValue, formatTimestamp, normalizeQuality, timeAgo } from '../../lib/format';
 
 interface SignalInspectorProps {
   signal: SignalItem | null;
@@ -51,7 +51,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
 
   const isEnabled = signal.enabled !== false;
   const quality = !isEnabled ? 'DISABLED' : normalizeQuality(signal.quality);
-  const formattedVal = formatValue(signal.value);
+  const formattedVal = formatCurrentSignalValue(signal.value, quality);
   // Center rule: stale after max(2 x expected interval, 12 s) without a new read.
   const staleSec = Math.round((signal.staleAfterMs ?? Math.max(2 * (signal.expectedIntervalMs || 1000), 12000)) / 1000);
   const lastRead = signal.lastAcquiredAt || signal.receivedTime || signal.lastUpdated;

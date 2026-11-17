@@ -136,6 +136,7 @@ async def test_live_state_5_protocols_quality_stale_recovery_and_cold_tdengine_r
             flush_ms=20,
             shadow_pg=False,
             live_provider=worker_provider,
+            update_connection_liveness=False,
         )
         runtime, _lkg, _spool, _acq_pub = make_runtime(
             pg_pool,
@@ -212,6 +213,20 @@ async def test_live_state_5_protocols_quality_stale_recovery_and_cold_tdengine_r
             await asyncio.sleep(0.25)
         assert steady_ok, f"Expected steady acquisition timestamps > changed timestamps, got: {latest}"
 
+        # Source health and telemetry commits must be independent in acquisition mode.
+        previous_mqtt_read = latest[sig_mq_run]["last_acquired_at"]
+        async with pg_pool.acquire() as lock_conn, lock_conn.transaction():
+            await lock_conn.fetchval(
+                "SELECT id FROM connections WHERE id = $1 FOR NO KEY UPDATE",
+                seeded["connections"]["mqtt"]["connection_id"],
+            )
+            async with asyncio.timeout(6):
+                while True:
+                    row = (await _fetch_latest_map([sig_mq_run]))[sig_mq_run]
+                    if row["last_acquired_at"] > previous_mqtt_read:
+                        break
+                    await asyncio.sleep(0.1)
+
         mq_steady_changed_before = latest[sig_mq_run]["last_value_changed_at"]
 
         # 3. Inject OPC UA BAD source fault + pause MQTT publisher until STALE (>12s min_stale_ms)
@@ -251,17 +266,15 @@ async def test_live_state_5_protocols_quality_stale_recovery_and_cold_tdengine_r
             await asyncio.sleep(0.4)
         assert mq_stale, f"MQTT signals did not become STALE after publisher silence: {latest}"
 
-        # While MQTT is STALE, verify models_engine respects STALE / BAD fallback without labeling GOOD
+        # Models expose quality but leave unavailable source values empty.
         async with sa_maker() as session:
             samples, qualities = await models_engine.load_samples(
                 session, tid, [sig_mq_run, sig_opc_temp], live_provider=api_provider
             )
         assert qualities[str(sig_mq_run).lower()] == "STALE"
-        assert samples[str(sig_mq_run).lower()] is not None and samples[str(sig_mq_run).lower()].quality == "STALE"
+        assert samples[str(sig_mq_run).lower()] is None
         assert qualities[str(sig_opc_temp).lower()] == "BAD"
-        assert samples[str(sig_opc_temp).lower()] is not None
-        assert samples[str(sig_opc_temp).lower()].quality == "BAD"
-        assert samples[str(sig_opc_temp).lower()].value is not None
+        assert samples[str(sig_opc_temp).lower()] is None
 
         # Replay an older timestamped MQTT packet -> must be rejected and MUST NOT clear STALE
         stale_acq_before = latest[sig_mq_run]["last_acquired_at"]
@@ -361,6 +374,7 @@ async def test_live_state_5_protocols_quality_stale_recovery_and_cold_tdengine_r
             flush_ms=20,
             shadow_pg=False,
             live_provider=cold_provider,
+            update_connection_liveness=False,
         )
         await worker.start()
         runtime_restarted, _lkg2, _spool2, _pub2 = make_runtime(

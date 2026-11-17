@@ -3,8 +3,7 @@
 Every RUNNING model is sampled every ``sample_ms`` (independent of the collectors). A sample:
 
 1. reads the latest **valid** value (GOOD/UNCERTAIN) of every referenced signal with one query
-   per tenant and tick; a signal whose latest row is BAD falls back to its last good value (the
-   source time of that value is looked up once in ``observations`` and cached);
+   per tenant and tick; unavailable current values are emitted as null;
 2. evaluates the body (:func:`factorix.domain.body.evaluate_detailed`); ``value_at`` lookups use
    the ``observations (tenant_id, signal_id, source_time DESC)`` index and are cached;
 3. stores the ordered JSON text in ``model_state`` and appends it to the ``model_snapshots`` ring
@@ -35,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain import rules as R
 from factorix.domain.body import BodyContext, CompiledSpec, EvalResult, compile_spec, evaluate_detailed
+from factorix.domain.signal_state import evaluate_signal_state
 from factorix.modules.common import execute, fetch_all, queue_stream_event, utcnow
 from factorix.platform import after_commit
 
@@ -111,7 +111,6 @@ class _Lru:
 
 
 _value_at_cache = _Lru(4096)
-_fallback_source_cache = _Lru(8192)
 
 
 def _value_at_ttl(at: datetime, now: datetime, found: bool) -> float | None:
@@ -182,30 +181,28 @@ async def load_catalog(session: AsyncSession, tenant_id: UUID, signal_ids: Itera
     )
 
 
-def sample_from_latest(row: Mapping[str, Any]) -> tuple[R.Sample | None, datetime | None]:
-    """Latest valid sample of a ``latest_signal_state`` row (pure).
-
-    Returns ``(sample, fallback_at)``. When the latest row is not valid (BAD) the last good value
-    is used and ``fallback_at`` is its event time (its source time must be looked up).
-    """
-    quality = str(row.get("quality") or "")
-    if quality in VALID_QUALITIES:
-        value_json = _json(row.get("value_json"))
-        return (
-            R.Sample(
-                value=value_json.get("v") if isinstance(value_json, dict) else None,
-                quality=quality,
-                source_time=R.as_utc(row.get("source_time")),
-                received_time=R.as_utc(row.get("received_time")),
-            ),
-            None,
-        )
-    good = _json(row.get("last_good_value_json"))
-    good_at = R.as_utc(row.get("last_good_event_time"))
-    if isinstance(good, dict) and good.get("v") is not None and good_at is not None:
-        # event_time == received_time (time model); source_time is filled from observations.
-        return R.Sample(value=good.get("v"), quality="GOOD", source_time=None, received_time=good_at), good_at
-    return None, None
+def sample_from_latest(row: Mapping[str, Any], *, now: datetime | None = None) -> tuple[R.Sample | None, str]:
+    """Apply canonical freshness before making a PostgreSQL sample available to the model."""
+    value_json = _json(row.get("value_json"))
+    value = value_json.get("v") if isinstance(value_json, dict) else None
+    received_at = R.as_utc(row.get("received_time"))
+    evaluation = evaluate_signal_state(
+        has_observation=True,
+        raw_quality=row.get("quality"),
+        raw_value=value,
+        event_time=received_at,
+        last_acquired_at=R.as_utc(row.get("last_acquired_at")),
+        expected_interval_ms=row.get("expected_interval_ms"),
+        null_allowed=bool(row.get("nullable")),
+        binding_enabled=bool(row.get("binding_enabled", True)),
+        connection_paused=row.get("connection_status") == "PAUSED",
+        connection_health=row.get("connection_health"),
+        now=now,
+    )
+    quality = evaluation.effective_status
+    if quality not in VALID_QUALITIES:
+        return None, quality
+    return R.Sample(value, quality, R.as_utc(row.get("source_time")), received_at), quality
 
 
 async def load_samples(
@@ -338,7 +335,6 @@ async def load_samples(
 
         samples_p: dict[str, R.Sample | None] = {}
         qualities_p: dict[str, str | None] = {}
-        fallbacks_p: dict[str, datetime] = {}
         for sid_u in ids:
             sid_key = str(sid_u).lower()
             meta = meta_by_id.get(sid_u, {})
@@ -363,136 +359,41 @@ async def load_samples(
             qualities_p[sid_key] = ev.effective_status
             if ev.effective_status in VALID_QUALITIES:
                 samples_p[sid_key] = R.Sample(rec.value, ev.effective_status, rec.source_time, rec.last_acquired_at)
-            elif ev.effective_status in {"STALE", "PAUSED", "DISABLED"} and rec.raw_quality in VALID_QUALITIES:
-                # Preserve value for fallback while strictly NOT labeling stale/paused samples GOOD (§6.3)
-                samples_p[sid_key] = R.Sample(rec.value, ev.effective_status, rec.source_time, rec.last_acquired_at)
-            elif rec.last_good_value is not None and rec.last_good_at is not None:
-                good_src = evaluated.last_good_source_time
-                samples_p[sid_key] = R.Sample(rec.last_good_value, ev.effective_status, good_src, rec.last_good_at)
-                if good_src is None:
-                    fallbacks_p[sid_key] = rec.last_good_at
             else:
                 samples_p[sid_key] = None
-
-        missing_fb = []
-        for sid_key, at in fallbacks_p.items():
-            cached = _fallback_source_cache.get((str(tenant_id), active_epoch, sid_key, at))
-            if cached is _Lru.MISS:
-                missing_fb.append((sid_key, at))
-            elif cached is not None:
-                samples_p[sid_key] = _with_source(samples_p[sid_key], cached)
-        if missing_fb and isinstance(session, AsyncSession):
-            from factorix.modules.history_repository import get_history_provider
-
-            hist_provider = get_history_provider()
-            remaining_fb = list(missing_fb)
-            if hist_provider is not None:
-                try:
-                    td_fb = await hist_provider.fallback_source_times(
-                        tenant_id,
-                        remaining_fb,
-                        session=session,
-                        active_epoch=active_epoch,
-                    )
-                    still_missing: list[tuple[str, datetime]] = []
-                    for sid_key, at in remaining_fb:
-                        src = td_fb.get((sid_key, at))
-                        if src is not None:
-                            _fallback_source_cache.put((str(tenant_id), active_epoch, sid_key, at), src)
-                            samples_p[sid_key] = _with_source(samples_p[sid_key], src)
-                        elif active_epoch > 1:
-                            _fallback_source_cache.put((str(tenant_id), active_epoch, sid_key, at), None)
-                        else:
-                            still_missing.append((sid_key, at))
-                    remaining_fb = still_missing
-                except Exception:  # noqa: BLE001 - fall back to PG when epoch == 1
-                    pass
-
-            if remaining_fb and active_epoch == 1:
-                try:
-                    async with session.begin_nested():
-                        found = await fetch_all(
-                            session,
-                            """
-                            SELECT q.signal_id, o.source_time
-                            FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[])) AS q(signal_id, at)
-                            LEFT JOIN LATERAL (
-                                SELECT source_time FROM observations o
-                                WHERE o.tenant_id = :tenant_id AND o.signal_id = q.signal_id AND o.event_time = q.at
-                                ORDER BY o.received_time DESC
-                                LIMIT 1
-                            ) o ON TRUE
-                            """,
-                            {
-                                "tenant_id": tenant_id,
-                                "ids": [UUID(sid_k) for sid_k, _ in remaining_fb],
-                                "ats": [at for _, at in remaining_fb],
-                            },
-                        )
-                        by_id = {str(row["signal_id"]).lower(): R.as_utc(row.get("source_time")) for row in found}
-                        for sid_key, at in remaining_fb:
-                            source = by_id.get(sid_key)
-                            _fallback_source_cache.put((str(tenant_id), active_epoch, sid_key, at), source)
-                            if source is not None:
-                                samples_p[sid_key] = _with_source(samples_p[sid_key], source)
-                except _SQLAlchemyError:
-                    pass
         return samples_p, qualities_p
 
     rows = await fetch_all(
         session,
         """
-        SELECT signal_id, value_json, quality, source_time, received_time, last_good_value_json, last_good_event_time
-        FROM latest_signal_state
-        WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids)
+        SELECT l.signal_id, l.value_json, l.quality, l.source_time, l.received_time, l.last_acquired_at,
+               s.expected_interval_ms,
+               COALESCE(b.enabled, TRUE) AND s.status = 'ACTIVE' AS binding_enabled,
+               COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable,
+               c.status AS connection_status, c.health AS connection_health
+        FROM latest_signal_state l
+        JOIN signal_definitions s ON s.id = l.signal_id AND s.tenant_id = l.tenant_id
+        LEFT JOIN LATERAL (
+            SELECT sb.enabled, sb.source_field_id
+            FROM signal_bindings sb
+            WHERE sb.signal_id = l.signal_id AND sb.valid_to IS NULL
+            ORDER BY sb.enabled DESC, sb.valid_from DESC
+            LIMIT 1
+        ) b ON TRUE
+        LEFT JOIN source_fields f ON f.id = b.source_field_id
+        LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+        LEFT JOIN connections c ON c.id = j.connection_id
+        WHERE l.tenant_id = :tenant_id AND l.signal_id = ANY(:ids)
         """,
         {"tenant_id": tenant_id, "ids": ids},
     )
     samples: dict[str, R.Sample | None] = {}
     qualities: dict[str, str | None] = {}
-    fallbacks: dict[str, datetime] = {}
+    now = utcnow()
     for row in rows:
         sid = str(row["signal_id"]).lower()
-        sample, fallback_at = sample_from_latest(row)
-        samples[sid] = sample
-        qualities[sid] = row.get("quality")
-        if fallback_at is not None:
-            fallbacks[sid] = fallback_at
-    missing = []
-    for sid, at in fallbacks.items():
-        cached = _fallback_source_cache.get((str(tenant_id), sid, at))
-        if cached is _Lru.MISS:
-            missing.append((sid, at))
-        elif cached is not None:
-            samples[sid] = _with_source(samples[sid], cached)
-    if missing:
-        found = await fetch_all(
-            session,
-            """
-            SELECT q.signal_id, o.source_time
-            FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[])) AS q(signal_id, at)
-            LEFT JOIN LATERAL (
-                SELECT source_time FROM observations o
-                WHERE o.tenant_id = :tenant_id AND o.signal_id = q.signal_id AND o.event_time = q.at
-                ORDER BY o.received_time DESC
-                LIMIT 1
-            ) o ON TRUE
-            """,
-            {"tenant_id": tenant_id, "ids": [UUID(sid) for sid, _ in missing], "ats": [at for _, at in missing]},
-        )
-        by_id = {str(row["signal_id"]).lower(): R.as_utc(row.get("source_time")) for row in found}
-        for sid, at in missing:
-            source = by_id.get(sid)
-            _fallback_source_cache.put((str(tenant_id), sid, at), source)
-            if source is not None:
-                samples[sid] = _with_source(samples[sid], source)
+        samples[sid], qualities[sid] = sample_from_latest(row, now=now)
     return samples, qualities
-
-
-def _with_source(sample: R.Sample | None, source: datetime) -> R.Sample | None:
-    if sample is None:
-        return None
-    return R.Sample(sample.value, sample.quality, source, sample.received_time)
 
 
 async def fetch_value_at(

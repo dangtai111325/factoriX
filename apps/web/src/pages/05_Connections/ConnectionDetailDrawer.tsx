@@ -4,7 +4,7 @@ import { X, Play, Pause, PlusCircle, Activity, Edit2 } from 'lucide-react';
 import { ConnectionItem, SignalItem, ResourceNode } from '../../types';
 import { StatusBadge } from '../../components/common/StatusBadge';
 import { CommissionResult } from '../../lib/commissioning';
-import { formatTimestamp, formatValue, timeAgo } from '../../lib/format';
+import { formatTimestamp, formatCurrentSignalValue, timeAgo } from '../../lib/format';
 import { ConnectionStatusCell } from './connectionStatus';
 import { TestResultPanel } from './TestResultPanel';
 import { PROTOCOL_LABEL } from '../../lib/protocols';
@@ -181,7 +181,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
                           </div>
                           <div className="text-right shrink-0">
                             <div className="font-mono font-black text-[#0B2545]">
-                              {formatValue(s.value)}
+                              {formatCurrentSignalValue(s.value, s.quality)}
                             </div>
                             <StatusBadge status={s.quality || 'NO_DATA'} />
                           </div>

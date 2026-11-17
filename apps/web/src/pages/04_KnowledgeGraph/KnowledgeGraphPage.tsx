@@ -19,7 +19,7 @@ import { useApp } from '../../store/AppContext';
 import { api } from '../../api/client';
 import { ResourceNode, SignalItem } from '../../types';
 import { resourceTypeLabel } from '../../components/common/ResourceTypeIcon';
-import { formatValue, normalizeQuality, QUALITY_HINT, QUALITY_LABEL } from '../../lib/format';
+import { formatCurrentSignalValue, normalizeQuality, QUALITY_HINT, QUALITY_LABEL } from '../../lib/format';
 import { qualityLine, summarizeQualities, useValuesReady } from '../01_Overview/signalSummary';
 import { translateApiError } from '../../utils/apiErrors';
 import { ancestorPath, compareResourcesByName, descendantIds } from '../../utils/resourceHierarchy';
@@ -955,7 +955,7 @@ export const KnowledgeGraphPage: React.FC = () => {
                             </div>
                             <div className="text-right shrink-0">
                               <div className="font-mono font-bold text-xs text-[#0B2545]">
-                                {formatValue(sig.value)}
+                                {formatCurrentSignalValue(sig.value, sig.quality)}
                               </div>
                               <div
                                 title={QUALITY_HINT[quality]}

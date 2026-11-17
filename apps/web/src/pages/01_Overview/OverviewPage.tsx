@@ -20,7 +20,7 @@ import { StatusBadge } from '../../components/common/StatusBadge';
 import { refreshCollectorHealth, useCollectorHealth } from '../../components/shell/collectorHealth';
 import { api } from '../../api/client';
 import { ACCOUNT_EVENTS, AuditRow, describeAudit } from '../../utils/auditText';
-import { formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { formatTimestamp, formatCurrentSignalValue, normalizeQuality, timeAgo } from '../../lib/format';
 import { connectivityDelay, onConnectivityRestored, useConnectivity } from '../../lib/connectivity';
 import { qualityLine, summarizeQualities, useValuesReady } from './signalSummary';
 
@@ -772,7 +772,7 @@ export const OverviewPage: React.FC = () => {
                           {resourceName}
                         </td>
                         <td className={`py-2.5 px-3 font-semibold tabular-nums font-mono whitespace-nowrap overflow-hidden text-ellipsis ${connectionLost ? 'text-[#94A3B8]' : 'text-[#111B37]'}`}>
-                          {formatValue(sig.value)}
+                          {formatCurrentSignalValue(sig.value, connectionLost ? 'NO_CONNECTION' : sig.quality)}
                         </td>
                         <td className="py-2.5 px-3 whitespace-nowrap">
                           <StatusBadge status={normalizeQuality(sig.quality)} />

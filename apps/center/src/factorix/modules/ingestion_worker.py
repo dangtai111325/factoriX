@@ -12,7 +12,7 @@ durable storage effects succeed.
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -141,6 +141,13 @@ class LatencyHistogram:
         self._ingest_to_commit_ms: list[float] = []
         self._events: dict[UUID, list[float]] = {}
         self._conn_events: dict[UUID, list[float]] = {}
+        self._batch_stages: dict[str, deque[float]] = {}
+
+    def record_batch_stage(self, stage: str, started_at: float) -> None:
+        samples = self._batch_stages.get(stage)
+        if samples is None:
+            samples = self._batch_stages[stage] = deque(maxlen=256)
+        samples.append((time.monotonic() - started_at) * 1000)
 
     def record(self, tenant_id: UUID, sli: LatencySLIs, *, connection_id: UUID | None = None) -> None:
         now = time.monotonic()
@@ -182,7 +189,7 @@ class LatencyHistogram:
         return out
 
     @staticmethod
-    def _pct(values: list[float], pct: float) -> float | None:
+    def _pct(values: list[float] | deque[float], pct: float) -> float | None:
         if not values:
             return None
         ordered = sorted(values)
@@ -196,6 +203,10 @@ class LatencyHistogram:
             "sli_acq_to_commit_max_ms": round(max(self._acq_to_commit_ms), 3) if self._acq_to_commit_ms else None,
             "sli_ingest_to_commit_p50_ms": self._pct(self._ingest_to_commit_ms, 0.50),
             "sli_ingest_to_commit_p95_ms": self._pct(self._ingest_to_commit_ms, 0.95),
+            "batch_stage_timings_ms": {
+                stage: {"samples": len(values), "p50": self._pct(values, 0.50), "p95": self._pct(values, 0.95)}
+                for stage, values in self._batch_stages.items()
+            },
         }
 
 
@@ -677,7 +688,7 @@ class PgIngestionStore:
         *,
         tenant_id: UUID,
         latest_rows: Sequence[dict[str, Any]],
-        live_connection_ids: set[UUID],
+        connection_sample_times: Mapping[UUID, datetime],
         stream_events: list[dict[str, Any]],
         shadow_pg_rows: Sequence[dict[str, Any]],
         now: datetime,
@@ -820,18 +831,21 @@ class PgIngestionStore:
                 else:
                     returned_rows = {}
 
-                if live_connection_ids:
+                if connection_sample_times:
+                    ordered_connections = sorted(connection_sample_times, key=str)
                     conn_rows = await conn.fetch(
                         """
                         WITH prev AS (
-                            SELECT id, health AS old_health
-                            FROM connections
-                            WHERE id = ANY($1::uuid[]) AND tenant_id = $2::uuid AND status = 'ACTIVE'
-                            ORDER BY id
-                            FOR UPDATE
+                            SELECT c.id, c.health AS old_health, sample.observed_at
+                            FROM connections c
+                            JOIN unnest($1::uuid[], $2::timestamptz[]) AS sample(id, observed_at) ON sample.id = c.id
+                            WHERE c.tenant_id = $3::uuid AND c.status = 'ACTIVE'
+                              AND (c.last_success_at IS NULL OR c.last_success_at < sample.observed_at)
+                            ORDER BY c.id
+                            FOR UPDATE OF c
                         )
                         UPDATE connections c
-                        SET last_success_at = GREATEST(COALESCE(c.last_success_at, $3::timestamptz), $3::timestamptz),
+                        SET last_success_at = prev.observed_at,
                             health = CASE
                                 WHEN c.health = 'UNKNOWN' THEN 'HEALTHY'
                                 WHEN c.health = 'DEGRADED' AND c.last_error LIKE $4 THEN 'HEALTHY'
@@ -842,9 +856,9 @@ class PgIngestionStore:
                         WHERE c.id = prev.id
                         RETURNING c.id, c.health, c.last_error, c.last_success_at, prev.old_health
                         """,
-                        sorted(live_connection_ids, key=str),
+                        ordered_connections,
+                        [connection_sample_times[connection_id] for connection_id in ordered_connections],
                         tenant_id,
-                        now,
                         f"{NO_DATA_PREFIX}%",
                     )
                     for cr in conn_rows:
@@ -1069,12 +1083,21 @@ class IngestionWorker:
         live_provider: TDengineLiveStateProvider | None = None,
         db_dsn_for_notify: str | None = None,
         enable_gap_sweep: bool = True,
+        update_connection_liveness: bool = True,
     ) -> None:
         self.pg = pg_store
         self.td = tdengine
         self.broker_cfg = broker_cfg
         self.instance_id = instance_id
         self.batch_size = max(1, min(1000, int(batch_size)))
+        self._batch_wake_size = self.batch_size
+        if broker_cfg is not None:
+            # Delivery slots stay occupied until the batch commits and its messages are acknowledged.
+            self._batch_wake_size = min(
+                self.batch_size,
+                broker_cfg.prefetch_count or self.batch_size,
+                broker_cfg.consumer_concurrency,
+            )
         self.flush_interval_s = max(0.002, int(flush_ms) / 1000.0)
         self.shadow_pg = bool(shadow_pg)
         self._formula_ast_cache: dict[tuple[UUID, int], Any] = {}
@@ -1086,6 +1109,7 @@ class IngestionWorker:
         )
         self._notify_dsn = to_asyncpg_dsn(db_dsn_for_notify) if db_dsn_for_notify else None
         self.enable_gap_sweep = bool(enable_gap_sweep)
+        self.update_connection_liveness = update_connection_liveness
 
         self.metrics = WorkerMetrics()
         self.hist = LatencyHistogram()
@@ -1197,7 +1221,7 @@ class IngestionWorker:
         )
         async with self._pending_lock:
             self._pending.append(env)
-            should_wake = len(self._pending) >= self.batch_size
+            should_wake = len(self._pending) >= self._batch_wake_size
         if should_wake:
             self._wake_batcher.set()
         return await fut
@@ -1289,6 +1313,7 @@ class IngestionWorker:
                     if self._pending:
                         self._wake_batcher.set()
             if batch:
+                batch_started_at = time.monotonic()
                 try:
                     await self._process_batch(batch)
                 except Exception as exc:  # noqa: BLE001 - ensure all futures resolve on unexpected error
@@ -1298,6 +1323,8 @@ class IngestionWorker:
                         if not env.future.done():
                             env.future.set_result(ConsumeOutcome.RETRY)
                             self.metrics.retried_total += 1
+                finally:
+                    self.hist.record_batch_stage("batch_processing", batch_started_at)
 
     async def _get_catalog(self, tenant_id: UUID, *, need_signal: UUID | None = None) -> TenantCatalog:
         lock = self._catalog_locks.setdefault(tenant_id, asyncio.Lock())
@@ -1932,9 +1959,12 @@ class IngestionWorker:
                     }
                 )
 
+        raw_write_started_at = time.monotonic()
         succeeded_uids, perm_failures, stopping_aborted = await self._write_td_with_retry(
             tenant_id, td_records, record_kind="RAW_OPERATIONAL"
         )
+        if td_records:
+            self.hist.record_batch_stage("tdengine_operational_write", raw_write_started_at)
         # Include any item where write_operational was False as succeeded for live state update
         op_written_uids = {str(r["event_uid"]) for r in td_records}
         for uid in list(env_by_uid):
@@ -1968,7 +1998,7 @@ class IngestionWorker:
 
         # Build newest candidate per signal for PG latest_signal_state + stream notification
         newest_map: dict[UUID, dict[str, Any]] = {}
-        live_conns: set[UUID] = set()
+        connection_sample_times: dict[UUID, datetime] = {}
         shadow_rows: list[dict[str, Any]] = []
         formula_triggers: list[_PreparedObs] = []
 
@@ -2000,8 +2030,11 @@ class IngestionWorker:
                     "expected_interval_ms": prep.owned.get("expected_interval_ms"),
                     "nullable": bool(prep.owned.get("nullable")),
                 }
-            if prep.norm_quality in {"GOOD", "UNCERTAIN"}:
-                live_conns.add(UUID(str(prep.owned["connection_id"])))
+            if self.update_connection_liveness and prep.norm_quality in {"GOOD", "UNCERTAIN"}:
+                connection_id = UUID(str(prep.owned["connection_id"]))
+                previous_sample = connection_sample_times.get(connection_id)
+                if previous_sample is None or prep.received_time > previous_sample:
+                    connection_sample_times[connection_id] = prep.received_time
             if self.shadow_pg:
                 shadow_rows.append(
                     {
@@ -2029,9 +2062,11 @@ class IngestionWorker:
         # Evaluate synchronous published formulas (depth <= 4) & write calculated outputs to TDengine before PG commit
         calc_td: list[dict[str, Any]] = []
         if formula_triggers:
+            formula_started_at = time.monotonic()
             calc_td, calc_latest, calc_shadow, calc_stopped = await self._evaluate_formulas(
                 tenant_id, cat, formula_triggers, newest_map
             )
+            self.hist.record_batch_stage("formula_evaluation_and_write", formula_started_at)
             if calc_stopped:
                 for env, _prep in committed_items:
                     if not env.future.done():
@@ -2072,6 +2107,7 @@ class IngestionWorker:
                     managed_inputs.append((calc_obs, calc_obs.quality.value, calc_obs.quality_reason, targets))
 
             if managed_inputs:
+                managed_started_at = time.monotonic()
                 targets_needed = [t for _obs, _q, _r, tlist in managed_inputs for t in tlist]
                 sigs_needed = [obs.signal_id for obs, _q, _r, _tlist in managed_inputs]
                 try:
@@ -2127,6 +2163,7 @@ class IngestionWorker:
                             reason=f"MANAGED_TDENGINE_REJECTED ({fail.code}): {fail.message}",
                             payload={"subtable": fail.subtable, "item_id": item_id},
                         )
+                self.hist.record_batch_stage("managed_evaluation_and_write", managed_started_at)
 
         now_commit = _utcnow()
         latest_list = list(newest_map.values())
@@ -2176,12 +2213,13 @@ class IngestionWorker:
                 }
             )
 
+        metadata_started_at = time.monotonic()
         try:
             replaced_signals, _health_events = await self._retry_pg_op(
                 lambda: self.pg.commit_batch_metadata(
                     tenant_id=tenant_id,
                     latest_rows=latest_list,
-                    live_connection_ids=live_conns,
+                    connection_sample_times=connection_sample_times,
                     stream_events=stream_events,
                     shadow_pg_rows=shadow_rows,
                     now=now_commit,
@@ -2193,6 +2231,7 @@ class IngestionWorker:
                     env.future.set_result(ConsumeOutcome.RETRY)
                     self.metrics.retried_total += 1
             return
+        self.hist.record_batch_stage("postgres_metadata_commit", metadata_started_at)
 
         t_cache = self._live_cache.setdefault(tenant_id, {})
         for sig_id, row in newest_map.items():
