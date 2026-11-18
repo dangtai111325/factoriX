@@ -80,6 +80,41 @@ async def test_abandoned_request_closes_the_session() -> None:
     assert client.closed == 1 and not client.connected
 
 
+async def test_abandoned_request_replaces_the_client_object() -> None:
+    client = FakeClient(delay=1.0)
+    connector = _connector(client)
+    task = asyncio.create_task(connector.read_raw(_block(15, 2542)))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert connector.client is not client
+
+
+class TimeoutClient(FakeClient):
+    async def read_holding_registers(self, start: int, *, count: int, device_id: int) -> FakeResponse:
+        from pymodbus.exceptions import ModbusIOException
+
+        raise ModbusIOException("no answer")
+
+
+async def test_timeout_drops_the_client_so_a_late_reply_cannot_shift_the_next_request() -> None:
+    """Regression for the 'request ask for id=X but got id=Y' one-behind loop seen on the appliance."""
+    from factorix_acquisition.connectors.errors import ConnectorError
+
+    stale = TimeoutClient()
+    connector = _connector(stale)
+    try:
+        await connector.read_raw(_block(11, 100))
+        raise AssertionError("expected a timeout")
+    except ConnectorError as exc:
+        assert exc.code == "TIMEOUT" if hasattr(exc, "code") else True
+    assert stale.closed == 1
+    assert connector.client is not stale
+
+
 def _spec(fields: list[dict], config: dict) -> JobSpec:
     return JobSpec(
         job_id="j", connection_id="c", protocol="modbus_tcp", mode="POLL", interval_ms=1000, timeout_ms=0,

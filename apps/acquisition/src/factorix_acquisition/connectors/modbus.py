@@ -139,7 +139,23 @@ class ModbusConnector:
         self.retries = max(0, int(retries))
         self.priority = bool(priority)
         self.last_wait_s = 0.0
-        self.client = AsyncModbusTcpClient(host, port=port, timeout=timeout_s, retries=self.retries, reconnect_delay=0)
+        self.client = self._new_client()
+
+    def _new_client(self) -> AsyncModbusTcpClient:
+        return AsyncModbusTcpClient(self.host, port=self.port, timeout=self.timeout_s, retries=self.retries, reconnect_delay=0)
+
+    def _reset_session(self) -> None:
+        """Drop the TCP session AND the client object after a failed or abandoned request.
+
+        Closing and reconnecting the same pymodbus client can keep a late reply queued, after which
+        every request receives the previous unit's answer ("request ask for id=X but got id=Y") and
+        times out in a permanent one-behind loop. A fresh client guarantees a fresh socket and an
+        empty transaction state."""
+        try:
+            self.client.close()
+        except Exception:  # noqa: BLE001 - closing a broken session must never mask the original error
+            logger.debug("Modbus client close failed for %s:%s", self.host, self.port, exc_info=True)
+        self.client = self._new_client()
 
     @property
     def request_budget_s(self) -> float:
@@ -178,22 +194,22 @@ class ModbusConnector:
                     request = self.client.read_discrete_inputs(block.start, count=block.count, device_id=block.unit_id)
                 response = await bounded(request, timeout=self.request_budget_s + 1.0)
             except ConnectionException as exc:
-                self.client.close()
+                self._reset_session()
                 raise ConnectorError("NETWORK", f"Modbus TCP {self.host}:{self.port} is not connected.") from exc
             except ModbusIOException as exc:
-                self.client.close()
+                self._reset_session()
                 raise ConnectorError("TIMEOUT", f"Modbus unit {block.unit_id} did not answer within {self.timeout_s:g} s.") from exc
             except asyncio.TimeoutError as exc:
-                self.client.close()
+                self._reset_session()
                 raise ConnectorError("TIMEOUT", f"Modbus unit {block.unit_id} did not answer within {self.timeout_s:g} s.") from exc
             except ModbusException as exc:
                 raise ConnectorError("PROTOCOL", f"Modbus request failed: {exc}") from exc
             except OSError as exc:
-                self.client.close()
+                self._reset_session()
                 raise ConnectorError("NETWORK", f"Modbus TCP {self.host}:{self.port} connection failed.") from exc
             except asyncio.CancelledError:
                 logger.info("Modbus request to unit %s on %s:%s abandoned; closing the session", block.unit_id, self.host, self.port)
-                self.client.close()
+                self._reset_session()
                 raise
         if response.isError():
             code = int(getattr(response, "exception_code", 0) or 0)
