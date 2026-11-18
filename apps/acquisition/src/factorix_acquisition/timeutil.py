@@ -5,25 +5,11 @@ from __future__ import annotations
 import math
 import time
 from datetime import datetime, timezone
-from typing import Any, overload
+from typing import Any
 
-
-@overload
-def iso_ms(moment: None) -> None: ...
-
-
-@overload
-def iso_ms(moment: datetime) -> str: ...
-
-
-def iso_ms(moment: datetime | None) -> str | None:
-    """Format an aware (or naive-UTC) datetime as UTC with exactly three fraction digits."""
-    if moment is None:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    moment = moment.astimezone(timezone.utc)
-    return f"{moment:%Y-%m-%dT%H:%M:%S}.{moment.microsecond // 1000:03d}Z"
+# Shared kernel (R2-E B7): one ``iso_ms`` for Center and Acquisition. Same output for an aware or naive-UTC
+# datetime and for ``None``; the kernel version also accepts ISO text (Acquisition passes datetimes only).
+from factorix_core.time import iso_ms
 
 
 def from_epoch(seconds: float) -> str:

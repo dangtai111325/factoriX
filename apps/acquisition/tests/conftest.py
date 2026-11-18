@@ -12,7 +12,7 @@ os.environ.setdefault("FACTORIX_ENVIRONMENT", "test")
 
 APPS = Path(__file__).resolve().parents[2]
 ROOT = APPS.parent
-for path in (APPS / "acquisition/src", APPS / "center/src", ROOT):
+for path in (APPS / "acquisition/src", APPS / "center/src", APPS / "shared/src", ROOT):
     p = str(path)
     if p not in sys.path:
         sys.path.insert(0, p)

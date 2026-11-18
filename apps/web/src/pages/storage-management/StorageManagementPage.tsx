@@ -142,7 +142,8 @@ const DraftsDialog: React.FC<{
   onResume: (kind: string) => void;
   onDiscard: (key: string) => void;
   onDiscardServer: (d: StorageDraftItem) => void;
-}> = ({ open, onClose, local, server, onResume, onDiscard, onDiscardServer }) => (
+  onResumeServer: (d: StorageDraftItem) => void;
+}> = ({ open, onClose, local, server, onResume, onDiscard, onDiscardServer, onResumeServer }) => (
   <Dialog open={open} onClose={onClose} title="Drafts" subtitle="Unfinished storage objects" width="md" footer={<Button size="sm" variant="outline" onClick={onClose}>Close</Button>}>
     <div className="space-y-4">
       <section className="space-y-2">
@@ -177,7 +178,7 @@ const DraftsDialog: React.FC<{
                   <th>Type</th>
                   <th>State</th>
                   <th>Updated</th>
-                  <th className="w-24"><span className="sr-only">Actions</span></th>
+                  <th className="w-40"><span className="sr-only">Actions</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -189,7 +190,10 @@ const DraftsDialog: React.FC<{
                     <td>
                       <TimeCell iso={d.updated_at} />
                     </td>
-                    <td className="text-right">
+                    <td className="text-right whitespace-nowrap">
+                      <Button size="sm" variant="outline" onClick={() => onResumeServer(d)}>
+                        Resume
+                      </Button>
                       <Button size="sm" variant="ghost" onClick={() => onDiscardServer(d)}>
                         Discard
                       </Button>
@@ -199,7 +203,7 @@ const DraftsDialog: React.FC<{
               </tbody>
             </table>
           </div>
-          <p className="text-[11px] text-[#657794]">Server drafts are listed for reference; the wizards do not open them yet.</p>
+          <p className="text-[11px] text-[#657794]">Resume opens a server draft in its wizard; Create there publishes it. Failed creations also stay here as drafts.</p>
         </section>
       )}
     </div>
@@ -484,6 +488,7 @@ export const StorageManagementPage: React.FC = () => {
           }
           setLocalDrafts(readLocalDrafts());
         }}
+        onResumeServer={(d) => navigate(`/historian/storage/create?kind=${encodeURIComponent(d.object_kind)}&draft=${encodeURIComponent(d.id)}`, { state: { from, draft: d } })}
         onDiscardServer={(d) => {
           discardStorageDraft(d.id)
             .then(() => {

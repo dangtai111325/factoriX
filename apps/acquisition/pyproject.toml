@@ -19,6 +19,6 @@ line-length = 120
 target-version = "py312"
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "../center/src"]
+pythonpath = ["src", "../center/src", "../shared/src"]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]

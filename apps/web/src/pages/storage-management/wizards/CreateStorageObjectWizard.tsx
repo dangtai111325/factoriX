@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useSearchParams, useNavigate, Link } from 'react-router-dom';
+import { useSearchParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import {
   Database,
   Layers,
@@ -17,7 +17,8 @@ import {
 import { StorageWizardLayout, useWizardDraft, useStorageBackTarget } from './WizardShared';
 import { Button } from '../../../components/common/Button';
 import { ActionToast, useActionToast } from '../../../components/common/ActionToast';
-import { WizardHeader, DraftChip } from '../../historian/hsUi';
+import { WizardHeader, DraftChip, Banner } from '../../historian/hsUi';
+import { databaseIntent, draftNameFor, draftSpecFor, ServerDraftRef, stableIntent, subtableIntent, wizardDataFromSpec, WizardKind } from './serverDrafts';
 import {
   DatabaseBasicsStep,
   DatabaseSettingsStep,
@@ -33,7 +34,6 @@ import {
   StableRecordingStep,
   StableReviewStep,
   StableWizardData,
-  stableSpecFromWizard,
 } from './StableWizardSteps';
 import {
   SubtableIdentityStep,
@@ -42,7 +42,6 @@ import {
   SubtableRowAssemblyStep,
   SubtableReviewStep,
   SubtableWizardData,
-  buildSubtableSpec,
 } from './SubtableWizardSteps';
 import { ApiError } from '../../../api/client';
 import {
@@ -52,6 +51,11 @@ import {
   getOperation,
   getStable,
   getStorageObject,
+  getStorageDraft,
+  createStorageDraft,
+  patchStorageDraft,
+  publishStorageDraft,
+  StorageDraftItem,
   TDStable,
   StorageOperation,
   ColumnDefinition,
@@ -180,6 +184,113 @@ export const CreateStorageObjectWizard: React.FC = () => {
 
   // Subtable wizard state
   const subtableDraft = useWizardDraft<SubtableWizardData>('fx_wizard_draft_subtable', INITIAL_SUBTABLE_DATA);
+  // ---- server draft (D5 / H14): ?draft=<id> reopens it; "Save draft" keeps it on the server
+  const location = useLocation();
+  const draftParam = searchParams.get('draft');
+  const [serverDraft, setServerDraft] = useState<ServerDraftRef | null>(null);
+  const [draftState, setDraftState] = useState<{ loading: boolean; error: string | null; opened: string | null }>({ loading: false, error: null, opened: null });
+  const wizardFor = (k: string | null) => (k === 'database' ? dbDraft : k === 'stable' ? stableDraft : subtableDraft);
+  useEffect(() => {
+    if (!draftParam) {
+      setServerDraft(null);
+      return;
+    }
+    if (serverDraft?.id === draftParam) return; // just created by "Save draft"
+    let active = true;
+    setDraftState({ loading: true, error: null, opened: null });
+    const fromList = (location.state as { draft?: StorageDraftItem } | null)?.draft;
+    getStorageDraft(draftParam)
+      .catch((err: unknown) => {
+        // Older Center without GET /td/drafts/{id}: the Drafts list already carried the spec.
+        if (fromList && fromList.id === draftParam) return fromList;
+        throw err;
+      })
+      .then((d) => {
+        if (!active) return;
+        const k = (d.object_kind || kind || 'stable') as WizardKind;
+        if (kind !== k) {
+          const next = new URLSearchParams(searchParams);
+          next.set('kind', k);
+          setSearchParams(next, { replace: true, state: location.state });
+        }
+        const w = wizardFor(k);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (w.resetData as (x: any) => void)(wizardDataFromSpec(k, (d.spec || {}) as Record<string, unknown>, w.data as never));
+        setServerDraft({ id: d.id, revision: Number(d.revision || 1), name: d.name, updatedAt: d.updated_at });
+        setDraftState({ loading: false, error: null, opened: `${d.name}${d.updated_at ? ` (saved ${new Date(d.updated_at).toLocaleString()})` : ''}` });
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        setDraftState({ loading: false, error: `Could not open the draft: ${describeError(err)}`, opened: null });
+      });
+    return () => { active = false; };
+  }, [draftParam]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Save draft: on the server (create, then PATCH with the revision lock) and in this tab as a fallback. */
+  const saveDraft = async () => {
+    const k = (kind || 'stable') as WizardKind;
+    const w = wizardFor(k);
+    w.saveDraft();
+    const spec = draftSpecFor(k, w.data as never);
+    const name = draftNameFor(k, w.data as never);
+    try {
+      const saved = serverDraft
+        ? await patchStorageDraft(serverDraft.id, { revision: serverDraft.revision, name, spec })
+        : await createStorageDraft({ kind: k, name, spec });
+      setServerDraft({ id: saved.id, revision: Number(saved.revision || 1), name: saved.name, updatedAt: saved.updated_at });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (w.resetData as (x: any) => void)(w.data);
+      w.setLastSavedAt(`${new Date().toLocaleTimeString()} on the server`);
+      setDraftState((s0) => ({ ...s0, error: null }));
+      if (!draftParam) {
+        const next = new URLSearchParams(searchParams);
+        next.set('draft', saved.id);
+        setSearchParams(next, { replace: true });
+      }
+    } catch (err: unknown) {
+      const status = (err as { status?: number }).status;
+      setDraftState((s0) => ({
+        ...s0,
+        error:
+          status === 409
+            ? 'This draft was changed elsewhere since you opened it. Reload the page to get the latest version (your edits are kept in this tab).'
+            : `Saved in this browser tab only; the server did not keep the draft (${describeError(err)}).`,
+      }));
+    }
+  };
+
+  /** Create from a server draft: write the current input into it (revision lock), then publish it. */
+  const publishFromDraft = async (k: WizardKind, data: unknown): Promise<StorageOperation> => {
+    if (!serverDraft) throw new Error('No server draft');
+    const saved = await patchStorageDraft(serverDraft.id, { revision: serverDraft.revision, name: draftNameFor(k, data as never), spec: draftSpecFor(k, data as never) });
+    setServerDraft({ id: saved.id, revision: Number(saved.revision || 1), name: saved.name, updatedAt: saved.updated_at });
+    const res = await publishStorageDraft(serverDraft.id);
+    return {
+      id: res.operation_id,
+      status: res.status,
+      object_name: res.object_key || saved.name,
+      object_key: res.object_key,
+      error_message: res.error_message,
+    } as unknown as StorageOperation;
+  };
+
+  const draftNotice =
+    draftState.loading || draftState.error || (serverDraft && draftState.opened) ? (
+      <div className="mb-4">
+        {draftState.loading ? (
+          <Banner tone="info">Opening the saved draft…</Banner>
+        ) : draftState.error ? (
+          <Banner tone={draftState.error.startsWith('Saved in this browser') ? 'warning' : 'error'} onClose={() => setDraftState((s0) => ({ ...s0, error: null }))}>
+            {draftState.error}
+          </Banner>
+        ) : (
+          <Banner tone="info" onClose={() => setDraftState((s0) => ({ ...s0, opened: null }))}>
+            Reopened the server draft <span className="font-mono font-semibold">{draftState.opened}</span>. “Save draft” updates it; “Create” publishes it.
+          </Banner>
+        )}
+      </div>
+    ) : null;
+
   const [parentStable, setParentStable] = useState<TDStable | null>(null);
   const stableId = subtableDraft.data.stable_id;
   const updateSubtableDraft = subtableDraft.updateData;
@@ -287,6 +398,12 @@ export const CreateStorageObjectWizard: React.FC = () => {
       const key = String((op as unknown as { object_key?: string }).object_key || op.object_name || '');
       const objectId = kind === 'database' ? `db:${key}` : `${kind}:${key}`;
       setCreated({ kind: kind || 'object', name: key, objectId });
+      setServerDraft(null);
+      if (draftParam) {
+        const next = new URLSearchParams(searchParams);
+        next.delete('draft');
+        setSearchParams(next, { replace: true });
+      }
       const noun = kind === 'stable' ? 'supertable' : kind || 'object';
       showToast({
         tone: 'success',
@@ -381,15 +498,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
     if (!validateDbStep(2)) return;
 
     executeWithPolling(
-      createDatabase({
-        physical_name: dbDraft.data.physical_name,
-        display_name: dbDraft.data.display_name || undefined,
-        description: dbDraft.data.description || undefined,
-        precision: dbDraft.data.precision,
-        retention_days: dbDraft.data.retention_days,
-        vgroups: dbDraft.data.vgroups,
-        cache_mb: dbDraft.data.cache_mb,
-      }).then((res) => {
+      (serverDraft ? publishFromDraft('database', dbDraft.data) : createDatabase(databaseIntent(dbDraft.data))).then((res) => {
         dbDraft.clearDraft();
         return res;
       })
@@ -467,29 +576,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
     if (!validateStableStep(5)) return;
 
     executeWithPolling(
-      createStable({
-        database_name: stableDraft.data.database_name,
-        physical_name: stableDraft.data.physical_name,
-        display_name: stableDraft.data.display_name || undefined,
-        description: stableDraft.data.description || undefined,
-        columns: (stableSpecFromWizard(stableDraft.data).columns as ColumnDefinition[]),
-        tags: stableDraft.data.tags,
-        default_recording_mode: stableDraft.data.default_recording_mode,
-        retention_days: stableDraft.data.retention_days,
-        source_mapping_template: stableDraft.data.skip_source_mapping
-          ? undefined
-          : stableDraft.data.source_mapping_template.map((m) => ({
-              id: `tmpl_${m.column_name}`,
-              destination_column: m.column_name,
-              source_id: m.source_id,
-              source_kind: m.source_kind,
-              source_path: m.source_path,
-              source_type: m.source_type,
-              source_unit: m.source_unit,
-              status: 'ACTIVE',
-              created_at: new Date().toISOString(),
-            })),
-      }).then((res) => {
+      (serverDraft ? publishFromDraft('stable', stableDraft.data) : createStable(stableIntent(stableDraft.data))).then((res) => {
         stableDraft.clearDraft();
         return res;
       })
@@ -548,10 +635,9 @@ export const CreateStorageObjectWizard: React.FC = () => {
     if (!validateSubtableStep(4)) return;
 
     executeWithPolling(
-      createSubtable({
-        ...(buildSubtableSpec(subtableDraft.data) as unknown as Parameters<typeof createSubtable>[0]),
-        stable_id: subtableDraft.data.stable_id,
-      }).then((res) => res)
+      serverDraft
+        ? publishFromDraft('subtable', subtableDraft.data)
+        : createSubtable(subtableIntent(subtableDraft.data) as unknown as Parameters<typeof createSubtable>[0])
     );
   };
 
@@ -698,13 +784,15 @@ export const CreateStorageObjectWizard: React.FC = () => {
           onBack={() => setCurrentStep((prev) => Math.max(prev - 1, 0))}
           onNext={handleDbNext}
           onSubmit={handleDbSubmit}
-          onSaveDraft={dbDraft.saveDraft}
+          onSaveDraft={() => void saveDraft()}
+          badge={serverDraft ? <DraftChip state="draft" label={`Server draft · revision ${serverDraft.revision}`} /> : undefined}
           isDirty={dbDraft.isDirty}
           lastSavedAt={dbDraft.lastSavedAt}
           loading={submitting}
           error={submitError}
           submitLabel="Create database"
         >
+          {draftNotice}
           {currentStep === 0 && (
             <DatabaseBasicsStep
               data={dbDraft.data}
@@ -754,13 +842,15 @@ export const CreateStorageObjectWizard: React.FC = () => {
           onBack={() => setCurrentStep((prev) => Math.max(prev - 1, 0))}
           onNext={handleStableNext}
           onSubmit={handleStableSubmit}
-          onSaveDraft={stableDraft.saveDraft}
+          onSaveDraft={() => void saveDraft()}
+          badge={serverDraft ? <DraftChip state="draft" label={`Server draft · revision ${serverDraft.revision}`} /> : undefined}
           isDirty={stableDraft.isDirty}
           lastSavedAt={stableDraft.lastSavedAt}
           loading={submitting}
           error={submitError}
           submitLabel="Create supertable"
         >
+          {draftNotice}
           {currentStep === 0 && (
             <StableTargetStep
               data={stableDraft.data}
@@ -830,13 +920,15 @@ export const CreateStorageObjectWizard: React.FC = () => {
         onBack={() => setCurrentStep((prev) => Math.max(prev - 1, 0))}
         onNext={handleSubtableNext}
         onSubmit={handleSubtableSubmit}
-        onSaveDraft={subtableDraft.saveDraft}
+        onSaveDraft={() => void saveDraft()}
+        badge={serverDraft ? <DraftChip state="draft" label={`Server draft · revision ${serverDraft.revision}`} /> : undefined}
         isDirty={subtableDraft.isDirty}
         lastSavedAt={subtableDraft.lastSavedAt}
         loading={submitting}
         error={submitError}
         submitLabel="Create subtable"
       >
+        {draftNotice}
         {currentStep === 0 && (
           <SubtableIdentityStep
             data={subtableDraft.data}

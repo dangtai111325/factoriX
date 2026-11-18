@@ -493,7 +493,7 @@ class FakeProvider:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("total", "downsampled"), [(3, False), (50_000, True)])
+@pytest.mark.parametrize(("total", "downsampled"), [(3, True), (50_000, True)])
 async def test_historian_query_is_complete_or_explicitly_downsampled(monkeypatch, total, downsampled):
     from factorix.modules import historian_service as HS
 
@@ -513,15 +513,42 @@ async def test_historian_query_is_complete_or_explicitly_downsampled(monkeypatch
     client = FakeHistClient(total)
     res = await HS.query_historian(object(), TENANT, {"signal_ids": [str(sid)], "range": "7d"},
                                    history_provider=FakeProvider(client))
-    series = res["series"][str(sid)]
-    assert series["total"] == total and series["downsampled"] is downsampled
+    series = res["series_list"][0]
+    assert series["downsampled"] is downsampled
+    assert "points" not in res["series"][str(sid)] and "rows" not in res and "items" not in res  # D1: points once
     assert series["display_name"] == "AA10-01 · speed_1"
     assert all("value" in p and "values" not in p for p in series["points"])  # P0-3 contract
-    if downsampled:
-        assert series["bucket_ms"] == 600_000 and series["points"][0]["min"] == 1.0
-        assert any("INTERVAL(600000a)" in q for q in client.sql)
-    else:
-        assert [p["value"] for p in series["points"]] == [0.0, 1.0, 2.0]
+    # 7 days at a 1 s expected interval: aggregated by TDengine directly — one round trip, no COUNT,
+    # total = sum of the bucket counts.
+    assert series["bucket_ms"] == 600_000 and series["points"][0]["min"] == 1.0 and series["total"] == 10
+    assert [q for q in client.sql if "COUNT(*)" in q] == [] and len(client.sql) == 1
+    assert set(series["points"][0]) <= {"ts", "value", "quality", "record_kind", "min", "max", "count", "last"}
+
+
+@pytest.mark.asyncio
+async def test_historian_short_window_is_one_raw_query(monkeypatch):
+    from factorix.modules import historian_service as HS
+
+    sid = uuid4()
+
+    async def fetch_all(_s, sql, p):
+        if "from signal_definitions" in sql.lower():
+            return [{"id": sid, "key": "speed_1", "display_name": "speed_1", "unit": "rpm", "data_type": "float64",
+                     "expected_interval_ms": 1000, "resource_id": None, "resource_name": None}]
+        return []
+
+    async def epoch(_s, _t):
+        return 1
+
+    monkeypatch.setattr(HS, "fetch_all", fetch_all)
+    monkeypatch.setattr(HS, "_active_epoch", epoch)
+    client = FakeHistClient(3)
+    res = await HS.query_historian(object(), TENANT, {"signal_ids": [str(sid)], "range": "15m"},
+                                   history_provider=FakeProvider(client))
+    sr = res["series_list"][0]
+    assert [p["value"] for p in sr["points"]] == [0.0, 1.0, 2.0] and sr["total"] == 3 and not sr["downsampled"]
+    assert len(client.sql) == 1 and "ORDER BY `ts` DESC LIMIT 1501" in client.sql[0]  # no DESCRIBE, no COUNT
+    assert [g["quality"] for g in sr["quality_segments"]] == ["GOOD", "STALE"]  # merged, not one per point
 
 
 @pytest.mark.asyncio
@@ -641,3 +668,65 @@ async def test_historian_compare_period_shifts_previous_window(monkeypatch):
     pt = prev["series_list"][0]["points"][0]
     assert pt["original_ts"] != pt["ts"]
     assert "gap_count" in res["series_list"][0]["stats"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 3 (D2–D4)
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_quality_transitions_come_from_stored_history(monkeypatch):
+    from factorix.modules import historian_service as HS
+
+    sid = uuid4()
+
+    async def fetch_all(_s, sql, p):
+        if "from signal_definitions" in sql.lower():
+            return [{"id": sid, "key": "speed_1", "data_type": "float64"}]
+        return []
+
+    async def epoch(_s, _t):
+        return 1
+
+    class C:
+        sql: list[str] = []
+
+        async def query_rows(self, sql):
+            self.sql.append(sql)
+            return [{"ws": T0, "we": T0 + timedelta(minutes=1), "q": "GOOD", "n": 60},
+                    {"ws": T0 + timedelta(minutes=1), "we": T0 + timedelta(minutes=2), "q": "BAD", "n": 5},
+                    {"ws": T0 + timedelta(minutes=2), "we": T0 + timedelta(minutes=3), "q": "GOOD", "n": 60}]
+
+    client = C()
+    monkeypatch.setattr(HS, "fetch_all", fetch_all)
+    monkeypatch.setattr(HS, "_active_epoch", epoch)
+    monkeypatch.setattr(HS, "get_history_provider", lambda: FakeProvider(client))
+    res = await HS.list_historian_events(object(), TENANT, signal_ids=[str(sid)], start=T0.isoformat(),
+                                         end=(T0 + timedelta(minutes=5)).isoformat(), types=["QUALITY_TRANSITION"])
+    trans = [(e["from_state"], e["to_state"]) for e in sorted(res["items"], key=lambda e: e["ts"])]
+    assert trans == [("GOOD", "BAD"), ("BAD", "GOOD")]
+    assert "STATE_WINDOW(raw_quality)" in client.sql[0]
+    # Not asked for -> not computed
+    client.sql.clear()
+    await HS.list_historian_events(object(), TENANT, signal_ids=[str(sid)], types=["EPOCH_RESET"])
+    assert client.sql == []
+
+
+def test_saved_view_keeps_the_ui_shape():
+    from factorix.modules import historian_views as HV
+
+    sid = str(uuid4())
+    spec = {"v": 1, "sources": [sid], "labels": {sid: "AA10-01 · speed_1"}, "mode": "operational", "range": "1h",
+            "start": None, "end": None, "compare_offset": "1d", "layout": "stacked", "hidden": [], "tab": "trend"}
+    out = HV.normalize_query_spec(spec)
+    assert out["labels"] == {sid: "AA10-01 · speed_1"} and out["layout"] == "stacked" and out["tab"] == "trend"
+    assert out["v"] == 1 and out["hidden"] == [] and "start" not in out
+
+
+def test_export_item_returns_the_stored_title():
+    from factorix.modules import historian_service as HS
+
+    item = HS._export_item({"id": uuid4(), "status": "COMPLETED", "query_json": {"title": "AA10-01 · speed_1 · Last 5m",
+                                                                                  "_result": {"series": ["a"]}},
+                            "created_at": T0}, T0)
+    assert item["title"] == "AA10-01 · speed_1 · Last 5m" and item["series"] == ["a"] and item["download_url"]

@@ -105,6 +105,15 @@ def _parse_signals_param(
     return parsed
 
 
+def _json_response(payload: Any) -> Response:
+    """Large read payloads (Historian series) are serialized once with ``json.dumps``; FastAPI's
+    generic response-model encoding walks every point again (D1)."""
+    return Response(
+        content=json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str, allow_nan=False),
+        media_type="application/json",
+    )
+
+
 def build_router(
     admin: Callable[..., Any] | None = None,
     db_session: Callable[..., Any] | None = None,
@@ -248,7 +257,7 @@ def build_router(
         tenant_id, _actor = ids(principal)
         return await SD.get_storage_health(session, tenant_id)
 
-    @router.get("/api/v1/storage/operations", tags=["storage"])
+    @router.get("/api/v1/storage/designs/operations", tags=["storage"])
     async def list_operations(
         design_id: str | None = None,
         kind: str | None = None,
@@ -545,9 +554,9 @@ def build_router(
         body: dict[str, Any] = Body(default_factory=dict),
         principal: dict[str, Any] = Depends(admin_dep),
         session: AsyncSession = Depends(db_dep),
-    ) -> dict[str, Any]:
+    ) -> Response:
         tenant_id, _actor = ids(principal)
-        return await HS.query_historian(session, tenant_id, body)
+        return _json_response(await HS.query_historian(session, tenant_id, body))
 
     @router.get("/api/v1/historian/query", tags=["historian"])
     async def historian_query_get(
@@ -578,7 +587,7 @@ def build_router(
             "cursor": cursor,
             "limit": limit,
         }
-        return await HS.query_historian(session, tenant_id, payload)
+        return _json_response(await HS.query_historian(session, tenant_id, payload))
 
     @router.get("/api/v1/historian/events", tags=["historian"])
     async def historian_events(
@@ -1594,6 +1603,21 @@ def build_router(
         except StorageObjectError as exc:
             raise _storage_error(exc) from exc
 
+    @router.get("/api/v1/storage/td/drafts/{draft_id}", tags=["storage"])
+    async def get_td_draft(
+        draft_id: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Reopen a server draft (D5): ``spec`` is exactly the body the create endpoint of
+        ``object_kind`` accepts; continue with PATCH /td/objects/drafts/{id} (``revision`` = optimistic
+        lock), validate/plan, then POST /td/objects/drafts/{id}/publish or the normal create."""
+        tenant_id, _actor = ids(principal)
+        draft = await revision_service.get_draft(session, tenant_id, parse_uuid(draft_id))
+        if not draft or draft.get("state") not in ("DRAFT", "FAILED"):
+            raise AppError(404, "NOT_FOUND", f"Draft '{draft_id}' not found")
+        return {k: draft.get(k) for k in ("id", "object_kind", "name", "revision", "state", "spec", "created_at", "updated_at")}
+
     @router.get("/api/v1/storage/td/drafts", tags=["storage"])
     async def list_td_drafts(
         kind: str | None = None,
@@ -2137,7 +2161,7 @@ def build_router(
         rows = await fetch_all(session, sql, params)
         items = []
         for r in rows:
-            step_state = r["step_state_json"]
+            step_state = r.get("step_state_json") or {}
             if isinstance(step_state, str):
                 try:
                     import json

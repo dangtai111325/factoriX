@@ -65,7 +65,7 @@ def test_acquisition_runtime_block_round_trips_to_the_center_sweep() -> None:
 
 
 def test_ingestion_heartbeat_writes_every_key_the_api_reads() -> None:
-    fn = _function(CENTER / "modules" / "ingestion_worker.py", "_heartbeat_loop")
+    fn = _function(CENTER / "application" / "ingestion" / "worker.py", "_heartbeat_loop")  # moved from modules/ingestion_worker.py (R2-E B4)
     keys: set[str] = set()
     for node in ast.walk(fn):
         if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "queues_json" for t in node.targets) and isinstance(node.value, ast.Dict):

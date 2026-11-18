@@ -1145,7 +1145,7 @@ async def test_fastapi_router_end_to_end_endpoints() -> None:
         assert bulk_resp.json()["succeeded"] == 1
 
         # 15. Operations list
-        ops_resp = await client.get("/api/v1/storage/operations")
+        ops_resp = await client.get("/api/v1/storage/designs/operations")  # CT-01: designs journal path
         assert ops_resp.status_code == 200
         assert isinstance(ops_resp.json(), list)
 

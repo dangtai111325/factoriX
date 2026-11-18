@@ -76,3 +76,13 @@ def _shift_month(value: date, delta: int) -> date:
     year = value.year + month // 12
     month = month % 12 + 1
     return date(year, month, 1)
+
+
+def to_asyncpg_dsn(dsn: str) -> str:
+    """SQLAlchemy ``postgresql+asyncpg://`` URL -> plain ``postgresql://`` DSN for asyncpg (moved from ingestion_worker, R2-E B4)."""
+    text = str(dsn or "").strip()
+    if text.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + text[len("postgresql+asyncpg://") :]
+    if text.startswith("postgres+asyncpg://"):
+        return "postgresql://" + text[len("postgres+asyncpg://") :]
+    return text

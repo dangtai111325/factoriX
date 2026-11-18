@@ -623,6 +623,44 @@ export async function listStorageDrafts(kind?: TDObjectType): Promise<{ items: S
   return api(`/api/v1/storage/td/drafts${kind ? `?kind=${kind}` : ''}`);
 }
 
+export interface StorageDraftDetail extends StorageDraftItem {
+  created_at?: string | null;
+}
+
+/** GET /api/v1/storage/td/drafts/{id} → the draft with its `spec` (= the create body of its kind), H14. */
+export async function getStorageDraft(id: string): Promise<StorageDraftDetail> {
+  return api(`/api/v1/storage/td/drafts/${encodeURIComponent(id)}`);
+}
+
+/** POST /api/v1/storage/td/objects/drafts {kind, name, spec} → the new draft (revision 1). */
+export async function createStorageDraft(body: { kind: TDObjectType; name: string; spec: Record<string, unknown> }): Promise<StorageDraftDetail> {
+  return api('/api/v1/storage/td/objects/drafts', { method: 'POST', body: JSON.stringify(body) });
+}
+
+/**
+ * PATCH /api/v1/storage/td/objects/drafts/{id} {revision, name, spec}: optimistic lock on `revision`
+ * (409 when the draft changed elsewhere). The server MERGES `spec` at the top level, so callers send every key
+ * (null for cleared values).
+ */
+export async function patchStorageDraft(id: string, body: { revision: number; name?: string; spec: Record<string, unknown> }): Promise<StorageDraftDetail> {
+  return api(`/api/v1/storage/td/objects/drafts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) });
+}
+
+/** POST /api/v1/storage/td/objects/drafts/{id}/publish (202) → `{operation_id, status, object_key, …}`. */
+export async function publishStorageDraft(id: string, idempotencyKey?: string): Promise<{
+  operation_id: string;
+  status: string;
+  object_key?: string | null;
+  error_message?: string | null;
+  idempotent_replay?: boolean;
+}> {
+  return api(`/api/v1/storage/td/objects/drafts/${encodeURIComponent(id)}/publish`, {
+    method: 'POST',
+    headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+    body: JSON.stringify({}),
+  });
+}
+
 /** DELETE /api/v1/storage/td/drafts/{id} → state CANCELLED (contract H9; 404/405 on older servers). */
 export async function discardStorageDraft(id: string): Promise<{ id: string; state: string }> {
   return api(`/api/v1/storage/td/drafts/${encodeURIComponent(id)}`, { method: 'DELETE' });
@@ -797,8 +835,12 @@ export interface HistorianRow {
   [key: string]: unknown;
 }
 
+/**
+ * Compact point (H10): `ts, value, quality, record_kind` always; the rest only when present. Lineage that is the
+ * same for every point (unit, value type, series key) lives on the series.
+ */
 export interface HistorianSeriesPoint {
-  id: string;
+  id?: string;
   ts: string;
   value: unknown;
   quality: string | null;
@@ -806,13 +848,15 @@ export interface HistorianSeriesPoint {
   min?: number | null;
   max?: number | null;
   count?: number;
+  /** Bucket: last value of the bucket. */
+  last?: unknown;
   source_time?: string | null;
   acquired_at?: string | null;
   reason_code?: string | null;
   event_uid?: string | null;
   data_epoch?: number | null;
   virtual?: boolean;
-  series_key: string;
+  series_key?: string;
   signal_key?: string | null;
   /** Compare period: real timestamp of a point shifted onto the main axis (newer servers). */
   original_ts?: string | null;
@@ -855,6 +899,15 @@ export interface HistorianSeriesResult {
   column?: string | null;
   coverage_notes: string[];
   stats: HistorianSeriesStats;
+  /** Merged runs of equal quality; `STALE` + `reason_code: STALE_GAP` for silences past the stale threshold; [] when downsampled. */
+  quality_segments?: HistorianQualitySegment[];
+}
+
+export interface HistorianQualitySegment {
+  start: string;
+  end: string;
+  quality: 'GOOD' | 'UNCERTAIN' | 'STALE' | 'BAD' | string;
+  reason_code?: string | null;
 }
 
 export interface HistorianMultiQuery {
@@ -907,19 +960,29 @@ export interface HistorianEvent {
   id: string;
   ts: string;
   kind: 'QUALITY_TRANSITION' | 'STORAGE_OPERATION' | 'EPOCH_RESET' | string;
-  summary: string;
+  summary?: string;
   message?: string;
   signal_id?: string;
+  signal_key?: string;
+  /** QUALITY_TRANSITION (H12): stored history of the signal's raw quality. */
+  from_state?: string | null;
+  to_state?: string | null;
+  samples?: number | null;
+  until?: string | null;
   data_epoch?: number;
 }
 
-/** GET /api/v1/historian/events — storage operations and telemetry resets (tenant-wide). */
+/**
+ * GET /api/v1/historian/events. Storage operations and telemetry resets are tenant-wide; quality transitions
+ * (H12) come from the stored rows of the named signals only (`signal_ids` required for them).
+ */
 export async function listHistorianEvents(
-  params: { start: string; end: string; types?: string[]; limit?: number },
+  params: { start: string; end: string; types?: string[]; signal_ids?: string[]; limit?: number },
   signal?: AbortSignal,
 ): Promise<{ items: HistorianEvent[] }> {
   const qs = new URLSearchParams({ start: params.start, end: params.end, limit: String(params.limit ?? 200) });
   if (params.types?.length) qs.set('types', params.types.join(','));
+  if (params.signal_ids?.length) qs.set('signal_ids', params.signal_ids.join(','));
   return api(`/api/v1/historian/events?${qs}`, { signal });
 }
 
@@ -933,6 +996,7 @@ export interface HistorianViewSpec {
   start?: string | null;
   end?: string | null;
   compare_offset?: string | null;
+  live?: boolean;
   layout?: string;
   hidden?: string[];
   tab?: string;

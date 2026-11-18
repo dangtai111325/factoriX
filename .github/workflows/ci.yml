@@ -21,7 +21,7 @@ jobs:
           FACTORIX_DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/factorix_test
           FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
           FACTORIX_ENVIRONMENT: test
-          PYTHONPATH: ".:apps/center/src:apps/acquisition/src:apps/edge/src"
+          PYTHONPATH: ".:apps/center/src:apps/acquisition/src:apps/edge/src:apps/shared/src"
         run: |
           python -m pytest apps/center/tests/unit apps/acquisition/tests/unit apps/edge/tests tests/safety tests/simulators -q
 
@@ -91,7 +91,7 @@ jobs:
           FACTORIX_ENVIRONMENT: test
           FACTORIX_DATABASE_URL: postgresql+asyncpg://test:test@127.0.0.1:5432/factorix_test
           FACTORIX_DATA_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
-          PYTHONPATH: "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/apps/center/src:$GITHUB_WORKSPACE/apps/acquisition/src:$GITHUB_WORKSPACE/apps/edge/src"
+          PYTHONPATH: "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/apps/center/src:$GITHUB_WORKSPACE/apps/acquisition/src:$GITHUB_WORKSPACE/apps/edge/src:$GITHUB_WORKSPACE/apps/shared/src"
         working-directory: apps/center
         run: |
           python -m alembic upgrade head
@@ -106,7 +106,7 @@ jobs:
           FACTORIX_RABBITMQ_URL: amqp://factorix_mq:factorix-mq-pw@127.0.0.1:5672/
           FACTORIX_RABBITMQ_MGMT_URL: http://127.0.0.1:15672
           FACTORIX_TDENGINE_DSN: ws://root:taosdata@127.0.0.1:6041
-          PYTHONPATH: "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/apps/center/src:$GITHUB_WORKSPACE/apps/acquisition/src:$GITHUB_WORKSPACE/apps/edge/src"
+          PYTHONPATH: "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/apps/center/src:$GITHUB_WORKSPACE/apps/acquisition/src:$GITHUB_WORKSPACE/apps/edge/src:$GITHUB_WORKSPACE/apps/shared/src"
         run: |
           set -o pipefail
           python -m pytest apps/center/tests/integration apps/acquisition/tests/integration -v --tb=short --junitxml=pytest-integration.xml 2>&1 | tee /tmp/test_output.log

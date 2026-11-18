@@ -41,7 +41,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 ROOT = Path(__file__).resolve().parents[2]
-for rel in ("apps/center/src", "apps/acquisition/src"):
+for rel in ("apps/center/src", "apps/acquisition/src", "apps/shared/src"):
     path = str(ROOT / rel)
     if os.environ.get("FX_BENCH_SRC_ROOT"):
         path = str(Path(os.environ["FX_BENCH_SRC_ROOT"]) / rel)

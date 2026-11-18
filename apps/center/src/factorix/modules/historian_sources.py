@@ -145,12 +145,24 @@ def _is_uuid(text: str) -> bool:
         return False
 
 
+_SCHEMA_CACHE: dict[str, tuple[float, list[tuple[str, str, str]]]] = {}
+
+#: Operational subtables (``op_<type>_<signal hex>``) have a fixed schema: no DESCRIBE needed.
+OP_VALUE_TYPES = {"float64": "DOUBLE", "int64": "BIGINT", "bool": "BOOL", "string": "VARCHAR", "enum": "VARCHAR", "json": "VARCHAR"}
+
+
+def operational_schema(value_type: str) -> list[tuple[str, str, str]]:
+    return [("ts", "TIMESTAMP", ""), ("val", OP_VALUE_TYPES.get(str(value_type).lower(), "VARCHAR"), ""),
+            ("raw_quality", "VARCHAR", ""), ("data_epoch", "BIGINT", "")]
+
+
 class TableSeriesReader:
     """Reads one value column of one TDengine table in a window: count, raw page, buckets."""
 
     def __init__(self, client: Any) -> None:
         self.client = client
-        self._schemas: dict[str, tuple[float, list[tuple[str, str, str]]]] = {}
+        # Shared by every request (the reader itself is per request): one DESCRIBE per table per minute.
+        self._schemas = _SCHEMA_CACHE
 
     async def schema(self, db: str, table: str) -> list[tuple[str, str, str]]:
         """``[(name, base type, note)]`` of data columns (tags excluded)."""
@@ -242,6 +254,8 @@ def decode_value(raw: Any, base_type: str) -> Any:
             f = float(raw)
         except (TypeError, ValueError):
             return raw
+        if not math.isfinite(f):
+            return None  # NaN / Inf are not JSON values; shown as a gap, never as a fake number
         return int(f) if base_type not in ("DOUBLE", "FLOAT") and f.is_integer() else f
     if isinstance(raw, (bytes, bytearray)):
         return raw.decode("utf-8", "replace")

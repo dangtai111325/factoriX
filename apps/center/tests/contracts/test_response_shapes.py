@@ -111,19 +111,18 @@ async def test_collector_status_shape_in_acquisition_mode(api: Any, monkeypatch:
     assert (item["health"], item["effective_health"], item["desired_revision"]) == ("ONLINE", "ONLINE", 7)
 
 
-async def test_storage_operations_list_is_served_by_the_first_registration(api: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    """CT-01 characterization: today the legacy designs handler (bare list) answers the physical UI's route."""
+async def test_storage_design_operations_moved_to_their_own_path(api: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CT-01 fixed: the logical designs journal (bare list) lives at /storage/designs/operations."""
     from factorix.modules import storage_designs as SD
 
     async def fake_list(*_a: Any, **_kw: Any) -> list[dict[str, Any]]:
         return []
 
     monkeypatch.setattr(SD, "list_storage_operations", fake_list)
-    response = await _get(api, "/api/v1/storage/operations")
+    response = await _get(api, "/api/v1/storage/designs/operations")
     assert response.status_code == 200 and response.json() == []
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="CT-01: storagePhysicalApi.listOperations expects {items,total,page,page_size}")
 async def test_storage_operations_list_matches_the_physical_ui(api: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     from factorix.modules import storage_designs as SD
     from factorix.transport import storage_api

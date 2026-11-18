@@ -32,6 +32,10 @@ MAX_SERIES = 20
 VISIBILITIES = ("PRIVATE", "TEAM")
 _QUERY_KEYS = ("sources", "range", "start", "end", "mode", "resolution", "max_points", "bucket_ms",
                "compare_offset", "quality_filter")
+#: Presentation keys of the Historian UI (WS-D, D4) kept verbatim: spec version, labels per token,
+#: layout, hidden series, active tab, live follow.
+_UI_KEYS = ("v", "labels", "layout", "hidden", "tab", "live")
+MAX_SPEC_BYTES = 32_768
 
 
 def _json(raw: Any) -> dict[str, Any]:
@@ -60,6 +64,17 @@ def normalize_query_spec(raw: Any) -> dict[str, Any]:
         raise AppError(422, "TOO_MANY_SERIES", f"A view holds at most {MAX_SERIES} series.")
     out = {k: spec[k] for k in _QUERY_KEYS if k in spec and spec[k] is not None}
     out["sources"] = tokens
+    for k in _UI_KEYS:
+        if k in spec and spec[k] is not None:
+            out[k] = spec[k]
+    if isinstance(out.get("labels"), dict):
+        out["labels"] = {str(t): str(v)[:200] for t, v in out["labels"].items() if str(t) in tokens or HSRC.parse_source_token(t)}
+    elif "labels" in out:
+        raise AppError(422, "INVALID_LABELS", "labels must be an object {token: label}.")
+    if "hidden" in out and not isinstance(out["hidden"], list):
+        raise AppError(422, "INVALID_HIDDEN", "hidden must be a list of tokens.")
+    if len(json.dumps(out)) > MAX_SPEC_BYTES:
+        raise AppError(422, "VIEW_TOO_LARGE", f"A saved view is limited to {MAX_SPEC_BYTES // 1024} KB.")
     if out.get("mode") not in (None, "operational", "recorded", "reconstructed"):
         raise AppError(422, "INVALID_MODE", "mode must be operational, recorded or reconstructed.")
     return out

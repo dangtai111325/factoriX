@@ -38,6 +38,7 @@ from factorix.platform.tdengine import (
     tenant_database_name,
     to_utc_datetime,
 )
+from factorix_core.time import utcnow as _core_utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +49,7 @@ WARM_CONCURRENCY = 4
 WARM_NEGATIVE_TTL_S = 60.0
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+_utcnow = _core_utcnow  # shared kernel ``factorix_core.time.utcnow`` (R2-E B7)
 
 
 def _utc(dt: Any) -> datetime | None:

@@ -58,6 +58,7 @@ import {
   compareOffsetMs,
   CompareOffset,
   findGaps,
+  qualitySegments,
   formatBytes,
   formatClock,
   formatDateTime,
@@ -81,7 +82,6 @@ import {
   safeFilePart,
   Series,
   SERIES_COLORS,
-  shiftSeries,
   specFromState,
   stateFromParams,
   stateFromSpec,
@@ -110,7 +110,8 @@ function sameState(a: ViewState, b: ViewState): boolean {
 interface QueryResult {
   res: HistorianQueryResponse;
   compare: HistorianQueryResponse | null;
-  compareShiftMs: number;
+  /** Comparison asked for but this server does not compute it (older Center). */
+  compareUnsupported: boolean;
   startMs: number;
   endMs: number;
   fetchedAt: number;
@@ -222,22 +223,11 @@ export const HistorianExplorerPage: React.FC = () => {
           { ...base, start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString(), ...(offset ? { compare_offset: offset } : {}) },
           ctrl.signal,
         );
-        let compare: HistorianQueryResponse | null = null;
-        let compareShiftMs = 0;
-        if (offset) {
-          if (res.compare && Array.isArray(res.compare.series_list)) {
-            compare = { ...res, series_list: res.compare.series_list, compare: null };
-          } else {
-            // Older Center: query the earlier window ourselves and shift it onto this axis.
-            compare = await queryHistorianSeries(
-              { ...base, start: new Date(startMs - offset).toISOString(), end: new Date(endMs - offset).toISOString() },
-              ctrl.signal,
-            );
-            compareShiftMs = offset;
-          }
-        }
+        // The server runs the earlier window in parallel and shifts its points onto this axis (H8/H10).
+        const compare: HistorianQueryResponse | null =
+          offset && res.compare && Array.isArray(res.compare.series_list) ? { ...res, series_list: res.compare.series_list, compare: null } : null;
         if (my !== seq.current) return;
-        setResult({ res, compare, compareShiftMs, startMs, endMs, fetchedAt: Date.now() });
+        setResult({ res, compare, compareUnsupported: !!offset && !compare, startMs, endMs, fetchedAt: Date.now() });
         res.series_list.forEach((sr) => {
           if (sr.display_name && !catalog.current.has(sr.series_key))
             catalog.current.set(sr.series_key, {
@@ -262,7 +252,18 @@ export const HistorianExplorerPage: React.FC = () => {
         }
       }
       // Appliance-wide events of the window (resets, storage changes); optional, never blocks the chart.
-      listHistorianEvents({ start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString(), types: ['EPOCH_RESET', 'STORAGE_OPERATION'] }, ctrl.signal)
+      // Appliance-wide resets/storage changes + the stored quality history of the selected signals (H12).
+      const signalIds = sources.filter((t) => kindOfToken(t) === 'signal');
+      listHistorianEvents(
+        {
+          start: new Date(startMs).toISOString(),
+          end: new Date(endMs).toISOString(),
+          types: ['EPOCH_RESET', 'STORAGE_OPERATION', ...(signalIds.length ? ['QUALITY_TRANSITION'] : [])],
+          signal_ids: signalIds,
+          limit: 500,
+        },
+        ctrl.signal,
+      )
         .then((r) => my === seq.current && setEvents(r.items || []))
         .catch(() => my === seq.current && setEvents([]));
     },
@@ -331,6 +332,8 @@ export const HistorianExplorerPage: React.FC = () => {
             notes: [],
             points: [],
             serverStats: null,
+            segments: null,
+            changeOnly: false,
           } as Series;
         return normalizeSeries(sr, colorOf(tok), labelOf(tok));
       }),
@@ -345,27 +348,46 @@ export const HistorianExplorerPage: React.FC = () => {
       .map((t) => idx.get(t))
       .filter((sr): sr is NonNullable<typeof sr> => Boolean(sr))
       .map((sr) => {
-        const s = normalizeSeries(sr, colorOf(sr.series_key), labelOf(sr.series_key), true);
-        return result.compareShiftMs ? shiftSeries(s, result.compareShiftMs) : s;
+        return normalizeSeries(sr, colorOf(sr.series_key), labelOf(sr.series_key), true);
       });
   }, [result, state.sources, state.hidden, colorOf, labelOf]);
   const compareLabel = COMPARE_OPTIONS.find((c) => c.id === state.compare)?.label.toLowerCase();
 
   const gapsBySeries = useMemo(() => {
     const m = new Map<string, Gap[]>();
-    for (const s of allSeries) m.set(s.token, findGaps(s, state.mode, win.startMs, win.endMs));
+    for (const s of allSeries) m.set(s.token, findGaps(s, win.startMs, win.endMs));
     for (const c of compareSeries) m.set(`cmp:${c.token}`, []);
     return m;
-  }, [allSeries, compareSeries, state.mode, win.startMs, win.endMs]);
+  }, [allSeries, compareSeries, win.startMs, win.endMs]);
 
   const eventRows: EventRow[] = useMemo(() => {
     const out: EventRow[] = [];
+    const byToken = new Map(allSeries.map((s) => [s.token, s]));
+    // Signals: quality transitions from the stored history (H12). A response without `from_state` is the old
+    // "current state" feed and is ignored.
+    const serverTransitions = events.filter((e) => e.kind === 'QUALITY_TRANSITION' && e.from_state != null && e.signal_id);
+    const covered = new Set(serverTransitions.map((e) => String(e.signal_id)));
+    for (const e of serverTransitions) {
+      const t = Date.parse(e.ts);
+      const s = byToken.get(String(e.signal_id));
+      if (!Number.isFinite(t) || !s) continue;
+      const until = e.until ? Date.parse(e.until) : NaN;
+      out.push({
+        id: `q-${s.token}-${t}`,
+        t,
+        kind: 'quality',
+        series: s,
+        title: `Quality ${e.from_state} → ${e.to_state}`,
+        detail: [e.samples != null ? `${e.samples.toLocaleString()} rows` : '', Number.isFinite(until) ? `until ${formatClock(until)}` : ''].filter(Boolean).join(' · ') || undefined,
+      });
+    }
     for (const s of allSeries) {
-      let prev = '';
-      for (const p of s.points) {
-        if (!p.q) continue;
-        if (prev && p.q !== prev) out.push({ id: `q-${s.token}-${p.t}`, t: p.t, kind: 'quality', series: s, title: `Quality ${prev} → ${p.q}`, detail: p.reason || undefined });
-        prev = p.q;
+      // Model fields / recorded tables (and signals of an older Center): changes between the quality runs shown.
+      if (!covered.has(s.token) && !(kindOfToken(s.token) === 'signal' && s.serverStats && 'gap_threshold_ms' in s.serverStats)) {
+        const segs = qualitySegments(s, win.startMs, win.endMs).filter((g) => g.q !== 'GAP');
+        for (let i = 1; i < segs.length; i++)
+          if (segs[i].q !== segs[i - 1].q)
+            out.push({ id: `q-${s.token}-${segs[i].startMs}`, t: segs[i].startMs, kind: 'quality', series: s, title: `Quality ${segs[i - 1].q} → ${segs[i].q}` });
       }
       for (const g of gapsBySeries.get(s.token) || [])
         out.push({ id: `g-${s.token}-${g.startMs}`, t: g.startMs, kind: 'gap', series: s, title: `No data for ${formatDuration(g.endMs - g.startMs)}`, detail: `${formatClock(g.startMs)} → ${formatClock(g.endMs)}` });
@@ -373,10 +395,11 @@ export const HistorianExplorerPage: React.FC = () => {
     for (const e of events) {
       const t = Date.parse(e.ts);
       if (!Number.isFinite(t)) continue;
-      out.push({ id: `e-${e.id}`, t, kind: e.kind === 'EPOCH_RESET' ? 'reset' : 'storage', title: e.summary, detail: e.message });
+      if (e.kind !== 'EPOCH_RESET' && e.kind !== 'STORAGE_OPERATION') continue;
+      out.push({ id: `e-${e.id}`, t, kind: e.kind === 'EPOCH_RESET' ? 'reset' : 'storage', title: e.summary || e.kind, detail: e.message });
     }
     return out.sort((a, b) => b.t - a.t);
-  }, [allSeries, gapsBySeries, events]);
+  }, [allSeries, gapsBySeries, events, win.startMs, win.endMs]);
 
   const markers: ChartMarker[] = useMemo(
     () =>
@@ -388,7 +411,10 @@ export const HistorianExplorerPage: React.FC = () => {
 
   const totalRows = allSeries.reduce((a, s) => a + (s.total || 0), 0);
   const allNoData = result && allSeries.length > 0 && allSeries.every((s) => s.status !== 'OK' && s.status !== 'LOADING');
-  const notes = Array.from(new Set(allSeries.flatMap((s) => s.notes))).slice(0, 6);
+  const notes = [
+    ...(result?.compareUnsupported ? ['Comparison needs a newer Center version (the server computes the earlier period).'] : []),
+    ...Array.from(new Set(allSeries.flatMap((s) => s.notes))),
+  ].slice(0, 6);
   const downsampled = allSeries.some((s) => s.downsampled);
 
   // ------------------------------------------------------------------ actions

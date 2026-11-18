@@ -36,3 +36,13 @@ async def sim_suite():
         yield suite, endpoints
     finally:
         await suite.stop()
+
+
+def pytest_collection_modifyitems(config, items):  # type: ignore[no-untyped-def]
+    """R2-E B9: every test under this folder carries the ``integration`` marker (``pytest -m integration``)."""
+    import pytest as _pytest
+
+    here = Path(__file__).resolve().parent
+    for item in items:
+        if Path(str(item.fspath)).resolve().is_relative_to(here):
+            item.add_marker(_pytest.mark.integration)

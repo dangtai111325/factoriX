@@ -58,3 +58,13 @@ def _verify_test_isolation() -> None:
 
 # Keep NetworkPolicyError imported cleanly for safety checks if needed
 __all__ = ["NetworkPolicyError", "assert_isolated_test_environment"]
+
+
+def pytest_collection_modifyitems(config, items):  # type: ignore[no-untyped-def]
+    """R2-E B9: every test under this folder carries the ``integration`` marker (``pytest -m integration``)."""
+    import pytest as _pytest
+
+    here = Path(__file__).resolve().parent
+    for item in items:
+        if Path(str(item.fspath)).resolve().is_relative_to(here):
+            item.add_marker(_pytest.mark.integration)

@@ -481,7 +481,7 @@ export const HistorianTrendChart: React.FC<Props> = ({
         </text>
         {series.map((s, i) => {
           const y = qualityTop + i * (qualityRow + 3);
-          const segs = qualitySegments(s, mode, startMs, endMs);
+          const segs = qualitySegments(s, startMs, endMs);
           return (
             <g key={`q-${s.token}`}>
               <rect x={padLeft} y={y} width={plotW} height={qualityRow} fill="#F8FAFC" />

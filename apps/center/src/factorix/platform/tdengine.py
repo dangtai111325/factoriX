@@ -15,30 +15,31 @@ Design guarantees (ADR-002, ADR-003, ADR-005, §5.1, docs/storage/version-matrix
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import math
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
 
 import taosws
 
 from factorix.domain.canonical import intern_uuid, uuid_str
+from factorix_core.tdengine import naming as _td_naming
+from factorix_core.tdengine import sql as _td_sql
 
 logger = logging.getLogger(__name__)
 
-_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,15}$")
-_INT64_MIN = -(2**63)
-_INT64_MAX = 2**63 - 1
+# Shared kernel constants (R2-E B7): the same values as the former local copies.
+_EPOCH_UTC = _td_sql.EPOCH_UTC
+_IDENT_RE = _td_sql.IDENT_RE
+_PREFIX_RE = _td_naming.DB_PREFIX_RE
+_INT64_MIN = _td_sql.INT64_MIN
+_INT64_MAX = _td_sql.INT64_MAX
 
 OP_STABLES: dict[str, str] = {
     "float64": "op_float64",
@@ -118,10 +119,20 @@ def td_error_is_schema_missing(message: str, native_code: int | None = None) -> 
     return any(tok in low for tok in ("not exist", "doesn't exist", "does not exist"))
 
 
+# Naming, quoting and literal rendering delegate to the shared kernel ``factorix_core.tdengine`` (R2-E B7);
+# these wrappers keep raising ``TDEngineError`` with the same codes and messages as before.
+
+
+def _invalid_identifier(name: object, kind: str) -> TDEngineError:
+    return TDEngineError("INVALID_IDENTIFIER", f"Unsafe or invalid TDengine {kind}: {name!r}")
+
+
+def _invalid_prefix(prefix: object) -> TDEngineError:
+    return TDEngineError("INVALID_PREFIX", f"Invalid database prefix: {prefix!r}")
+
+
 def validate_identifier(name: str, *, kind: str = "identifier") -> str:
-    if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
-        raise TDEngineError("INVALID_IDENTIFIER", f"Unsafe or invalid TDengine {kind}: {name!r}")
-    return name
+    return _td_sql.validate_identifier(name, kind=kind, invalid=_invalid_identifier)
 
 
 def quote_ident(name: str, *, kind: str = "identifier") -> str:
@@ -133,17 +144,11 @@ def quote_fq_table(database: str, table: str) -> str:
 
 
 def quote_str(value: str) -> str:
-    if "\x00" in value:
-        raise TDEngineError("INVALID_STRING", "NUL byte is not allowed in TDengine string values.")
-    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{escaped}'"
+    return _td_sql.quote_str(value, error=TDEngineError)
 
 
 def tenant_database_name(tenant_id: UUID | str, prefix: str = "fx_t_") -> str:
-    if not _PREFIX_RE.fullmatch(prefix):
-        raise TDEngineError("INVALID_PREFIX", f"Invalid database prefix: {prefix!r}")
-    uid_hex = intern_uuid(tenant_id).hex
-    return f"{prefix}{uid_hex}"
+    return _td_naming.tenant_database_name(tenant_id, prefix, invalid_prefix=_invalid_prefix, to_uuid=intern_uuid)
 
 
 def op_stable_for_type(value_type: str) -> str:
@@ -164,58 +169,15 @@ def model_snapshot_subtable_name(group_id: UUID | str) -> str:
 
 
 def to_td_timestamp_us(dt: datetime) -> int:
-    if not isinstance(dt, datetime):
-        raise TDEngineError("INVALID_TIMESTAMP", f"Expected datetime, got {type(dt).__name__}.")
-    utc_dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-    if utc_dt.year < 1970 or utc_dt.year > 2262:
-        raise TDEngineError("TIMESTAMP_OUT_OF_RANGE", f"Timestamp out of supported range: {utc_dt.isoformat()}")
-    return (utc_dt - _EPOCH_UTC) // timedelta(microseconds=1)
+    return _td_sql.to_td_timestamp_us(dt, error=TDEngineError)
 
 
 def to_utc_datetime(val: Any) -> datetime | None:
-    if val is None:
-        return None
-    if isinstance(val, datetime):
-        return val.replace(tzinfo=timezone.utc) if val.tzinfo is None else val.astimezone(timezone.utc)
-    if isinstance(val, int):
-        return _EPOCH_UTC + timedelta(microseconds=val)
-    if isinstance(val, str):
-        parsed = datetime.fromisoformat(val.replace("Z", "+00:00"))
-        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
-    raise TDEngineError("INVALID_TIMESTAMP", f"Cannot convert {val!r} to UTC datetime.")
+    return _td_sql.to_utc_datetime(val, error=TDEngineError)
 
 
 def sql_literal(value: Any, *, value_type: str | None = None) -> str:
-    if value is None:
-        return "NULL"
-    if value_type == "timestamp" or isinstance(value, datetime):
-        if isinstance(value, str):
-            dt = to_utc_datetime(value)
-            assert dt is not None
-            return str(to_td_timestamp_us(dt))
-        return str(to_td_timestamp_us(value))
-    if isinstance(value, bool) or value_type == "bool":
-        if not isinstance(value, bool):
-            raise TDEngineError("TYPE_MISMATCH", f"Expected bool value, got {type(value).__name__}.")
-        return "true" if value else "false"
-    if isinstance(value, int) and value_type != "float64":
-        if value < _INT64_MIN or value > _INT64_MAX:
-            raise TDEngineError("INT64_OVERFLOW", f"Integer {value} exceeds signed 64-bit bounds.")
-        return str(value)
-    if isinstance(value, (int, float)) or value_type == "float64":
-        num = float(value)
-        if math.isnan(num) or math.isinf(num):
-            raise TDEngineError("NON_FINITE_FLOAT", "NaN and Infinity are not valid TDengine DOUBLE literals.")
-        if num == 0.0:
-            # Preserve -0.0 cleanly via repr(-0.0) == '-0.0'
-            return "-0.0" if math.copysign(1.0, num) < 0 else "0.0"
-        return repr(num)
-    if isinstance(value, (dict, list)) or value_type == "json":
-        payload = value if isinstance(value, str) else json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-        return quote_str(payload)
-    if isinstance(value, str):
-        return quote_str(value)
-    return quote_str(str(value))
+    return _td_sql.sql_literal(value, value_type=value_type, error=TDEngineError)
 
 
 @dataclass(frozen=True, slots=True)

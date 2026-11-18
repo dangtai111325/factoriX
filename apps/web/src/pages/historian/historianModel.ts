@@ -181,6 +181,7 @@ export function specFromState(s: ViewState, labels: Record<string, string>): His
     start: s.range.kind === 'abs' ? new Date(s.range.startMs).toISOString() : null,
     end: s.range.kind === 'abs' ? new Date(s.range.endMs).toISOString() : null,
     compare_offset: s.compare || null,
+    live: s.live && s.range.kind === 'preset',
     layout: s.layout,
     hidden: s.hidden,
     tab: s.tab,
@@ -197,6 +198,7 @@ export function stateFromSpec(spec: HistorianViewSpec): ViewState {
   } else if (spec.range) p.set('range', String(spec.range));
   if (spec.mode) p.set('mode', spec.mode);
   if (spec.compare_offset) p.set('cmp', String(spec.compare_offset));
+  if (spec.live) p.set('live', '1');
   if (spec.layout) p.set('layout', String(spec.layout));
   if (Array.isArray(spec.hidden) && spec.hidden.length) p.set('hide', spec.hidden.join(','));
   const st = stateFromParams(p);
@@ -362,6 +364,10 @@ export interface Series {
   notes: string[];
   points: Pt[];
   serverStats: HistorianSeriesResult['stats'] | null;
+  /** Server quality timeline (H10: merged runs; silences past the stale threshold = GAP). null = not sent. */
+  segments: QualitySeg[] | null;
+  /** Change-only data (recorded rows, model fields, subtables): silence is not a gap. */
+  changeOnly: boolean;
   compare?: boolean;
 }
 
@@ -397,6 +403,7 @@ export function normalizeSeries(sr: HistorianSeriesResult, color: string, fallba
     })
     .filter((p) => Number.isFinite(p.t))
     .sort((a, b) => a.t - b.t);
+  const changeOnly = !(sr.source_kind === 'signal' && (sr.fidelity === 'operational_full' || sr.fidelity === 'postgres_fallback'));
   return {
     token: sr.series_key,
     label: sr.display_name || fallbackLabel,
@@ -415,8 +422,33 @@ export function normalizeSeries(sr: HistorianSeriesResult, color: string, fallba
     notes: sr.coverage_notes || [],
     points,
     serverStats: sr.stats || null,
+    // Compare-period segments keep their original timestamps (only points are shifted): not drawn.
+    segments: compare ? null : serverSegments(sr, changeOnly),
+    changeOnly,
     compare,
   };
+}
+
+/**
+ * Server quality segments → lane segments. For change-only series the server's STALE_GAP after the hold time is
+ * not a silence (the value is valid until the next stored change), so it continues the previous quality.
+ */
+function serverSegments(sr: HistorianSeriesResult, changeOnly: boolean): QualitySeg[] | null {
+  const raw = sr.quality_segments;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const out: QualitySeg[] = [];
+  for (const g of raw) {
+    const a = Date.parse(g.start);
+    const b = Date.parse(g.end);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) continue;
+    const isGap = String(g.reason_code || '').toUpperCase().startsWith('STALE_GAP');
+    let q: QualitySeg['q'] = isGap ? 'GAP' : normQ(String(g.quality || '').toUpperCase());
+    if (isGap && changeOnly) q = out.length ? out[out.length - 1].q : 'GOOD';
+    const last = out[out.length - 1];
+    if (last && last.q === q && Math.abs(last.endMs - a) < 2) last.endMs = b;
+    else out.push({ startMs: a, endMs: b, q });
+  }
+  return out;
 }
 
 /** Index series of a response by token (the backend echoes the token as `series_key`). */
@@ -424,49 +456,28 @@ export function indexResponse(res: HistorianQueryResponse | null | undefined): M
   return new Map((res?.series_list || []).map((s) => [s.series_key, s]));
 }
 
-/** Shift every point of a series forward (client-side period compare for servers without `compare`). */
-export function shiftSeries(s: Series, offsetMs: number): Series {
-  return { ...s, points: s.points.map((p) => ({ ...p, originalTs: new Date(p.t).toISOString(), t: p.t + offsetMs })) };
-}
-
 // ------------------------------------------------------------------ gaps, quality, statistics
-
-function median(nums: number[]): number {
-  if (!nums.length) return 0;
-  const a = [...nums].sort((x, y) => x - y);
-  const m = Math.floor(a.length / 2);
-  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
-}
-
-/**
- * Gap threshold for "the source was silent": only meaningful for raw readings (operational) and for
- * downsampled buckets. Change-only recorded data is silent by design, so no gaps are reported there.
- */
-export function gapThresholdMs(s: Series, mode: HistorianMode): number | null {
-  if (s.serverStats?.gap_threshold_ms) return s.serverStats.gap_threshold_ms;
-  if (s.downsampled && s.bucketMs) return s.bucketMs * 2.5;
-  if (mode !== 'operational' || s.token.startsWith('mod:') || s.token.startsWith('subtable:')) return null;
-  const deltas: number[] = [];
-  for (let i = 1; i < s.points.length; i++) deltas.push(s.points[i].t - s.points[i - 1].t);
-  const med = median(deltas);
-  if (!med) return null;
-  return Math.max(12_000, med * 3);
-}
+// Gap and coverage statistics, quality runs and the gap threshold come from the server (H8/H10). The client only
+// derives gap POSITIONS for drawing: from the server's GAP segments, or missing buckets of a downsampled series.
 
 export interface Gap {
   startMs: number;
   endMs: number;
 }
 
-export function findGaps(s: Series, mode: HistorianMode, startMs: number, endMs: number): Gap[] {
-  const th = gapThresholdMs(s, mode);
-  if (!th || !s.points.length) return [];
-  const out: Gap[] = [];
-  const pts = s.points;
-  if (pts[0].t - startMs > th) out.push({ startMs, endMs: pts[0].t });
-  for (let i = 1; i < pts.length; i++) if (pts[i].t - pts[i - 1].t > th) out.push({ startMs: pts[i - 1].t, endMs: pts[i].t });
-  if (endMs - pts[pts.length - 1].t > th && !s.compare) out.push({ startMs: pts[pts.length - 1].t, endMs });
-  return out;
+export function findGaps(s: Series, startMs: number, endMs: number): Gap[] {
+  if (!s.points.length || s.compare) return [];
+  if (s.downsampled) {
+    // A missing bucket is a gap (same rule as the server's gap statistics for buckets).
+    if (!s.bucketMs) return [];
+    const th = s.bucketMs * 1.5;
+    const out: Gap[] = [];
+    const pts = s.points;
+    for (let i = 1; i < pts.length; i++) if (pts[i].t - pts[i - 1].t > th) out.push({ startMs: pts[i - 1].t, endMs: pts[i].t });
+    return out;
+  }
+  if (!s.segments) return [];
+  return s.segments.filter((g) => g.q === 'GAP' && g.endMs > startMs && g.startMs < endMs).map((g) => ({ startMs: g.startMs, endMs: g.endMs }));
 }
 
 function normQ(q: string): QualitySeg['q'] {
@@ -476,27 +487,24 @@ function normQ(q: string): QualitySeg['q'] {
   return 'BAD';
 }
 
-/** Quality timeline: each row's quality holds until the next row; silent periods longer than the gap threshold are GAP. */
-export function qualitySegments(s: Series, mode: HistorianMode, startMs: number, endMs: number): QualitySeg[] {
+/** Quality lane: the server's runs; without them (older server) each row's quality holds until the next row. */
+export function qualitySegments(s: Series, startMs: number, endMs: number): QualitySeg[] {
+  if (s.segments) {
+    return s.segments
+      .filter((g) => g.endMs > startMs && g.startMs < endMs)
+      .map((g) => ({ ...g, startMs: Math.max(startMs, g.startMs), endMs: Math.min(endMs, g.endMs) }));
+  }
   const pts = s.points.filter((p) => p.q);
-  if (!pts.length) return [];
-  const th = gapThresholdMs(s, mode);
+  if (!pts.length || s.downsampled) return [];
   const segs: QualitySeg[] = [];
-  const push = (a: number, b: number, q: QualitySeg['q']) => {
-    if (b <= a) return;
+  for (let i = 0; i < pts.length; i++) {
+    const a = Math.max(startMs, pts[i].t);
+    const b = Math.min(endMs, i + 1 < pts.length ? pts[i + 1].t : s.compare ? pts[i].t : endMs);
+    if (b <= a) continue;
+    const q = normQ(pts[i].q);
     const last = segs[segs.length - 1];
     if (last && last.q === q && Math.abs(last.endMs - a) < 1) last.endMs = b;
     else segs.push({ startMs: a, endMs: b, q });
-  };
-  for (let i = 0; i < pts.length; i++) {
-    const a = Math.max(startMs, pts[i].t);
-    const next = i + 1 < pts.length ? pts[i + 1].t : s.compare ? pts[i].t : endMs;
-    const b = Math.min(endMs, next);
-    const q = normQ(pts[i].q);
-    if (th && b - a > th) {
-      push(a, a + th, q);
-      push(a + th, b, 'GAP');
-    } else push(a, b, q);
   }
   return segs;
 }
@@ -518,7 +526,7 @@ export interface SeriesStats {
   distinct: number | null;
 }
 
-export function computeStats(s: Series, mode: HistorianMode, startMs: number, endMs: number): SeriesStats {
+export function computeStats(s: Series, _mode: HistorianMode, startMs: number, endMs: number): SeriesStats {
   const pts = s.points.filter((p) => p.t >= startMs - 1 && p.t <= endMs + 1);
   const inWindow = pts.length === s.points.length;
   const nums = pts.filter((p) => p.v != null) as (Pt & { v: number })[];
@@ -545,21 +553,12 @@ export function computeStats(s: Series, mode: HistorianMode, startMs: number, en
   }
   const withQ = pts.filter((p) => p.q);
   const goodPct = withQ.length && !s.downsampled ? (withQ.filter((p) => p.q === 'GOOD').length / withQ.length) * 100 : s.serverStats?.good_pct ?? null;
-  const th = gapThresholdMs(s, mode);
-  let gaps: number | null = null;
-  let longest: number | null = null;
-  let coverage: number | null = null;
-  if (s.serverStats?.gap_count != null && !s.compare && inWindow) {
-    gaps = s.serverStats.gap_count;
-    longest = s.serverStats.longest_gap_ms ?? null;
-    coverage = s.serverStats.coverage_pct ?? null;
-  } else if (th) {
-    const g = findGaps({ ...s, points: pts }, mode, startMs, endMs);
-    gaps = g.length;
-    longest = g.reduce((a, x) => Math.max(a, x.endMs - x.startMs), 0) || null;
-    const silent = g.reduce((a, x) => a + (x.endMs - x.startMs), 0);
-    coverage = Math.max(0, Math.min(100, 100 - (silent / Math.max(1, endMs - startMs)) * 100));
-  }
+  // Gaps and coverage are the server's (computed over the queried window); while a zoom waits for its answer
+  // they do not describe the visible window, so they are not shown.
+  const serverWindow = !s.compare && inWindow && s.serverStats != null;
+  const gaps = serverWindow ? s.serverStats?.gap_count ?? null : null;
+  const longest = serverWindow ? s.serverStats?.longest_gap_ms ?? null : null;
+  const coverage = serverWindow ? s.serverStats?.coverage_pct ?? null : null;
   let changes: number | null = null;
   let distinct: number | null = null;
   if (s.discrete || s.integer) {

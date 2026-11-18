@@ -26,13 +26,16 @@ ACQ_SRC = Path(__file__).resolve().parents[3] / "acquisition" / "src" / "factori
 TENANT = "00000000-0000-0000-0000-0000000000a1"
 NOW = datetime(2026, 11, 18, 5, 0, 0, tzinfo=timezone.utc)
 
-# Channel -> (producers, consumers) as documented in notify.md.
+# Channel -> (producers, consumers) as documented in notify.md (module stems).
+# R2-E Phase B moved the code, not the channels or payloads: ``collect`` -> application/legacy_edge/fleet +
+# application/collector/commissioning; ``app`` -> transport/http/routers/connections + transport/background/notify_bridge;
+# ``ingestion_worker`` -> application/ingestion/{notify,catalog}.
 CHANNELS = {
-    "factorix_config_changed": ({"collect", "storage_designs", "telemetry_reset", "app"}, {"config_provider", "ingestion_worker"}),
-    "factorix_epoch_changed": ({"telemetry_reset"}, {"config_provider", "ingestion_worker", "app"}),
-    "factorix_stream_events": ({"ingestion_worker"}, {"app"}),
-    "factorix_health_changed": ({"pg_control", "ingestion_worker"}, {"app"}),
-    "factorix_commissioning": ({"collect"}, {"config_provider"}),
+    "factorix_config_changed": ({"fleet", "storage_designs", "telemetry_reset", "connections"}, {"config_provider", "catalog"}),
+    "factorix_epoch_changed": ({"telemetry_reset"}, {"config_provider", "catalog", "notify_bridge"}),
+    "factorix_stream_events": ({"notify"}, {"notify_bridge"}),
+    "factorix_health_changed": ({"pg_control", "notify"}, {"notify_bridge"}),
+    "factorix_commissioning": ({"commissioning"}, {"config_provider"}),
 }
 
 _LISTEN_RE = re.compile(r"add_listener\(\s*\"(factorix_[a-z_]+)\"")

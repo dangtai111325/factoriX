@@ -53,6 +53,7 @@ from factorix.platform.tdengine import (
     to_td_timestamp_us,
     to_utc_datetime,
 )
+from factorix_core.time import utcnow as _core_utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +83,7 @@ def get_model_snapshot_provider() -> TDengineModelSnapshotProvider | None:
     return _MODEL_SNAPSHOT_PROVIDER
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+_utcnow = _core_utcnow  # shared kernel ``factorix_core.time.utcnow`` (R2-E B7)
 
 
 def _utc(dt: datetime | str | int | None) -> datetime | None:

@@ -136,6 +136,7 @@ GET /api/v1/storage/designs
 POST /api/v1/storage/designs
 POST /api/v1/storage/designs/bulk
 POST /api/v1/storage/designs/import
+GET /api/v1/storage/designs/operations
 POST /api/v1/storage/designs/physical-plan
 POST /api/v1/storage/designs/simulate
 POST /api/v1/storage/designs/validate
@@ -176,6 +177,7 @@ POST /api/v1/storage/td/databases
 GET /api/v1/storage/td/databases/{name}
 GET /api/v1/storage/td/drafts
 DELETE /api/v1/storage/td/drafts/{draft_id}
+GET /api/v1/storage/td/drafts/{draft_id}
 POST /api/v1/storage/td/objects/drafts
 PATCH /api/v1/storage/td/objects/drafts/{draft_id}
 POST /api/v1/storage/td/objects/drafts/{draft_id}/plan

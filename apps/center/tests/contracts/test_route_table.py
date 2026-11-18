@@ -60,7 +60,6 @@ def test_route_table_snapshot() -> None:
     )
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="CT-01: GET /api/v1/storage/operations is registered twice (storage_api.py); the first (bare list) wins")
 def test_no_duplicate_method_path() -> None:
     dupes = {pair: n for pair, n in Counter(route_pairs()).items() if n > 1}
     assert dupes == {}

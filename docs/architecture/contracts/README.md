@@ -37,7 +37,7 @@ Who owns which table/queue/channel: [ADR-017](../ADR-017-bounded-contexts-and-ow
 
 | Id | Contract | Summary | Owner | Test |
 |---|---|---|---|---|
-| CT-01 | REST | `GET /api/v1/storage/operations` registered twice (`storage_api.py:251` bare list, `:2108` `{items,...}`); the first wins, `storagePhysicalApi.listOperations` expects `{items}` | WS-H | `test_route_table.py::test_no_duplicate_method_path` (xfail) |
+| CT-01 | REST | **Fixed (WS-H round 3):** the logical designs journal moved to `GET /api/v1/storage/designs/operations`; `GET /api/v1/storage/operations` is only the physical `{items,total,page,page_size}` list | WS-H | `test_route_table.py::test_no_duplicate_method_path`, `test_response_shapes.py::test_storage_operations_list_matches_the_physical_ui` (pass) |
 | CT-02 | NOTIFY v1 → live cache | `_seed_live_cache` treats a missing `quality` as `GOOD` and then also records it as last-good | WS-Q / lead (`app.py`) | `test_notify_payloads.py::test_seed_live_cache_missing_quality_is_not_good` (xfail) |
 | CT-03 | NOTIFY v2 | `latest_ids` path only calls `hub.dispatch`; it never refreshes the API live-state provider used by the model engine, so v2 cannot become the default | WS-Q (`app.py`) | `test_notify_payloads.py::test_v2_latest_ids_seeds_live_cache` (xfail) |
 | CT-04 | NOTIFY v2 | bridge detects v2 by substring `'"signal_ids"'` instead of `v`/`kind` | Phase C6 | documented only |

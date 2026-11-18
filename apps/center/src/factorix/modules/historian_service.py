@@ -11,7 +11,9 @@ Architectural invariants (§5.2, §5.3, §6.2, §8.3, ADR-002, ADR-008):
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -468,27 +470,22 @@ async def _tenant_owns_database(session: AsyncSession, tenant_id: UUID, db: str)
     return bool(row)
 
 
+def _iso(ts: datetime) -> str:
+    """``YYYY-MM-DDTHH:MM:SS.mmmZ`` (same text as ``iso_ms``, ~4x faster: it runs once per point)."""
+    if ts.tzinfo is not timezone.utc:
+        ts = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    return ts.replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
+
+
 def _point(src: HSRC.SeriesSource, ts: datetime, value: Any, quality: str | None, record_kind: str,
            extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    t = iso_ms(ts)
-    pt = {
-        "id": f"{src.key}@{t}",
-        "ts": t,
-        "event_time": t,
-        "acquired_at": t,
-        "source_time": None,
-        "series_key": src.key,
-        "signal_id": str(src.signal_id) if src.signal_id else src.key,
-        "signal_key": src.label,
-        "value": value,
-        "value_type": src.value_type,
-        "unit": src.unit,
-        "quality": quality,
-        "record_kind": record_kind,
-        "virtual": False,
-    }
+    """Compact point: series-level facts (key, label, unit, type) live on the series, not on every
+    point (D1: the old shape was ~400 bytes/point and was repeated 4x in the response)."""
+    pt: dict[str, Any] = {"ts": _iso(ts), "value": value, "quality": quality, "record_kind": record_kind}
     if extra:
-        pt.update(extra)
+        for k, v in extra.items():
+            if v is not None and v is not False:
+                pt[k] = v
     return pt
 
 
@@ -507,8 +504,16 @@ async def _read_table_series(
     cursor: str | None,
     bucket_ms: int | None,
     record_kind: str,
+    schema: list[tuple[str, str, str]] | None = None,
 ) -> dict[str, Any]:
-    schema = await reader.schema(db, table)
+    """One series. Usually ONE TDengine round trip:
+
+    * ``bucket`` or a window that clearly holds more than ``max_points`` samples (expected interval
+      known) -> INTERVAL buckets directly (avg/min/max/count/last), ``total`` = sum of counts;
+    * otherwise the newest ``max_points + 1`` rows; ``<= max_points`` -> complete raw series;
+      more -> numeric: buckets (2nd query); text: the most recent ``max_points`` rows + COUNT.
+    """
+    schema = schema or await reader.schema(db, table)
     if not schema:
         return {"points": [], "total": 0, "status": "NO_TABLE"}
     names = [c[0] for c in schema]
@@ -524,36 +529,50 @@ async def _read_table_series(
     quality_col = "quality" if "quality" in types else ("raw_quality" if "raw_quality" in types else None)
     epoch_col = "data_epoch" in types
     base = types[value_col]
-    total = await reader.count(db, table, ts_col, value_col, start_dt, end_dt, epoch_col, epoch)
     numeric = base in HSRC.NUMERIC_TYPES
-    meta: dict[str, Any] = {"total": total, "column": value_col, "column_type": base, "downsampled": False,
+    meta: dict[str, Any] = {"column": value_col, "column_type": base, "downsampled": False,
                             "truncated": False, "bucket_ms": None, "next_cursor": None}
-    use_buckets = numeric and (resolution == "bucket" or (resolution == "auto" and total > max_points))
-    if use_buckets:
+
+    async def as_buckets() -> dict[str, Any]:
         bms = bucket_ms or HSRC.choose_bucket_ms(start_dt, end_dt, max_points)
         rows = await reader.buckets(db, table, ts_col, value_col, quality_col, start_dt, end_dt, epoch_col, epoch, bms)
-        meta.update(downsampled=True, bucket_ms=bms)
+        meta.update(downsampled=True, bucket_ms=bms, total=sum(r["count"] for r in rows), times=[r["ts"] for r in rows])
         meta["points"] = [
-            _point(src, r["ts"], r["avg"], None, "AGGREGATE",
-                   {"min": r["min"], "max": r["max"], "count": r["count"], "last": r["last"]})
+            _point(src, r["ts"], r["avg"], None, "AGGREGATE", {"min": r["min"], "max": r["max"], "count": r["count"], "last": r["last"]})
             for r in rows
         ]
         return meta
-    after = None
-    if cursor and resolution == "raw":
-        after = HSRC._utc(cursor)
-    newest = resolution == "auto" and total > max_points
+
+    def as_raw(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        meta["times"] = [r["ts"] for r in rows]  # kept as datetimes for gap stats / quality segments
+        return [_point(src, r["ts"], HSRC.decode_value(r["value"], base),
+                       (str(r["quality"]).upper() if r.get("quality") else None), record_kind) for r in rows]
+
+    if numeric and resolution == "bucket":
+        return await as_buckets()
+    if resolution == "raw":
+        after = HSRC._utc(cursor) if cursor else None
+        rows = await reader.raw(db, table, ts_col, value_col, quality_col, start_dt, end_dt, epoch_col, epoch,
+                                max_points, after=after)
+        meta["points"] = as_raw(rows)
+        if len(rows) >= max_points:
+            meta["next_cursor"] = iso_ms(rows[-1]["ts"])
+            meta["total"] = await reader.count(db, table, ts_col, value_col, start_dt, end_dt, epoch_col, epoch)
+        else:
+            meta["total"] = len(rows) if not cursor else None
+        return meta
+    span_ms = (end_dt - start_dt).total_seconds() * 1000.0
+    if numeric and src.expected_interval_ms and span_ms / max(1, src.expected_interval_ms) > 2 * max_points:
+        return await as_buckets()
     rows = await reader.raw(db, table, ts_col, value_col, quality_col, start_dt, end_dt, epoch_col, epoch,
-                            max_points, after=after, newest_first=newest)
-    if newest:
-        meta["truncated"] = True
-    elif resolution == "raw" and len(rows) >= max_points:
-        meta["next_cursor"] = iso_ms(rows[-1]["ts"]) if rows else None
-    meta["points"] = [
-        _point(src, r["ts"], HSRC.decode_value(r["value"], base),
-               (str(r["quality"]).upper() if r.get("quality") else None), record_kind)
-        for r in rows
-    ]
+                            max_points + 1, newest_first=True)
+    if len(rows) <= max_points:
+        meta.update(points=as_raw(rows), total=len(rows))
+        return meta
+    if numeric:
+        return await as_buckets()
+    meta.update(points=as_raw(rows[-max_points:]), truncated=True,
+                total=await reader.count(db, table, ts_col, value_col, start_dt, end_dt, epoch_col, epoch))
     return meta
 
 
@@ -563,6 +582,8 @@ _WRITER_COLUMNS = frozenset({
     "source_event_uid", "time_basis", "acquired_at", "source_time", "raw_quality", "reason_code",
     "origin", "unit", "event_uid", "config_rev", "record_kind",
 })
+#: Concurrent TDengine reads per request (the client pool has 4 workers shared with the API process).
+TD_PARALLEL = 4
 
 
 async def query_historian(
@@ -574,10 +595,12 @@ async def query_historian(
 ) -> dict[str, Any]:
     """Multi-series Historian query over signals, Data Model fields and user subtables.
 
-    Points always carry ``value`` (singular). No page is silently dropped: ``total`` is the true row
-    count of the window, long ranges are downsampled server-side (``downsampled``/``bucket_ms``), raw
-    paging returns ``next_cursor``. Without a TDengine history provider the PostgreSQL observation
-    fallback is used and labelled; nothing is synthesized (P0-6).
+    Flow (D1): all PostgreSQL work first (source resolution, epoch, tenant checks), then the TDengine
+    reads of every series — and of the compare window — run concurrently (bounded by ``TD_PARALLEL``),
+    one round trip per series in the common case, long ranges aggregated by TDengine (INTERVAL).
+    Points are compact (``ts, value, quality, record_kind`` + bucket/lineage extras when present) and the
+    response carries them once, in ``series_list``. Without a TDengine provider the labelled
+    PostgreSQL fallback is used; nothing is synthesized (P0-6).
     """
     payload_dict = dict(payload)
     sources = _collect_sources(payload_dict)
@@ -586,7 +609,6 @@ async def query_historian(
     mode = str(payload_dict.get("mode") or "operational").lower()
     if mode not in {"operational", "recorded", "reconstructed"}:
         mode = "operational"
-    time_axis = str(payload_dict.get("time_axis") or "acquired_at").lower()
     start_val = payload_dict.get("start") or payload_dict.get("from_ts") or payload_dict.get("from")
     end_val = payload_dict.get("end") or payload_dict.get("to_ts") or payload_dict.get("to")
     start_dt, end_dt = _parse_time_bounds(start_val, end_val, payload_dict.get("range"))
@@ -605,237 +627,216 @@ async def query_historian(
     resolution = str(payload_dict.get("resolution") or ("bucket" if bucket_ms else "auto")).lower()
     if resolution not in {"auto", "raw", "bucket"}:
         resolution = "auto"
-    agg = "avg" if resolution == "bucket" or bucket_ms else None
     quality_filter = payload_dict.get("quality_filter") or payload_dict.get("quality")
 
+    # ---- PostgreSQL phase (one session, sequential)
     await _enrich_sources(session, tenant_id, sources)
+    for src in sources:
+        if src.kind == "subtable" and src.database and src.table and not await _tenant_owns_database(session, tenant_id, src.database):
+            raise AppError(404, "NOT_FOUND", f"Subtable '{src.database}.{src.table}' not found")
     active_epoch_num = await _active_epoch(session, tenant_id)
     provider = history_provider or get_history_provider()
-    reader = HSRC.TableSeriesReader(provider.client) if provider is not None else None
-    tenant_db = tenant_td_database(tenant_id)
-
-    series_results: list[dict[str, Any]] = []
-    all_points: list[dict[str, Any]] = []
-    next_cursor_out: str | None = None
-    any_downsampled = False
-    for src in sources:
-        status = "OK"
-        notes = list(src.notes)
-        info: dict[str, Any] = {"points": [], "total": 0}
-        fidelity = "operational_full"
-        try:
-            if src.kind == "signal" and src.value_type:
-                if provider is None:
-                    fidelity = "postgres_fallback"
-                    notes.append("TDengine history is not configured; showing PostgreSQL observations.")
-                    info = await _pg_signal_points(session, tenant_id, src, start_dt, end_dt, max_points)
-                elif mode in ("recorded", "reconstructed"):
-                    fidelity = "managed_recorded" if mode == "recorded" else "reconstructed"
-                    info = await _legacy_mode_points(provider, session, tenant_id, src, start_dt, end_dt, mode,
-                                                     max_points, cursor, active_epoch_num)
-                    notes.extend(info.pop("notes", []))
-                else:
-                    assert reader is not None
-                    table = op_subtable_name(src.signal_id, src.value_type)
-                    info = await _read_table_series(
-                        reader, src, db=tenant_db, table=table, value_col="val", start_dt=start_dt, end_dt=end_dt,
-                        epoch=active_epoch_num, resolution=resolution, max_points=max_points, cursor=cursor,
-                        bucket_ms=bucket_ms, record_kind="RAW_OPERATIONAL",
-                    )
-            elif src.kind == "model_field" and src.model_id:
-                if reader is None:
-                    status = "UNAVAILABLE"
-                    notes.append("TDengine history is not configured.")
-                elif src.table and src.database:
-                    fidelity = "managed_recorded"
-                    notes.append(f"Recorded in {src.database}.{src.table} ({src.column}); rows are changes only.")
-                    info = await _read_table_series(
-                        reader, src, db=src.database, table=src.table, value_col=src.column, start_dt=start_dt,
-                        end_dt=end_dt, epoch=active_epoch_num, resolution=resolution, max_points=max_points,
-                        cursor=cursor, bucket_ms=bucket_ms, record_kind="MANAGED_RECORDED",
-                    )
-                else:
-                    fidelity = "model_snapshots"
-                    snap = get_model_snapshot_provider()
-                    records = await snap.list_snapshots(tenant_id, src.model_id, limit=500, active_epoch=active_epoch_num) if snap else []
-                    pts = HSRC.snapshot_points(records, src.field_path or "", start_dt, end_dt)
-                    notes.append(
-                        "This field is not recorded. Only the model's recent samples are kept "
-                        f"({len(records)} available); record it in Storage Management for full history."
-                    )
-                    info = {"points": [_point(src, p["ts"], p["value"], p["quality"], "MODEL_SAMPLE") for p in pts],
-                            "total": len(pts), "truncated": False}
-            elif src.kind == "subtable" and src.database and src.table:
-                if not await _tenant_owns_database(session, tenant_id, src.database):
-                    raise AppError(404, "NOT_FOUND", f"Subtable '{src.database}.{src.table}' not found")
-                if reader is None:
-                    status = "UNAVAILABLE"
-                    notes.append("TDengine history is not configured.")
-                else:
-                    fidelity = "managed_recorded"
-                    info = await _read_table_series(
-                        reader, src, db=src.database, table=src.table, value_col=src.column, start_dt=start_dt,
-                        end_dt=end_dt, epoch=active_epoch_num, resolution=resolution, max_points=max_points,
-                        cursor=cursor, bucket_ms=bucket_ms, record_kind="MANAGED_RECORDED",
-                    )
-            else:
-                status = "NOT_FOUND"
-        except AppError:
-            raise
-        except TDEngineError as exc:
-            if "not exist" in str(exc).lower() or "0x2603" in str(exc).lower() or "0x2662" in str(exc).lower():
-                status = "NO_DATA"
-                notes.append("No rows have been stored for this series yet.")
-            else:
-                status = "ERROR"
-                notes.append(f"History query failed: {exc}")
-                logger.warning("History query failed for %s: %s", src.key, exc)
-        points = info.get("points", [])
-        if quality_filter and str(quality_filter).upper() != "ALL":
-            points = [pt for pt in points if str(pt.get("quality") or "").upper() == str(quality_filter).upper()]
-        if status == "OK" and not points:
-            status = "NO_DATA"
-        any_downsampled = any_downsampled or bool(info.get("downsampled"))
-        if info.get("next_cursor") and next_cursor_out is None:
-            next_cursor_out = info["next_cursor"]
-        if info.get("downsampled"):
-            mins = [p["min"] for p in points if p.get("min") is not None]
-            maxs = [p["max"] for p in points if p.get("max") is not None]
-            cnt = sum(int(p.get("count") or 0) for p in points)
-            wsum = sum(float(p["value"]) * int(p.get("count") or 0) for p in points if p.get("value") is not None)
-            min_val, max_val = (min(mins) if mins else None), (max(maxs) if maxs else None)
-            avg_val = round(wsum / cnt, 6) if cnt else None
-            good_count, good_pct = None, None
-            count = cnt
-        else:
-            nums = [float(pt["value"]) for pt in points if isinstance(pt.get("value"), (int, float))
-                    and not isinstance(pt.get("value"), bool) and math.isfinite(float(pt["value"]))]
-            min_val = min(nums) if nums else None
-            max_val = max(nums) if nums else None
-            avg_val = round(sum(nums) / len(nums), 6) if nums else None
-            known = [pt for pt in points if pt.get("quality")]
-            good_count = sum(1 for pt in known if str(pt["quality"]).upper() == "GOOD")
-            good_pct = round(good_count / len(known) * 100.0, 1) if known else None
-            count = len(points)
-        last_pt = points[-1] if points else None
-        times = [HSRC._utc(p["ts"]) for p in points if p.get("ts")]
-        times = [t for t in times if t is not None]
-        if info.get("downsampled"):
-            gap_threshold = int(info.get("bucket_ms") or 0) or None  # a missing bucket = a gap
-        elif src.kind == "signal" and mode == "operational":
-            gap_threshold = canonical_stale_after_ms(src.expected_interval_ms or 1000)
-        else:
-            gap_threshold = None  # change-only / event series: silence is not a gap
-        gaps = HSRC.gap_stats(times, start_dt, end_dt, gap_threshold) if status != "ERROR" else {}
-        stats = {
-            "signal_id": src.key,
-            "series_key": src.key,
-            "key": src.label or src.key,
-            "display_name": src.label or src.key,
-            "unit": src.unit,
-            "value_type": src.value_type,
-            "min": min_val,
-            "max": max_val,
-            "avg": avg_val,
-            "last": last_pt["value"] if last_pt else None,
-            "last_ts": last_pt["ts"] if last_pt else None,
-            "count": count,
-            "total": info.get("total", count),
-            "good_count": good_count,
-            "good_pct": good_pct,
-            "fidelity": fidelity,
-            "first": points[0]["value"] if points else None,
-            "first_ts": points[0]["ts"] if points else None,
-            "gap_count": gaps.get("gap_count"),
-            "longest_gap_ms": gaps.get("longest_gap_ms"),
-            "coverage_pct": gaps.get("coverage_pct"),
-            "gap_threshold_ms": gap_threshold,
-        }
-        quality_segments = [] if info.get("downsampled") else _build_quality_segments(
-            [p for p in points if p.get("quality")], start_dt, end_dt,
-            timedelta(milliseconds=canonical_stale_after_ms(1000)),
-        )
-        series_results.append({
-            "signal_id": src.key,
-            "series_key": src.key,
-            "source_kind": src.kind,
-            "key": src.label or src.key,
-            "display_name": src.label or src.key,
-            "resource_id": src.resource_id,
-            "resource_name": src.resource_name,
-            "value_type": src.value_type,
-            "unit": src.unit,
-            "mode": mode,
-            "fidelity": fidelity,
-            "status": status,
-            "points": points,
-            "total": info.get("total", len(points)),
-            "downsampled": bool(info.get("downsampled")),
-            "bucket_ms": info.get("bucket_ms"),
-            "truncated": bool(info.get("truncated")),
-            "next_cursor": info.get("next_cursor"),
-            "column": info.get("column"),
-            "stats": stats,
-            "quality_segments": quality_segments,
-            "coverage_notes": notes,
-        })
-        all_points.extend(points)
-
-    all_points.sort(key=lambda pt: str(pt.get("ts") or ""))
-    sql_preview = _build_sql_preview(
-        tenant_id=tenant_id,
-        signal_ids=[sr["series_key"] for sr in series_results],
-        dataset_key=None,
-        mode=mode,
-        time_axis=time_axis,
-        start_iso=start_dt.isoformat().replace("+00:00", "Z"),
-        end_iso=end_dt.isoformat().replace("+00:00", "Z"),
-        quality_filter=str(quality_filter) if quality_filter else None,
-        bucket_ms=bucket_ms,
-        agg=agg,
-        limit=max_points,
+    ctx = _SeriesContext(
+        reader=HSRC.TableSeriesReader(provider.client) if provider is not None else None,
+        tenant_id=tenant_id, tenant_db=tenant_td_database(tenant_id), epoch=active_epoch_num, mode=mode,
+        resolution=resolution, max_points=max_points, cursor=cursor, bucket_ms=bucket_ms,
     )
+    # Session-bound series (PG fallback, designer recorded/reconstructed) cannot run concurrently.
+    session_bound: dict[str, dict[str, Any]] = {}
+    for window in [(start_dt, end_dt)] + ([(start_dt - timedelta(milliseconds=compare_ms),
+                                            end_dt - timedelta(milliseconds=compare_ms))] if compare_ms else []):
+        for src in sources:
+            if src.kind == "signal" and src.value_type and (provider is None or mode in ("recorded", "reconstructed")):
+                key = f"{src.key}|{window[0].isoformat()}"
+                if provider is None:
+                    info = await _pg_signal_points(session, tenant_id, src, window[0], window[1], max_points)
+                    info["fidelity"] = "postgres_fallback"
+                    info["notes"] = ["TDengine history is not configured; showing PostgreSQL observations."]
+                else:
+                    info = await _legacy_mode_points(provider, session, tenant_id, src, window[0], window[1], mode,
+                                                     max_points, cursor, active_epoch_num)
+                    info["fidelity"] = "managed_recorded" if mode == "recorded" else "reconstructed"
+                session_bound[key] = info
+
+    # ---- TDengine phase (concurrent, no session)
+    sem = asyncio.Semaphore(TD_PARALLEL)
+
+    async def one(src: HSRC.SeriesSource, w_start: datetime, w_end: datetime) -> dict[str, Any]:
+        pre = session_bound.get(f"{src.key}|{w_start.isoformat()}")
+        if pre is not None:
+            return pre
+        async with sem:
+            return await _series_info(ctx, src, w_start, w_end)
+
+    windows = [(start_dt, end_dt)]
+    if compare_ms:
+        shift = timedelta(milliseconds=compare_ms)
+        windows.append((start_dt - shift, end_dt - shift))
+    infos = await asyncio.gather(*[one(src, w0, w1) for (w0, w1) in windows for src in sources])
+    main = [_series_result(src, infos[i], start_dt, end_dt, mode, quality_filter) for i, src in enumerate(sources)]
     compare: dict[str, Any] | None = None
     if compare_ms:
-        # Same series and settings over the earlier window; points are shifted forward by the offset
-        # so both periods share one time axis (``original_ts`` keeps the real timestamp).
+        w0, w1 = windows[1]
+        prev = [_series_result(src, infos[len(sources) + i], w0, w1, mode, quality_filter) for i, src in enumerate(sources)]
         shift = timedelta(milliseconds=compare_ms)
-        prev = await query_historian(
-            session, tenant_id,
-            {**payload_dict, "compare_offset": None, "range": None, "cursor": None,
-             "start": (start_dt - shift).isoformat(), "end": (end_dt - shift).isoformat()},
-            history_provider=history_provider,
-        )
-        for sr in prev["series_list"]:
+        for sr in prev:
             for pt in sr["points"]:
-                pt["original_ts"] = pt["ts"]
                 moved = HSRC._utc(pt["ts"])
                 if moved is not None:
-                    pt["ts"] = pt["event_time"] = iso_ms(moved + shift)
-        compare = {"offset_ms": compare_ms, "start": prev["start"], "end": prev["end"],
-                   "series_list": prev["series_list"], "stats": prev["stats"]}
+                    pt["original_ts"] = pt["ts"]
+                    pt["ts"] = iso_ms(moved + shift)
+        compare = {"offset_ms": compare_ms, "start": _z(w0), "end": _z(w1),
+                   "series_list": prev, "stats": [sr["stats"] for sr in prev]}
 
     return {
         "mode": mode,
-        "start": start_dt.isoformat().replace("+00:00", "Z"),
-        "end": end_dt.isoformat().replace("+00:00", "Z"),
+        "start": _z(start_dt),
+        "end": _z(end_dt),
         "compare": compare,
         "resolution": resolution,
         "bucket_ms": bucket_ms,
-        "agg": agg,
+        "agg": "avg" if any(sr["downsampled"] for sr in main) else None,
         "max_points": max_points,
-        "downsampled": any_downsampled,
+        "downsampled": any(sr["downsampled"] for sr in main),
         "history_available": provider is not None,
-        "series": {sr["series_key"]: sr for sr in series_results},
-        "series_list": series_results,
-        "points": all_points,
-        "rows": all_points,
-        "items": all_points,
-        "stats": [sr["stats"] for sr in series_results],
-        "quality_segments": [seg for sr in series_results for seg in sr["quality_segments"]],
-        "sql_preview": sql_preview,
-        "next_cursor": next_cursor_out,
-        "coverage_notes": [n for sr in series_results for n in sr["coverage_notes"]],
+        # Per-series summary by key (no points; the points are only in series_list).
+        "series": {sr["series_key"]: {k: v for k, v in sr.items() if k not in ("points", "quality_segments")} for sr in main},
+        "series_list": main,
+        "stats": [sr["stats"] for sr in main],
+        "next_cursor": next((sr["next_cursor"] for sr in main if sr.get("next_cursor")), None),
+        "coverage_notes": [n for sr in main for n in sr["coverage_notes"]],
+    }
+
+
+def _z(dt: datetime) -> str:
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class _SeriesContext:
+    reader: HSRC.TableSeriesReader | None
+    tenant_id: UUID
+    tenant_db: str
+    epoch: int
+    mode: str
+    resolution: str
+    max_points: int
+    cursor: str | None
+    bucket_ms: int | None
+
+
+async def _series_info(ctx: _SeriesContext, src: HSRC.SeriesSource, start_dt: datetime, end_dt: datetime) -> dict[str, Any]:
+    """TDengine read of one series in one window; never raises for data problems (status + note)."""
+    info: dict[str, Any] = {"points": [], "total": 0, "notes": list(src.notes), "fidelity": "operational_full"}
+    kw = dict(start_dt=start_dt, end_dt=end_dt, epoch=ctx.epoch, resolution=ctx.resolution,
+              max_points=ctx.max_points, cursor=ctx.cursor, bucket_ms=ctx.bucket_ms)
+    try:
+        if src.kind == "signal" and src.value_type and src.signal_id is not None:
+            if ctx.reader is None:
+                return {**info, "status": "UNAVAILABLE"}
+            info.update(await _read_table_series(
+                ctx.reader, src, db=ctx.tenant_db, table=op_subtable_name(src.signal_id, src.value_type), value_col="val",
+                record_kind="RAW_OPERATIONAL", schema=HSRC.operational_schema(src.value_type), **kw))
+        elif src.kind == "model_field" and src.model_id:
+            if ctx.reader is None:
+                info["notes"].append("TDengine history is not configured.")
+                return {**info, "status": "UNAVAILABLE"}
+            if src.table and src.database:
+                info["fidelity"] = "managed_recorded"
+                info["notes"].append(f"Recorded in {src.database}.{src.table} ({src.column}); rows are changes only.")
+                info.update(await _read_table_series(ctx.reader, src, db=src.database, table=src.table,
+                                                     value_col=src.column, record_kind="MANAGED_RECORDED", **kw))
+            else:
+                info["fidelity"] = "model_snapshots"
+                snap = get_model_snapshot_provider()
+                records = await snap.list_snapshots(ctx.tenant_id, src.model_id, limit=500, active_epoch=ctx.epoch) if snap else []
+                pts = HSRC.snapshot_points(records, src.field_path or "", start_dt, end_dt)
+                info["notes"].append("This field is not recorded. Only the model's recent samples are kept "
+                                     f"({len(records)} available); record it in Storage Management for full history.")
+                info.update(points=[_point(src, p["ts"], p["value"], p["quality"], "MODEL_SAMPLE") for p in pts], total=len(pts))
+        elif src.kind == "subtable" and src.database and src.table:
+            if ctx.reader is None:
+                info["notes"].append("TDengine history is not configured.")
+                return {**info, "status": "UNAVAILABLE"}
+            info["fidelity"] = "managed_recorded"
+            info.update(await _read_table_series(ctx.reader, src, db=src.database, table=src.table,
+                                                 value_col=src.column, record_kind="MANAGED_RECORDED", **kw))
+        else:
+            info["status"] = "NOT_FOUND"
+    except TDEngineError as exc:
+        low = str(exc).lower()
+        if "not exist" in low or "0x2603" in low or "0x2662" in low:
+            info.update(status="NO_DATA", points=[], total=0)
+            info["notes"].append("No rows have been stored for this series yet.")
+        else:
+            info.update(status="ERROR", points=[], total=0)
+            info["notes"].append(f"History query failed: {exc}")
+            logger.warning("History query failed for %s: %s", src.key, exc)
+    return info
+
+
+def _series_result(src: HSRC.SeriesSource, info: dict[str, Any], start_dt: datetime, end_dt: datetime,
+                   mode: str, quality_filter: Any) -> dict[str, Any]:
+    status = info.get("status") or "OK"
+    points = info.get("points", [])
+    times = info.get("times")
+    if times is None or len(times) != len(points):
+        times = [HSRC._utc(p["ts"]) for p in points]
+    if quality_filter and str(quality_filter).upper() != "ALL":
+        keep = [i for i, pt in enumerate(points) if str(pt.get("quality") or "").upper() == str(quality_filter).upper()]
+        points, times = [points[i] for i in keep], [times[i] for i in keep]
+    if status == "OK" and not points:
+        status = "NO_DATA"
+    downsampled = bool(info.get("downsampled"))
+    if downsampled:
+        mins = [p["min"] for p in points if p.get("min") is not None]
+        maxs = [p["max"] for p in points if p.get("max") is not None]
+        cnt = sum(int(p.get("count") or 0) for p in points)
+        wsum = sum(float(p["value"]) * int(p.get("count") or 0) for p in points if p.get("value") is not None)
+        min_val, max_val = (min(mins) if mins else None), (max(maxs) if maxs else None)
+        avg_val = round(wsum / cnt, 6) if cnt else None
+        good_count, good_pct, count = None, None, cnt
+    else:
+        nums = [float(pt["value"]) for pt in points if isinstance(pt.get("value"), (int, float))
+                and not isinstance(pt.get("value"), bool) and math.isfinite(float(pt["value"]))]
+        min_val = min(nums) if nums else None
+        max_val = max(nums) if nums else None
+        avg_val = round(sum(nums) / len(nums), 6) if nums else None
+        known = [pt for pt in points if pt.get("quality")]
+        good_count = sum(1 for pt in known if str(pt["quality"]).upper() == "GOOD")
+        good_pct = round(good_count / len(known) * 100.0, 1) if known else None
+        count = len(points)
+    if downsampled:
+        gap_threshold = int(info.get("bucket_ms") or 0) or None
+    elif src.kind == "signal" and mode == "operational":
+        gap_threshold = canonical_stale_after_ms(src.expected_interval_ms or 1000)
+    else:
+        gap_threshold = None
+    gaps = HSRC.gap_stats([t for t in times if t is not None], start_dt, end_dt, gap_threshold) if status != "ERROR" else {}
+    total = info.get("total")
+    stats = {
+        "signal_id": src.key, "series_key": src.key, "key": src.label or src.key, "display_name": src.label or src.key,
+        "unit": src.unit, "value_type": src.value_type, "min": min_val, "max": max_val, "avg": avg_val,
+        "last": points[-1]["value"] if points else None, "last_ts": points[-1]["ts"] if points else None,
+        "count": count, "total": total if total is not None else count, "good_count": good_count, "good_pct": good_pct,
+        "fidelity": info.get("fidelity"), "first": points[0]["value"] if points else None,
+        "first_ts": points[0]["ts"] if points else None, "gap_count": gaps.get("gap_count"),
+        "longest_gap_ms": gaps.get("longest_gap_ms"), "coverage_pct": gaps.get("coverage_pct"),
+        "gap_threshold_ms": gap_threshold,
+    }
+    notes = list(info.get("notes") or [])
+    info.pop("times", None)
+    return {
+        "signal_id": src.key, "series_key": src.key, "source_kind": src.kind, "key": src.label or src.key,
+        "display_name": src.label or src.key, "resource_id": src.resource_id, "resource_name": src.resource_name,
+        "value_type": src.value_type, "unit": src.unit, "mode": mode, "fidelity": info.get("fidelity"),
+        "status": status, "points": points, "total": total if total is not None else len(points),
+        "downsampled": downsampled, "bucket_ms": info.get("bucket_ms"), "truncated": bool(info.get("truncated")),
+        "next_cursor": info.get("next_cursor"), "column": info.get("column"), "stats": stats,
+        "quality_segments": [] if downsampled else _build_quality_segments(
+            [(t, str(p.get("quality") or "").upper()) for t, p in zip(times, points, strict=False) if t is not None and p.get("quality")],
+            start_dt, end_dt, timedelta(milliseconds=canonical_stale_after_ms(src.expected_interval_ms or 1000))),
+        "coverage_notes": notes,
     }
 
 
@@ -899,49 +900,37 @@ async def _legacy_mode_points(provider: TDengineHistoryRepository, session: Asyn
 
 
 def _build_quality_segments(
-    points: list[dict[str, Any]],
+    points: list[dict[str, Any]] | list[tuple[datetime, str]],
     start_dt: datetime,
     end_dt: datetime,
     hold_delta: timedelta,
 ) -> list[dict[str, Any]]:
-    """Build continuous quality segments with gap truncation across STALE boundaries."""
-    if not points:
-        return []
-
+    """Quality timeline: consecutive points of the same quality form ONE segment; a silence longer
+    than ``hold_delta`` after a GOOD/UNCERTAIN point becomes a STALE segment (was one segment per point)."""
     segments: list[dict[str, Any]] = []
-    for i, pt in enumerate(points):
-        ts = datetime.fromisoformat(str(pt["ts"]).replace("Z", "+00:00"))
-        next_ts = (
-            datetime.fromisoformat(str(points[i + 1]["ts"]).replace("Z", "+00:00"))
-            if i + 1 < len(points)
-            else end_dt
-        )
-        qual = str(pt.get("quality") or "GOOD").upper()
-        norm_q = "GOOD" if qual == "GOOD" else ("UNCERTAIN" if qual in {"UNCERTAIN", "WARN"} else ("STALE" if qual in {"STALE", "PAUSED"} else "BAD"))
 
-        seg_end = min(next_ts, ts + hold_delta) if norm_q in {"GOOD", "UNCERTAIN"} else next_ts
-        segments.append(
-            {
-                "signal_id": pt.get("signal_id"),
-                "start": ts.isoformat().replace("+00:00", "Z"),
-                "end": seg_end.isoformat().replace("+00:00", "Z"),
-                "quality": norm_q,
-                "reason_code": pt.get("reason_code"),
-            }
-        )
+    raw: list[list[Any]] = []  # [start, end, quality, reason] as datetimes; rendered once at the end
 
-        # If natural end exceeds valid hold window, insert STALE gap marker segment
-        if norm_q in {"GOOD", "UNCERTAIN"} and next_ts > seg_end:
-            segments.append(
-                {
-                    "signal_id": pt.get("signal_id"),
-                    "start": seg_end.isoformat().replace("+00:00", "Z"),
-                    "end": next_ts.isoformat().replace("+00:00", "Z"),
-                    "quality": "STALE",
-                    "reason_code": "STALE_GAP_TRUNCATED",
-                }
-            )
+    def push(a: datetime, b: datetime, q: str, reason: str | None = None) -> None:
+        if b <= a:
+            return
+        last = raw[-1] if raw else None
+        if last and last[2] == q and last[1] == a and last[3] == reason:
+            last[1] = b
+        else:
+            raw.append([a, b, q, reason])
 
+    parsed = [p if isinstance(p, tuple) else (HSRC._utc(p["ts"]), str(p.get("quality") or "").upper()) for p in points]
+    parsed = [(t, q) for t, q in parsed if t is not None]
+    for i, (ts, qual) in enumerate(parsed):
+        nxt = parsed[i + 1][0] if i + 1 < len(parsed) else end_dt
+        norm = "GOOD" if qual == "GOOD" else ("UNCERTAIN" if qual in {"UNCERTAIN", "WARN", "DELAYED"} else
+                                              ("STALE" if qual in {"STALE", "PAUSED"} else "BAD"))
+        held = min(nxt, ts + hold_delta) if norm in {"GOOD", "UNCERTAIN"} else nxt
+        push(ts, held, norm)
+        if held < nxt:
+            push(held, nxt, "STALE", "STALE_GAP")
+    segments.extend({"start": _iso(a), "end": _iso(b), "quality": q, "reason_code": r} for a, b, q, r in raw)
     return segments
 
 
@@ -1026,47 +1015,56 @@ async def list_historian_events(
             }
         )
 
-    # 3. Quality transitions
-    active_epoch_num = await _active_epoch(session, tenant_id)
-    qual_clauses = ["l.tenant_id = :tenant_id", "l.updated_at >= :start_dt", "l.updated_at <= :end_dt", "l.data_epoch >= :epoch"]
-    qual_params: dict[str, Any] = {"tenant_id": tenant_id, "start_dt": start_dt, "end_dt": end_dt, "epoch": active_epoch_num}
-    if effective_sig_ids:
-        uids = [_safe_uuid(s) for s in effective_sig_ids if _safe_uuid(s)]
-        if uids:
-            qual_clauses.append("l.signal_id = ANY(:uids)")
-            qual_params["uids"] = uids
-
-    qual_rows = await fetch_all(
-        session,
-        f"""
-        SELECT l.signal_id, s.key AS signal_key, l.quality, l.reason_code, l.updated_at, l.data_epoch
-        FROM latest_signal_state l
-        JOIN signal_definitions s ON s.id = l.signal_id
-        WHERE {' AND '.join(qual_clauses)}
-        ORDER BY l.updated_at DESC
-        LIMIT 50
-        """,
-        qual_params,
-    )
-    for qr in qual_rows:
-        q_val = str(qr.get("quality") or "GOOD").upper()
-        ts_val = qr.get("updated_at") or qr.get("last_acquired_at") or qr.get("source_time") or utcnow()
-        events.append(
-            {
-                "id": f"qual-{qr.get('signal_id')}-{ts_val}",
-                "ts": iso_ms(ts_val),
-                "timestamp": iso_ms(ts_val),
-                "kind": "QUALITY_TRANSITION",
-                "signal_id": str(qr.get("signal_id") or ""),
-                "signal_key": str(qr.get("signal_key") or ""),
-                "to_state": q_val,
-                "quality": q_val,
-                "reason_code": qr.get("reason_code"),
-                "data_epoch": int(qr.get("data_epoch") or active_epoch_num),
-                "summary": f"{qr['signal_key']}: quality is {q_val}",
-                "message": f"Signal {qr['signal_key']} transitioned to {q_val}",
-            }
+    # 3. Quality transitions — real history (D3): TDengine STATE_WINDOW over the stored raw quality of
+    #    each requested signal in the window (not the current latest state). Only computed when the
+    #    caller names signals and asks for them (or does not filter by type).
+    wanted = {t.strip().upper() for t in types or [] if t.strip()}
+    sig_uuids = [u for u in (_safe_uuid(s) for s in (effective_sig_ids or [])) if u is not None][:MAX_SERIES]
+    provider = get_history_provider()
+    if sig_uuids and provider is not None and (not wanted or "QUALITY_TRANSITION" in wanted):
+        active_epoch_num = await _active_epoch(session, tenant_id)
+        meta_rows = await fetch_all(
+            session,
+            "SELECT id, key, data_type FROM signal_definitions WHERE tenant_id = :tenant_id AND id = ANY(:ids)",
+            {"tenant_id": tenant_id, "ids": sig_uuids},
         )
+        db = tenant_td_database(tenant_id)
+        sem = asyncio.Semaphore(TD_PARALLEL)
+
+        async def transitions(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+            table = op_subtable_name(as_uuid(row["id"]), str(row.get("data_type") or "float64"))
+            sql = (
+                f"SELECT _wstart AS ws, _wend AS we, raw_quality AS q, COUNT(*) AS n FROM {quote_fq_table(db, table)} "
+                f"WHERE ts >= {HSRC.ts_literal(start_dt)} AND ts < {HSRC.ts_literal(end_dt)} "
+                f"AND data_epoch >= {int(active_epoch_num)} STATE_WINDOW(raw_quality) LIMIT {bounded_limit + 1}"
+            )
+            async with sem:
+                try:
+                    windows = await provider.client.query_rows(sql)
+                except TDEngineError as exc:
+                    if "not exist" not in str(exc).lower():
+                        logger.warning("Quality transition query failed for %s: %s", row["id"], exc)
+                    return []
+            out: list[dict[str, Any]] = []
+            prev: str | None = None
+            for w in windows or []:
+                q = str(w.get("q") or "UNKNOWN").upper()
+                ts_val = HSRC._utc(w.get("ws"))
+                if prev is not None and q != prev and ts_val is not None:
+                    out.append({
+                        "id": f"qual-{row['id']}-{iso_ms(ts_val)}",
+                        "ts": iso_ms(ts_val), "timestamp": iso_ms(ts_val), "kind": "QUALITY_TRANSITION",
+                        "signal_id": str(row["id"]), "signal_key": str(row["key"]),
+                        "from_state": prev, "to_state": q, "quality": q, "samples": int(w.get("n") or 0),
+                        "until": iso_ms(HSRC._utc(w.get("we"))) if w.get("we") else None,
+                        "summary": f"{row['key']}: {prev} \u2192 {q}",
+                        "message": f"Signal {row['key']} quality changed from {prev} to {q}",
+                    })
+                prev = q
+            return out
+
+        for chunk in await asyncio.gather(*[transitions(r) for r in meta_rows]):
+            events.extend(chunk)
 
     if types:
         wanted = {t.strip().upper() for t in types if t.strip()}
@@ -1146,7 +1144,13 @@ async def create_export_job(
                       "_max_points_cap": EXPORT_MAX_ROWS_PER_SERIES}
     export_payload.pop("cursor", None)
     query_res = await query_historian(session, tenant_id, export_payload, history_provider=history_provider)
-    pts = query_res.get("points") or []
+    labels = payload_dict.get("labels") if isinstance(payload_dict.get("labels"), dict) else {}
+    pts = []
+    for sr in query_res.get("series_list", []):
+        name = sr["display_name"] if sr.get("resource_name") or sr["display_name"] != sr["series_key"] else labels.get(sr["series_key"], sr["display_name"])
+        for pt in sr["points"]:
+            pts.append({**pt, "signal_id": sr["series_key"], "signal_key": name, "unit": sr.get("unit")})
+    pts.sort(key=lambda pt: str(pt.get("ts") or ""))
     truncated_series = [sr["display_name"] for sr in query_res.get("series_list", []) if len(sr["points"]) >= EXPORT_MAX_ROWS_PER_SERIES]
 
     # Build formula-injection-safe CSV using csv_row and csv_cell
@@ -1236,6 +1240,8 @@ async def create_export_job(
         "format": fmt,
         "truncated_series": truncated_series,
         "progress_pct": 100,
+        "title": str(payload_dict.get("title") or "").strip()[:300] or None,
+        "labels": payload_dict.get("labels") if isinstance(payload_dict.get("labels"), dict) else {},
         "series": [sr["display_name"] for sr in query_res.get("series_list", [])],
         "start": query_res.get("start"),
         "end": query_res.get("end"),
@@ -1266,7 +1272,7 @@ def _export_item(r: Mapping[str, Any], now: datetime) -> dict[str, Any]:
     spec = _safe_json_dict(r.get("query_json"))
     result = spec.pop("_result", {}) if isinstance(spec.get("_result"), dict) else {}
     series = result.get("series") or []
-    title = (
+    title = str(spec.get("title") or "").strip()[:300] or (
         f"{len(series)} series · {result.get('start') or spec.get('start') or spec.get('range') or ''}"
         f" → {result.get('end') or spec.get('end') or ''} · {spec.get('mode') or 'operational'}"
     )

@@ -116,7 +116,7 @@ export function useWizardDraft<T extends object>(
     try {
       sessionStorage.setItem(storageKey, JSON.stringify(data));
       const timeStr = new Date().toLocaleTimeString();
-      setLastSavedAt(timeStr);
+      setLastSavedAt(`${timeStr} (this browser tab)`);
       return true;
     } catch {
       return false;
@@ -148,6 +148,7 @@ export function useWizardDraft<T extends object>(
     setIsDirty,
     saveDraft,
     clearDraft,
+    setLastSavedAt,
     resetData,
     lastSavedAt,
   };
@@ -238,7 +239,7 @@ export const WizardFooter: React.FC<WizardFooterProps> = ({
               <Button type="button" variant="ghost" size="sm" icon={<Save className="w-3.5 h-3.5" />} onClick={onSaveDraft} disabled={loading || !isDirty}>
                 {draftLabel}
               </Button>
-              {lastSavedAt && <span className="text-[11px] text-[#657794]">Draft saved {lastSavedAt} (this browser tab)</span>}
+              {lastSavedAt && <span className="text-[11px] text-[#657794]">Draft saved {lastSavedAt}</span>}
             </>
           )}
         </div>
