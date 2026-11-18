@@ -94,12 +94,12 @@ export const StorageObjectDrawer: React.FC<StorageObjectDrawerProps> = ({ object
             )}
             {kind === 'stable' && !locked && (
               <Button size="sm" variant="primary" icon={<Plus className="w-3.5 h-3.5" />} onClick={() => navigate(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(ref)}`, { state: { from } })}>
-                New subtable
+                Create subtable
               </Button>
             )}
             {kind === 'database' && (
               <Button size="sm" variant="primary" icon={<Plus className="w-3.5 h-3.5" />} onClick={() => navigate(`/historian/storage/create?kind=stable&database=${encodeURIComponent(name)}`, { state: { from } })}>
-                New supertable
+                Create supertable
               </Button>
             )}
           </>

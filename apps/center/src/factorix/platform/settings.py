@@ -11,7 +11,48 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _PLACEHOLDERS = {"", "change-me", "changeme", "password", "postgres", "secret"}
 
 
-class Settings(BaseSettings):
+class BrokerSettings(BaseSettings):
+    """RabbitMQ section (§4), shared by every process (R2-E C9 / CT-08, CT-09).
+
+    Acquisition builds its ``BrokerConfig`` from this section too, so both sides read the same
+    ``FACTORIX_RABBITMQ_*`` variables with the same defaults (one definition of the topology arguments).
+    It needs no database / key variables, unlike ``Settings``.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="FACTORIX_", env_file=".env", extra="ignore")
+
+    rabbitmq_url: str = ""
+    rabbitmq_mgmt_url: str = ""
+    rabbitmq_exchange: str = "factorix.telemetry.ingress"
+    rabbitmq_queue: str = "factorix.telemetry.ingest.q"
+    rabbitmq_live_queue: str = "factorix.telemetry.live.q"
+    rabbitmq_dlx: str = "factorix.telemetry.dlx"
+    rabbitmq_dlq: str = "factorix.telemetry.dlq"
+    rabbitmq_binding_pattern: str = "telemetry.v1.*"
+    rabbitmq_live_binding_pattern: str = "telemetry.live.v1.*"
+    rabbitmq_max_length_bytes: int = Field(default=512 * 1024 * 1024, ge=65536)
+    rabbitmq_live_max_length_bytes: int = Field(default=256 * 1024 * 1024, ge=65536)
+    rabbitmq_delivery_limit: int = Field(default=5, ge=1, le=100)
+    rabbitmq_prefetch: int = Field(default=128, ge=1, le=4096)
+    rabbitmq_live_prefetch: int = Field(default=256, ge=1, le=4096)
+    rabbitmq_publisher_max_inflight: int = Field(default=64, ge=1, le=2048)
+    rabbitmq_confirm_timeout_s: float = Field(default=10.0, ge=0.5, le=120.0)
+    rabbitmq_freshness_window_s: float = Field(default=12.0, gt=0.0, le=3600.0)
+    ingestion_consumer_concurrency: int = Field(default=128, ge=1, le=2048)
+    ingestion_live_consumer_concurrency: int = Field(default=256, ge=1, le=2048)
+
+    @field_validator("rabbitmq_url")
+    @classmethod
+    def _rmq(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            return ""
+        if not text.startswith(("amqp://", "amqps://")):
+            raise ValueError("FACTORIX_RABBITMQ_URL must start with amqp:// or amqps://.")
+        return text
+
+
+class Settings(BrokerSettings):
     model_config = SettingsConfigDict(env_prefix="FACTORIX_", env_file=".env", extra="ignore")
 
     environment: Literal["development", "test", "production"] = "production"
@@ -32,19 +73,7 @@ class Settings(BaseSettings):
     data_dir: str = ""
     web_dist: str = ""
 
-    # RabbitMQ transport (§4)
-    rabbitmq_url: str = ""
-    rabbitmq_mgmt_url: str = ""
-    rabbitmq_exchange: str = "factorix.telemetry.ingress"
-    rabbitmq_queue: str = "factorix.telemetry.ingest.q"
-    rabbitmq_dlx: str = "factorix.telemetry.dlx"
-    rabbitmq_dlq: str = "factorix.telemetry.dlq"
-    rabbitmq_max_length_bytes: int = Field(default=512 * 1024 * 1024, ge=65536)
-    rabbitmq_delivery_limit: int = Field(default=5, ge=1, le=100)
-    rabbitmq_prefetch: int = Field(default=128, ge=1, le=4096)
-    rabbitmq_live_prefetch: int = Field(default=256, ge=1, le=4096)
-    rabbitmq_publisher_max_inflight: int = Field(default=64, ge=1, le=2048)
-    rabbitmq_confirm_timeout_s: float = Field(default=10.0, ge=0.5, le=120.0)
+    # RabbitMQ transport (§4): fields inherited from ``BrokerSettings``.
 
     # TDengine data plane & exports (§5)
     tdengine_dsn: str = ""
@@ -62,9 +91,10 @@ class Settings(BaseSettings):
     # Ingestion & local acquisition (§3, §4, §7)
     ingestion_batch_size: int = Field(default=256, ge=1, le=4096)
     ingestion_flush_ms: int = Field(default=100, ge=10, le=5000)
-    ingestion_consumer_concurrency: int = Field(default=128, ge=1, le=2048)
-    ingestion_live_consumer_concurrency: int = Field(default=256, ge=1, le=2048)
     ingestion_shadow_pg: bool = False
+    # Read the legacy PostgreSQL ``observations`` table as a history fallback (R2-E C3). Unset = only in
+    # Edge mode (which still writes it); the appliance (acquisition mode) no longer writes that table.
+    pg_telemetry_fallback: bool | None = None
     collector_mode: str = "edge"
     ot_allowlist: str = ""
     acquisition_spool_path: str = ""
@@ -84,16 +114,6 @@ class Settings(BaseSettings):
         if value.strip().lower() in _PLACEHOLDERS or len(value) < 32:
             raise ValueError("FACTORIX_DATA_KEY không hợp lệ.")
         return value
-
-    @field_validator("rabbitmq_url")
-    @classmethod
-    def _rmq(cls, value: str) -> str:
-        text = value.strip()
-        if not text:
-            return ""
-        if not text.startswith(("amqp://", "amqps://")):
-            raise ValueError("FACTORIX_RABBITMQ_URL must start with amqp:// or amqps://.")
-        return text
 
     @field_validator("tdengine_dsn")
     @classmethod

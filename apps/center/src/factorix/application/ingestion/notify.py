@@ -11,10 +11,13 @@ from uuid import UUID
 import asyncpg
 
 from factorix.modules.common import iso_ms
+from factorix_core.contracts.notify import Channel, LatestIdsV2
 
 
+# Literal names kept (the channel registry test scans for them); they are the registry values.
 NOTIFY_CHANNEL_STREAM = "factorix_stream_events"
 NOTIFY_CHANNEL_HEALTH = "factorix_health_changed"
+assert NOTIFY_CHANNEL_STREAM == Channel.STREAM_EVENTS and NOTIFY_CHANNEL_HEALTH == Channel.HEALTH_CHANGED
 # Same {"events":[...]} wire format; pack as many events as fit one PG NOTIFY (< 8000 bytes).
 NOTIFY_CHUNK_MAX_EVENTS = 64
 NOTIFY_CHUNK_MAX_BYTES = 7800
@@ -26,21 +29,16 @@ def _latest_ids_payloads(
     connection_ids: Sequence[str],
     max_acquired_at: datetime | None,
 ) -> list[str]:
-    """Pack committed signal ids into v2 ``latest_ids`` NOTIFY payloads, each < NOTIFY_CHUNK_MAX_BYTES."""
+    """Pack committed signal ids into v2 ``latest_ids`` NOTIFY payloads, each < NOTIFY_CHUNK_MAX_BYTES
+    (typed contract ``factorix_core.contracts.notify.LatestIdsV2``, R2-E C6)."""
     if not signal_ids:
         return []
-    head: dict[str, Any] = {"v": 2, "kind": "latest_ids", "tenant_id": str(tenant_id)}
-    if max_acquired_at is not None:
-        head["max_acquired_at"] = iso_ms(max_acquired_at)
-    if connection_ids:
-        head["connection_ids"] = list(connection_ids)[:32]
-    base = len(json.dumps({**head, "signal_ids": []}, separators=(",", ":")))
-    per_id = 39  # '"<36-char uuid>",'
-    per_payload = max(1, (NOTIFY_CHUNK_MAX_BYTES - base) // per_id)
-    return [
-        json.dumps({**head, "signal_ids": list(signal_ids[i : i + per_payload])}, separators=(",", ":"))
-        for i in range(0, len(signal_ids), per_payload)
-    ]
+    return LatestIdsV2(
+        tenant_id=str(tenant_id),
+        signal_ids=tuple(signal_ids),
+        connection_ids=tuple(connection_ids or ()),
+        max_acquired_at=iso_ms(max_acquired_at) if max_acquired_at is not None else None,
+    ).to_payloads(NOTIFY_CHUNK_MAX_BYTES)
 
 
 async def _emit_chunked_notify(conn: asyncpg.Connection, channel: str, events: Sequence[dict[str, Any]]) -> None:

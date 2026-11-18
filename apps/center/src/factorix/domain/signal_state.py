@@ -10,19 +10,11 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any
 
-
-class SourceQuality(StrEnum):
-    GOOD = "GOOD"
-    UNCERTAIN = "UNCERTAIN"
-    BAD = "BAD"
+from factorix.domain.quality import Freshness, Quality
 
 
-class Freshness(StrEnum):
-    FRESH = "FRESH"
-    DELAYED = "DELAYED"
-    STALE = "STALE"
-    UNKNOWN = "UNKNOWN"
-    NO_DATA = "NO_DATA"
+# One quality and one freshness vocabulary (R2-E C1 / CT-11): both enums live in ``domain.quality``.
+SourceQuality = Quality
 
 
 class EffectiveStatus(StrEnum):
@@ -131,6 +123,18 @@ def classify_freshness(
     if age_ms > max(DELAY_CAP_FACTOR * stale_after_ms, DELAY_CAP_MIN_MS):
         return FreshnessVerdict(str(Freshness.STALE), age_ms, age_ms, str(ReasonCode.DELIVERY_STALLED))
     return FreshnessVerdict(str(Freshness.DELAYED), age_ms, age_ms, str(ReasonCode.DELIVERY_DELAYED))
+
+
+OFFLINE_CONNECTION_HEALTH = frozenset({"DEGRADED", "OFFLINE", "DOWN", "DISCONNECTED"})
+
+
+def stale_reason_code(verdict_reason: str | None, connection_health: str | None = None) -> str:
+    """Reason of a STALE verdict: a silent source of a connection reported DEGRADED/OFFLINE is
+    ``CONNECTION_OFFLINE`` (CT-12); otherwise the time verdict's own reason."""
+    reason = str(verdict_reason or ReasonCode.NO_FRESH_ACQUISITION)
+    if reason == ReasonCode.NO_FRESH_ACQUISITION and str(connection_health or "").upper() in OFFLINE_CONNECTION_HEALTH:
+        return str(ReasonCode.CONNECTION_OFFLINE)
+    return reason
 
 
 def canonical_stale_after_ms(
@@ -288,13 +292,14 @@ def evaluate_signal_state(
             delivery_lag_ms=lag_ms,
         )
 
-    # 5. Stale acquisition (no fresh sample or keepalive within policy)
+    # 5. Stale acquisition (no fresh sample or keepalive within policy). A stale value of a connection
+    # whose health is DEGRADED/OFFLINE is explained as CONNECTION_OFFLINE (CT-12); status stays STALE.
     if is_stale:
         return SignalEvaluationResult(
             source_quality=str(SourceQuality.GOOD),
             freshness=str(Freshness.STALE),
             effective_status=str(EffectiveStatus.STALE),
-            reason_code=str((verdict.reason_code if verdict else None) or ReasonCode.NO_FRESH_ACQUISITION),
+            reason_code=stale_reason_code(verdict.reason_code if verdict else None, connection_health),
             evaluated_at=eval_now_iso,
             stale_after_ms=stale_after_ms,
             last_good=last_good_payload,

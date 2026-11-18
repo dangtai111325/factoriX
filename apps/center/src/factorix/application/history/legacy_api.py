@@ -1,4 +1,7 @@
-"""History/aggregate read API with the PG ``observations`` fallback, storage totals and CSV export. Moved verbatim from ``factorix.modules.telemetry`` (R2-E B5, move-only)."""
+"""History/aggregate read API, storage totals and CSV export (moved from ``factorix.modules.telemetry``, R2-E B5).
+
+R2-E C3: ``history`` / ``aggregate`` delegate to ``application.history.query_service.HistoryQueryService``
+(the PG ``observations`` fallback is behind ``FACTORIX_PG_TELEMETRY_FALLBACK``)."""
 
 from __future__ import annotations
 
@@ -9,36 +12,26 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain.csv_safe import csv_row
+from factorix.application.history.query_service import (  # noqa: F401 - AGGREGATES re-exported
+    AGGREGATES,
+    HistoryQuery,
+    active_epoch as _qs_active_epoch,
+    history_query_service,
+    pg_fallback_enabled,
+)
 from factorix.modules.history_repository import get_history_provider
-from factorix.modules.common import as_uuid, execute, fetch_all, fetch_one, jsonb, utcnow
-from factorix.platform.errors import AppError
+from factorix.modules.common import execute, fetch_all, fetch_one, jsonb, utcnow
 
 from factorix.application.live.latest_api import logger
 
 
-AGGREGATES = {"min", "max", "avg", "count", "sum"}
-
 
 async def _active_epoch(session: AsyncSession, tenant_id: UUID) -> int:
-    if not isinstance(session, AsyncSession):
-        return 1
-    try:
-        async with session.begin_nested():
-            gen_res = await session.execute(
-                text("SELECT active_epoch FROM telemetry_generations WHERE tenant_id = :tenant_id"),
-                {"tenant_id": tenant_id},
-            )
-            gen_row = gen_res.mappings().first()
-            if gen_row is not None and gen_row.get("active_epoch") is not None:
-                return max(1, int(gen_row["active_epoch"]))
-    except SQLAlchemyError:
-        return 1
-    return 1
+    return await _qs_active_epoch(session, tenant_id)
 
 
 async def history(
@@ -52,106 +45,15 @@ async def history(
     cursor: str | None,
     mode: str = "operational",
     dataset_id: UUID | None = None,
+    order: str = "oldest",
 ) -> dict[str, Any]:
-    if end <= start:
-        raise AppError(422, "RANGE", "Invalid time range.")
-    if end - start > timedelta(days=31):
-        raise AppError(422, "RANGE", "Query window is limited to 31 days. Narrow the range or use aggregation.")
-    limit = min(max(limit, 1), 2000)
-
-    clean_mode = str(mode or "operational").strip().lower()
-    if clean_mode not in {"operational", "recorded", "reconstructed"}:
-        raise AppError(422, "INVALID_MODE", f"Unsupported history mode: {mode!r}")
-
-    provider = get_history_provider() if isinstance(session, AsyncSession) else None
-    if provider is not None:
-        epoch = await _active_epoch(session, tenant_id)
-        page = await provider.query_raw(
-            tenant_id,
-            signal_id=signal_id,
-            start=start,
-            end=end,
-            limit=limit,
-            cursor=cursor,
-            mode=clean_mode,  # type: ignore[arg-type]
-            dataset_id=dataset_id,
-            session=session,
-            active_epoch=epoch,
-        )
-        if page.items or clean_mode != "operational" or epoch > 1:
-            items = [
-                {
-                    "id": pt.id,
-                    "event_uid": pt.event_uid,
-                    "event_time": pt.event_time,
-                    "received_time": pt.received_time,
-                    "source_time": pt.source_time,
-                    "value_type": pt.value_type,
-                    "value_json": {"v": pt.value},
-                    "value": pt.value,
-                    "unit": pt.unit,
-                    "quality": pt.quality,
-                    "reason_code": pt.reason_code,
-                    "origin": pt.origin,
-                    "config_revision": pt.config_revision,
-                    "data_epoch": pt.data_epoch,
-                    "record_kind": pt.record_kind,
-                    "virtual": pt.virtual,
-                    "dataset_id": str(pt.dataset_id) if pt.dataset_id else None,
-                }
-                for pt in page.items
-            ]
-            return {
-                "items": items,
-                "next_cursor": page.next_cursor,
-                "downsampled": page.downsampled,
-                "fidelity": page.fidelity,
-                "coverage_notes": list(page.coverage_notes),
-            }
-
-    if clean_mode != "operational":
-        return {
-            "items": [],
-            "next_cursor": None,
-            "downsampled": False,
-            "fidelity": "managed_recorded" if clean_mode == "recorded" else "reconstructed",
-            "coverage_notes": [],
-        }
-
-    params: dict[str, Any] = {
-        "tenant_id": tenant_id,
-        "signal_id": signal_id,
-        "start": start,
-        "end": end,
-        "limit": limit + 1,
-    }
-    cursor_sql = ""
-    if cursor:
-        moment_text, _, id_text = cursor.partition("|")
-        params["cursor_time"] = datetime.fromisoformat(moment_text.replace("Z", "+00:00"))
-        params["cursor_id"] = as_uuid(id_text)
-        cursor_sql = "AND (event_time, id) > (:cursor_time, :cursor_id)"
-    rows = await fetch_all(
+    """Raw history of one signal (``HistoryQueryService.history``, R2-E C3)."""
+    return await history_query_service().history(
         session,
-        f"""
-        SELECT id, event_uid, event_time, received_time, source_time, value_type, value_json, unit, quality, origin, config_revision
-        FROM observations
-        WHERE tenant_id = :tenant_id AND signal_id = :signal_id
-          AND event_time >= :start AND event_time < :end
-          {cursor_sql}
-        ORDER BY event_time, id
-        LIMIT :limit
-        """,
-        params,
+        tenant_id,
+        HistoryQuery(signal_id=signal_id, start=start, end=end, limit=limit, cursor=cursor, mode=mode,
+                     dataset_id=dataset_id, order="newest" if order == "newest" else "oldest"),
     )
-    next_cursor = None
-    if len(rows) > limit:
-        last = rows[limit - 1]
-        next_cursor = f"{last['event_time']}|{last['id']}"
-        rows = rows[:limit]
-    for row in rows:
-        row["value"] = None if row["value_json"] is None else row["value_json"].get("v")
-    return {"items": rows, "next_cursor": next_cursor, "downsampled": False}
 
 
 async def aggregate(
@@ -164,68 +66,10 @@ async def aggregate(
     bucket_ms: int,
     fn: str,
 ) -> dict[str, Any]:
-    if fn not in AGGREGATES:
-        raise AppError(422, "AGGREGATE", "Unsupported aggregate function.")
-    if bucket_ms < 1000 or bucket_ms > 86_400_000:
-        raise AppError(422, "BUCKET", "Bucket must be between 1 second and 1 day.")
-    if len(signal_ids) > 20:
-        raise AppError(422, "LIMIT", "At most 20 signals per aggregation query.")
-    if end <= start:
-        raise AppError(422, "RANGE", "Invalid time range.")
-
-    provider = get_history_provider() if isinstance(session, AsyncSession) else None
-    if provider is not None:
-        epoch = await _active_epoch(session, tenant_id)
-        td_buckets = await provider.aggregate(
-            tenant_id,
-            signal_ids=signal_ids,
-            start=start,
-            end=end,
-            bucket_ms=bucket_ms,
-            fn=fn,  # type: ignore[arg-type]
-            session=session,
-            active_epoch=epoch,
-        )
-        if td_buckets or epoch > 1:
-            return {
-                "fn": fn,
-                "bucket_ms": bucket_ms,
-                "buckets": [
-                    {
-                        "signal_id": b.signal_id,
-                        "bucket": b.bucket,
-                        "value": b.value,
-                        "good_count": b.good_count,
-                        "sample_count": b.sample_count,
-                    }
-                    for b in td_buckets
-                ],
-                "empty_buckets": "omitted",
-                "quality_policy": "GOOD_ONLY",
-            }
-
-    sql_fn = {"min": "min", "max": "max", "avg": "avg", "sum": "sum", "count": "count"}[fn]
-    value_expr = "count(*)" if fn == "count" else f"{sql_fn}((value_json->>'v')::double precision)"
-    rows = await fetch_all(
-        session,
-        f"""
-        SELECT signal_id,
-               to_timestamp(floor(extract(epoch FROM event_time) * 1000 / :bucket) * :bucket / 1000.0) AS bucket,
-               {value_expr} AS value,
-               count(*) FILTER (WHERE quality = 'GOOD') AS good_count,
-               count(*) AS sample_count
-        FROM observations
-        WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids)
-          AND event_time >= :start AND event_time < :end
-          AND value_type IN ('float64', 'int64')
-          AND quality = 'GOOD'
-          AND jsonb_typeof(value_json->'v') = 'number'
-        GROUP BY signal_id, bucket
-        ORDER BY signal_id, bucket
-        """,
-        {"tenant_id": tenant_id, "ids": signal_ids, "start": start, "end": end, "bucket": bucket_ms},
+    """Bucketed aggregates (``HistoryQueryService.aggregate``, R2-E C3)."""
+    return await history_query_service().aggregate(
+        session, tenant_id, signal_ids=signal_ids, start=start, end=end, bucket_ms=bucket_ms, fn=fn
     )
-    return {"fn": fn, "bucket_ms": bucket_ms, "buckets": rows, "empty_buckets": "omitted", "quality_policy": "GOOD_ONLY"}
 
 
 class _IngestRate:
@@ -283,8 +127,9 @@ async def _compute_observation_totals(
         )
         totals.update(td_metrics)
 
-    # Pre-S17 PG fallback ONLY when TDengine has no active-epoch observations and epoch == 1
-    if int(totals.get("observations") or 0) == 0 and active_epoch == 1:
+    # Pre-S17 PG fallback ONLY when TDengine has no active-epoch observations and epoch == 1, and only
+    # when the PostgreSQL observations fallback is enabled (R2-E C3).
+    if int(totals.get("observations") or 0) == 0 and active_epoch == 1 and pg_fallback_enabled():
         row = await fetch_one(
             session,
             """

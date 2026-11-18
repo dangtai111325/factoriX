@@ -4,14 +4,16 @@
  *
  * Signals come from the app store (already loaded, live quality); Data Model fields from
  * `GET /storage/sources?view=models` (one ~1 s call, cached for the session); recorded tables from
- * `GET /storage/td/subtables` (system op_* / ms_* tables are hidden: they are the raw store itself).
+ * `GET /historian/sources?kinds=subtable` (every bound table, grouped by the machine it records, R2-03), or on
+ * older servers `GET /storage/td/subtables` paged by 500 (system op_* / ms_* tables are hidden: they are the raw
+ * store itself). When that list is incomplete, a search also asks the server.
  * Search switches to a flat result list grouped by machine.
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Database, Layers, RefreshCw, Table2 } from 'lucide-react';
 import { useApp } from '../../store/AppContext';
 import { buildResourceTree, ResourceTreeNode, resourceTypeGlyph } from '../../components/tree/resourceTree';
-import { getSources, isSystemStorageName, listSubtables, ModelSourceGroup, SourceRef, TDSubtable } from '../../lib/storagePhysicalApi';
+import { getHistorianSources, getSources, isSystemStorageName, listRecordedSeries, listSubtables, ModelSourceGroup, RecordedSeriesItem, SourceRef, TDSubtable } from '../../lib/storagePhysicalApi';
 import { MAX_SERIES, SeriesKind } from './historianModel';
 import { SearchInput, Segmented } from './hsUi';
 
@@ -29,6 +31,34 @@ export interface PickItem {
   freshness?: string | null;
   group?: string;
   recorded?: boolean;
+  /** Recorded table: the series it records (`<signal uuid>` or `mod:<model>:<path>`) and its physical name. */
+  source?: string | null;
+  physical?: string;
+}
+
+interface TableRow {
+  token: string;
+  label: string;
+  physical: string;
+  stable?: string | null;
+  column?: string | null;
+  mode?: string | null;
+  status?: string | null;
+  resourceId: string | null;
+  source?: string | null;
+}
+
+function rowFromSubtable(t: TDSubtable, machineOf: (t: TDSubtable) => string | null): TableRow {
+  return {
+    token: `subtable:${t.database_name}.${t.physical_name}`,
+    label: t.display_name || t.physical_name,
+    physical: t.physical_name,
+    stable: t.stable_name,
+    mode: t.recording_mode,
+    status: t.status,
+    resourceId: machineOf(t),
+    source: null,
+  };
 }
 
 interface ModelGroup {
@@ -49,10 +79,73 @@ function loadModels(force = false): Promise<ModelSourceGroup[]> {
   });
   return promise;
 }
-let tablesCache: { at: number; promise: Promise<TDSubtable[]> } | null = null;
-function loadTables(force = false): Promise<TDSubtable[]> {
+interface TableList {
+  rows: TableRow[];
+  /** False when only part of the list could be loaded (older server, page cap): searches also ask the server. */
+  complete: boolean;
+  /** Subtables of the fallback path still need their machine resolved from tags. */
+  raw?: TDSubtable[];
+  /** Loaded from the H-R4.1 catalogue: the server search uses it too. */
+  recordedApi?: boolean;
+}
+let tablesCache: { at: number; promise: Promise<TableList> } | null = null;
+function rowFromRecorded(t: RecordedSeriesItem): TableRow {
+  return {
+    token: t.token,
+    label: t.label || t.subtable,
+    physical: t.subtable,
+    stable: t.stable,
+    column: t.column,
+    status: t.recording,
+    resourceId: t.machine?.id || null,
+    source: t.source || null,
+  };
+}
+
+async function fetchTables(): Promise<TableList> {
+  // 1) H-R4.1 recorded catalogue (paged, ≤ 500 per page; at most 10 pages, then the server search takes over)
+  try {
+    const rows: TableRow[] = [];
+    let more = true;
+    for (let page = 1; page <= 10 && more; page++) {
+      const res = await listRecordedSeries({ page, page_size: 500 });
+      rows.push(...(res.items || []).map(rowFromRecorded));
+      more = !!res.has_more;
+    }
+    return { rows, complete: !more, recordedApi: true };
+  } catch (err) {
+    const status = (err as { status?: number }).status;
+    if (status !== 404 && status !== 405) throw err;
+  }
+  // 2) H8 sources-by-machine (complete list, no paging)
+  try {
+    const res = await getHistorianSources({ kinds: ['subtable'] });
+    const rows: TableRow[] = [];
+    for (const g of res.items || []) {
+      const rid = g.resource?.id && g.resource.id !== 'unassigned' ? g.resource.id : null;
+      for (const t of g.subtables || [])
+        rows.push({ token: t.token, label: t.label || t.subtable, physical: t.subtable, column: t.column, status: t.recording, resourceId: rid, source: t.source || null });
+    }
+    return { rows, complete: true };
+  } catch (err) {
+    const status = (err as { status?: number }).status;
+    if (status !== 404 && status !== 405) throw err;
+  }
+  // Older Center: page through the subtable list (500 per page, at most 10 pages).
+  const raw: TDSubtable[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 10; page++) {
+    const res = await listSubtables({ limit: 500, cursor });
+    raw.push(...(res?.items || []));
+    cursor = res?.next_cursor || undefined;
+    if (!cursor) break;
+  }
+  const user = raw.filter((t) => !isSystemStorageName(t.physical_name) && !isSystemStorageName(t.stable_name));
+  return { rows: [], raw: user, complete: !cursor };
+}
+function loadTables(force = false): Promise<TableList> {
   if (!force && tablesCache && Date.now() - tablesCache.at < 120_000) return tablesCache.promise;
-  const promise = listSubtables().then((res) => (res?.items || []).filter((t) => !isSystemStorageName(t.physical_name) && !isSystemStorageName(t.stable_name)));
+  const promise = fetchTables();
   tablesCache = { at: Date.now(), promise };
   promise.catch(() => {
     tablesCache = null;
@@ -90,7 +183,10 @@ export const SeriesPicker: React.FC<{
   const [kind, setKind] = useState<KindFilter>('all');
   const [models, setModels] = useState<ModelSourceGroup[] | null>(null);
   const [modelsError, setModelsError] = useState<string | null>(null);
-  const [tables, setTables] = useState<TDSubtable[] | null>(null);
+  const [tables, setTables] = useState<TableList | null>(null);
+  const [tablesError, setTablesError] = useState<string | null>(null);
+  const [searchTables, setSearchTables] = useState<TDSubtable[]>([]);
+  const [searchRecorded, setSearchRecorded] = useState<TableRow[]>([]);
   const [expanded, setExpanded] = useState<Set<string> | null>(null);
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const [reloadKey, setReloadKey] = useState(0);
@@ -102,8 +198,16 @@ export const SeriesPicker: React.FC<{
       .then((m) => alive && setModels(m))
       .catch((e) => alive && setModelsError(e?.message || 'Could not load Data Model fields'));
     loadTables(reloadKey > 0)
-      .then((t) => alive && setTables(t))
-      .catch(() => alive && setTables([]));
+      .then((t) => {
+        if (!alive) return;
+        setTables(t);
+        setTablesError(null);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setTables({ rows: [], complete: true });
+        setTablesError(e?.message || 'Could not load the recorded tables');
+      });
     return () => {
       alive = false;
     };
@@ -161,26 +265,62 @@ export const SeriesPicker: React.FC<{
     });
   }, [models, dataModels, resById]);
 
-  const tableItems: PickItem[] = useMemo(
-    () =>
-      (tables || []).map((t) => {
-        const ref = (t.tag_values || []).find((tv) => /machine/.test(tv.name) && tv.value && resById.has(String(tv.value)));
-        return {
-          token: `subtable:${t.database_name}.${t.physical_name}`,
-          kind: 'subtable' as const,
-          label: t.display_name || t.physical_name,
-          name: t.display_name || t.physical_name,
-          sub: [t.stable_name, t.recording_mode ? t.recording_mode.toLowerCase().replace(/_/g, ' ') : ''].filter(Boolean).join(' · '),
-          unit: '',
-          valueType: '',
-          resourceId: ref ? String(ref.value) : null,
-          quality: t.status === 'ACTIVE' ? 'GOOD' : t.status,
-          freshness: null,
-          recorded: true,
-        };
-      }),
-    [tables, resById],
-  );
+  // Server-side search when the table list is incomplete (older server / page cap).
+  useEffect(() => {
+    const qq = query.trim();
+    if (!tables || tables.complete || qq.length < 2) {
+      setSearchTables([]);
+      setSearchRecorded([]);
+      return;
+    }
+    let alive = true;
+    const t = window.setTimeout(() => {
+      if (tables.recordedApi) {
+        listRecordedSeries({ q: qq, page_size: 200 })
+          .then((res) => alive && setSearchRecorded((res.items || []).map(rowFromRecorded)))
+          .catch(() => alive && setSearchRecorded([]));
+        return;
+      }
+      listSubtables({ search: qq, limit: 200 })
+        .then((res) => alive && setSearchTables((res?.items || []).filter((x) => !isSystemStorageName(x.physical_name) && !isSystemStorageName(x.stable_name))))
+        .catch(() => alive && setSearchTables([]));
+    }, 350);
+    return () => {
+      alive = false;
+      window.clearTimeout(t);
+    };
+  }, [query, tables]);
+
+  const tableItems: PickItem[] = useMemo(() => {
+    const machineOf = (t: TDSubtable) => {
+      const ref = (t.tag_values || []).find((tv) => /machine/.test(tv.name) && tv.value && resById.has(String(tv.value)));
+      return ref ? String(ref.value) : null;
+    };
+    const rows = new Map<string, TableRow>();
+    for (const r of [...(tables?.rows || []), ...searchRecorded]) rows.set(r.token, r);
+    for (const t of [...(tables?.raw || []), ...searchTables]) {
+      const r = rowFromSubtable(t, machineOf);
+      if (!rows.has(r.token)) rows.set(r.token, r);
+    }
+    return Array.from(rows.values())
+      .sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }))
+      .map((r) => ({
+        token: r.token,
+        kind: 'subtable' as const,
+        label: r.label,
+        name: r.label,
+        // the physical name is searchable even when a display name is shown (R2-03)
+        sub: [r.label !== r.physical ? r.physical : '', r.stable, r.column, r.mode ? r.mode.toLowerCase().replace(/_/g, ' ') : ''].filter(Boolean).join(' · '),
+        unit: '',
+        valueType: '',
+        resourceId: r.resourceId,
+        quality: !r.status || r.status === 'ACTIVE' ? 'GOOD' : r.status,
+        freshness: null,
+        recorded: true,
+        source: r.source ?? null,
+        physical: r.physical,
+      }));
+  }, [tables, searchTables, searchRecorded, resById]);
 
   const allItems = useMemo(() => [...signalItems, ...modelGroups.flatMap((g) => g.fields), ...tableItems], [signalItems, modelGroups, tableItems]);
   useEffect(() => {
@@ -463,7 +603,11 @@ export const SeriesPicker: React.FC<{
                 {openGroups.has('orphans-t') && orphanTables.map((t) => leaf(t, 1))}
               </div>
             )}
-            {kind === 'subtable' && tables && tableItems.length === 0 && (
+            {kindOk('subtable') && tablesError && <p className="px-3 py-3 text-[12px] text-red-700">{tablesError}</p>}
+            {kind === 'subtable' && tables && !tables.complete && (
+              <p className="px-3 py-2 text-[11px] text-[#657794]">Showing the first {tableItems.length.toLocaleString()} recorded tables; search to find others.</p>
+            )}
+            {kind === 'subtable' && tables && !tablesError && tableItems.length === 0 && (
               <p className="px-3 py-6 text-center text-[12px] text-[#657794] leading-relaxed">
                 No recorded tables yet. Create supertables and subtables in Storage Management to record Data Model fields; they appear here.
               </p>

@@ -26,7 +26,7 @@ import {
   useStreamStatus,
 } from '../lib/liveStream'
 import { CommissionResult, runConnectionTest } from '../lib/commissioning'
-import { normalizeQuality } from '../lib/format'
+import { displayFreshness, normalizeQuality, serverStaleAfterMs } from '../lib/format'
 import { endpointWithScheme } from '../lib/protocols'
 import { connectivityDelay, onConnectivityRestored, reportApiSuccess, useConnectivity } from '../lib/connectivity'
 
@@ -92,6 +92,8 @@ interface AppContextType {
    * background failure keeps 'ready' (data stays visible) and only sets `loadError`.
    */
   loadState: LoadState
+  /** True once the first latest-values read finished (R2-18: counts are not shown before that). */
+  latestValuesLoaded: boolean
   loadError: string | null
   /** Re-run the metadata load (Retry button). */
   retryLoad: () => Promise<void>
@@ -375,6 +377,7 @@ function mapSignal(row: Record<string, unknown>, connectionName: Map<string, str
     topic: text(addressJson?.topic || addressJson?.path || addressJson?.node_id) || undefined,
     address: addressJson?.jsonpath ? text(addressJson.jsonpath) : summary || undefined,
     expectedIntervalMs: row.expected_interval_ms != null ? Number(row.expected_interval_ms) : undefined,
+    staleAfterMs: optNumber(row.stale_after_ms),
     sampleIntervalMs: Number(row.expected_interval_ms || 1000),
     currentValue: '—',
     value: null,
@@ -402,6 +405,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [searchQuery, setSearchQuery] = useState('')
   const [collectorLabel, setCollectorLabel] = useState('Collector: not enrolled')
   const [loadState, setLoadState] = useState<LoadState>('loading')
+  const [latestValuesLoaded, setLatestValuesLoaded] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const loadedOnceRef = useRef(false)
   const streamStatus = useStreamStatus()
@@ -493,6 +497,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     }
     if (changed) scheduleLiveFlush()
+    setLatestValuesLoaded(true)
   }, [applyLive, scheduleLiveFlush])
 
   const resources = useMemo(
@@ -567,7 +572,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       // NOT flip GOOD to STALE by its own clock any more (that turned every pipeline delay into
       // "Stale" and blanked the value). Safety net only: when neither push nor polling produced a
       // verdict for threshold + 15 s, the value is marked stale.
-      const staleAfter = live.staleAfterMs || Math.max(2 * (meta.expectedIntervalMs || 1000), 12000)
+      const staleAfter = serverStaleAfterMs(live.staleAfterMs, meta.staleAfterMs)
       const acquiredTime = live.lastAcquiredAt || live.receivedTime
       const approxNow = now + serverOffsetMsRef.current
       const evaluatedTs = timeOf(live.evaluatedAt || '') || timeOf(acquiredTime)
@@ -575,7 +580,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const verdictExpired = !pushedLive && evaluatedTs > 0 && approxNow - evaluatedTs > staleAfter + CLIENT_SAFETY_MARGIN_MS
       const becameStale = live.quality === 'GOOD' && verdictExpired
       const quality = becameStale ? 'STALE' : live.quality
-      const freshness = becameStale ? 'STALE' : live.freshness
+      const freshness = becameStale ? 'STALE' : displayFreshness(live.freshness, live.quality, acquiredTime, staleAfter)
       const reasonCode = becameStale ? 'NO_FRESH_ACQUISITION' : live.reasonCode || undefined
       return {
         ...meta,
@@ -1204,6 +1209,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const value: AppContextType = {
     loadState,
+    latestValuesLoaded,
     loadError,
     retryLoad,
     revertToZero,

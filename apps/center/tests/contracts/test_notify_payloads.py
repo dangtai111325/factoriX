@@ -34,7 +34,8 @@ CHANNELS = {
     "factorix_config_changed": ({"fleet", "storage_designs", "telemetry_reset", "connections"}, {"config_provider", "catalog"}),
     "factorix_epoch_changed": ({"telemetry_reset"}, {"config_provider", "catalog", "notify_bridge"}),
     "factorix_stream_events": ({"notify"}, {"notify_bridge"}),
-    "factorix_health_changed": ({"pg_control", "notify"}, {"notify_bridge"}),
+    # R2-E C2: acquisition's health push is written by HealthService (single writer of connections.health).
+    "factorix_health_changed": ({"health_service", "notify"}, {"notify_bridge"}),
     "factorix_commissioning": ({"commissioning"}, {"config_provider"}),
 }
 
@@ -130,9 +131,14 @@ def test_v2_latest_ids_payload_shape_and_chunking() -> None:
 
 def test_v2_payload_is_routed_by_the_bridge_and_not_by_the_v1_parser() -> None:
     from factorix.transport import app as A
+    from factorix_core.contracts.notify import LatestIdsV2, StreamEventsV1, parse_stream_events
 
     payload = IW._latest_ids_payloads(UUID(TENANT), [str(uuid4())], [str(uuid4())], NOW)[0]
-    assert '"signal_ids"' in payload  # the bridge sniffs this substring today (CT-04)
+    # CT-04 fixed: classified by its v / kind markers, not by a substring.
+    assert isinstance(parse_stream_events(payload), LatestIdsV2)
+    assert isinstance(parse_stream_events(json.dumps({"events": [_latest_event(1)]})), StreamEventsV1)
+    assert parse_stream_events(json.dumps({"v": 3, "kind": "latest_ids", "tenant_id": TENANT, "signal_ids": []})) is None
+    assert parse_stream_events(json.dumps({"events": [], "note": '"signal_ids"'})) == StreamEventsV1(())
     tenant, ids = A._parse_latest_ids(payload)
     assert tenant == TENANT and len(ids) == 1
     assert parse_pg_notify_events("factorix_stream_events", payload) == []
@@ -144,12 +150,11 @@ def test_v2_payload_is_routed_by_the_bridge_and_not_by_the_v1_parser() -> None:
 def test_health_payload_shapes_are_identical_for_all_producers() -> None:
     cid = uuid4()
     center = connection_health_payload(connection_id=cid, health="DEGRADED", effective_health="DEGRADED", last_error="x", last_success_at=NOW)
-    # pg_control builds the same dict inline (acquisition must not import telemetry); keep the key set in sync.
-    src = (ACQ_SRC / "pg_control.py").read_text(encoding="utf-8")
-    block = src[src.index('payload = {\n                        "type": "health"'):]
-    block = block[: block.index("}\n") + 1]
-    acq_keys = set(re.findall(r'"([a-z_]+)":', block))
-    assert acq_keys == set(center)
+    # R2-E C2: every producer (acquisition report, sweep, Edge, sample evidence) builds it with
+    # HealthService.health_payload.
+    from factorix.application.health.health_service import health_payload
+
+    assert health_payload(connection_id=cid, health="DEGRADED", effective_health="DEGRADED", last_error="x", last_success_at=NOW) == center
     wire = json.dumps({"tenant_id": TENANT, "event": center})
     (event,) = parse_pg_notify_events("factorix_health_changed", wire)
     assert event == {"kind": "health", "tenant_id": TENANT, "payload": center}
@@ -177,13 +182,18 @@ def test_parser_ignores_malformed_payloads(payload: str) -> None:
 def test_ingestion_accepts_every_config_and_epoch_payload(channel: str, payload: str, expect_tid: str | None, expect_epoch: bool) -> None:
     calls: list[tuple[Any, bool]] = []
     cleared: list[Any] = []
-    stub = SimpleNamespace(
-        invalidate_tenant_cache=lambda tid, epoch_changed=False: calls.append((tid, epoch_changed)),
-        recent_uids=SimpleNamespace(clear_tenant=cleared.append),
-    )
+    epochs: list[Any] = []
+
+    def _invalidate(tid: Any, epoch_changed: bool = False, new_epoch: Any = None) -> None:
+        calls.append((tid, epoch_changed))
+        epochs.append(new_epoch)
+
+    stub = SimpleNamespace(invalidate_tenant_cache=_invalidate, recent_uids=SimpleNamespace(clear_tenant=cleared.append))
     IW.IngestionWorker._on_pg_notify(stub, None, 0, channel, payload)  # type: ignore[arg-type]
     assert calls == [(UUID(expect_tid) if expect_tid else None, expect_epoch)]
     assert cleared == ([UUID(expect_tid)] if expect_epoch and expect_tid else [])
+    # CT-06 fixed: the ingestion live provider is fenced at the payload's epoch (was cached + 1).
+    assert epochs == [2 if expect_epoch else None]
 
 
 async def test_collect_config_changed_payload() -> None:
@@ -217,7 +227,6 @@ def live_provider():
         configure_live_state_provider(previous)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="CT-02: _seed_live_cache treats a missing quality as GOOD (and as last good value)")
 def test_seed_live_cache_missing_quality_is_not_good(live_provider: TDengineLiveStateProvider) -> None:
     from factorix.transport import app as A
 
@@ -227,6 +236,7 @@ def test_seed_live_cache_missing_quality_is_not_good(live_provider: TDengineLive
     entry = live_provider.get_entry(UUID(TENANT), UUID(ev["signal_id"]))
     assert entry is not None
     assert entry.record.raw_quality != "GOOD"
+    assert entry.record.last_good_value is None  # CT-02 fixed: not recorded as last good either
 
 
 def test_seed_live_cache_from_v1_event(live_provider: TDengineLiveStateProvider) -> None:
@@ -238,7 +248,6 @@ def test_seed_live_cache_from_v1_event(live_provider: TDengineLiveStateProvider)
     assert entry is not None and entry.record.value == 1.0 and entry.record.last_acquired_at == NOW
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="CT-03: v2 latest_ids path only dispatches to sockets; the API live cache is not refreshed")
 async def test_v2_latest_ids_seeds_live_cache(live_provider: TDengineLiveStateProvider, monkeypatch: pytest.MonkeyPatch) -> None:
     from factorix.transport import app as A
 
@@ -260,3 +269,61 @@ async def test_v2_latest_ids_seeds_live_cache(live_provider: TDengineLiveStatePr
     await A._dispatch_latest_ids(TENANT, [str(sid)])
     assert dispatched, "push path itself must work"
     assert live_provider.get_entry(UUID(TENANT), sid) is not None
+
+
+# ---------------------------------------------------------------------------- v2 is the default (R2-E C6)
+
+
+def test_v2_is_the_default_notify_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FACTORIX_NOTIFY_FORMAT", raising=False)
+    assert IW.PgIngestionStore("postgresql://x:y@localhost:1/db").notify_format == "v2"
+    monkeypatch.setenv("FACTORIX_NOTIFY_FORMAT", "v1")  # kill switch
+    assert IW.PgIngestionStore("postgresql://x:y@localhost:1/db").notify_format == "v1"
+
+
+def test_every_channel_literal_is_in_the_registry() -> None:
+    """The typed registry (``factorix_core.contracts.notify.Channel``) is the documented channel set."""
+    from factorix_core.contracts.notify import CHANNELS as REGISTRY
+
+    produced, listened = _scan()
+    assert set(produced) | set(listened) <= REGISTRY
+    assert REGISTRY == set(CHANNELS)
+
+
+async def test_v2_bridge_feeds_every_v1_consumer(live_provider: TDengineLiveStateProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every consumer of ``factorix_stream_events`` gets from v2 what it got from v1: the API live cache
+    (model engine / Data Models), the delivery evidence (DELAYED vs STALE) and the socket push."""
+    from factorix.modules.live_state import PipelineEvidence
+    from factorix.transport import app as A
+    from factorix.transport.background import notify_bridge as NB
+
+    sid, conn_id = uuid4(), str(uuid4())
+    row = {"signal_id": sid, "resource_id": uuid4(), "value": 3.0, "value_json": {"v": 3.0}, "raw_quality": "GOOD",
+           "quality": "GOOD", "effective_status": "GOOD", "reason_code": "OK", "received_time": "2026-11-18T05:00:00.000Z",
+           "source_time": None, "last_acquired_at": "2026-11-18T05:00:00.000Z", "data_epoch": 1, "connection_id": conn_id,
+           "freshness": "FRESH", "stale_after_ms": 12000}
+
+    @asynccontextmanager
+    async def fake_session():
+        yield None
+
+    async def fake_latest_states(_session: Any, _tid: Any, _ids: Any) -> list[dict[str, Any]]:
+        return [row]
+
+    evidence = PipelineEvidence()
+    monkeypatch.setattr(NB, "get_pipeline_evidence", lambda: evidence)
+    monkeypatch.setattr(A, "session_factory", lambda: fake_session)
+    monkeypatch.setattr(A.telemetry, "latest_states", fake_latest_states)
+    dispatched: list[Any] = []
+    monkeypatch.setattr(A.hub, "dispatch", dispatched.append)
+
+    payload = IW._latest_ids_payloads(UUID(TENANT), [str(sid)], [conn_id], NOW)[0]
+    request = A._parse_latest_ids(payload)
+    assert request is not None
+    assert evidence.delivered[conn_id] == NOW  # delivery evidence from the v2 head
+    await A._dispatch_latest_ids(*request)
+    (events,) = dispatched
+    (event,) = events
+    assert event["kind"] == "latest" and event["payload"]["value"] == 3.0 and event["payload"]["signal_id"] == str(sid)
+    entry = live_provider.get_entry(UUID(TENANT), sid)
+    assert entry is not None and entry.record.value == 3.0 and not entry.restored_unverified  # model engine input

@@ -27,6 +27,8 @@ import {
   listStables,
   planStorageObject,
 } from '../../../lib/storagePhysicalApi';
+import { useApp } from '../../../store/AppContext';
+import { ResourceRefValue } from '../objectViews';
 
 // ============================================================================
 // Types & helpers
@@ -287,9 +289,36 @@ function factoryChoices(groups: ModelSourceGroup[]): FactoryRef[] {
 // Step 2: Tag values
 // ============================================================================
 
+/** Resource types a reference tag usually points at, from its name (machine_ref → machine, line_ref → line…). */
+function refTypesFor(tagName: string): string[] {
+  const n = tagName.toLowerCase();
+  if (n.startsWith('machine') || n.startsWith('resource') || n.startsWith('equipment')) return ['machine', 'equipment', 'cell'];
+  if (n.startsWith('line')) return ['line'];
+  if (n.startsWith('zone') || n.startsWith('area')) return ['zone', 'area'];
+  if (n.startsWith('site') || n.startsWith('plant')) return ['site', 'plant'];
+  return [];
+}
+
 export const SubtableTagValuesStep: React.FC<SubtableStepProps> = ({ data, onChange, errors = {}, parentStable }) => {
-  const { groups, loading } = useModelGroups();
-  const choices = useMemo(() => factoryChoices(groups), [groups]);
+  const { groups } = useModelGroups();
+  const { resources, refresh, loadState } = useApp();
+  const [refreshing, setRefreshing] = useState(false);
+  // The whole Factory Model (live store, so resources created a minute ago are there — R2-19), plus any
+  // resource the Data Models know that the store has not loaded.
+  const choices = useMemo(() => {
+    const m = new Map<string, FactoryRef>();
+    for (const r of resources) m.set(r.id, { id: r.id, name: r.name, code: r.code, type_key: String(r.type || '') });
+    for (const c of factoryChoices(groups)) if (!m.has(c.id)) m.set(c.id, c);
+    return [...m.values()].sort((a, b) => a.type_key.localeCompare(b.type_key) || a.name.localeCompare(b.name, undefined, { numeric: true }));
+  }, [resources, groups]);
+  const lastRefresh = React.useRef(0);
+  const reloadResources = () => {
+    // At most every 30 s: the store reload is not free on a busy appliance.
+    if (refreshing || Date.now() - lastRefresh.current < 30_000) return;
+    lastRefresh.current = Date.now();
+    setRefreshing(true);
+    void refresh().finally(() => setRefreshing(false));
+  };
   const tags = parentStable?.tags || [];
 
   const setValue = (name: string, value: string) => {
@@ -313,19 +342,38 @@ export const SubtableTagValuesStep: React.FC<SubtableStepProps> = ({ data, onCha
           const value = data.tag_values.find((tv) => tv.tag_name === t.name)?.value || '';
           const isRef = /(_ref|_id)$/.test(t.name);
           const picked = choices.find((c) => c.id === value);
+          const wanted = refTypesFor(t.name);
+          const suggested = wanted.length ? choices.filter((c) => wanted.includes(c.type_key.toLowerCase())) : [];
+          const others = choices.filter((c) => !suggested.includes(c));
+          const label = (c: FactoryRef) => `${c.name}${c.code && c.code !== c.name ? ` (${c.code})` : ''} · ${c.type_key}`;
           return (
             <Field key={t.name} label={`${t.name} (${t.td_type}${t.length ? `(${t.length})` : ''})`}
-              hint={picked ? `${picked.name} · ${picked.type_key}${picked.code ? ` · ${picked.code}` : ''}` : isRef ? 'Pick a Factory Model resource or paste its id.' : undefined}>
-              <div className="flex gap-2">
-                <input type="text" value={value} onChange={(e) => setValue(t.name, e.target.value)} className={`${inputCls} font-mono`} />
-                {isRef && (
-                  <select aria-label={`Pick ${t.name} from Factory Model`} value="" onChange={(e) => e.target.value && setValue(t.name, e.target.value)}
-                    className="h-9 px-2 rounded-lg border border-[#D4DFEC] text-[12px] bg-white max-w-[240px]">
-                    <option value="">{loading ? 'Loading…' : 'Pick from Factory Model…'}</option>
-                    {choices.map((c) => (
-                      <option key={c.id} value={c.id}>{c.type_key} · {c.name}</option>
-                    ))}
-                  </select>
+              hint={picked ? `${picked.name}${picked.code ? ` · ${picked.code}` : ''} · ${picked.type_key} · id ${picked.id}` : isRef && value ? 'This id is not in the Factory Model.' : isRef ? 'Pick a Factory Model resource, or paste its id.' : undefined}>
+              <div className="flex flex-wrap gap-2">
+                {isRef ? (
+                  <>
+                    <select
+                      aria-label={`Pick ${t.name} from Factory Model`}
+                      value={picked ? picked.id : ''}
+                      onFocus={reloadResources}
+                      onChange={(e) => setValue(t.name, e.target.value)}
+                      className={`${inputCls} flex-1 min-w-[220px]`}
+                    >
+                      <option value="">{loadState !== 'ready' || refreshing ? 'Loading the Factory Model…' : 'Pick from Factory Model…'}</option>
+                      {suggested.length > 0 && (
+                        <optgroup label={`Suggested (${wanted.join(' / ')})`}>
+                          {suggested.map((c) => <option key={c.id} value={c.id}>{label(c)}</option>)}
+                        </optgroup>
+                      )}
+                      <optgroup label={suggested.length ? 'Other resources' : 'Resources'}>
+                        {others.map((c) => <option key={c.id} value={c.id}>{label(c)}</option>)}
+                      </optgroup>
+                    </select>
+                    <input type="text" value={value} onChange={(e) => setValue(t.name, e.target.value.trim())} placeholder="or paste an id"
+                      aria-label={`${t.name} id`} className={`${inputCls} font-mono w-[300px] max-w-full text-[12px]`} />
+                  </>
+                ) : (
+                  <input type="text" value={value} onChange={(e) => setValue(t.name, e.target.value)} className={`${inputCls} font-mono`} />
                 )}
               </div>
             </Field>
@@ -613,6 +661,17 @@ export const SubtableReviewStep: React.FC<SubtableStepProps> = ({ data, onChange
             <div className="p-3 rounded-xl border border-[#E3EAF3] bg-white"><div className="text-[#657794]">Recording</div><div className="text-[#111B37]">{plan.recording?.mode || data.recording_mode} · {plan.recording?.start_recording ? 'starts after creation' : 'off until started'}</div></div>
             <div className="p-3 rounded-xl border border-[#E3EAF3] bg-white"><div className="text-[#657794]">Bindings</div><div className="text-[#111B37]">{(plan.bindings || []).length || (data.no_binding ? 'none (explicit)' : '0')}</div></div>
           </div>
+          {data.tag_values.length > 0 && (
+            <div className="p-3 rounded-xl border border-[#E3EAF3] bg-white text-[12px] space-y-1.5">
+              <div className="text-[#657794]">Tag values</div>
+              {data.tag_values.map((tv) => (
+                <div key={tv.tag_name} className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono font-semibold text-[#111B37] w-28 shrink-0">{tv.tag_name}</span>
+                  {/(_ref|_id)$/.test(tv.tag_name) ? <ResourceRefValue value={tv.value} /> : <span className="font-mono break-all">{tv.value || '—'}</span>}
+                </div>
+              ))}
+            </div>
+          )}
           {(plan.bindings || []).length > 0 && (
             <table className="w-full text-[12px] border border-[#E3EAF3] rounded-xl bg-white">
               <thead><tr className="text-left text-[#657794] bg-[#F6F8FC]"><th className="p-2">Kind</th><th>Model</th><th>Field path</th><th>Column</th></tr></thead>

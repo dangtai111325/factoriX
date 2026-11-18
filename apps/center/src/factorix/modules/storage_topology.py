@@ -16,13 +16,18 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from factorix_core.tdengine.sql import IDENT_RE
+from factorix_core.tdengine.naming import TENANT_DB_RE
+
+from factorix.modules.storage_dsl import tenant_td_database
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Identifier validation — mirrors platform/tdengine.py rules
 # ---------------------------------------------------------------------------
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-_TENANT_DB_RE = re.compile(r"^fx_t_[0-9a-f]{32}$")
+_IDENT_RE = IDENT_RE  # B-18: the shared kernel pattern (same object)
+_TENANT_DB_RE = TENANT_DB_RE  # R2-E B7: shared kernel (factorix_core.tdengine.naming), same pattern
 _SYSTEM_DBS = frozenset({"information_schema", "performance_schema", "log"})
 
 
@@ -225,7 +230,7 @@ class StorageTopologyInspector:
                 continue
             is_tenant = bool(_TENANT_DB_RE.fullmatch(name))
             if tenant_id is not None:
-                expected = f"fx_t_{UUID(str(tenant_id)).hex}"
+                expected = tenant_td_database(tenant_id)
                 if name != expected and name not in allowed_extra:
                     continue
             _safe_ident(name)
@@ -737,13 +742,15 @@ class StorageTopologyInspector:
             is_tag = "TAG" in note
             is_ts = ctype.upper() == "TIMESTAMP" and not is_tag and not cols
             role = "time_key" if is_ts else ("tag" if is_tag else "value")
+            is_key = ("COMPOSITE" in note or "PRIMARY" in note) and not is_tag
             ci = ColumnInfo(
                 name=cname,
                 td_type=ctype,
                 length=clength,
                 role=role,
-                nullable=not is_ts,
-                primary_key=("COMPOSITE" in note or "PRIMARY" in note) and not is_tag,
+                # TDengine: only the first timestamp and the composite key are NOT NULL (R2-13).
+                nullable=not (is_ts or is_key),
+                primary_key=is_key,
             )
             if is_tag:
                 tags.append(ci)

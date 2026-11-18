@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from typing import Any
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import collect
+from factorix.application.health.health_service import collector_report_state
+from factorix.application.live.freshness_service import FreshnessService
 from factorix.modules.live_state import get_pipeline_evidence
 from factorix.modules.collect import EdgeIn, EdgePatch, ReleaseIn
 from factorix.domain.health import edge_config_state, effective_edge_health, heartbeat_fresh
@@ -28,6 +31,16 @@ router = RouteTable()
 async def create_edge(body: EdgeIn, request: Request, principal: dict[str, Any] = Depends(admin), session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     tenant_id, actor = _ids(principal)
     return await collect.create_edge(session, tenant_id, actor, body, correlation_id(request))
+
+
+def _runtime_info(queues: Any) -> dict[str, Any]:
+    if isinstance(queues, str):
+        try:
+            queues = json.loads(queues)
+        except ValueError:
+            return {}
+    info = queues.get("runtime") if isinstance(queues, dict) else None
+    return info if isinstance(info, dict) else {}
 
 
 def _normalize_edge(row: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
@@ -56,7 +69,7 @@ async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSessio
             session,
             """
             SELECT instance_id, role, health, software_version, config_revision,
-                   spool_pending, fast_buffered, broker_ok, last_heartbeat, diagnostic
+                   spool_pending, fast_buffered, broker_ok, last_heartbeat, diagnostic, queues_json
             FROM collector_runtime_status
             WHERE role = 'acquisition'
             ORDER BY last_heartbeat DESC NULLS LAST
@@ -69,6 +82,15 @@ async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSessio
             pipeline = get_pipeline_evidence().pipeline_summary(now)
             lags = [int(v["delivery_lag_ms"]) for v in pipeline.values() if v.get("delivery_lag_ms") is not None]
             max_lag_ms = max(lags) if lags else None
+            # R2-02: a delivery stall (source read normally, values late in the pipeline) degrades the
+            # collector status honestly instead of "online" while every signal is DELAYED.
+            delayed = FreshnessService(get_pipeline_evidence()).delayed_connections(now)
+            delayed_note = (
+                f"Data delayed {max(delayed.values()) // 1000} s: {len(delayed)} "
+                f"{'connection is' if len(delayed) == 1 else 'connections are'} read normally, but values reach the appliance late."
+                if delayed
+                else None
+            )
             for r in run_status:
                 last_hb = r.get("last_heartbeat")
                 # One liveness rule for every surface (domain.health.heartbeat_fresh, 15 s); was 30 s here.
@@ -76,7 +98,12 @@ async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSessio
                 raw = str(r.get("health") or "HEALTHY").upper()
                 # R1-03: a collector that reports itself DEGRADED (jobs not running, broker down, ...)
                 # is not shown as a green "online".
-                effective = "OFFLINE" if not is_fresh else ("DEGRADED" if raw == "DEGRADED" else "ONLINE")
+                report = collector_report_state(last_hb, _runtime_info(r.get("queues_json")), now)
+                effective = (
+                    "OFFLINE"
+                    if not is_fresh
+                    else ("DEGRADED" if raw == "DEGRADED" or delayed or report.state == "REPORT_LATE" else "ONLINE")
+                )
                 items.append({
                     "id": str(r["instance_id"]),
                     "name": "Data Collector (Acquisition Runtime)",
@@ -88,7 +115,12 @@ async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSessio
                     "health": "ONLINE" if is_fresh else "OFFLINE",
                     "effective_health": effective,
                     "health_raw": str(r.get("health") or "HEALTHY"),
-                    "diagnostic": r.get("diagnostic"),
+                    "diagnostic": (report.diagnostic() if is_fresh and report.state == "REPORT_LATE" else None)
+                    or r.get("diagnostic")
+                    or (delayed_note if is_fresh else None),
+                    # P6: REPORTING | REPORT_LATE | NOT_REPORTING (additive; the UI shows "not reporting").
+                    "report_state": report.state,
+                    "delayed_connections": len(delayed),
                     # Age of the newest data Center received, worst connection (DELAYED vs fresh).
                     "delivery_lag_ms": max_lag_ms,
                     "software_version": str(r.get("software_version") or "1.0.0"),

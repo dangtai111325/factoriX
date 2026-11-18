@@ -43,7 +43,11 @@ def test_connection_rows_are_locked_in_id_order_and_after_model_composition() ->
     # Data Model v2: ingest no longer composes models (the engine samples on its own schedule).
     assert "_notify_models" not in ingest and "on_signals_changed" not in inspect.getsource(telemetry)
     assert "_mark_connections_live(" in ingest
-    assert "ORDER BY id\n            FOR UPDATE" in inspect.getsource(telemetry._mark_connections_live).replace("\r\n", "\n")
+    # R2-E C2: the locking UPDATE moved into HealthService (single writer of connections.health).
+    from factorix.application.health import health_service as HS
+
+    assert "note_samples(" in inspect.getsource(telemetry._mark_connections_live)
+    assert "ORDER BY id\n            FOR UPDATE" in inspect.getsource(HS.note_samples).replace("\r\n", "\n")
     assert "ORDER BY id\n        FOR UPDATE" in inspect.getsource(edge_sync._apply_connection_reports).replace("\r\n", "\n")
     store = inspect.getsource(telemetry._store_batch)
     assert "sorted(newest_per_signal(new_rows).values(), key=lambda row: str(row[1].signal_id))" in store

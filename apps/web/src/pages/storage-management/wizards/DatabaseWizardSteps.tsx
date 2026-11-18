@@ -215,7 +215,7 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
                   retention_days: e.target.value === '' ? null : e.target.valueAsNumber,
                 })
               }
-              placeholder="Default: 3650 days"
+              placeholder="Default: 3650 days (about 10 years)"
               className={`w-full h-9 px-3 rounded-lg border text-[13px] transition-colors focus:outline-none focus:ring-2 ${
                 errors.retention_days
                   ? 'border-[#EF1B24] focus:ring-red-100'
@@ -230,7 +230,7 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
             </p>
           ) : (
             <p className="text-[11px] text-[#657794] mt-1">
-              Corresponds to TDengine <code className="font-mono text-[#334568]">KEEP</code> option. Minimum 30 days (KEEP &gt;= 3 x DURATION). Data older than this threshold will be pruned automatically.
+              Corresponds to TDengine <code className="font-mono text-[#334568]">KEEP</code> option. Minimum 30 days (KEEP &gt;= 3 x DURATION). Data older than this is pruned automatically. Empty = 3650 days.
             </p>
           )}
         </div>
@@ -304,9 +304,8 @@ export function generateDatabaseDDL(data: DatabaseWizardData): string {
   if (data.precision) {
     parts.push(`PRECISION '${data.precision}'`);
   }
-  if (data.retention_days != null && data.retention_days > 0) {
-    parts.push(`KEEP ${data.retention_days}`);
-  }
+  // The backend default KEEP is 3650 days (storage_revisions._database_spec), so the preview says so too (R2-22).
+  parts.push(`KEEP ${data.retention_days != null && data.retention_days > 0 ? data.retention_days : 3650}d`);
   if (data.vgroups != null && data.vgroups > 0) {
     parts.push(`VGROUPS ${data.vgroups}`);
   }
@@ -429,7 +428,7 @@ export const DatabaseReviewStep: React.FC<StepProps> = ({ data, onChange, errors
           <div className="flex px-4 py-2.5">
             <span className="w-48 font-medium text-[#657794]">Data Retention</span>
             <span className="text-[#111B37]">
-              {data.retention_days ? `${data.retention_days} days` : 'Unlimited (Default KEEP)'}
+              {data.retention_days ? `${data.retention_days} days` : '3650 days (default)'}
             </span>
           </div>
           <div className="flex px-4 py-2.5">

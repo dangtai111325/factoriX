@@ -13,7 +13,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factorix.domain.signal_state import evaluate_signal_state
+from factorix.application.live.freshness_service import FreshnessService, freshness_service
+from factorix.domain.signal_state import evaluate_signal_state  # noqa: F401 - re-exported by modules.telemetry
 from factorix.modules.live_state import (
     compute_health_dimensions,
     extract_runtime_health,
@@ -65,6 +66,9 @@ def select_binding(rows: list[dict[str, Any]], moment: datetime) -> dict[str, An
     return None
 
 
+_NO_EVIDENCE = FreshnessService(use_evidence=False)
+
+
 def latest_stream_payload(
     *,
     signal_id: Any,
@@ -81,16 +85,26 @@ def latest_stream_payload(
     last_acquired_at: datetime | None = None,
     last_value_changed_at: datetime | None = None,
     health_dimensions: Mapping[str, str] | None = None,
+    job_interval_ms: int | None = None,
+    freshness: FreshnessService | None = None,
 ) -> dict[str, Any]:
-    """Push message for ``/stream`` subscribers, evaluated with the canonical signal-state rules."""
+    """Push message for ``/stream`` subscribers, evaluated by ``FreshnessService``.
+
+    Without ``freshness`` the payload is evaluated with intervals only (signal interval, falling back
+    to the job interval): ingestion has no pipeline evidence, so it cannot tell DELAYED from STALE.
+    The API re-evaluates every pushed message at dispatch (``FreshnessService.refresh_message``).
+    """
     acq = last_acquired_at or received_time
-    state = evaluate_signal_state(
+    service = freshness or _NO_EVIDENCE
+    state = service.evaluate(
+        signal_id=signal_id,
         has_observation=True,
         raw_quality=quality,
         raw_value=value,
         event_time=received_time,
         last_acquired_at=acq,
         expected_interval_ms=expected_interval_ms,
+        job_interval_ms=job_interval_ms,
         raw_reason_code=reason,
         null_allowed=null_allowed,
         now=now,
@@ -151,6 +165,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                nb.connection_id AS nb_connection_id,
                nb.connection_health AS nb_connection_health,
                nb.connection_status AS nb_connection_status,
+               nb.job_interval_ms AS nb_job_interval_ms,
                COALESCE(nb.binding_enabled, TRUE) AS nb_binding_enabled,
                s.status AS nb_signal_status
         FROM latest_signal_state l
@@ -160,7 +175,8 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                    b.enabled AS binding_enabled,
                    c.id AS connection_id,
                    c.health AS connection_health,
-                   c.status AS connection_status
+                   c.status AS connection_status,
+                   j.interval_ms AS job_interval_ms
             FROM signal_bindings b
             JOIN source_fields f ON f.id = b.source_field_id
             LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
@@ -224,14 +240,16 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                                    s.expected_interval_ms, s.status AS signal_status,
                                    COALESCE(nb.nullable, FALSE) AS nullable,
                                    COALESCE(nb.binding_enabled, FALSE) AS binding_enabled,
-                                   nb.connection_id, nb.connection_health, nb.connection_status
+                                   nb.connection_id, nb.connection_health, nb.connection_status,
+                                   nb.job_interval_ms
                             FROM signal_definitions s
                             LEFT JOIN LATERAL (
                                 SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable,
                                        b.enabled AS binding_enabled,
                                        c.id AS connection_id,
                                        c.health AS connection_health,
-                                       c.status AS connection_status
+                                       c.status AS connection_status,
+                                       j.interval_ms AS job_interval_ms
                                 FROM signal_bindings b
                                 JOIN source_fields f ON f.id = b.source_field_id
                                 LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
@@ -272,6 +290,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
         nb_conn_health = row.pop("nb_connection_health", None)
         nb_conn_status = row.pop("nb_connection_status", None)
         nb_conn_id = row.pop("nb_connection_id", None)
+        nb_job_interval = row.pop("nb_job_interval_ms", None)
         nb_binding_enabled = bool(row.pop("nb_binding_enabled", True))
         nb_signal_status = str(row.pop("nb_signal_status", "ACTIVE") or "ACTIVE")
         raw_reason = row.pop("raw_reason", None)
@@ -315,6 +334,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                 storage_ok=storage_ok,
                 now=now,
                 connection_id=nb_conn_id,
+                job_interval_ms=nb_job_interval,
             )
             rec = evaluated.record
             eval_result = evaluated.evaluation
@@ -344,13 +364,17 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                 last_good_val = row["last_good_value_json"].get("v")
             reason_code_in = row.get("reason_code") or raw_reason
             last_acq = row.get("last_acquired_at") or row.get("received_time")
-            eval_result = evaluate_signal_state(
+            eval_result = freshness_service().evaluate(
+                signal_id=sid,
                 has_observation=True,
                 raw_quality=row.get("quality"),
                 raw_value=val,
                 event_time=row.get("event_time"),
                 last_acquired_at=last_acq,
                 expected_interval_ms=row.get("expected_interval_ms"),
+                job_interval_ms=nb_job_interval,
+                connection_id=nb_conn_id,
+                connection_health=nb_conn_health,
                 last_good_value=last_good_val,
                 last_good_time=row.get("last_good_event_time"),
                 raw_reason_code=reason_code_in,
@@ -423,6 +447,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                 storage_ok=storage_ok,
                 now=now,
                 connection_id=meta.get("connection_id"),
+                job_interval_ms=meta.get("job_interval_ms"),
             )
             rec = evaluated.record
             if rec is None:

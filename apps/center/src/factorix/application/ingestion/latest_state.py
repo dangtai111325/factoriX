@@ -6,15 +6,14 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 import json
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import asyncpg
 
 from factorix.domain.canonical import intern_uuid
-from factorix.domain.health import NO_DATA_PREFIX, effective_connection_health
 from factorix.modules.common import iso_ms
 from factorix.modules.providers import LiveSignalRecord
-from factorix.application.live.latest_api import connection_health_payload
+from factorix.application.health.health_service import note_samples_pg
 
 from factorix.application.ingestion.common import _json_val
 from factorix.application.ingestion.notify import (
@@ -264,68 +263,8 @@ class _LatestStateStore:
                     returned_rows = {}
 
                 if connection_sample_times:
-                    ordered_connections = sorted(connection_sample_times, key=str)
-                    conn_rows = await conn.fetch(
-                        """
-                        WITH prev AS (
-                            SELECT c.id, c.health AS old_health, sample.observed_at
-                            FROM connections c
-                            JOIN unnest($1::uuid[], $2::timestamptz[]) AS sample(id, observed_at) ON sample.id = c.id
-                            WHERE c.tenant_id = $3::uuid AND c.status = 'ACTIVE'
-                              AND (c.last_success_at IS NULL OR c.last_success_at < sample.observed_at)
-                            ORDER BY c.id
-                            FOR UPDATE OF c
-                        )
-                        UPDATE connections c
-                        SET last_success_at = prev.observed_at,
-                            health = CASE
-                                WHEN c.health = 'UNKNOWN' THEN 'HEALTHY'
-                                WHEN c.health = 'DEGRADED' AND c.last_error LIKE $4 THEN 'HEALTHY'
-                                ELSE c.health
-                            END,
-                            last_error = CASE WHEN c.last_error LIKE $4 THEN NULL ELSE c.last_error END
-                        FROM prev
-                        WHERE c.id = prev.id
-                        RETURNING c.id, c.health, c.last_error, c.last_success_at, prev.old_health
-                        """,
-                        ordered_connections,
-                        [connection_sample_times[connection_id] for connection_id in ordered_connections],
-                        tenant_id,
-                        f"{NO_DATA_PREFIX}%",
-                    )
-                    for cr in conn_rows:
-                        if cr["health"] == cr["old_health"]:
-                            continue
-                        if cr["old_health"] == "DEGRADED":
-                            await conn.execute(
-                                """
-                                INSERT INTO audit_events (
-                                    id, tenant_id, event_type, actor_id, entity_type, entity_id,
-                                    before_json, after_json, correlation_id, occurred_at, severity
-                                ) VALUES ($1, $2, 'CONNECTION_RECOVERED', NULL, 'connection', $3, $4::jsonb, $5::jsonb, 'ingestion', $6, 'INFO')
-                                """,
-                                uuid4(),
-                                tenant_id,
-                                cr["id"],
-                                json.dumps({"health": cr["old_health"]}),
-                                json.dumps({"health": cr["health"]}),
-                                now,
-                            )
-                        payload = connection_health_payload(
-                            connection_id=cr["id"],
-                            health=cr["health"],
-                            effective_health=effective_connection_health(
-                                status="ACTIVE",
-                                health=cr["health"],
-                                active_bindings=1,
-                                edge_health="ONLINE",
-                            ),
-                            last_error=cr.get("last_error"),
-                            last_success_at=cr.get("last_success_at"),
-                        )
-                        health_events.append(
-                            {"kind": "health", "tenant_id": str(tenant_id), "payload": payload}
-                        )
+                    # Sample evidence -> HealthService, the single writer of connections.health (R2-E C2).
+                    health_events.extend(await note_samples_pg(conn, tenant_id, connection_sample_times, now))
 
                 if self.notify_format == "v2":
                     # Compact v2: committed signal ids only; the API bridge reads the rows itself
@@ -349,7 +288,7 @@ class _LatestStateStore:
                             NOTIFY_CHANNEL_STREAM,
                             payloads,
                         )
-                    other_events.extend(health_events)
+                    # CT-05: health events only on the health channel (the bridge listens to both).
                     await _emit_chunked_notify(conn, NOTIFY_CHANNEL_STREAM, other_events)
                     if health_events:
                         await _emit_chunked_notify(conn, NOTIFY_CHANNEL_HEALTH, health_events)
@@ -373,7 +312,7 @@ class _LatestStateStore:
                     if meta_row.get("data_epoch") is not None:
                         payload["data_epoch"] = int(meta_row["data_epoch"])
                     to_notify.append({**ev, "payload": payload})
-                to_notify.extend(health_events)
+                # CT-05: health events only on the health channel (the bridge listens to both).
                 await _emit_chunked_notify(conn, NOTIFY_CHANNEL_STREAM, to_notify)
                 if health_events:
                     await _emit_chunked_notify(conn, NOTIFY_CHANNEL_HEALTH, health_events)

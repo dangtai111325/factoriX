@@ -19,18 +19,29 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factorix.domain.signal_state import canonical_stale_after_ms
+from factorix.application.live.freshness_service import FreshnessService, freshness_service
 from factorix.modules import storage_bindings as SB
 from factorix.modules.common import fetch_all, iso_ms, utcnow
 
 UNASSIGNED = "unassigned"
 
 
-def _freshness(last: datetime | None, interval_ms: int | None, now: datetime) -> str:
-    if last is None:
-        return "NO_DATA"
-    age_ms = (now - last).total_seconds() * 1000.0
-    return "FRESH" if age_ms <= canonical_stale_after_ms(interval_ms or 1000) else "STALE"
+def _freshness(
+    last: datetime | None,
+    interval_ms: int | None,
+    now: datetime,
+    *,
+    signal_id: Any = None,
+    job_interval_ms: int | None = None,
+    connection_id: Any = None,
+    service: FreshnessService | None = None,
+) -> str:
+    """Badge ``NO_DATA | FRESH | DELAYED | STALE`` from ``FreshnessService`` (R2-E C1 / CT-10): the job
+    interval is the fallback of the signal interval, and pipeline evidence separates DELAYED from STALE."""
+    return (service or freshness_service()).classify(
+        signal_id=signal_id, last_acquired_at=last, now=now, expected_interval_ms=interval_ms,
+        job_interval_ms=job_interval_ms, connection_id=connection_id,
+    )
 
 
 def _value_of(raw: Any) -> Any:
@@ -71,9 +82,18 @@ async def sources_by_machine(session: AsyncSession, tenant_id: UUID, *, search: 
             session,
             """
             SELECT s.id, s.key, s.display_name, s.data_type, s.unit, s.resource_id, s.expected_interval_ms,
-                   l.quality, l.last_acquired_at, l.value_json
+                   l.quality, l.last_acquired_at, l.value_json, nb.connection_id, nb.job_interval_ms
             FROM signal_definitions s
             LEFT JOIN latest_signal_state l ON l.tenant_id = s.tenant_id AND l.signal_id = s.id
+            LEFT JOIN LATERAL (
+                SELECT j.connection_id, j.interval_ms AS job_interval_ms
+                FROM signal_bindings b
+                JOIN source_fields f ON f.id = b.source_field_id
+                JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+                WHERE b.signal_id = s.id AND b.valid_to IS NULL
+                ORDER BY b.enabled DESC, b.valid_from DESC
+                LIMIT 1
+            ) nb ON TRUE
             WHERE s.tenant_id = :tenant_id AND s.status = 'ACTIVE'
             ORDER BY s.key
             """,
@@ -88,7 +108,10 @@ async def sources_by_machine(session: AsyncSession, tenant_id: UUID, *, search: 
                 "kind": "signal", "token": str(r["id"]), "key": r["key"], "label": r.get("display_name") or r["key"],
                 "value_type": r.get("data_type"), "unit": r.get("unit"),
                 "quality": (str(r["quality"]).upper() if r.get("quality") else None),
-                "freshness": _freshness(r.get("last_acquired_at"), r.get("expected_interval_ms"), now),
+                "freshness": _freshness(
+                    r.get("last_acquired_at"), r.get("expected_interval_ms"), now, signal_id=r["id"],
+                    job_interval_ms=r.get("job_interval_ms"), connection_id=r.get("connection_id"),
+                ),
                 "last_value": _value_of(r.get("value_json")),
                 "last_at": iso_ms(r["last_acquired_at"]) if r.get("last_acquired_at") else None,
             })

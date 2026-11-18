@@ -17,6 +17,11 @@ from factorix.application.ingestion.catalog import _CatalogStore
 from factorix.application.ingestion.latest_state import _LatestStateStore
 
 
+# CT-19: the real worker version (was the constant 's06-worker'). config_revision stays 1: ingestion has no
+# configuration revision of its own (it follows the catalog per tenant); readers must not use it.
+INGESTION_SOFTWARE_VERSION = os.environ.get("FACTORIX_INGESTION_VERSION", "ingestion-v1")
+
+
 class PgIngestionStore(_CatalogStore, _LatestStateStore):
     """Direct asyncpg adapter for catalog lookup, fencing, latest state, formulas, liveness & quarantine."""
 
@@ -30,8 +35,9 @@ class PgIngestionStore(_CatalogStore, _LatestStateStore):
         self.has_ingested_at = False
         # latest_signal_state is a derived read model (rebuildable from TDengine history); its
         # commits do not need to wait for the WAL flush. FACTORIX_INGESTION_SYNC_COMMIT=on opts out.
-        # Stream NOTIFY wire format: "v1" = full {"events":[...]} (default), "v2" = compact latest_ids.
-        self.notify_format = "v2" if os.environ.get("FACTORIX_NOTIFY_FORMAT", "v1").strip().lower() == "v2" else "v1"
+        # Stream NOTIFY wire format (R2-E C6): "v2" = compact latest_ids (default; the API bridge reads the
+        # committed rows, pushes them and refreshes its live cache), "v1" = full {"events":[...]} kill switch.
+        self.notify_format = "v1" if os.environ.get("FACTORIX_NOTIFY_FORMAT", "v2").strip().lower() == "v1" else "v2"
         self.async_latest_commit = os.environ.get("FACTORIX_INGESTION_SYNC_COMMIT", "off").strip().lower() not in {
             "on",
             "true",
@@ -170,9 +176,10 @@ class PgIngestionStore(_CatalogStore, _LatestStateStore):
                     instance_id, role, health, software_version, config_revision,
                     spool_pending, fast_buffered, broker_ok, queues_json, diagnostic,
                     last_heartbeat, updated_at
-                ) VALUES ($1, 'ingestion', $2, 's06-worker', 1, 0, 0, $3, $4::jsonb, $5, $6, $6)
+                ) VALUES ($1, 'ingestion', $2, $7, 1, 0, 0, $3, $4::jsonb, $5, $6, $6)
                 ON CONFLICT (instance_id) DO UPDATE SET
                     health = EXCLUDED.health,
+                    software_version = EXCLUDED.software_version,
                     broker_ok = EXCLUDED.broker_ok,
                     queues_json = EXCLUDED.queues_json,
                     diagnostic = EXCLUDED.diagnostic,
@@ -185,4 +192,5 @@ class PgIngestionStore(_CatalogStore, _LatestStateStore):
                 json.dumps(queues_json, default=str),
                 (diagnostic or "")[:500] or None,
                 now,
+                INGESTION_SOFTWARE_VERSION,
             )

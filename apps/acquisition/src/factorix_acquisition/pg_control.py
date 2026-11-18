@@ -6,13 +6,12 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import asyncpg
 
-from factorix.domain.health import ConnectionUpdate, apply_connection_report, effective_connection_health
+from factorix.application.health.health_service import apply_collector_reports
 from factorix_acquisition.config_provider import _table_exists, json_val
-from factorix_acquisition.timeutil import iso_ms
 
 logger = logging.getLogger(__name__)
 
@@ -171,73 +170,8 @@ class PgControlPlane:
                     [r["id"] for r in rows],
                 )
                 bindings = {str(r["connection_id"]): int(r["active_bindings"] or 0) for r in counts}
-                for row in rows:
-                    cid = row["id"]
-                    tenant_id = row["tenant_id"]
-                    update: ConnectionUpdate | None = apply_connection_report(dict(row), by_id[cid], current_now)
-                    if update is None:
-                        continue
-                    await conn.execute(
-                        "UPDATE connections SET health = $1, last_error = $2, last_success_at = $3 WHERE id = $4",
-                        update.health,
-                        update.last_error,
-                        update.last_success_at,
-                        cid,
-                    )
-                    updated += 1
-                    payload = {
-                        "type": "health",
-                        "entity": "connection",
-                        "id": str(cid),
-                        "health": update.health,
-                        "effective_health": effective_connection_health(
-                            status=str(row["status"] or "ACTIVE"),
-                            health=update.health,
-                            active_bindings=bindings.get(str(cid), 0),
-                            edge_health="ONLINE",
-                        ),
-                        "last_error": update.last_error,
-                        "last_success_at": iso_ms(update.last_success_at),
-                    }
-                    if update.health != row["health"]:
-                        if update.health == "DEGRADED":
-                            await conn.execute(
-                                """
-                                INSERT INTO audit_events (
-                                    id, tenant_id, event_type, actor_id, entity_type, entity_id,
-                                    before_json, after_json, correlation_id, occurred_at, severity
-                                ) VALUES ($1, $2, 'CONNECTION_DEGRADED', NULL, 'connection', $3, $4::jsonb, $5::jsonb, 'acquisition', $6, 'WARN')
-                                """,
-                                uuid4(),
-                                tenant_id,
-                                cid,
-                                json.dumps({"health": row["health"]}),
-                                json.dumps({"health": "DEGRADED", "last_error": update.last_error, "source": "acquisition"}),
-                                current_now,
-                            )
-                        elif row["health"] == "DEGRADED":
-                            await conn.execute(
-                                """
-                                INSERT INTO audit_events (
-                                    id, tenant_id, event_type, actor_id, entity_type, entity_id,
-                                    before_json, after_json, correlation_id, occurred_at, severity
-                                ) VALUES ($1, $2, 'CONNECTION_RECOVERED', NULL, 'connection', $3, $4::jsonb, $5::jsonb, 'acquisition', $6, 'INFO')
-                                """,
-                                uuid4(),
-                                tenant_id,
-                                cid,
-                                json.dumps({"health": "DEGRADED"}),
-                                json.dumps({"health": update.health}),
-                                current_now,
-                            )
-                    # Push only real changes. last_success_at advances every heartbeat; the API reads
-                    # it from PostgreSQL itself (source evidence for DELAYED vs STALE), so notifying
-                    # every connection every 5 s was pure NOTIFY/WebSocket noise.
-                    if update.health != row["health"] or (update.last_error or None) != (row["last_error"] or None):
-                        await conn.execute(
-                            "SELECT pg_notify('factorix_health_changed', $1)",
-                            json.dumps({"tenant_id": str(tenant_id), "event": payload}),
-                        )
+                # The single writer of connections.health (R2-E C2): acquisition submits its report.
+                updated = await apply_collector_reports(conn, rows, by_id, bindings, current_now)
         return updated
 
     async def record_heartbeat(

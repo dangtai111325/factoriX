@@ -313,23 +313,27 @@ export const WizardHeader: React.FC<{
   headingRef?: React.Ref<HTMLHeadingElement>;
   srStep?: string;
 }> = ({ backLabel, onBack, title, chip, note, stepper, headingRef, srStep }) => (
-  <div className="flex flex-wrap items-center gap-3">
-    <Button variant="ghost" size="sm" icon={<ArrowLeft className="w-3.5 h-3.5" />} onClick={onBack}>
-      {backLabel}
-    </Button>
-    <div className="min-w-0 mr-auto">
-      <h1 ref={headingRef} tabIndex={-1} className="text-[18px] font-bold text-[#111B37] outline-none truncate">
-        {title}
-        {srStep && <span className="sr-only">, {srStep}</span>}
-      </h1>
-      {(chip || note) && (
-        <div className="flex flex-wrap items-center gap-2 text-[12px] text-[#657794]">
-          {chip}
-          {note}
-        </div>
-      )}
+  // R2-25: one layout for every storage wizard — back link + title row, then the stepper on its own row,
+  // left-aligned (it used to sit right of the title or wrap under it depending on the title length).
+  <div className="space-y-3">
+    <div className="flex flex-wrap items-center gap-3">
+      <Button variant="ghost" size="sm" icon={<ArrowLeft className="w-3.5 h-3.5" />} onClick={onBack}>
+        {backLabel}
+      </Button>
+      <div className="min-w-0 mr-auto">
+        <h1 ref={headingRef} tabIndex={-1} className="text-[18px] font-bold text-[#111B37] outline-none truncate">
+          {title}
+          {srStep && <span className="sr-only">, {srStep}</span>}
+        </h1>
+        {(chip || note) && (
+          <div className="flex flex-wrap items-center gap-2 text-[12px] text-[#657794]">
+            {chip}
+            {note}
+          </div>
+        )}
+      </div>
     </div>
-    {stepper}
+    {stepper && <div className="min-w-0">{stepper}</div>}
   </div>
 );
 

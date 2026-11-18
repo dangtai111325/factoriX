@@ -548,6 +548,11 @@ class StorageRevisionService:
             except StorageObjectError as exc:
                 res.errors.extend(getattr(exc, "field_errors", None) or [{"field": "bindings", "code": exc.code, "message": str(exc)}])
                 res.valid = False
+            else:
+                mismatch = await self.machine_tag_errors(session, tenant_id, sub, extra["bindings"])
+                if mismatch:
+                    res.errors.extend(mismatch)
+                    res.valid = False
         else:
             res = ValidationResult(valid=False, errors=[{"field": "kind", "code": "UNKNOWN_KIND", "message": f"Unknown object kind '{kind}'."}])
         if len(display) > MAX_DISPLAY_NAME_LEN:
@@ -563,8 +568,14 @@ class StorageRevisionService:
         sub: SubtableSpec,
         columns: list[ColumnSpec],
         spec_data: dict[str, Any],
+        *,
+        models: dict[str, dict[str, Any]] | None = None,
+        owners: dict[tuple[str, str], dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Validate and normalise the bindings of a subtable (G-02: model_id + field path persisted)."""
+        """Validate and normalise the bindings of a subtable (G-02: model_id + field path persisted).
+
+        ``models`` / ``owners`` are caches a caller validating many subtables passes in (bulk, R2-05):
+        models found there are not queried again, and ``owners`` replaces the per-call owner lookup."""
         raw = [b for b in (spec_data.get("bindings") or []) if isinstance(b, dict)]
         recording = recording_from(spec_data)
         errors: list[dict[str, Any]] = []
@@ -588,7 +599,7 @@ class StorageRevisionService:
         col_by_name = {c.name: c for c in columns}
         ts_col = columns[0].name if columns else "ts"
         key_cols = {c.name for c in columns if c.primary_key}
-        models: dict[str, dict[str, Any]] = {}
+        models = models if models is not None else {}
         model_ids = []
         for b in raw:
             if not b.get("model_id") and str(b.get("source_kind") or "") == "model_field":
@@ -602,28 +613,10 @@ class StorageRevisionService:
             if mid:
                 model_ids.append(str(mid))
         if model_ids:
-            valid_ids = []
-            for mid in model_ids:
-                try:
-                    valid_ids.append(UUID(mid))
-                except ValueError:
-                    pass
-            if valid_ids:
-                rows = await fetch_all(
-                    session,
-                    """
-                    SELECT id, display_name, kind, version, spec_json, resource_id
-                    FROM output_groups
-                    WHERE tenant_id = :tenant_id AND status = 'ACTIVE' AND id = ANY(:ids)
-                    """,
-                    {"tenant_id": tenant_id, "ids": valid_ids},
-                )
-                for r in rows:
-                    models[str(r["id"])] = {
-                        "name": r["display_name"], "kind": r.get("kind"), "version": int(r.get("version") or 1),
-                        "leaves": {leaf["path"]: leaf for leaf in SB.model_leaf_fields(r.get("spec_json"))},
-                    }
-        owners = await SB.bound_model_fields(session, tenant_id)
+            missing = [m for m in model_ids if m not in models]
+            models.update(await load_models(session, tenant_id, missing))
+        if owners is None:
+            owners = await SB.bound_model_fields(session, tenant_id)
         out: list[dict[str, Any]] = []
         used_cols: set[str] = set()
         for i, b in enumerate(raw):
@@ -715,6 +708,72 @@ class StorageRevisionService:
         if errors:
             raise storage_error("BINDING_INVALID", errors[0]["message"], errors)
         return out
+
+    async def machine_tag_errors(
+        self,
+        session: AsyncSession,
+        tenant_id: UUID,
+        sub: SubtableSpec,
+        bindings: list[dict[str, Any]],
+        *,
+        ctx: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """R2-09 / guide K1 (no cross-machine rows): a tag whose value is a *machine* of the Factory
+        Model must be the machine the bound source belongs to (the model's machine, or the signal's
+        resource). Tags that are not machine ids (lines, zones, free text) are not checked, and a
+        source whose machine cannot be determined is not guessed. ``ctx`` caches the resource index /
+        signal map / model rows across calls (bulk)."""
+        if not bindings or not sub.tag_values:
+            return []
+        tag_ids: dict[str, str] = {}
+        for name, value in sub.tag_values.items():
+            try:
+                tag_ids[name] = str(UUID(str(value)))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if not tag_ids:
+            return []
+        ctx = ctx if ctx is not None else {}
+        if "resources" not in ctx:
+            ctx["resources"] = await SB.load_resource_index(session, tenant_id)
+        resources: dict[str, dict[str, Any]] = ctx["resources"]
+
+        def is_machine(rid: str | None) -> bool:
+            return bool(rid) and rid in resources and "machine" in resources[rid]["type_key"].lower()
+
+        machine_tags = {k: v for k, v in tag_ids.items() if is_machine(v)}
+        if not machine_tags:
+            return []
+        if "signals" not in ctx:
+            ctx["signals"] = await SB.signal_resource_map(session, tenant_id)
+        signal_res: dict[str, str] = ctx["signals"]
+        model_rows: dict[str, dict[str, Any]] = ctx.setdefault("models", {})
+        want = [str(b["model_id"]) for b in bindings if b.get("model_id") and str(b["model_id"]) not in model_rows]
+        if want:
+            model_rows.update(await load_models(session, tenant_id, want))
+        errors: list[dict[str, Any]] = []
+        for b in bindings:
+            owner: str | None = None
+            label = str(b.get("model_field_path") or b.get("canonical_id") or "source")
+            if b.get("model_id"):
+                m = model_rows.get(str(b["model_id"])) or {}
+                rid = str(m["resource_id"]) if m.get("resource_id") else None
+                owner = rid if is_machine(rid) else SB.model_resource_id(m.get("spec_json"), resources, signal_res)
+                label = f"{m.get('name') or b.get('model_name') or 'model'} · {b.get('model_field_path')}"
+            elif b.get("signal_id"):
+                owner = signal_res.get(str(b["signal_id"]).lower())
+            if not is_machine(owner):
+                continue
+            for tag, rid in machine_tags.items():
+                if rid != owner:
+                    errors.append({
+                        "field": f"tag_values.{tag}", "code": "TAG_MACHINE_MISMATCH",
+                        "message": (f"Tag '{tag}' is machine '{resources[rid]['name']}', but '{label}' belongs to "
+                                    f"machine '{resources[owner]['name']}'. A subtable records one machine; "
+                                    "use that machine's id."),
+                        "expected": owner,
+                    })
+        return errors
 
     async def plan_draft(
         self, session: AsyncSession, tenant_id: UUID, draft_id: UUID | None, custom_spec: dict[str, Any] | None = None
@@ -1303,6 +1362,35 @@ class StorageRevisionService:
             "error_code": row["error_code"],
             "error_message": row["error_message"],
         }
+
+
+async def load_models(session: AsyncSession, tenant_id: UUID, model_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Active Data Models by id: name, kind, version, field leaves (path -> leaf), spec and resource."""
+    valid_ids = []
+    for mid in model_ids:
+        try:
+            valid_ids.append(UUID(str(mid)))
+        except ValueError:
+            pass
+    if not valid_ids:
+        return {}
+    rows = await fetch_all(
+        session,
+        """
+        SELECT id, display_name, kind, version, spec_json, resource_id
+        FROM output_groups
+        WHERE tenant_id = :tenant_id AND status = 'ACTIVE' AND id = ANY(:ids)
+        """,
+        {"tenant_id": tenant_id, "ids": valid_ids},
+    )
+    return {
+        str(r["id"]): {
+            "name": r["display_name"], "kind": r.get("kind"), "version": int(r.get("version") or 1),
+            "leaves": {leaf["path"]: leaf for leaf in SB.model_leaf_fields(r.get("spec_json"))},
+            "spec_json": r.get("spec_json"), "resource_id": r.get("resource_id"),
+        }
+        for r in rows
+    }
 
 
 def _json_list(raw: Any) -> list[Any]:

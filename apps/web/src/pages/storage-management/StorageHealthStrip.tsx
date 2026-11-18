@@ -1,5 +1,5 @@
 import React from 'react';
-import { KpiTile } from '../historian/hsUi';
+import { KpiTile, Skeleton } from '../historian/hsUi';
 
 interface StorageHealthStripProps {
   databaseCount: number | null;
@@ -12,6 +12,8 @@ interface StorageHealthStripProps {
   activeType?: 'all' | 'database' | 'stable' | 'subtable';
   onFilterType?: (type: 'database' | 'stable' | 'subtable') => void;
   onOpenDrafts?: () => void;
+  /** Totals not loaded yet: skeleton tiles, never a 0 or "nothing is recorded yet" (R2-18). */
+  loading?: boolean;
 }
 
 const n = (v: number | null | undefined) => (v == null ? '—' : v.toLocaleString());
@@ -31,13 +33,30 @@ export const StorageHealthStrip: React.FC<StorageHealthStripProps> = ({
   activeType,
   onFilterType,
   onOpenDrafts,
+  loading,
 }) => {
-  const recordingSub = [
-    recordingPaused ? `${recordingPaused} paused` : '',
-    recordingError ? `${recordingError} with write errors` : '',
-  ]
-    .filter(Boolean)
-    .join(' · ');
+  if (loading) {
+    return (
+      <div className={`grid grid-cols-2 ${draftCount != null ? 'sm:grid-cols-5' : 'sm:grid-cols-4'} gap-3`} aria-busy="true" aria-label="Loading storage totals">
+        {['Databases', 'Supertables', 'Subtables', 'Recording', ...(draftCount != null ? ['Drafts'] : [])].map((label) => (
+          <div key={label} className="p-3.5 rounded-2xl border bg-white border-[#E2E8F0] min-w-0">
+            <div className="text-[11px] font-bold text-[#64748B] uppercase tracking-wider truncate">{label}</div>
+            <Skeleton className="h-7 w-16 mt-1.5" />
+            <Skeleton className="h-3 w-24 mt-1.5" />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  // R2-25: the number is never red; only the "with write errors" line is.
+  const recordingSub =
+    recordingPaused || recordingError ? (
+      <>
+        {recordingPaused ? `${recordingPaused} paused` : ''}
+        {recordingPaused && recordingError ? ' · ' : ''}
+        {recordingError ? <span className="text-[#DB2028] font-semibold">{recordingError} with write errors</span> : null}
+      </>
+    ) : null;
   return (
     <div className={`grid grid-cols-2 ${draftCount != null ? 'sm:grid-cols-5' : 'sm:grid-cols-4'} gap-3`}>
       <KpiTile label="Databases" value={n(databaseCount)} active={activeType === 'database'} onClick={onFilterType ? () => onFilterType('database') : undefined} hint="Show databases in the Objects table" />
@@ -46,7 +65,7 @@ export const StorageHealthStrip: React.FC<StorageHealthStripProps> = ({
       <KpiTile
         label="Recording"
         value={n(recordingActive)}
-        tone={recordingError ? 'error' : recordingActive ? 'success' : 'muted'}
+        tone={recordingActive ? 'success' : 'muted'}
         sub={recordingSub || (recordingActive ? 'subtables with an active binding' : 'nothing is recorded yet')}
         hint="User subtables that are active and have at least one active binding"
       />

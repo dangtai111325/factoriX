@@ -23,12 +23,15 @@ ModelEngine.process ── one PG transaction ───────────�
     on change -> storage_record_outbox row + storage_field_state update  │
 commit ◄─────────────────────────────────────────────────────────────────┘
 RecordingDispatcher (background, started in app lifespan)
-  PENDING outbox rows (FOR UPDATE SKIP LOCKED) -> epoch fence -> INSERT INTO db.sub (existing columns only)
-  -> CONFIRMED after TDengine accepted; retry with backoff; FAILED (visible) after budget / non-retryable error
+  1. claim: due PENDING rows (FOR UPDATE SKIP LOCKED) get a 60 s lease (next_attempt_at), COMMIT
+  2. epoch fence -> INSERT INTO db.sub (existing columns only) — no PostgreSQL transaction open (WS-P P6)
+  3. short transaction: CONFIRMED after TDengine accepted; retry with backoff; FAILED (visible) after budget /
+     non-retryable error. A crash between 2 and 3 replays the batch after the lease (idempotent upsert).
+  prune: CONFIRMED rows older than the keep window, batches of 5000 on the partial index of migration 0012
 ```
 
 Why: the change decision and its durable record commit atomically with the model state (no lost or invented
-change on crash); the outbox is replayable; `(ts, event_key)` is deterministic (`sha256(tenant|binding|epoch|seq)`)
+change on crash); the outbox is replayable; `(ts, event_key)` is deterministic (epoch(6 hex) + seq(10 hex) + `sha256(tenant|binding|epoch|seq)`[:16]; ordered so rows sharing a `ts` keep write order, R2-20)
 so a replay is an upsert on the TDengine composite key; no new broker topology, no ordering problem between
 model state and the change stream. Signal-bound subtables stay on the ingestion path (WS-P), using the same
 schema-aware row builder (`recording_policy.ManagedSubtableWrite`).

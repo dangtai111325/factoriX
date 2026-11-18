@@ -1,9 +1,14 @@
-"""PG NOTIFY bridge: stream/health/epoch channels -> live cache, pipeline evidence and the hub. Moved verbatim from ``factorix.transport.app`` (R2-E B2, move-only)."""
+"""PG NOTIFY bridge: stream/health/epoch channels -> live cache, pipeline evidence and the hub.
+
+Moved from ``factorix.transport.app`` (R2-E B2). R2-E C6: payloads are decoded with the typed contract
+``factorix_core.contracts.notify`` (by ``v`` / ``kind``, no substring sniffing, CT-04); the v2
+``latest_ids`` path refreshes the API live cache like v1 does (CT-03); a v1 event without ``quality``
+is not seeded as GOOD (CT-02).
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from typing import Any
 from uuid import UUID
@@ -11,7 +16,7 @@ from uuid import UUID
 import asyncpg
 
 from factorix.modules import telemetry
-from factorix.modules.live_state import get_live_state_provider, get_pipeline_evidence
+from factorix.modules.live_state import get_live_state_provider, get_pipeline_evidence, record_from_pg_row
 from factorix.modules.providers import LiveSignalRecord
 from factorix.modules.common import utcnow
 from factorix.platform.db import to_asyncpg_dsn
@@ -20,6 +25,15 @@ from factorix.platform.db import session_factory
 
 from factorix.transport.http.deps import _opt_time, _settings, hub, logger
 from factorix.transport.ws.stream import _latest_message
+from factorix_core.contracts.notify import (
+    Channel,
+    HealthChanged,
+    LatestIdsV2,
+    StreamEventsV1,
+    parse_epoch_changed,
+    parse_health_changed,
+    parse_stream_events,
+)
 
 
 _parse_pg_notify_events = parse_pg_notify_events
@@ -47,7 +61,9 @@ def _seed_live_cache(events: list[dict[str, Any]]) -> None:
                     prev_entry.record.last_value_changed_at if prev_entry else ev_dt
                 )
                 src_dt = _opt_time(p.get("source_time"))
-                qual = str(p.get("quality") or "GOOD").upper()
+                # CT-02: a missing quality is not evidence of a good read (it used to seed GOOD and
+                # become the last good value). UNCERTAIN keeps the value visible without vouching for it.
+                qual = str(p.get("quality") or "UNCERTAIN").upper()
                 epoch_val = max(
                     1,
                     int(
@@ -109,8 +125,8 @@ def _note_health_evidence(events: list[dict[str, Any]]) -> None:
         if ev.get("kind") != "health":
             continue
         payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
-        if str(payload.get("entity") or "") == "connection" and payload.get("last_success_at"):
-            evidence.note_source(payload.get("id"), payload.get("last_success_at"))
+        if str(payload.get("entity") or "") == "connection" and (payload.get("last_success_at") or payload.get("health")):
+            evidence.note_source(payload.get("id"), payload.get("last_success_at"), payload.get("health"))
 
 
 async def _dispatch_latest_ids(tenant_id: str, signal_ids: list[str]) -> None:
@@ -130,9 +146,31 @@ async def _dispatch_latest_ids(tenant_id: str, signal_ids: list[str]) -> None:
     async with session_factory()() as session:
         for start in range(0, len(ids), _NOTIFY_FETCH_CHUNK):
             rows = await telemetry.latest_states(session, tid, ids[start : start + _NOTIFY_FETCH_CHUNK])
+            _seed_live_cache_from_rows(tid, rows)
             hub.dispatch(
                 [{"kind": "latest", "tenant_id": str(tid), "signal_id": str(row["signal_id"]), "payload": _latest_message(row)} for row in rows]
             )
+
+
+def _seed_live_cache_from_rows(tenant_id: UUID, rows: list[dict[str, Any]]) -> None:
+    """CT-03: the v2 path refreshes the API live cache (read by the model engine and Data Models) from the
+    committed rows it read, exactly like the v1 path does from the event payloads. Ordering/epoch guards
+    of the provider apply; a row the cache already holds is a no-op."""
+    provider = get_live_state_provider()
+    if provider is None:
+        return
+    for row in rows:
+        try:
+            rec, seq, _upd = record_from_pg_row(row, tenant_id=tenant_id)
+            provider.seed_from_record(
+                rec,
+                source_sequence=seq,
+                restored_unverified=False,
+                expected_interval_ms=row.get("expected_interval_ms"),
+                null_allowed=bool(row.get("nullable")),
+            )
+        except Exception:  # noqa: BLE001 - the push must not fail because of one row
+            logger.debug("Live cache v2 seed skipped", exc_info=True)
 
 
 async def _latest_ids_worker(queue: "asyncio.Queue[tuple[str, list[str]]]") -> None:
@@ -151,19 +189,32 @@ async def _latest_ids_worker(queue: "asyncio.Queue[tuple[str, list[str]]]") -> N
                 logger.warning("Live push of %d committed signal(s) failed", len(tid_ids), exc_info=True)
 
 
-def _parse_latest_ids(payload: str) -> tuple[str, list[str]] | None:
-    try:
-        data = json.loads(payload)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("signal_ids"), list) or not data.get("tenant_id"):
-        return None
+def _latest_ids_request(msg: LatestIdsV2) -> tuple[str, list[str]]:
+    """Record the v2 delivery evidence and return the (tenant, signal ids) read request."""
     evidence = get_pipeline_evidence()
-    max_acq = _opt_time(data.get("max_acquired_at"))
+    max_acq = _opt_time(msg.max_acquired_at)
     if max_acq is not None:
-        for cid in data.get("connection_ids") or []:
+        for cid in msg.connection_ids:
             evidence.note_delivery(None, max_acq, connection_id=cid)
-    return str(data["tenant_id"]), [str(item) for item in data["signal_ids"]]
+    return msg.tenant_id, list(msg.signal_ids)
+
+
+def _parse_latest_ids(payload: str) -> tuple[str, list[str]] | None:
+    msg = parse_stream_events(payload)
+    if not isinstance(msg, LatestIdsV2):
+        return None
+    return _latest_ids_request(msg)
+
+
+def _hub_events(channel: str, msg: StreamEventsV1 | HealthChanged | LatestIdsV2 | None) -> list[dict[str, Any]]:
+    """Typed payload -> hub events (the shapes ``hub.parse_pg_notify_events`` produces)."""
+    if isinstance(msg, StreamEventsV1):
+        return list(msg.events)
+    if isinstance(msg, HealthChanged):
+        event_type = str(msg.event.get("type") or "health")
+        kind = "health" if channel == Channel.HEALTH_CHANGED or event_type == "health" else event_type
+        return [{"kind": kind, "tenant_id": msg.tenant_id, "payload": msg.event}]
+    return []
 
 
 async def _pg_notify_bridge_loop() -> None:
@@ -190,31 +241,25 @@ async def _pg_notify_bridge_loop() -> None:
 
                 def _on_notify(_c: Any, _pid: int, channel: str, payload: str) -> None:
                     _bridge_state["last_event_at"] = time.monotonic()
-                    if channel == "factorix_epoch_changed":
+                    if channel == Channel.EPOCH_CHANGED:
                         provider = get_live_state_provider()
-                        if provider is not None and payload:
+                        epoch_msg = parse_epoch_changed(payload)
+                        if provider is not None and epoch_msg.active_epoch:
                             try:
-                                data = json.loads(payload)
-                            except json.JSONDecodeError:
-                                data = {}
-                            if isinstance(data, dict) and (data.get("active_epoch") or data.get("new_epoch")):
-                                try:
-                                    tid_raw = data.get("tenant_id")
-                                    tid_u = UUID(str(tid_raw)) if tid_raw else None
-                                    new_epoch = int(data.get("active_epoch") or data.get("new_epoch"))
-                                    provider.invalidate_epoch_sync(tid_u, new_epoch)
-                                except (TypeError, ValueError):
-                                    pass
+                                tid_u = UUID(epoch_msg.tenant_id) if epoch_msg.tenant_id else None
+                                provider.invalidate_epoch_sync(tid_u, epoch_msg.active_epoch)
+                            except (TypeError, ValueError):
+                                pass
                         return
-                    if channel == "factorix_stream_events" and '"signal_ids"' in (payload or ""):
-                        request = _parse_latest_ids(payload)
-                        if request is not None:
-                            try:
-                                ids_queue.put_nowait(request)
-                            except asyncio.QueueFull:
-                                logger.warning("Live push queue full; dropping %d signal id(s)", len(request[1]))
-                            return
-                    events = _parse_pg_notify_events(channel, payload)
+                    msg = parse_stream_events(payload) if channel == Channel.STREAM_EVENTS else parse_health_changed(payload)
+                    if isinstance(msg, LatestIdsV2):
+                        request = _latest_ids_request(msg)
+                        try:
+                            ids_queue.put_nowait(request)
+                        except asyncio.QueueFull:
+                            logger.warning("Live push queue full; dropping %d signal id(s)", len(request[1]))
+                        return
+                    events = _hub_events(channel, msg)
                     if events:
                         _seed_live_cache(events)
                         _note_health_evidence(events)

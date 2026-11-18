@@ -14,7 +14,7 @@ import {
   Radio,
   FileCode,
 } from 'lucide-react';
-import { StorageWizardLayout, useWizardDraft, useStorageBackTarget } from './WizardShared';
+import { StorageWizardLayout, useWizardDraft, useStorageBackTarget, PendingDraftBanner } from './WizardShared';
 import { Button } from '../../../components/common/Button';
 import { ActionToast, useActionToast } from '../../../components/common/ActionToast';
 import { WizardHeader, DraftChip, Banner } from '../../historian/hsUi';
@@ -34,6 +34,8 @@ import {
   StableRecordingStep,
   StableReviewStep,
   StableWizardData,
+  splitTagType,
+  TAG_MAX_LENGTH,
 } from './StableWizardSteps';
 import {
   SubtableIdentityStep,
@@ -321,6 +323,17 @@ export const CreateStorageObjectWizard: React.FC = () => {
     return () => { active = false; };
   }, [kind, stableId, updateSubtableDraft]);
 
+  // "Resume" in the Drafts dialog (?resume=1) is an explicit choice: apply that tab draft once.
+  const resumeParam = searchParams.get('resume');
+  useEffect(() => {
+    if (!resumeParam || draftParam) return;
+    const w = kind === 'database' ? dbDraft : kind === 'stable' ? stableDraft : kind === 'subtable' ? subtableDraft : null;
+    w?.resumeDraft();
+    const next = new URLSearchParams(searchParams);
+    next.delete('resume');
+    setSearchParams(next, { replace: true, state: location.state });
+  }, [resumeParam, kind]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Reset step index when kind changes
   useEffect(() => {
     setCurrentStep(0);
@@ -552,6 +565,11 @@ export const CreateStorageObjectWizard: React.FC = () => {
           }
           if (tagNames.has(t.name)) {
             errs.tags = `Duplicate tag name "${t.name}".`;
+            break;
+          }
+          const len = splitTagType(t.td_type, t.length).length;
+          if (len != null && (len < 1 || len > TAG_MAX_LENGTH)) {
+            errs.tags = `Tag "${t.name}": length must be between 1 and ${TAG_MAX_LENGTH}.`;
             break;
           }
           tagNames.add(t.name);
@@ -793,6 +811,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
           submitLabel="Create database"
         >
           {draftNotice}
+          {!draftParam && <PendingDraftBanner draft={dbDraft.pendingDraft} onResume={dbDraft.resumeDraft} onDiscard={dbDraft.discardPendingDraft} />}
           {currentStep === 0 && (
             <DatabaseBasicsStep
               data={dbDraft.data}
@@ -851,6 +870,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
           submitLabel="Create supertable"
         >
           {draftNotice}
+          {!draftParam && <PendingDraftBanner draft={stableDraft.pendingDraft} onResume={stableDraft.resumeDraft} onDiscard={stableDraft.discardPendingDraft} />}
           {currentStep === 0 && (
             <StableTargetStep
               data={stableDraft.data}
@@ -929,6 +949,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
         submitLabel="Create subtable"
       >
         {draftNotice}
+        {!draftParam && <PendingDraftBanner draft={subtableDraft.pendingDraft} onResume={subtableDraft.resumeDraft} onDiscard={subtableDraft.discardPendingDraft} />}
         {currentStep === 0 && (
           <SubtableIdentityStep
             data={subtableDraft.data}

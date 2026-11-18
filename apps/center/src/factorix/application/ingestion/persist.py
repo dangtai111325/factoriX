@@ -220,6 +220,7 @@ class _PersistStage:
                 "reason_code": prep.reason_code,
                 "event_uid": obs.event_uid,
                 "expected_interval_ms": prep.owned.get("expected_interval_ms"),
+                "job_interval_ms": prep.owned.get("job_interval_ms"),
                 "nullable": bool(prep.owned.get("nullable")),
                 "ingested_at": prep.ingested_at,
             }
@@ -382,6 +383,7 @@ class _PersistStage:
                         received_time=r["received_time"],
                         source_time=r["source_time"],
                         expected_interval_ms=r.get("expected_interval_ms"),
+                        job_interval_ms=r.get("job_interval_ms"),
                         null_allowed=bool(r.get("nullable")),
                         now=now_commit,
                         include_meta=True,

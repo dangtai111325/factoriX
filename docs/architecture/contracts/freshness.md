@@ -72,6 +72,28 @@ A STALE / PAUSED / DELAYED signal keeps its last value (Q3, H1); only BAD / NO_D
 ✘ = disagrees with the reference for at least one scenario (`xfail(strict)` cells, CT-10). Target: one
 `FreshnessService.evaluate(record, evidence, now)` for every surface (Phase C1).
 
+### 5b. Since R2-E C1 (ARCH-C): one evaluator
+
+`application/live/freshness_service.py::FreshnessService` is the only caller of `evaluate_signal_state` /
+`classify_freshness` for live surfaces. It resolves the interval (signal `expected_interval_ms` → acquisition
+job `interval_ms` → API mapping → 1000 ms only when nothing is known), passes the API `PipelineEvidence`
+(source_ok / reported / delivered) and the connection health (CT-12 `CONNECTION_OFFLINE`).
+
+| Surface | Call | Matrix row |
+|---|---|---|
+| REST latest (cache) / Data Models / models engine (cache) | `TDengineLiveStateProvider.evaluate_signal(..., connection_id, job_interval_ms)` → `FreshnessService.evaluate` | `live_provider` ✔ |
+| REST latest without cache, Data Models PG fallback | `FreshnessService.evaluate` / `evaluate_latest_row` (SQL adds `connection_id`, `job_interval_ms`) | `latest_row_pg_fallback` ✔ |
+| Models engine PG fallback | `models_engine.sample_from_latest(row, freshness=...)` | `models_engine_pg_fallback` ✔ |
+| Push dispatch + 5 s sweep | `Hub.refresher = FreshnessService(evidence).refresh_message` | `push_refresh` ✔ |
+| Ingestion v1 payload | `latest_stream_payload(..., job_interval_ms)` (no evidence in that process: provisional, re-evaluated at dispatch) | `ingestion_commit` ✔ (as delivered) + `test_ingestion_raw_payload_agrees_without_evidence` |
+| Historian catalog badge | `historian_catalog._freshness` → `FreshnessService.classify` (`NO_DATA/FRESH/DELAYED/STALE`) | `historian_catalog` ✔ |
+| Historian quality segments / gap threshold | `FreshnessService.stale_after_ms(signal, expected)` (job interval via the evidence mapping) | — |
+| Historian latest (`/historian/latest`) | additive `effective_status`, `freshness`, `stale_after_ms` | — |
+| Signals list | additive `stale_after_ms` per signal (job-interval fallback) | — |
+| Collector status `/api/v1/edges` | `FreshnessService.delayed_connections()`: a delivery stall → `effective_health=DEGRADED`, diagnostic "Data delayed N s …", `delayed_connections` (R2-02) | `test_collector_status_degrades_during_a_delivery_stall` |
+| Browser | renders the server verdict; `serverStaleAfterMs()` (no interval math); `displayFreshness()` shows an expired FRESH verdict as DELAYED until the next server verdict; Overview "Data delayed", "N delayed" in signal summaries; counts wait for the first latest read (R2-18) | TS |
+
+
 ## 6. Health definitions
 
 * **Process liveness**: heartbeat age ≤ 15 s (`heartbeat_fresh`) — see `runtime-status.md`.

@@ -54,10 +54,13 @@ def test_acquisition_runtime_block_round_trips_to_the_center_sweep() -> None:
         job_tasks={"j1": running},
         started_at="2026-11-18T05:00:00.000Z",
         leader_since="2026-11-18T05:00:01.000Z",
+        last_report_at="2026-11-18T05:00:05.000Z",
     )
     produced = AcquisitionRuntime.runtime_info(stub)  # type: ignore[arg-type]
+    # last_report_at (ARCH-C, P6): additive; Center tells "collector report late" from "no samples".
     assert produced == {"started_at": "2026-11-18T05:00:00.000Z", "leader_since": "2026-11-18T05:00:01.000Z",
-                        "jobs_expected": 2, "jobs_running": 1, "connections_running": ["c1"]}
+                        "jobs_expected": 2, "jobs_running": 1, "connections_running": ["c1"],
+                        "last_report_at": "2026-11-18T05:00:05.000Z"}
     row = {"queues_json": json.dumps({"publisher": {}, "runtime": produced, "c9": {"pending": 0}})}
     assert _acquisition_runtime_info(row) == produced
     assert _acquisition_runtime_info({"queues_json": "not json"}) == {}
@@ -170,9 +173,35 @@ async def test_config_revision_derivation() -> None:
     assert rev2 == 3 and digest2 != digest1
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="CT-07: revision is process-local; after an acquisition restart it falls back to max(entity counters)")
-async def test_config_revision_monotonic_across_restart() -> None:
-    rev1, digest1 = await _revision(_FakeConn("Line 1"), 0, "")
-    rev2, _ = await _revision(_FakeConn("Line 1 renamed"), rev1, digest1)
-    after_restart, _ = await _revision(_FakeConn("Line 1 renamed"), 0, "")
-    assert after_restart >= rev2
+async def test_config_revision_monotonic_across_restart(tmp_path: Path) -> None:
+    """CT-07 fixed: an acquisition restart continues from its last-known-good revision (and never below the
+    revision it last published in its heartbeat)."""
+    from factorix_acquisition.config_provider import ConfigProvider, LkgSnapshotStore, load_pg_snapshot
+
+    state = {"name": "Line 1"}
+
+    async def loader(_conn: Any, prev_rev: int, prev_digest: str) -> dict[str, Any]:
+        return await load_pg_snapshot(_FakeConn(state["name"]), prev_revision=prev_rev, prev_digest=prev_digest)  # type: ignore[arg-type]
+
+    secrets = SimpleNamespace(set_pool=lambda _p: None)
+    lkg = tmp_path / "lkg.json"
+    first = ConfigProvider(None, secrets, LkgSnapshotStore(lkg), loader=loader)  # type: ignore[arg-type]
+    up1 = await first.fetch_if_changed()
+    first.mark_applied(up1.revision, up1.digest, up1.struct_hash)
+    state["name"] = "Line 1 renamed"  # structure change without an entity counter bump
+    up2 = await first.fetch_if_changed()
+    first.mark_applied(up2.revision, up2.digest, up2.struct_hash)
+    assert up2.revision == up1.revision + 1
+
+    restarted = ConfigProvider(None, secrets, LkgSnapshotStore(lkg), loader=loader)  # type: ignore[arg-type]
+    up3 = await restarted.fetch_if_changed()
+    assert up3.changed and up3.revision == up2.revision  # same structure after the restart: same revision
+    # Without an LKG file the heartbeat floor keeps it from going down.
+    cold = await load_pg_snapshot(_FakeConn("Line 1 renamed"), revision_floor=up2.revision)  # type: ignore[arg-type]
+    assert int(cold["revision"]) >= up2.revision
+
+
+def test_post_jobs_bumps_the_job_config_revision() -> None:
+    """CT-07 fixed: ``POST /api/v1/jobs`` on an existing job bumps ``acquisition_jobs.config_revision``."""
+    src = (Path(__file__).resolve().parents[2] / "src" / "factorix" / "transport" / "http" / "routers" / "connections.py").read_text(encoding="utf-8")
+    assert "interval_ms = :interval_ms, config_revision = config_revision + 1 WHERE id = :id" in src

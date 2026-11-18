@@ -25,8 +25,14 @@ Semantics (guide D3/D4, plan §5.3):
   deduplicated. Limitation (guide D4/G-07): the source is the sampled model body, so two completions
   between two samples cannot be told apart; the UI states this.
 * EVERY_ACQUISITION: every model sample writes a row.
-* ``event_key`` = sha256(tenant | binding key | epoch | sequence) -> stable across replays, so a replay
-  of an outbox row is an idempotent upsert on the ``(ts, event_key)`` composite key.
+* ``ts`` (guide D2): a ``mapping`` field's own source time (its signal sample's source time, else
+  received time; ``field_source_timestamp`` = the same, ``time_basis=FIELD_SOURCE``); otherwise the
+  body ``source_timestamp`` (``time_basis=MODEL_BODY``). The body ``source_timestamp`` is
+  ``latest_ts()`` over ALL the model's signals, so a field whose signal lags the others changes
+  value without the body time moving (R2-20: two values at one body time); the field time fixes that.
+* ``event_key`` = hex(epoch) + hex(sequence) + sha256(tenant | binding key | epoch | sequence) ->
+  stable across replays (idempotent upsert on the ``(ts, event_key)`` composite key) and, since rows
+  of one ``ts`` sort by the key, in write order when two rows still share a timestamp.
 * Only columns that exist in the target STABLE are written: the guide's E1 audit columns are filled
   when present, no system column is ever added (an op-style schema is not assumed).
 * Old-epoch outbox rows are fenced (FAILED ``EPOCH_FENCED``) and never written after a reset.
@@ -38,6 +44,7 @@ import asyncio
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 import hashlib
 import json
 import logging
@@ -48,8 +55,10 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from factorix_core.tdengine.sql import parse_aware_ts, quote_str, ts_int_literal, typed_literal
+
 from factorix.modules import storage_bindings as SB
-from factorix.modules.common import execute, fetch_all, fetch_one, iso_ms, jsonb, utcnow
+from factorix.modules.common import execute, execute_rowcount, fetch_all, fetch_one, iso_ms, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +66,12 @@ BINDING_TTL_S = 10.0
 SCHEMA_TTL_S = 60.0
 DISPATCH_BATCH = 500
 DISPATCH_IDLE_S = 1.0
+#: A claimed batch is invisible to other dispatchers for this long; a dispatcher that dies after claiming
+#: lets the rows come back after the lease (replayed idempotently by the composite key).
+CLAIM_LEASE_S = 60
+#: Prune of CONFIRMED rows: at most PRUNE_BATCHES x PRUNE_BATCH rows per round, one short transaction each.
+PRUNE_BATCH = 5000
+PRUNE_BATCHES = 20
 MAX_ATTEMPTS = 8
 CONFIRMED_KEEP = timedelta(hours=1)
 QUALITY_ORDER = ("BAD", "NO_DATA", "DISABLED", "MISSING", "STALE", "PAUSED", "UNCERTAIN", "DELAYED", "GOOD")
@@ -216,6 +231,9 @@ class ModelResult:
     sampled_at: datetime
     body: Any
     field_quality: Mapping[str, tuple[str, str | None]]  # path -> (quality, reason)
+    # path -> the field's OWN source time (guide D2 provenance), see :func:`field_source_times`.
+    # Empty (engine did not pass it) -> every field falls back to the body time (MODEL_BODY).
+    field_source_ts: Mapping[str, datetime] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -247,20 +265,36 @@ def canonical(value: Any) -> str:
 
 
 def event_key_for(tenant_id: str, binding_key: str, epoch: int, sequence: int) -> str:
+    """32 hex chars = epoch (6) + sequence (10) + sha256(tenant|binding|epoch|sequence) (16).
+
+    Deterministic (a replay upserts the same ``(ts, event_key)``, OC-013) and, because TDengine orders
+    rows of one ``ts`` by the composite key, rows that share a timestamp keep their WRITE order
+    (R2-20: two changes inside one body timestamp — ``last()`` and the Historian must see the later
+    one last; a bare hash ordered them at random). Same length as before (fits ``VARCHAR(32+)``)."""
     raw = f"{tenant_id}|{binding_key}|{epoch}|{sequence}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{int(epoch) % 0x1000000:06x}{int(sequence) % 0x10000000000:010x}{digest}"
 
 
-def _parse_ts(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    return None
+def field_source_times(compiled: Any, samples: Mapping[str, Any]) -> dict[str, datetime]:
+    """Real per-field provenance (guide D2) for the recorder: a ``mapping`` field's value IS the
+    latest sample of its signal, so its own time is that sample's ``ts`` (source time, else received
+    time — the same time ``latest_ts()`` takes the maximum of for the body ``source_timestamp``).
+    Calculated fields get none (their value is derived; the body time is kept, ``MODEL_BODY``)."""
+    out: dict[str, datetime] = {}
+    for item in getattr(compiled, "fields", []) or []:
+        if getattr(item, "mode", None) != "mapping" or not getattr(item, "signal_id", None):
+            continue
+        sid = str(item.signal_id)
+        sample = samples.get(sid) or samples.get(sid.lower())
+        ts = _parse_ts(getattr(sample, "ts", None)) if sample is not None else None
+        if ts is not None:
+            out[SB.normalize_field_path(item.path)] = ts
+    return out
+
+
+# R2-E B7: datetime (naive = UTC) or ISO text -> aware datetime, else None (shared kernel, same behaviour).
+_parse_ts = parse_aware_ts
 
 
 def worst_quality(values: Iterable[str]) -> str:
@@ -272,22 +306,23 @@ def worst_quality(values: Iterable[str]) -> str:
 def _audit_columns(
     tenant_id: str, target: RecordingTarget, result: ModelResult, epoch: int, ts: datetime, event_key: str,
     quality: str, reason: str | None, is_null: bool | None, path: str | None,
+    field_ts: datetime | None = None,
 ) -> dict[str, Any]:
     src_ts = _parse_ts(SB.extract_field(result.body, "source_timestamp")[1]) if isinstance(result.body, dict) else None
     pub_ts = _parse_ts(SB.extract_field(result.body, "publish_timestamp")[1]) if isinstance(result.body, dict) else None
     cols: dict[str, Any] = {
         "ts": ts,
         "event_key": event_key,
-        "source_timestamp": src_ts,
+        "source_timestamp": src_ts,  # the body's, unchanged (guide D2: immutable body timestamp)
         "publish_timestamp": pub_ts or result.sampled_at,
-        "field_source_timestamp": None,
+        "field_source_timestamp": field_ts,
         "quality": quality[:16],
         "quality_reason": (reason or None) and str(reason)[:128],
         "model_ref": result.model_id,
         "model_revision": int(result.model_revision),
         "data_epoch": int(epoch),
         "source_event_uid": f"{result.model_id}:{iso_ms(result.sampled_at)}",
-        "time_basis": "MODEL_BODY",
+        "time_basis": "FIELD_SOURCE" if field_ts is not None else "MODEL_BODY",
     }
     if is_null is not None:
         cols["is_null"] = bool(is_null)
@@ -369,9 +404,13 @@ def plan_records(
                         continue
                 seq = (st.sequence + 1) if same_epoch and st is not None else 1
                 ekey = event_key_for(tenant_id, bkey, epoch, seq)
+                # Guide D2: ts = the field's own source time when provenance gives it (FIELD_SOURCE);
+                # else the body source_timestamp (MODEL_BODY); never now() as a source time.
+                field_ts = (result.field_source_ts or {}).get(b.path)
                 src_ts = _parse_ts(SB.extract_field(result.body, "source_timestamp")[1])
-                ts = src_ts or result.sampled_at
-                cols = _audit_columns(tenant_id, target, result, epoch, ts, ekey, quality, reason, is_null, b.path)
+                ts = field_ts or src_ts or result.sampled_at
+                cols = _audit_columns(tenant_id, target, result, epoch, ts, ekey, quality, reason, is_null, b.path,
+                                      field_ts)
                 cols[b.column] = value
                 records.append(PlannedRecord(tenant_id, target.database, target.subtable, ekey, ts, epoch, cols))
                 new_states[bkey] = FieldState(epoch, canon, quality, is_null, None, seq)
@@ -542,59 +581,19 @@ async def capture_safely(session: AsyncSession, tenant_id: UUID, results: Sequen
 # ============================================================================================
 
 
-def _ts_literal(value: datetime, precision: str) -> str:
-    utc = value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    micros = (utc - _EPOCH) // timedelta(microseconds=1)
-    if precision == "ms":
-        return str(micros // 1000)
-    if precision == "ns":
-        return str(micros * 1000)
-    return str(micros)
-
-
-def _str_literal(text: str) -> str:
-    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+# R2-E B7: the literal helpers are the shared kernel's (same output): epoch integer at the database precision,
+# and a quoted string that keeps NUL bytes (``reject_nul=False``, as this writer always did).
+_ts_literal = ts_int_literal
+_str_literal = partial(quote_str, reject_nul=False)
 
 
 class ValueRejected(ValueError):
     pass
 
 
-def value_literal(value: Any, td_type: str, length: int | None, precision: str) -> str:
-    """Typed literal for a column; raises :class:`ValueRejected` instead of truncating or guessing."""
-    if value is None:
-        return "NULL"
-    base = str(td_type or "").upper().split("(")[0].strip()
-    if base == "TIMESTAMP":
-        ts = value if isinstance(value, datetime) else _parse_ts(value)
-        if ts is None:
-            raise ValueRejected(f"'{value}' is not a timestamp")
-        return _ts_literal(ts, precision)
-    if base == "BOOL":
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        raise ValueRejected(f"{value!r} is not a boolean")
-    if base in ("DOUBLE", "FLOAT"):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueRejected(f"{value!r} is not a number")
-        num = float(value)
-        if not math.isfinite(num):
-            raise ValueRejected("NaN/Infinity cannot be stored")
-        return repr(num)
-    if base in ("BIGINT", "INT", "SMALLINT", "TINYINT") or base.endswith("UNSIGNED"):
-        if isinstance(value, bool):
-            raise ValueRejected(f"{value!r} is a boolean, not an integer")
-        if isinstance(value, float):
-            if not value.is_integer():
-                raise ValueRejected(f"{value!r} is not a whole number")
-            value = int(value)
-        if not isinstance(value, int):
-            raise ValueRejected(f"{value!r} is not an integer")
-        return str(value)
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if length and len(text.encode("utf-8")) > int(length):
-        raise ValueRejected(f"text of {len(text.encode('utf-8'))} bytes exceeds the column length {length}")
-    return _str_literal(text)
+#: Typed literal for a column; raises :class:`ValueRejected` instead of truncating or guessing
+#: (R2-E B7: ``factorix_core.tdengine.sql.typed_literal``, same output and messages).
+value_literal = partial(typed_literal, reject=ValueRejected)
 
 
 def build_row_sql(
@@ -699,40 +698,34 @@ class RecordingDispatcher:
         return prec
 
     async def run_once(self) -> int:
+        """One round in three steps so no PostgreSQL transaction is open while TDengine is written
+        (WS-P P6: an ``idle in transaction`` of 9-22 s held the vacuum horizon of the whole cluster):
+
+        1. claim: ``FOR UPDATE SKIP LOCKED`` + lease (``next_attempt_at = now() + CLAIM_LEASE_S``), COMMIT;
+        2. write the batch to TDengine with no session open;
+        3. one short transaction: CONFIRMED / reschedule / FAILED.
+
+        A crash between 2 and 3 replays the batch after the lease; ``(ts, event_key)`` makes it idempotent.
+        """
         if self.td is None:
             return 0
+        rows = await self._claim()
+        if not rows:
+            await self._prune()
+            return 0
+        fenced = [r["id"] for r in rows if int(r["data_epoch"] or 1) < int(r["active_epoch"] or 1)]
+        fenced_set = set(fenced)
+        live = [r for r in rows if r["id"] not in fenced_set]
+        ok_ids, retry, failed = await self._write(live) if live else ([], [], [])
         async with self._session() as session:
-            rows = await fetch_all(
-                session,
-                """
-                SELECT o.id, o.tenant_id, o.physical_db, o.physical_subtable, o.event_key, o.data_epoch,
-                       o.payload_json, o.attempts, COALESCE(g.active_epoch, 1) AS active_epoch
-                FROM storage_record_outbox o
-                LEFT JOIN telemetry_generations g ON g.tenant_id = o.tenant_id
-                WHERE o.status = 'PENDING' AND o.next_attempt_at <= now()
-                ORDER BY o.id
-                LIMIT :limit
-                FOR UPDATE OF o SKIP LOCKED
-                """,
-                {"limit": DISPATCH_BATCH},
-            )
-            if not rows:
-                await self._prune(session)
-                await session.commit()
-                return 0
-            fenced = [r["id"] for r in rows if int(r["data_epoch"] or 1) < int(r["active_epoch"] or 1)]
-            live = [r for r in rows if r["id"] not in set(fenced)]
             if fenced:
                 await self._mark(session, fenced, "FAILED", "EPOCH_FENCED: written before a telemetry reset")
-            ok_ids, retry, failed = await self._write(live)
             if ok_ids:
                 await execute(
                     session,
                     "UPDATE storage_record_outbox SET status = 'CONFIRMED', confirmed_at = now(), last_error = NULL WHERE id = ANY(:ids)",
                     {"ids": ok_ids},
                 )
-                self.stats["written"] += len(ok_ids)
-                self.stats["last_write_at"] = iso_ms(utcnow())
             for rid, attempts, msg in retry:
                 if attempts + 1 >= MAX_ATTEMPTS:
                     failed.append((rid, msg))
@@ -751,7 +744,37 @@ class RecordingDispatcher:
             for rid, msg in failed:
                 await self._mark(session, [rid], "FAILED", msg)
             await session.commit()
-            return len(rows)
+        if ok_ids:
+            self.stats["written"] += len(ok_ids)
+            self.stats["last_write_at"] = iso_ms(utcnow())
+        return len(rows)
+
+    async def _claim(self) -> list[dict[str, Any]]:
+        """Step 1: take a batch of due PENDING rows for ``CLAIM_LEASE_S`` and commit at once."""
+        async with self._session() as session:
+            rows = await fetch_all(
+                session,
+                """
+                WITH due AS (
+                    SELECT id FROM storage_record_outbox
+                    WHERE status = 'PENDING' AND next_attempt_at <= now()
+                    ORDER BY id
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE storage_record_outbox o
+                SET next_attempt_at = now() + make_interval(secs => :lease)
+                FROM due
+                WHERE o.id = due.id
+                RETURNING o.id, o.tenant_id, o.physical_db, o.physical_subtable, o.event_key, o.data_epoch,
+                          o.payload_json, o.attempts,
+                          COALESCE((SELECT g.active_epoch FROM telemetry_generations g WHERE g.tenant_id = o.tenant_id), 1)
+                              AS active_epoch
+                """,
+                {"limit": DISPATCH_BATCH, "lease": float(CLAIM_LEASE_S)},
+            )
+            await session.commit()
+        return sorted((dict(r) for r in rows), key=lambda r: int(r["id"]))
 
     async def _mark(self, session: AsyncSession, ids: list[Any], status: str, msg: str) -> None:
         await execute(
@@ -809,15 +832,34 @@ class RecordingDispatcher:
         await flush(chunk)
         return ok, retry, failed
 
-    async def _prune(self, session: AsyncSession) -> None:
+    async def _prune(self) -> int:
+        """Delete CONFIRMED rows older than ``CONFIRMED_KEEP`` in bounded batches (WS-P P6: the single
+        DELETE was a full scan of the table every 5 min). Uses the partial index of migration 0012; each
+        batch is its own short transaction."""
         if time.monotonic() - self._last_prune < 300:
-            return
+            return 0
         self._last_prune = time.monotonic()
-        await execute(
-            session,
-            "DELETE FROM storage_record_outbox WHERE status = 'CONFIRMED' AND confirmed_at < :cutoff",
-            {"cutoff": utcnow() - CONFIRMED_KEEP},
-        )
+        cutoff = utcnow() - CONFIRMED_KEEP
+        total = 0
+        for _ in range(PRUNE_BATCHES):
+            async with self._session() as session:
+                n = await execute_rowcount(
+                    session,
+                    """
+                    DELETE FROM storage_record_outbox WHERE id IN (
+                        SELECT id FROM storage_record_outbox
+                        WHERE status = 'CONFIRMED' AND confirmed_at < :cutoff
+                        ORDER BY confirmed_at
+                        LIMIT :batch
+                    )
+                    """,
+                    {"cutoff": cutoff, "batch": PRUNE_BATCH},
+                )
+                await session.commit()
+            total += int(n or 0)
+            if not n or n < PRUNE_BATCH:
+                break
+        return total
 
 
 DISPATCHER = RecordingDispatcher()

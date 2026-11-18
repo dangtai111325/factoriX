@@ -16,6 +16,7 @@ from pathlib import Path
 import asyncpg
 
 from factorix.platform.broker import BrokerConfig, RabbitMQPublisher
+from factorix.platform.settings import BrokerSettings
 from factorix_acquisition.config_provider import (
     DEFAULT_LOCK_KEY,
     ConfigProvider,
@@ -62,16 +63,9 @@ async def build_and_run() -> None:
     asyncpg_dsn = to_asyncpg_dsn(dsn)
     pool = await asyncpg.create_pool(asyncpg_dsn, min_size=2, max_size=8)
 
-    broker_cfg = BrokerConfig(
-        amqp_url=amqp_url,
-        mgmt_url=os.environ.get("FACTORIX_RABBITMQ_MGMT_URL", "").strip(),
-        exchange_name=os.environ.get("FACTORIX_RABBITMQ_EXCHANGE", "factorix.telemetry.ingress"),
-        queue_name=os.environ.get("FACTORIX_RABBITMQ_QUEUE", "factorix.telemetry.ingest.q"),
-        dlx_name=os.environ.get("FACTORIX_RABBITMQ_DLX", "factorix.telemetry.dlx"),
-        dlq_name=os.environ.get("FACTORIX_RABBITMQ_DLQ", "factorix.telemetry.dlq"),
-        confirm_timeout_s=float(os.environ.get("FACTORIX_RABBITMQ_CONFIRM_TIMEOUT_S", "10.0")),
-        max_inflight_publishes=_env_int("FACTORIX_RABBITMQ_PUBLISHER_MAX_INFLIGHT", 64),
-    )
+    # R2-E C9 / CT-08: the same RabbitMQ settings section as ingestion (same FACTORIX_RABBITMQ_* names and
+    # defaults); the publisher does not declare the topology (ingestion owns it), it checks it passively.
+    broker_cfg = BrokerConfig.from_settings(BrokerSettings(), declare_topology=False)
     broker = RabbitMQPublisher(broker_cfg)
     try:
         await broker.start()

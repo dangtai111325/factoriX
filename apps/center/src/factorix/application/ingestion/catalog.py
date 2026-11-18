@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-import json
 import time
 from typing import Any
 from uuid import UUID
@@ -21,6 +20,7 @@ from factorix.modules.recording_policy import (
 from factorix.application.live.latest_api import select_binding
 
 from factorix.application.ingestion.common import logger
+from factorix_core.contracts.notify import EpochChanged, parse_config_changed, parse_epoch_changed
 
 
 @dataclass(slots=True)
@@ -88,7 +88,7 @@ class _CatalogStore:
                 binding_rows = await conn.fetch(
                     """
                     SELECT b.signal_id, b.valid_from, b.valid_to, s.resource_id, s.expected_interval_ms, r.site_id,
-                           c.id AS connection_id, f.id AS source_field_id,
+                           c.id AS connection_id, f.id AS source_field_id, j.interval_ms AS job_interval_ms,
                            COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable
                     FROM signal_bindings b
                     JOIN signal_definitions s ON s.id = b.signal_id
@@ -293,14 +293,16 @@ class _CatalogStore:
 class _CatalogStage:
     """IngestionWorker part: catalog cache, config/epoch NOTIFY listener."""
 
-    def invalidate_tenant_cache(self, tenant_id: UUID | None = None, *, epoch_changed: bool = False) -> None:
+    def invalidate_tenant_cache(
+        self, tenant_id: UUID | None = None, *, epoch_changed: bool = False, new_epoch: int | None = None
+    ) -> None:
         if tenant_id is None:
             self._catalogs.clear()
             self._live_cache.clear()
             if epoch_changed:
                 if hasattr(self.recording_evaluator, "invalidate_tenant"):
                     self.recording_evaluator.invalidate_tenant(None)
-                self.live_provider.invalidate_epoch_sync(None, 1)
+                self.live_provider.invalidate_epoch_sync(None, new_epoch or 1)
             return
         cat = self._catalogs.get(tenant_id)
         if cat is not None:
@@ -310,7 +312,8 @@ class _CatalogStage:
         if epoch_changed:
             if hasattr(self.recording_evaluator, "invalidate_tenant"):
                 self.recording_evaluator.invalidate_tenant(tenant_id)
-            next_ep = (cat.active_epoch + 1) if cat is not None else 1
+            # CT-06: the payload's epoch when known (a reset can skip epochs); cached + 1 otherwise.
+            next_ep = new_epoch or ((cat.active_epoch + 1) if cat is not None else 1)
             self.live_provider.invalidate_epoch_sync(tenant_id, next_ep)
 
     async def _get_catalog(self, tenant_id: UUID, *, need_signal: UUID | None = None) -> TenantCatalog:
@@ -357,16 +360,18 @@ class _CatalogStage:
             return cat
 
     def _on_pg_notify(self, _conn: Any, _pid: int, channel: str, payload: str) -> None:
-        tid: UUID | None = None
-        if payload:
-            try:
-                obj = json.loads(payload)
-                if isinstance(obj, dict) and obj.get("tenant_id"):
-                    tid = UUID(str(obj["tenant_id"]))
-            except (ValueError, json.JSONDecodeError):
-                tid = None
         is_epoch = channel == "factorix_epoch_changed"
-        self.invalidate_tenant_cache(tid, epoch_changed=is_epoch)
+        msg = parse_epoch_changed(payload) if is_epoch else parse_config_changed(payload)
+        tid: UUID | None = None
+        if msg.tenant_id:
+            try:
+                tid = UUID(msg.tenant_id)
+            except ValueError:
+                tid = None
+        if is_epoch and isinstance(msg, EpochChanged) and msg.active_epoch:
+            self.invalidate_tenant_cache(tid, epoch_changed=True, new_epoch=msg.active_epoch)
+        else:
+            self.invalidate_tenant_cache(tid, epoch_changed=is_epoch)
         if is_epoch and tid is not None:
             self.recent_uids.clear_tenant(tid)
 

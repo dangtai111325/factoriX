@@ -85,8 +85,10 @@ class FakeResetAndMigrationSession:
             "signals_active": 336,
             "signals_archived": 8,
             "data_models": 36,
+            "data_models_archived": 2,
             "storage_designs": 4,
             "resources": 42,
+            "resources_archived": 3,
             "admin_accounts": 1,
             "sessions": 2,
             "secret_store": 5,
@@ -192,6 +194,10 @@ class FakeResetAndMigrationSession:
             return _FakeResult([{"cnt": self.preserved_counts["signals_active"]}])
         if "from signal_definitions" in low and "status = 'archived'" in low:
             return _FakeResult([{"cnt": self.preserved_counts["signals_archived"]}])
+        if "select count(*) as cnt from output_groups" in low and "status = 'archived'" in low:
+            return _FakeResult([{"cnt": self.preserved_counts["data_models_archived"]}])
+        if "select count(*) as cnt from resources" in low and "status = 'archived'" in low:
+            return _FakeResult([{"cnt": self.preserved_counts["resources_archived"]}])
         if "select count(*) as cnt from output_groups" in low:
             return _FakeResult([{"cnt": self.preserved_counts["data_models"]}])
         if "select count(*) as cnt from storage_designs" in low:
@@ -393,14 +399,22 @@ async def test_preview_returns_exact_cleared_and_preserved_inventories() -> None
         "connections": 5,
         "signals_active": 336,
         "signals_archived": 8,
-        "data_models": 36,
+        "data_models": 36,  # R2-08: active only; archived reported separately
+        "data_models_archived": 2,
         "storage_designs": 4,
         "resources": 42,
+        "resources_archived": 3,
         "admin_accounts": 1,
         "sessions": 2,
         "secret_store": 5,
         "formulas": 12,
+        # R2-08: user Storage objects kept by the reset (display only; none in this fake)
+        "storage_user_databases": 0,
+        "storage_user_stables": 0,
+        "storage_user_subtables": 0,
+        "storage_recording_bindings": 0,
     }
+    assert preview["warnings"] == []  # no user supertables -> no history warning
 
 
 async def test_execute_rejects_invalid_confirm_phrase_and_wrong_password_and_concurrent_reset() -> None:

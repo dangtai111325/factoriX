@@ -62,3 +62,6 @@ recording policies and the active epoch.
   observations and the heartbeat then report a **smaller** `config_revision` for the same configuration.
   Mutations that change no entity counter (e.g. `POST /api/v1/jobs` updates `mode`/`interval_ms` without
   `config_revision`; source field / formula edits) are only visible through the digest.
+  **Fixed (ARCH-C):** `ConfigProvider` starts from the LKG revision + structure hash after a restart and
+  `load_pg_snapshot(revision_floor=…)` never returns less than the revision of the last acquisition heartbeat;
+  `POST /api/v1/jobs` bumps `acquisition_jobs.config_revision`.

@@ -12,6 +12,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -202,20 +203,51 @@ QUEUE_ARGUMENT_FIELDS = {
 }
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="CT-08: acquisition passes only a subset of the queue arguments it declares")
-def test_acquisition_and_ingestion_declare_identical_queue_arguments() -> None:
-    """Both processes call ``declare_telemetry_topology``; every queue argument must come from the same config."""
+def test_acquisition_and_ingestion_declare_identical_queue_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CT-08 fixed (R2-E C9): one owner declares the topology (ingestion); acquisition builds its config from the
+    same ``BrokerSettings`` section and only checks the exchange passively, so queue arguments cannot diverge."""
+    from factorix.platform.settings import BrokerSettings
+
     src = (REPO / "apps" / "acquisition" / "src" / "factorix_acquisition" / "__main__.py").read_text(encoding="utf-8")
-    passed: set[str] = set()
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "BrokerConfig":
-            passed |= {kw.arg for kw in node.keywords if kw.arg}
-    assert passed, "acquisition no longer builds BrokerConfig inline; update this test"
-    assert QUEUE_ARGUMENT_FIELDS <= passed, f"not configurable in acquisition: {sorted(QUEUE_ARGUMENT_FIELDS - passed)}"
+    inline = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "BrokerConfig"]
+    assert not inline, "acquisition must not build BrokerConfig from a private env subset"
+    assert "BrokerConfig.from_settings(BrokerSettings(), declare_topology=False)" in src
+    for name, value in {"FACTORIX_RABBITMQ_MAX_LENGTH_BYTES": "1048576", "FACTORIX_RABBITMQ_DELIVERY_LIMIT": "7",
+                        "FACTORIX_RABBITMQ_LIVE_QUEUE": "x.live.q", "FACTORIX_RABBITMQ_LIVE_MAX_LENGTH_BYTES": "2097152"}.items():
+        monkeypatch.setenv(name, value)
+    acq = BrokerConfig.from_settings(BrokerSettings(rabbitmq_url="amqp://contract-test/"), declare_topology=False)
+    ing = BrokerConfig.from_settings(Settings.model_construct(**BrokerSettings(rabbitmq_url="amqp://contract-test/").model_dump()))
+    assert {f: getattr(acq, f) for f in QUEUE_ARGUMENT_FIELDS} == {f: getattr(ing, f) for f in QUEUE_ARGUMENT_FIELDS}
+    assert (acq.delivery_limit, acq.max_length_bytes, acq.live_queue_name) == (7, 1048576, "x.live.q")
+    assert ing.declare_topology and not acq.declare_topology
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="CT-09: BrokerConfig.from_settings reads settings that Settings does not declare")
+async def test_passive_publisher_never_declares_queues() -> None:
+    """The publisher of a non-owner checks the ingress exchange with ``passive=True`` and declares no queue."""
+    from factorix.platform import broker as B
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class Channel:
+        is_closed = False
+
+        async def declare_exchange(self, name: str, *_a: Any, **kw: Any) -> Any:
+            calls.append((name, kw))
+            if kw.get("passive") and name == "missing":
+                raise RuntimeError("NOT_FOUND - no exchange")
+            return SimpleNamespace(name=name)
+
+        async def declare_queue(self, *_a: Any, **_kw: Any) -> Any:  # pragma: no cover - must not be called
+            raise AssertionError("a passive publisher must not declare queues")
+
+    ex = await B.passive_ingress_exchange(Channel(), BrokerConfig(amqp_url="amqp://x/"))  # type: ignore[arg-type]
+    assert ex.name == "factorix.telemetry.ingress" and calls[0][1]["passive"] is True
+    with pytest.raises(B.BrokerUnavailableError, match="not provisioned"):
+        await B.passive_ingress_exchange(Channel(), BrokerConfig(amqp_url="amqp://x/", exchange_name="missing"))  # type: ignore[arg-type]
+
+
 def test_broker_settings_are_declared() -> None:
+    """CT-09 fixed: every setting ``BrokerConfig.from_settings`` reads is declared (no silent getattr default)."""
     real = Settings.model_construct(rabbitmq_url="amqp://contract-test/")
     read: set[str] = set()
 

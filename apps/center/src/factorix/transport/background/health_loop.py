@@ -12,7 +12,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import edge_sync, telemetry
-from factorix.modules.live_state import get_pipeline_evidence, refresh_live_message
+from factorix.application.health.health_service import report_continuity, sweep_no_data
+from factorix.application.live.freshness_service import FreshnessService
+from factorix.modules.live_state import get_pipeline_evidence, refresh_live_message  # noqa: F401
 from factorix.domain.health import (
     EDGE_OFFLINE_AFTER_S,
     HEARTBEAT_PERIOD_S,
@@ -115,6 +117,9 @@ async def _evaluate_connections(session: AsyncSession) -> None:
     # (single owner). This sweep only covers bound connections acquisition runs nothing for.
     running = set(acq_info.get("connections_running") or []) if isinstance(acq_info.get("connections_running"), list) else set()
     acq_since = [moment for moment in (_opt_time(acq_info.get("leader_since")), _opt_time(acq_info.get("started_at"))) if moment]
+    # P6: missing evidence is not negative evidence. While the collector's own report is late (or Center did
+    # not watch continuously), no connection it covers is inferred "No samples"; the window restarts.
+    report = report_continuity().observe((acq_runtime or {}).get("last_heartbeat"), acq_info, now)
 
     rows = await fetch_all(
         session,
@@ -157,55 +162,23 @@ async def _evaluate_connections(session: AsyncSession) -> None:
                 continue
             if str(acq_runtime.get("health") or "").upper() in {"OFFLINE", "DOWN"}:
                 continue
+            if not report.current:
+                continue  # keep the last verdict; the collector status says "not reporting"
             if str(row["id"]) in running:
                 continue
         since_candidates = [row.get(key) for key in ("bindings_since", "created_at", "updated_at", "activated_at") if row.get(key)]
         if row.get("edge_id") is None:
             # Acquisition (re)start / promotion: evidence from before it is not "no samples".
             since_candidates.extend(acq_since)
+            if report.reporting_since is not None:
+                since_candidates.append(report.reporting_since)
         since = max(since_candidates) if since_candidates else None
         if not connection_no_data_due(last_success_at=row.get("last_success_at"), since=since, interval_ms=row.get("interval_ms"), now=now):
             continue
         message = no_data_message(row.get("interval_ms"))
         cutoff = now - timedelta(seconds=no_data_threshold_s(row.get("interval_ms")))
-        # The predicate is re-checked atomically: if acquisition advanced last_success_at after the
-        # SELECT above (data arrived), this UPDATE matches nothing (no read-then-update race).
-        changed = await execute_rowcount(
-            session,
-            """
-            UPDATE connections SET health = 'DEGRADED', last_error = :error
-            WHERE id = :id AND status = 'ACTIVE' AND health <> 'DEGRADED'
-              AND (last_success_at IS NULL OR last_success_at < :cutoff)
-            """,
-            {"id": row["id"], "error": message, "cutoff": cutoff},
-        )
-        if not changed:
-            continue
-        await audit(
-            session,
-            tenant_id=as_uuid(row["tenant_id"]),
-            event_type="CONNECTION_DEGRADED",
-            actor_id=None,
-            entity_type="connection",
-            entity_id=as_uuid(row["id"]),
-            before={"health": row["health"]},
-            after={"health": "DEGRADED", "last_error": message, "source": "center"},
-            correlation_id=f"health-{uuid4().hex[:8]}",
-            severity="WARN",
-        )
-        queue_stream_event(
-            session,
-            "health",
-            row["tenant_id"],
-            telemetry.connection_health_payload(
-                connection_id=row["id"],
-                health="DEGRADED",
-                effective_health="DEGRADED",
-                last_error=message,
-                last_success_at=row.get("last_success_at"),
-            ),
-        )
-
+        # HealthService (single writer, R2-E C2) re-checks the predicate atomically and audits/pushes.
+        await sweep_no_data(session, row, message=message, cutoff=cutoff)
 
 def _acquisition_runtime_info(acq_runtime: dict[str, Any] | None) -> dict[str, Any]:
     """``queues_json.runtime`` of the acquisition heartbeat (started_at, leader_since, connections_running)."""
@@ -227,10 +200,10 @@ def commissioning_timeout(status: str, timeout_s: int) -> tuple[str, str]:
     if status == "PENDING":
         return (
             "EDGE_NOT_STARTED",
-            f"Collector did not start: no Edge collector picked up this test within {timeout_s} seconds. "
+            f"Collector did not start: no collector picked up this test within {timeout_s} seconds. "
             "Check that the collector is running and enrolled, then test again.",
         )
-    return "TIMEOUT", f"The Edge collector started the test but did not report a result within {timeout_s} seconds."
+    return "TIMEOUT", f"The collector started the test but did not report a result within {timeout_s} seconds."
 
 
 async def _reap_commissioning(session: AsyncSession) -> None:
@@ -332,7 +305,7 @@ async def _refresh_pipeline_evidence(session: AsyncSession, *, with_mapping: boo
             {},
         )
         evidence.set_mapping(rows, now=utcnow())
-    sources = await fetch_all(session, "SELECT id, last_success_at FROM connections WHERE status = 'ACTIVE'", {})
+    sources = await fetch_all(session, "SELECT id, last_success_at, health FROM connections WHERE status = 'ACTIVE'", {})
     beat = None
     try:
         async with session.begin_nested():
@@ -356,8 +329,9 @@ def _wire_hub_freshness() -> None:
             event.get("connection_id") or message.get("connection_id"),
         )
 
+    service = FreshnessService(evidence)
     hub.observer = _observe
-    hub.refresher = lambda message: refresh_live_message(message, evidence=evidence)
+    hub.refresher = lambda message: service.refresh_message(message)
     hub.summary = evidence.pipeline_summary
     hub.connection_of = evidence.connection_of
 

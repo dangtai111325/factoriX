@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from factorix.application.live.freshness_service import freshness_service
 from factorix.domain.source_address import AddressCheck, validate_address_patch
 from factorix.modules.common import (
     as_uuid,
@@ -365,7 +366,8 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
                r.code AS resource_code, r.name AS resource_name, r.path_code,
                c.id AS connection_id, c.name AS connection_name, c.protocol AS connection_protocol, c.status AS connection_status,
                e.id AS edge_id, e.name AS edge_name,
-               f.address_kind, f.address_json, COALESCE(f.ordinal, 0) AS source_ordinal, j.id AS job_id, b.enabled AS binding_enabled
+               f.address_kind, f.address_json, COALESCE(f.ordinal, 0) AS source_ordinal, j.id AS job_id, b.enabled AS binding_enabled,
+               j.interval_ms AS job_interval_ms
         FROM signal_definitions s
         JOIN resources r ON r.id = s.resource_id
         LEFT JOIN LATERAL (
@@ -387,10 +389,16 @@ async def list_signals(session: AsyncSession, tenant_id: UUID, *, resource_id: s
         """,
         params,
     )
+    freshness = freshness_service()
     for row in rows:
         if row.get("data_type") == "bool":
             row["data_type"] = "boolean"
         row["signal_id"] = str(row["id"])
+        # Server-side stale threshold (R2-E C1): signal interval, falling back to the job interval. The
+        # browser uses this instead of deriving its own threshold from expected_interval_ms.
+        row["stale_after_ms"] = freshness.stale_after_ms(
+            row["id"], expected_interval_ms=row.get("expected_interval_ms"), job_interval_ms=row.pop("job_interval_ms", None)
+        )
         conn_id = str(row["connection_id"]) if row.get("connection_id") else None
         row["connection_id"] = conn_id
         row["binding_enabled"] = None if row.get("binding_enabled") is None else bool(row["binding_enabled"])

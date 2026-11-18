@@ -112,6 +112,22 @@ def sweep(monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
     monkeypatch.setattr(app_mod, "audit", fake_audit)
     monkeypatch.setattr(app_mod, "queue_stream_event", lambda *a, **k: None)
     monkeypatch.setattr(app_mod, "utcnow", lambda: NOW)
+    # R2-E C2: the guarded UPDATE + audit + push run in HealthService (single writer); it resolves these
+    # helpers from factorix.modules.common at call time.
+    from factorix.modules import common as common_mod
+
+    monkeypatch.setattr(common_mod, "execute_rowcount", fake_rowcount)
+    monkeypatch.setattr(common_mod, "audit", fake_audit)
+    monkeypatch.setattr(common_mod, "queue_stream_event", lambda *a, **k: None)
+
+    # P6: these tests start from a collector that has been reporting continuously for an hour.
+    from factorix.application.health import health_service as HS
+    from factorix.transport.background import health_loop as HL
+
+    continuity = HS.ReportContinuity()
+    continuity.reporting_since = NOW - timedelta(hours=1)
+    continuity.last_observed = NOW - timedelta(seconds=5)
+    monkeypatch.setattr(HL, "report_continuity", lambda: continuity)
 
     async def run(rec: _Recorder) -> _Recorder:
         state["rec"] = rec
@@ -167,3 +183,62 @@ async def test_sweep_race_with_fresh_data_degrades_nothing(sweep) -> None:  # no
     rec.live[conn["id"]] = NOW - timedelta(seconds=1)  # acquisition wrote fresh evidence after the SELECT
     rec = await sweep(rec)
     assert len(rec.updates) == 1 and rec.changed == 0
+
+
+# ---------------------------------------------------------------------------- P6: missing evidence is not negative
+
+
+@pytest.mark.asyncio
+async def test_sweep_keeps_verdicts_while_the_collector_report_is_late(sweep) -> None:  # noqa: ANN001
+    """VM freeze: the heartbeat still lands but the report flush fails (last_report_at 40 s old) -> no
+    "No samples received" for any connection; they keep their last verdict."""
+    conns = [_conn(NOW - timedelta(minutes=2), NOW - timedelta(days=3)) for _ in range(5)]
+    rec = await sweep(_Recorder(conns, _runtime(started_at=(NOW - timedelta(hours=1)).isoformat(),
+                                                leader_since=(NOW - timedelta(hours=1)).isoformat(),
+                                                last_report_at=(NOW - timedelta(seconds=40)).isoformat())))
+    assert rec.updates == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_degrade_for_a_standby_collector(sweep) -> None:  # noqa: ANN001
+    conn = _conn(NOW - timedelta(minutes=2), NOW - timedelta(days=3))
+    rec = await sweep(_Recorder([conn], _runtime(started_at=(NOW - timedelta(hours=1)).isoformat(), leader_since=None,
+                                                 last_report_at=(NOW - timedelta(seconds=3)).isoformat())))
+    assert rec.updates == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_still_degrades_a_silent_connection_when_reports_are_current(sweep) -> None:  # noqa: ANN001
+    """Windowed semantics kept: a current report and no sample for > window still degrades (not covered by acquisition)."""
+    conn = _conn(NOW - timedelta(minutes=2), NOW - timedelta(days=3))
+    rec = await sweep(_Recorder([conn], _runtime(started_at=(NOW - timedelta(hours=1)).isoformat(),
+                                                 leader_since=(NOW - timedelta(hours=1)).isoformat(),
+                                                 last_report_at=(NOW - timedelta(seconds=4)).isoformat())))
+    assert len(rec.updates) == 1
+
+
+def test_report_continuity_restarts_the_window_after_a_gap() -> None:
+    from factorix.application.health.health_service import ReportContinuity, collector_report_state
+
+    info = {"leader_since": (NOW - timedelta(hours=1)).isoformat(), "last_report_at": (NOW - timedelta(seconds=3)).isoformat()}
+    c = ReportContinuity()
+    assert c.observe(NOW - timedelta(seconds=1), info, NOW).reporting_since == NOW
+    later = NOW + timedelta(seconds=5)
+    info_later = {**info, "last_report_at": (later - timedelta(seconds=3)).isoformat()}
+    assert c.observe(later - timedelta(seconds=1), info_later, later).reporting_since == NOW  # continuous
+    # report late -> not current, window cleared
+    late = later + timedelta(seconds=30)
+    assert c.observe(late - timedelta(seconds=1), info_later, late).state == "REPORT_LATE"
+    assert c.reporting_since is None
+    back = late + timedelta(seconds=5)
+    info_back = {**info, "last_report_at": (back - timedelta(seconds=2)).isoformat()}
+    assert c.observe(back - timedelta(seconds=1), info_back, back).reporting_since == back  # window restarts
+    # Center itself did not watch for 60 s (API frozen): window restarts too
+    resumed = back + timedelta(seconds=60)
+    info_resumed = {**info, "last_report_at": (resumed - timedelta(seconds=2)).isoformat()}
+    assert c.observe(resumed - timedelta(seconds=1), info_resumed, resumed).reporting_since == resumed
+    # stateless states
+    assert collector_report_state(NOW - timedelta(seconds=30), info, NOW).state == "NOT_REPORTING"
+    assert collector_report_state(NOW, {}, NOW).state == "REPORTING"  # older acquisition build: heartbeat only
+    late_state = collector_report_state(NOW, {**info, "last_report_at": (NOW - timedelta(seconds=40)).isoformat()}, NOW)
+    assert late_state.state == "REPORT_LATE" and late_state.diagnostic().startswith("Collector not reporting connection status (last report 40 s ago)")

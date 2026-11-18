@@ -21,7 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain import body as B
 from factorix.domain import rules as R
-from factorix.domain.signal_state import evaluate_signal_state
+from factorix.application.live.freshness_service import freshness_service
+from factorix.domain.signal_state import evaluate_signal_state  # noqa: F401
 from factorix.modules import models_engine as E
 from factorix.modules.common import as_uuid, audit, execute, execute_rowcount, fetch_all, fetch_one, iso_ms, jsonb, parse_uuid, utcnow
 from factorix.platform.errors import AppError
@@ -263,13 +264,14 @@ async def signal_states(session: AsyncSession, tenant_id: UUID, signal_ids: Iter
                l.value_json, l.event_time, l.received_time, l.last_acquired_at, l.last_value_changed_at,
                l.source_time, l.data_epoch, l.source_sequence, l.event_uid, l.config_revision, l.origin, l.updated_at,
                l.last_good_value_json, l.last_good_event_time,
-               nb.nullable, nb.enabled, nb.connection_status, nb.connection_id, nb.connection_name, nb.connection_health
+               nb.nullable, nb.enabled, nb.connection_status, nb.connection_id, nb.connection_name, nb.connection_health,
+               nb.job_interval_ms
         FROM signal_definitions s
         LEFT JOIN latest_signal_state l ON l.tenant_id = s.tenant_id AND l.signal_id = s.id
         LEFT JOIN LATERAL (
             SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable, b.enabled,
                    c.status AS connection_status, c.id AS connection_id, c.name AS connection_name,
-                   c.health AS connection_health
+                   c.health AS connection_health, j.interval_ms AS job_interval_ms
             FROM signal_bindings b
             JOIN source_fields f ON f.id = b.source_field_id
             LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
@@ -350,24 +352,21 @@ async def signal_states(session: AsyncSession, tenant_id: UUID, signal_ids: Iter
                 connection_status=row.get("connection_status"),
                 active_bindings=1 if binding_enabled else 0,
                 now=now,
+                connection_id=row.get("connection_id"),
+                job_interval_ms=row.get("job_interval_ms"),
             ).evaluation
         else:
+            # PostgreSQL fallback (no live cache): same evaluator, same evidence (R2-E C1 / CT-10).
             value_json = E._json(row.get("value_json"))
             good_json = E._json(row.get("last_good_value_json"))
-            result = evaluate_signal_state(
+            result = freshness_service().evaluate_latest_row(
+                {**row, "signal_id": sid},
+                now=now,
                 has_observation=row_has_obs,
-                raw_quality=row.get("quality"),
-                raw_value=value_json.get("v") if isinstance(value_json, dict) else None,
-                event_time=row.get("event_time"),
-                last_acquired_at=row.get("last_acquired_at") or row.get("received_time"),
-                expected_interval_ms=row.get("expected_interval_ms"),
-                last_good_value=good_json.get("v") if isinstance(good_json, dict) else None,
-                last_good_time=row.get("last_good_event_time"),
-                raw_reason_code=row.get("reason_code"),
-                null_allowed=bool(row.get("nullable")),
                 binding_enabled=binding_enabled,
                 connection_paused=conn_paused,
-                now=now,
+                raw_value=value_json.get("v") if isinstance(value_json, dict) else None,
+                last_good_value=good_json.get("v") if isinstance(good_json, dict) else None,
             )
         out[str(sid).lower()] = B.SignalStatus(
             status=result.effective_status,

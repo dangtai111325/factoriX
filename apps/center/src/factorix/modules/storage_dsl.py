@@ -23,6 +23,9 @@ from uuid import UUID, uuid5
 
 import yaml
 
+from factorix_core.tdengine.sql import IDENT_RE
+from factorix_core.tdengine.naming import tenant_database_name
+
 COMPILER_VERSION = "1.0.0"
 API_VERSION = "factorix.io/storage/v1"
 DESIGN_KIND = "StorageDesign"
@@ -59,7 +62,7 @@ RESERVED_FIELD_KEYS = frozenset(
     }
 )
 
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_IDENT_RE = IDENT_RE  # B-18: the shared kernel pattern (same object)
 _DATASET_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,47}$")
 _TAG_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,31}$")
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?\s*$", re.I)
@@ -1267,11 +1270,16 @@ def _td_column_type(field_type: str, max_length: int | None) -> tuple[str, int]:
     raise StorageDslError([DslIssue("error", "UNSUPPORTED_TD_TYPE", f"Unsupported TDengine field type {field_type!r}.")])
 
 
-def tenant_td_database(tenant_id: UUID | str, prefix: str = "fx_t_") -> str:
-    uid_hex = UUID(str(tenant_id)).hex
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,15}", prefix):
-        raise ValueError(f"Invalid TDengine db prefix {prefix!r}")
-    return f"{prefix}{uid_hex}"
+#: ``fx_t_<tenant hex>`` (R2-E B7: the shared kernel; the tenant id is parsed before the prefix is checked, both
+#: raise ``ValueError`` as before).
+def tenant_td_database(tenant_id: Any, prefix: str | None = None) -> str:
+    """``<prefix><tenant hex>`` with the configured ``tdengine_db_prefix`` (B-13; was always ``fx_t_``).
+    Same validation order as before (tenant id first, then prefix)."""
+    if prefix is None:
+        from factorix.platform.settings import get_settings  # noqa: PLC0415 - avoid import cycle at load
+
+        prefix = get_settings().tdengine_db_prefix
+    return tenant_database_name(tenant_id, prefix, uuid_first=True)
 
 
 def stable_name_for_dataset(design_id: UUID | str, dataset_key: str, schema_version: int = 1) -> str:

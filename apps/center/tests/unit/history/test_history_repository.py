@@ -297,13 +297,21 @@ async def test_aggregate_excludes_non_numeric_and_uses_good_filter() -> None:
 
 async def test_storage_overview_metrics_uses_first_last_and_probes_disk() -> None:
     client = _fake_client()
-    client.query_rows.side_effect = [
-        [{"cnt": 100, "oldest": T0, "newest": T0 + timedelta(minutes=10)}],
-        [{"cnt": 25, "oldest": T0 - timedelta(minutes=5), "newest": T0 + timedelta(minutes=2)}],
-        [{"cnt": 0, "oldest": None, "newest": None}],
-        TDEngineError("TDENGINE_QUERY_FAILED", "Table does not exist"),
-        [{"cnt": 5, "oldest": T0, "newest": T0 + timedelta(minutes=1)}],
-    ]
+    per_stable = {
+        "op_float64": {"cnt": 100, "oldest": T0, "newest": T0 + timedelta(minutes=10)},
+        "op_int64": {"cnt": 25, "oldest": T0 - timedelta(minutes=5), "newest": T0 + timedelta(minutes=2)},
+        "op_bool": {"cnt": 0, "oldest": None, "newest": None},
+        "op_json": {"cnt": 5, "oldest": T0, "newest": T0 + timedelta(minutes=1)},
+    }
+
+    async def query(sql, **_kw):
+        stable = sql.split(".`")[1].split("`")[0]
+        if stable == "op_string":
+            raise TDEngineError("TDENGINE_QUERY_FAILED", "Table does not exist")
+        alias = sql.split(" AS `")[1].split("`")[0]
+        return [{alias: per_stable[stable][alias]}]
+
+    client.query_rows.side_effect = query
     repo = TDengineHistoryRepository(client)
     metrics = await repo.storage_overview_metrics(TENANT, active_epoch=2)
     assert metrics["observations"] == 130
@@ -313,4 +321,11 @@ async def test_storage_overview_metrics_uses_first_last_and_probes_disk() -> Non
     assert metrics["approximate"] is False
     queried_sql = [call.args[0] for call in client.query_rows.call_args_list]
     for st in ("op_float64", "op_int64", "op_bool", "op_string", "op_json"):
-        assert any(f".`{st}` " in sql for sql in queried_sql)
+        assert any(f".`{st}`" in sql for sql in queried_sql)
+    # Metadata-only shapes: COUNT, FIRST and LAST never share one SELECT (that forces a full scan).
+    assert all(sum(f in sql for f in ("COUNT(*)", "FIRST(", "LAST(")) == 1 for sql in queried_sql)
+    assert all("`data_epoch` >= 2" in sql for sql in queried_sql)
+
+    client.query_rows.reset_mock()
+    await repo.storage_overview_metrics(TENANT, active_epoch=1)
+    assert not any("data_epoch" in call.args[0] for call in client.query_rows.call_args_list)

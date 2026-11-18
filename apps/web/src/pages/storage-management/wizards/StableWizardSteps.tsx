@@ -130,6 +130,22 @@ export const TD_TAG_TYPES = [
   'BOOL',
 ] as const;
 
+/** Tag base types offered in the Tags step; the length of VARCHAR/NCHAR/BINARY/VARBINARY is a free number (R2-11). */
+export const TD_TAG_BASE_TYPES = ['VARCHAR', 'NCHAR', 'BINARY', 'VARBINARY', 'INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'BOOL'] as const;
+export const TAG_MAX_LENGTH = 16382;
+
+/** "VARCHAR(36)" → {base: "VARCHAR", length: 36}; "INT" → {base: "INT", length: null}. */
+export function splitTagType(tdType: string, length?: number | null): { base: string; length: number | null } {
+  const m = /^\s*([A-Za-z]+)\s*(?:\(\s*(\d+)\s*\))?\s*$/.exec(tdType || '');
+  const base = (m?.[1] || tdType || 'VARCHAR').toUpperCase();
+  const len = m?.[2] ? Number(m[2]) : length ?? null;
+  return { base, length: VAR_LENGTH_TYPES.includes(base) ? len ?? 64 : null };
+}
+
+export function joinTagType(base: string, length: number | null): string {
+  return VAR_LENGTH_TYPES.includes(base) ? `${base}(${length ?? 64})` : base;
+}
+
 // ============================================================================
 // Step 1: StableTargetStep
 // ============================================================================
@@ -633,7 +649,7 @@ export const StableTagsStep: React.FC<StableStepProps> = ({ data, onChange, erro
             <tr>
               <th className="py-2.5 px-3 w-12 text-center">#</th>
               <th className="py-2.5 px-3">Tag Name</th>
-              <th className="py-2.5 px-3 w-56">Tag Type</th>
+              <th className="py-2.5 px-3 w-64">Tag type · length</th>
               <th className="py-2.5 px-3 w-20 text-center">Action</th>
             </tr>
           </thead>
@@ -655,17 +671,43 @@ export const StableTagsStep: React.FC<StableStepProps> = ({ data, onChange, erro
                   />
                 </td>
                 <td className="py-2.5 px-3">
-                  <select
-                    value={tag.td_type}
-                    onChange={(e) => updateTag(idx, { td_type: e.target.value })}
-                    className="w-full h-8 px-2 rounded-lg border border-[#D4DFEC] bg-white text-[12px] font-mono focus:outline-none focus:border-blue-500"
-                  >
-                    {TD_TAG_TYPES.map((t) => (
-                      <option key={t} value={t}>
-                        {t}
-                      </option>
-                    ))}
-                  </select>
+                  {(() => {
+                    const { base, length } = splitTagType(tag.td_type, tag.length);
+                    const bases: string[] = TD_TAG_BASE_TYPES.includes(base as (typeof TD_TAG_BASE_TYPES)[number]) ? [...TD_TAG_BASE_TYPES] : [base, ...TD_TAG_BASE_TYPES];
+                    const lenInvalid = length != null && (!Number.isInteger(length) || length < 1 || length > TAG_MAX_LENGTH);
+                    return (
+                      <div className="flex items-center gap-2">
+                        <select
+                          aria-label={`Type of tag ${tag.name}`}
+                          value={base}
+                          onChange={(e) => updateTag(idx, { td_type: joinTagType(e.target.value, length), length: undefined })}
+                          className="flex-1 min-w-0 h-8 px-2 rounded-lg border border-[#D4DFEC] bg-white text-[12px] font-mono focus:outline-none focus:border-blue-500"
+                        >
+                          {bases.map((t) => (
+                            <option key={t} value={t}>
+                              {t}
+                            </option>
+                          ))}
+                        </select>
+                        {length != null && (
+                          <input
+                            type="number"
+                            min={1}
+                            max={TAG_MAX_LENGTH}
+                            aria-label={`Length of tag ${tag.name}`}
+                            aria-invalid={lenInvalid}
+                            title={lenInvalid ? `Length must be 1–${TAG_MAX_LENGTH}` : 'Maximum length (bytes for VARCHAR/BINARY, characters for NCHAR)'}
+                            value={length}
+                            onChange={(e) => {
+                              const n = Math.round(Number(e.target.value));
+                              updateTag(idx, { td_type: joinTagType(base, Number.isFinite(n) && n > 0 ? n : 1), length: undefined });
+                            }}
+                            className={`w-20 h-8 px-2 rounded-lg border text-[12px] font-mono focus:outline-none focus:border-blue-500 ${lenInvalid ? 'border-red-400' : 'border-[#D4DFEC]'}`}
+                          />
+                        )}
+                      </div>
+                    );
+                  })()}
                 </td>
                 <td className="py-2.5 px-3 text-center">
                   <button

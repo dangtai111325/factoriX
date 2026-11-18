@@ -2,6 +2,7 @@
 
 Covers the review P0/P1 items and the tdengine_guide gates G-00, G-02..G-06, G-09, G-10 and the
 ON_CHANGE / ON_NEW_EVENT cases OC-001..OC-015 / PR-004..PR-006 at the unit level (no live system).
+Renamed from ``test_ws_h_storage_recording.py`` (R2-E B9: test files named by domain, not by workstream).
 """
 
 from __future__ import annotations

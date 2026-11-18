@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { X, Edit2, AlertCircle, AlertTriangle, Plus, Trash2 } from 'lucide-react';
+import { X, Edit2, AlertCircle, AlertTriangle, Plus, Trash2, Loader2 } from 'lucide-react';
 import { ApiError, api } from '../../api/client';
 import { Button } from '../common/Button';
 import { translateApiError } from '../../utils/apiErrors';
@@ -91,6 +91,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
       .then((row) => {
         if (!active) return;
         setDetail(row);
+        window.setTimeout(() => document.getElementById('edit-resource-name')?.focus(), 0);
         setName(row.name || '');
         setCode(row.code || '');
         setDescription(row.description || '');
@@ -116,6 +117,10 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
   }, [isOpen, resourceId]);
 
   if (!isOpen || !resource) return null;
+
+  // R2-21: nothing is editable until the saved record is loaded; the loaded values would otherwise
+  // overwrite what was typed meanwhile (same family as R1-22).
+  const locked = loading || !detail;
 
   const originalCode = detail?.code ?? resource.code ?? '';
   const isCodeChanged = code.trim().toLowerCase() !== originalCode.toLowerCase();
@@ -257,6 +262,13 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
               </div>
             )}
 
+            {loading && (
+              <div role="status" className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg flex items-center gap-2 text-slate-600 text-xs">
+                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" aria-hidden="true" />
+                <span>Loading the saved details… The fields can be edited once they are loaded.</span>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
               <div>
                 <label htmlFor="edit-resource-name" className="block text-xs font-semibold text-slate-700 mb-1">
@@ -268,6 +280,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
                   data-autofocus
                   maxLength={200}
                   value={name}
+                  disabled={locked}
                   aria-invalid={Boolean(nameError)}
                   aria-describedby="edit-resource-name-hint"
                   onChange={(event) => {
@@ -302,6 +315,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
                   type="text"
                   maxLength={64}
                   value={code}
+                  disabled={locked}
                   aria-invalid={Boolean(codeError)}
                   aria-describedby={codeError ? 'edit-resource-code-error' : undefined}
                   onChange={(event) => {
@@ -336,7 +350,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
                 id="edit-resource-description"
                 rows={2}
                 value={description}
-                disabled={loading}
+                disabled={locked}
                 onChange={(event) => setDescription(event.target.value)}
                 placeholder={loading ? 'Loading…' : 'Optional notes about this resource'}
                 className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2A82E7]/20 focus:border-[#2A82E7] disabled:bg-slate-50"
@@ -348,7 +362,7 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
                 <span className="text-xs font-semibold text-slate-700">Properties</span>
                 <button
                   type="button"
-                  disabled={loading}
+                  disabled={locked}
                   onClick={() => setProperties((prev) => [...prev, { key: '', value: '' }])}
                   className="inline-flex items-center gap-1 text-xs text-[#EF1B24] font-medium hover:underline disabled:opacity-50"
                 >

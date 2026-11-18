@@ -127,7 +127,8 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
   const navigate = useNavigate();
   const location = useLocation();
   const from = `${location.pathname}${location.search}`;
-  const [search, setSearch] = useState('');
+  // ?q= prefills the search (e.g. the bulk wizard's "Open in Objects table" for its name prefix).
+  const [search, setSearch] = useState(() => (new URLSearchParams(location.search).get('q') || '').slice(0, 200));
   const [page, setPage] = useState(1);
   const [items, setItems] = useState<StorageCatalogRow[]>([]);
   const [total, setTotal] = useState(0);
@@ -232,11 +233,11 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
       if (!locked) list.push({ key: 'dup', label: 'Duplicate', icon: <Copy className="w-3.5 h-3.5" />, onSelect: () => navigate(`/historian/storage/create?kind=subtable&duplicate=${encodeURIComponent(obj.id)}`, { state: { from } }) });
     }
     if (obj.object_type === 'database') {
-      list.push({ key: 'newst', label: 'New supertable', icon: <Plus className="w-3.5 h-3.5" />, onSelect: () => navigate(`/historian/storage/create?kind=stable&database=${encodeURIComponent(obj.physical_name)}`, { state: { from } }) });
+      list.push({ key: 'newst', label: 'Create supertable here', icon: <Plus className="w-3.5 h-3.5" />, onSelect: () => navigate(`/historian/storage/create?kind=stable&database=${encodeURIComponent(obj.physical_name)}`, { state: { from } }) });
     }
     if (obj.object_type === 'stable' && !locked) {
       list.push(
-        { key: 'newsub', label: 'New subtable', icon: <Plus className="w-3.5 h-3.5" />, onSelect: () => navigate(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(ref)}`, { state: { from } }) },
+        { key: 'newsub', label: 'Create subtable here', icon: <Plus className="w-3.5 h-3.5" />, onSelect: () => navigate(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(ref)}`, { state: { from } }) },
         { key: 'bulk', label: 'Subtables from Data Models', icon: <Plus className="w-3.5 h-3.5" />, onSelect: () => navigate(`/historian/storage/bulk?stable=${encodeURIComponent(ref)}`, { state: { from } }) },
         { key: 'dupst', label: 'Duplicate', icon: <Copy className="w-3.5 h-3.5" />, onSelect: () => navigate(`/historian/storage/create?kind=stable&duplicate=${encodeURIComponent(obj.id)}`, { state: { from } }) },
       );

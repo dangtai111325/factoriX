@@ -184,8 +184,8 @@ async function pollJobInner(jobId: string, timeoutMs: number, started: number, m
     stages,
     errorCode: 'TIMEOUT',
     message: notPickedUp(last)
-      ? 'The collector did not start within 2 minutes. Check that the Edge collector is running and enrolled.'
-      : 'The collector did not finish the test in time. Check that the Edge collector is online.',
+      ? 'The collector did not start within 2 minutes. Check that the collector is running and enrolled.'
+      : 'The collector did not finish the test in time. Check that the collector is online.',
     samples: last.samples_json ?? null,
   }
 }
@@ -196,7 +196,7 @@ function describeRequestError(error: unknown): CommissionResult {
       // Only reached after waiting COLLECTOR_START_WAIT_MS for the collector to enroll.
       return errorResult(
         'EDGE_NOT_ENROLLED',
-        'The collector of this site is still not enrolled after 2 minutes. Check the Edge collector, then test again.',
+        'The collector of this site is still not enrolled after 2 minutes. Check the collector, then test again.',
         'EDGE_ENROLLMENT',
       )
     }

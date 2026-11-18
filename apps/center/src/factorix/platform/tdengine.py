@@ -147,6 +147,20 @@ def quote_str(value: str) -> str:
     return _td_sql.quote_str(value, error=TDEngineError)
 
 
+#: Messages / codes TDengine uses when a database, supertable or table does not exist (one list for
+#: the storage routes and the reset inventory; B-14 — there were two copies with different tokens).
+MISSING_OBJECT_TOKENS = (
+    "not exist", "doesn't exist", "does not exist", "unknown database", "database not specified",
+    "0x0362", "0x2103", "0x2603", "0x0380",
+)
+
+
+def is_missing_object_error(exc: BaseException) -> bool:
+    """True when ``exc`` says the TDengine object (database / supertable / table) does not exist."""
+    msg = str(exc).lower()
+    return any(token in msg for token in MISSING_OBJECT_TOKENS)
+
+
 def tenant_database_name(tenant_id: UUID | str, prefix: str = "fx_t_") -> str:
     return _td_naming.tenant_database_name(tenant_id, prefix, invalid_prefix=_invalid_prefix, to_uuid=intern_uuid)
 
@@ -971,6 +985,18 @@ class TDEngineClient:
             raise TDEngineError("CONFIRM_REQUIRED", "Explicit confirm=True required to DROP DATABASE.")
         validate_identifier(database, kind="database")
         await self.execute_sql(f"DROP DATABASE IF EXISTS {quote_ident(database)}")
+
+    async def ping(self) -> bool:
+        """Cheap reachability check (one round trip on the probe pool).
+
+        Use this for liveness heartbeats. :meth:`health_probe` runs five metadata queries including
+        ``information_schema.ins_disk_usage`` (~0.4 s of TDengine work on the appliance); running
+        it every 5 s from the ingestion heartbeat was a constant background load (R2-01)."""
+        try:
+            rows = await self.query_rows("SELECT SERVER_VERSION() AS ver", use_probe_pool=True)
+            return bool(rows)
+        except Exception:  # noqa: BLE001 - unreachable is a False, never an exception
+            return False
 
     async def health_probe(self) -> TDEngineHealth:
         try:

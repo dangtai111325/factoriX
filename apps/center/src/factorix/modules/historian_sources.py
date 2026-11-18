@@ -30,9 +30,12 @@ import time
 from typing import Any
 from uuid import UUID
 
+from factorix_core.tdengine.sql import IDENT_RE
+from factorix_core.tdengine.sql import quote_ident, ts_iso_literal
+
 from factorix.modules import storage_bindings as SB
 
-_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_IDENT = IDENT_RE  # B-18: the shared kernel pattern (same object)
 NUMERIC_TYPES = {"DOUBLE", "FLOAT", "BIGINT", "INT", "SMALLINT", "TINYINT", "BIGINT UNSIGNED", "INT UNSIGNED",
                  "SMALLINT UNSIGNED", "TINYINT UNSIGNED"}
 NICE_BUCKETS_MS = [1_000, 2_000, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000,
@@ -40,15 +43,9 @@ NICE_BUCKETS_MS = [1_000, 2_000, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000,
 _SCHEMA_TTL_S = 60.0
 
 
-def _q(name: str) -> str:
-    if not isinstance(name, str) or not _IDENT.fullmatch(name):
-        raise ValueError(f"Unsafe identifier {name!r}")
-    return f"`{name}`"
-
-
-def ts_literal(dt: datetime) -> str:
-    utc = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    return "'" + utc.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc.microsecond:06d}+00:00'"
+# R2-E B7: one implementation in the shared kernel (same output and exception: ValueError "Unsafe identifier ...").
+_q = quote_ident
+ts_literal = ts_iso_literal
 
 
 def _utc(val: Any) -> datetime | None:
@@ -153,7 +150,12 @@ OP_VALUE_TYPES = {"float64": "DOUBLE", "int64": "BIGINT", "bool": "BOOL", "strin
 
 def operational_schema(value_type: str) -> list[tuple[str, str, str]]:
     return [("ts", "TIMESTAMP", ""), ("val", OP_VALUE_TYPES.get(str(value_type).lower(), "VARCHAR"), ""),
-            ("raw_quality", "VARCHAR", ""), ("data_epoch", "BIGINT", "")]
+            ("source_time", "TIMESTAMP", ""), ("raw_quality", "VARCHAR", ""), ("data_epoch", "BIGINT", "")]
+
+
+#: Column holding the source's own time, by table family (R2-24): operational tables store the
+#: device/source time as ``source_time``; recorded tables the model body time as ``source_timestamp``.
+SOURCE_TIME_COLUMNS = ("source_time", "source_timestamp")
 
 
 class TableSeriesReader:
@@ -199,17 +201,21 @@ class TableSeriesReader:
 
     async def raw(self, db: str, table: str, ts_col: str, value_col: str, quality_col: str | None,
                   start: datetime, end: datetime, epoch_col: bool, epoch: int, limit: int,
-                  *, after: datetime | None = None, newest_first: bool = False) -> list[dict[str, Any]]:
+                  *, after: datetime | None = None, newest_first: bool = False,
+                  source_time_col: str | None = None) -> list[dict[str, Any]]:
         cols = [f"{_q(ts_col)} AS `ts`", f"{_q(value_col)} AS `value`"]
         if quality_col:
             cols.append(f"{_q(quality_col)} AS `quality`")
+        if source_time_col:
+            cols.append(f"{_q(source_time_col)} AS `source_time`")
         extra = f" AND {_q(ts_col)} > {ts_literal(after)}" if after is not None else ""
         order = "DESC" if newest_first else "ASC"
         rows = await self.client.query_rows(
             f"SELECT {', '.join(cols)} FROM {_q(db)}.{_q(table)} "
             f"WHERE {self._where(ts_col, start, end, epoch_col, epoch, extra)} ORDER BY `ts` {order} LIMIT {int(limit)}"
         )
-        out = [{"ts": _utc(r.get("ts")), "value": r.get("value"), "quality": r.get("quality")} for r in rows or []]
+        out = [{"ts": _utc(r.get("ts")), "value": r.get("value"), "quality": r.get("quality"),
+                "source_time": _utc(r.get("source_time")) if source_time_col else None} for r in rows or []]
         out = [r for r in out if r["ts"] is not None]
         out.sort(key=lambda r: r["ts"])
         return out

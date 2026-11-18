@@ -74,6 +74,7 @@ import {
   MODES,
   normalizeSeries,
   paramsFromState,
+  rangeIssueFromParams,
   Pt,
   RANGE_PRESETS,
   RangeState,
@@ -124,6 +125,7 @@ export const HistorianExplorerPage: React.FC = () => {
 
   // ------------------------------------------------------------------ state <-> URL
   const [state, setState] = useState<ViewState>(() => stateFromParams(params));
+  const [rangeNotice, setRangeNotice] = useState(() => rangeIssueFromParams(params));
   const written = useRef<string>('');
   useEffect(() => {
     const next = paramsFromState(state);
@@ -137,6 +139,7 @@ export const HistorianExplorerPage: React.FC = () => {
     if (s === written.current) return;
     const next = stateFromParams(params);
     setState((prev) => (sameState(prev, next) ? prev : next));
+    setRangeNotice(rangeIssueFromParams(params));
   }, [params]);
   const patch = useCallback((p: Partial<ViewState>) => setState((prev) => ({ ...prev, ...p })), []);
 
@@ -409,6 +412,40 @@ export const HistorianExplorerPage: React.FC = () => {
     [eventRows, state.hidden],
   );
 
+  const recordedHints = useMemo(() => {
+    if (state.mode === 'operational') return [];
+    const tables = Array.from(catalog.current.values()).filter((it) => it.kind === 'subtable' && it.source);
+    const out: { signal: string; signalLabel: string; table: PickItem; exact: boolean }[] = [];
+    for (const tok of state.sources) {
+      if (kindOfToken(tok) !== 'signal') continue;
+      // H-R4.1: the server names the tables that record this signal (directly or via its Data Model field).
+      const fromServer = byToken.get(tok)?.recorded_in?.find((r) => !state.sources.includes(r.token));
+      if (fromServer) {
+        const known = catalog.current.get(fromServer.token);
+        const item: PickItem = known || { token: fromServer.token, kind: 'subtable', label: fromServer.label, name: fromServer.label, sub: '', unit: '', valueType: '', resourceId: null, recorded: true, physical: fromServer.label };
+        out.push({ signal: tok, signalLabel: labelOf(tok), table: item, exact: true });
+        continue;
+      }
+      const sig = catalog.current.get(tok);
+      const key = (sig?.name || '').toLowerCase();
+      // exact: the table records this signal; otherwise a Data Model field of the same machine with the same name
+      const exact = tables.find((t) => t.source === tok);
+      const byName =
+        exact ||
+        (key
+          ? tables.find(
+              (t) =>
+                !!t.source &&
+                t.source.startsWith('mod:') &&
+                (!sig?.resourceId || !t.resourceId || t.resourceId === sig.resourceId) &&
+                t.source.split(':').slice(2).join(':').split('/').pop()?.toLowerCase() === key,
+            )
+          : undefined);
+      if (byName && !state.sources.includes(byName.token)) out.push({ signal: tok, signalLabel: labelOf(tok), table: byName, exact: !!exact });
+    }
+    return out;
+  }, [state.mode, state.sources, labelOf, catalogVersion, byToken]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const totalRows = allSeries.reduce((a, s) => a + (s.total || 0), 0);
   const allNoData = result && allSeries.length > 0 && allSeries.every((s) => s.status !== 'OK' && s.status !== 'LOADING');
   const notes = [
@@ -475,6 +512,12 @@ export const HistorianExplorerPage: React.FC = () => {
       setCustomTo(toLocalInput(state.range.endMs));
     }
   }, [state.range]);
+  useEffect(() => {
+    if (rangeNotice?.kind !== 'reversed' || rangeNotice.fromMs == null || rangeNotice.toMs == null) return;
+    setCustomOpen(true);
+    setCustomFrom(toLocalInput(rangeNotice.fromMs));
+    setCustomTo(toLocalInput(rangeNotice.toMs));
+  }, [rangeNotice]);
   const customA = fromLocalInput(customFrom);
   const customB = fromLocalInput(customTo);
   const customError =
@@ -603,7 +646,8 @@ export const HistorianExplorerPage: React.FC = () => {
     setExporting({ fmt, startedAt: Date.now(), ctrl });
     const { startMs, endMs } = resolveRange(state.range);
     const first = labelOf(state.sources[0]);
-    const stamp = formatDateTime(startMs).replace(/[: ]/g, '').replace(/-/g, '').slice(0, 13);
+    const dt = formatDateTime(startMs); // yyyy-MM-dd HH:mm:ss (local)
+    const stamp = `${dt.slice(0, 10).replace(/-/g, '')}_${dt.slice(11, 19).replace(/:/g, '')}`;
     const fileName = `historian_${safeFilePart(first)}${state.sources.length > 1 ? `_and_${state.sources.length - 1}_more` : ''}_${stamp}.${fmt}`;
     try {
       const job = await createExportJob(
@@ -822,7 +866,11 @@ export const HistorianExplorerPage: React.FC = () => {
             title={`${s.label}${s.unit ? ` (${s.unit})` : ''}${st ? ` — ${st}` : ''}`}
           >
             <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: hidden ? '#CBD5E1' : s.color }} aria-hidden="true" />
-            <span className="truncate max-w-[220px] font-semibold">{s.label}</span>
+            {s.status === 'LOADING' && s.label === s.token.slice(0, 8) ? (
+              <span className="inline-block w-28 h-3 rounded bg-slate-200/80 animate-pulse" aria-label="Loading series name" />
+            ) : (
+              <span className="truncate max-w-[220px] font-semibold">{s.label}</span>
+            )}
             {s.unit && <span className="text-[11px] text-[#94A3B8]">{s.unit}</span>}
             {s.status === 'LOADING' && <RefreshCw className="w-3 h-3 animate-spin text-[#94A3B8]" aria-label="loading" />}
             {st && <span className="text-[10px] font-semibold text-amber-700">{st}</span>}
@@ -877,6 +925,20 @@ export const HistorianExplorerPage: React.FC = () => {
   );
 
   const trendBody = (() => {
+    if (error && (error as { code?: string }).code === 'INVALID_RANGE')
+      // H-R4.1: an inverted window is a 422 INVALID_RANGE from the Center, shown as a fixable message.
+      return (
+        <Banner
+          tone="warning"
+          action={
+            <Button size="sm" variant="outline" onClick={() => setRange({ kind: 'preset', preset: '1h' })}>
+              Show the last 1 h
+            </Button>
+          }
+        >
+          The end of the time window is not after its start, so nothing can be shown. Pick a preset or fix the window under Custom.
+        </Banner>
+      );
     if (error) return <ErrorBanner error={error} subject="the history" onRetry={() => void run()} />;
     if (!result && loading)
       return (
@@ -953,6 +1015,35 @@ export const HistorianExplorerPage: React.FC = () => {
     <div className="space-y-4 min-w-0">
       {header}
       {toolbar}
+      {rangeNotice && (
+        <Banner tone="warning" onClose={() => setRangeNotice(null)}>
+          {rangeNotice.message}
+        </Banner>
+      )}
+      {recordedHints.length > 0 && (
+        <Banner tone="info">
+          <div className="space-y-1.5">
+            {recordedHints.map((h) => (
+              <div key={h.signal} className="flex flex-wrap items-center gap-2">
+                <span>
+                  <span className="font-semibold">{h.signalLabel}</span> is a raw signal: {MODES.find((m) => m.id === state.mode)?.label} shows only what a recording rule stored
+                  for it. {h.exact ? 'It is recorded' : 'The same field of this machine is recorded'} in <span className="font-mono">{h.table.physical || h.table.label}</span>.
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    catalog.current.set(h.table.token, h.table);
+                    patch({ sources: state.sources.map((t) => (t === h.signal ? h.table.token : t)), hidden: state.hidden.filter((x) => x !== h.signal) });
+                  }}
+                >
+                  Show the recorded table instead
+                </Button>
+              </div>
+            ))}
+          </div>
+        </Banner>
+      )}
       {result && !result.res.history_available && (
         <Banner tone="warning">
           The time-series store (TDengine) is not configured on this appliance. Values come from PostgreSQL observations, which keep only a short history.

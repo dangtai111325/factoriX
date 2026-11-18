@@ -17,7 +17,7 @@ listens to it — CT-17, ADR corrected.)
 | `factorix_health_changed` | acquisition `pg_control.flush_connection_reports` (only when `health` or `last_error` changed); ingestion (edge mode only, connection recovered) | API bridge | `{"tenant_id","event":{type:"health",entity:"connection",id,health,effective_health,last_error,last_success_at}}` | parsed to `{kind:"health",tenant_id,payload:event}`; `last_success_at` also feeds `PipelineEvidence.note_source` |
 | `factorix_commissioning` | `collect` (capture request, commission/test request) | acquisition (wake the commands loop, payload ignored; it claims `PENDING` rows with `FOR NO KEY UPDATE SKIP LOCKED`) | `{"job_id","connection_id"}` | — |
 
-## 1. `factorix_stream_events` v1 (default)
+## 1. `factorix_stream_events` v1 (kill switch `FACTORIX_NOTIFY_FORMAT=v1` since ARCH-C)
 
 ```
 {"events":[{"kind":"latest","tenant_id","signal_id","resource_id","value_type","unit","event_uid",
@@ -44,9 +44,11 @@ listens to it — CT-17, ADR corrected.)
 
 * Built by `ingestion_worker._latest_ids_payloads`, each payload < 7800 bytes (~190 ids), as many NOTIFYs
   as needed; `connection_ids` is capped at 32 per payload; `max_acquired_at` / `connection_ids` are optional.
-* The bridge recognises v2 by the substring `'"signal_ids"'` (CT-04), notes delivery evidence for the listed
-  connections, coalesces bursts per tenant and reads the rows itself (`telemetry.latest_states`, 200 ids per
-  query), then dispatches. **It does not seed the API live cache** (CT-03), which is why v1 stays the default.
+* The bridge recognises v2 by its `v`/`kind` markers (`factorix_core.contracts.notify.parse_stream_events`,
+  CT-04 fixed), notes delivery evidence for the listed connections, coalesces bursts per tenant and reads the
+  rows itself (`telemetry.latest_states`, 200 ids per query), **seeds the API live cache from those rows**
+  (CT-03 fixed) and dispatches. **v2 is the default since ARCH-C** (bench 336 × 30: 11 NOTIFYs / 72 KB instead
+  of 178 / 1.26 MB).
 * A v2 payload is never mistaken for v1 (`parse_pg_notify_events` returns `[]` for it).
 
 ## 3. Rules
@@ -61,3 +63,11 @@ listens to it — CT-17, ADR corrected.)
 
 CT-02, CT-03, CT-04, CT-05 (ingestion edge mode emits each health event on two channels; the bridge
 listens to both, so the browser may receive it twice), CT-06, CT-17 — see README.
+
+## Typed contract (R2-E C6, ARCH-C)
+
+`apps/shared/src/factorix_core/contracts/notify.py`: `Channel` (the five channel names), `ConfigChanged`,
+`EpochChanged` (reads `active_epoch` or `new_epoch`), `CommissioningRequested`, `HealthChanged`, `StreamEventsV1`,
+`LatestIdsV2` (`to_payloads()` = the exact bytes ingestion sent before), `parse_*`. Unversioned payloads are v1;
+unknown versions/kinds are ignored. CT-05 fixed: ingestion health events go on `factorix_health_changed` only.
+CT-06 fixed: ingestion fences at the payload epoch.

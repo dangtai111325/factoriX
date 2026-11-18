@@ -73,7 +73,7 @@ export function resourceExamples(type: string): { name: string; code: string } {
 
 /** Neutral focus style: the brand red is reserved for errors and primary actions. */
 export const FIELD_BASE =
-  'w-full h-10 px-3 bg-white border rounded-lg text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2A82E7]/20';
+  'w-full h-10 px-3 bg-white border rounded-lg text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-[#2A82E7]/20 disabled:bg-slate-50 disabled:text-slate-500 disabled:cursor-not-allowed';
 export const FIELD_OK = 'border-slate-200 focus:border-[#2A82E7]';
 export const FIELD_ERROR = 'border-red-500 focus:border-red-500 focus:ring-red-500/20';
 

@@ -15,13 +15,16 @@ import {
   RecordingMode,
   SourceRef,
   TDStable,
+  BulkJob,
   bulkCreateSubtables,
+  getBulkJob,
   getSources,
   isSystemStorageName,
   listStables,
 } from '../../../lib/storagePhysicalApi';
 import { autoTagValues, suggestColumn, typeCompatible, valueColumns } from './SubtableWizardSteps';
 import { useStorageBackTarget } from './WizardShared';
+import { useApp } from '../../../store/AppContext';
 import { Button } from '../../../components/common/Button';
 import { Banner, DraftChip, LoadingBlock, WizardHeader, WizardStepper, selectCls } from '../../historian/hsUi';
 
@@ -32,8 +35,46 @@ interface PlannedRow {
   fields: { leaf: SourceRef; column: string }[];
   tags: { tag_name: string; value: string }[];
   problem?: string;
-  result?: BulkRowResult;
 }
+
+/** Outcome of the last Create run, shown above the table (R2-04). */
+interface RunSummary {
+  dryRun: boolean;
+  created: number;
+  exists: number;
+  failed: number;
+  invalid: number;
+  valid: number;
+  at: string;
+}
+
+const STATUS_TEXT: Record<string, string> = { CREATED: 'Created', EXISTS: 'Exists', VALID: 'Valid', INVALID: 'Invalid', FAILED: 'Failed' };
+
+/** The running/last bulk job of this tab: survives leaving the page and coming back (the job runs on the Center). */
+const JOB_KEY = 'fx_bulk_subtables_job';
+interface StoredJob {
+  jobId: string;
+  total: number;
+  startedAt: string;
+  stableId: string;
+}
+function readStoredJob(): StoredJob | null {
+  try {
+    const v = JSON.parse(sessionStorage.getItem(JOB_KEY) || 'null');
+    return v && typeof v.jobId === 'string' ? (v as StoredJob) : null;
+  } catch {
+    return null;
+  }
+}
+function writeStoredJob(j: StoredJob | null) {
+  try {
+    if (j) sessionStorage.setItem(JOB_KEY, JSON.stringify(j));
+    else sessionStorage.removeItem(JOB_KEY);
+  } catch {
+    /* private mode */
+  }
+}
+const sleep = (ms: number) => new Promise((r) => window.setTimeout(r, ms));
 
 function slug(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
@@ -82,16 +123,34 @@ export const BulkSubtablesWizard: React.FC = () => {
   const [running, setRunning] = useState<'validate' | 'create' | null>(null);
   const [progress, setProgress] = useState(0);
   const [runError, setRunError] = useState<string | null>(null);
+  // Results are kept by subtable name, apart from the planned rows: re-planning (any edit, or the reload of the
+  // Data Models after a create) never wipes what the server answered (R2-04).
+  const [results, setResults] = useState<Record<string, BulkRowResult>>({});
+  const [summary, setSummary] = useState<RunSummary | null>(null);
+  const [reloading, setReloading] = useState(false);
+  // Background job (H-R4.3): live progress, resumable after navigation; `gone` = the Center no longer knows it.
+  const [job, setJob] = useState<BulkJob | null>(null);
+  const [jobGone, setJobGone] = useState<string | null>(null);
+  const pollingRef = React.useRef<string | null>(null);
+  const { resources } = useApp();
+  const resById = useMemo(() => new Map(resources.map((x) => [x.id, x])), [resources]);
 
-  useEffect(() => {
+  const loadSources = (initial: boolean) =>
     Promise.all([listStables(), getSources({ view: 'models' })])
       .then(([st, src]) => {
         setStables((st.items || []).filter((s) => !isSystemStorageName(s.physical_name)));
         setGroups(((src.groups || src.items || []) as unknown) as ModelSourceGroup[]);
       })
-      .catch((err: Error) => setLoadError(err.message || 'Could not load supertables or Data Models.'))
-      .finally(() => setLoading(false));
-  }, []);
+      .catch((err: Error) => {
+        if (initial) setLoadError(err.message || 'Could not load supertables or Data Models.');
+      })
+      .finally(() => {
+        if (initial) setLoading(false);
+      });
+
+  useEffect(() => {
+    void loadSources(true);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const stable = stables.find((s) => s.id === stableId) || null;
   const cols = valueColumns(stable);
@@ -106,7 +165,7 @@ export const BulkSubtablesWizard: React.FC = () => {
     return groups.filter((g) => !q || `${g.display_name} ${g.resource?.name || ''} ${g.resource?.code || ''}`.toLowerCase().includes(q));
   }, [groups, modelSearch]);
 
-  const chosenGroups = groups.filter((g) => selectedModels.has(g.id));
+  const chosenGroups = useMemo(() => groups.filter((g) => selectedModels.has(g.id)), [groups, selectedModels]);
   const fieldUnion = useMemo(() => {
     const m = new Map<string, SourceRef>();
     for (const g of chosenGroups) for (const f of g.fields) if (f.field_path && !m.has(f.field_path)) m.set(f.field_path, f);
@@ -117,11 +176,18 @@ export const BulkSubtablesWizard: React.FC = () => {
   useEffect(() => {
     setColumnFor((prev) => {
       const next = { ...prev };
+      let changed = false;
       for (const f of fieldUnion) {
         const path = f.field_path as string;
-        if (!next[path]) next[path] = atomic && cols.some((c) => c.name === f.key) ? String(f.key) : suggestColumn(f.value_type, cols) || '';
+        if (!next[path]) {
+          const v = atomic && cols.some((c) => c.name === f.key) ? String(f.key) : suggestColumn(f.value_type, cols) || '';
+          if (v) {
+            next[path] = v;
+            changed = true;
+          }
+        }
       }
-      return next;
+      return changed ? next : prev;
     });
   }, [fieldUnion, stableId, atomic]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -129,12 +195,22 @@ export const BulkSubtablesWizard: React.FC = () => {
   useEffect(() => {
     if (!stable) { setRows([]); return; }
     const planned: PlannedRow[] = [];
+    const machineOf = (g: ModelSourceGroup) => slug(g.resource?.code || g.resource?.name || g.display_name);
+    // On new event: one subtable per model -> `{prefix}_{machine}` when the machine has one selected model,
+    // `{prefix}_{machine}_{model}` when it has several (lead decision, tdengine_guide §I.7).
+    const modelsPerMachine = new Map<string, number>();
+    for (const g of chosenGroups)
+      if (g.fields.some((f) => selectedFields.has(f.field_path as string))) modelsPerMachine.set(machineOf(g), (modelsPerMachine.get(machineOf(g)) || 0) + 1);
+    const modelSlug = (g: ModelSourceGroup) => {
+      const own = g.resource?.name ? g.display_name.replace(new RegExp(`^${g.resource.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*·\\s*`), '') : g.display_name;
+      return slug(own) || slug(g.display_name);
+    };
     for (const g of chosenGroups) {
-      const machine = slug(g.resource?.code || g.resource?.name || g.display_name);
+      const machine = machineOf(g);
       const leaves = g.fields.filter((f) => selectedFields.has(f.field_path as string));
       if (atomic) {
         if (!leaves.length) continue;
-        const name = `${prefix}_${machine}`.slice(0, 63);
+        const name = ((modelsPerMachine.get(machine) || 0) > 1 ? `${prefix}_${machine}_${modelSlug(g)}` : `${prefix}_${machine}`).slice(0, 63);
         const fields = leaves.map((leaf) => ({ leaf, column: columnFor[leaf.field_path as string] || '' }));
         const problem = fields.find((f) => !f.column)?.leaf.field_path;
         planned.push({ key: `${g.id}`, name, group: g, fields, tags: autoTagValues(stable.tags, [], g, null),
@@ -155,11 +231,19 @@ export const BulkSubtablesWizard: React.FC = () => {
         }
       }
     }
-    const names = new Map<string, number>();
-    planned.forEach((r) => names.set(r.name, (names.get(r.name) || 0) + 1));
-    planned.forEach((r) => { if ((names.get(r.name) || 0) > 1) r.problem = r.problem || 'Duplicate name in this batch'; });
+    // Never produce in-batch duplicates: a clash gets the model name, then a number.
+    const count = new Map<string, number>();
+    planned.forEach((r) => count.set(r.name, (count.get(r.name) || 0) + 1));
+    const used = new Set<string>();
+    planned.forEach((r) => {
+      let n = r.name;
+      if ((count.get(n) || 0) > 1 && !atomic) n = `${r.name}_${modelSlug(r.group)}`.slice(0, 63);
+      for (let i = 2; used.has(n); i++) n = `${r.name.slice(0, 59)}_${i}`;
+      used.add(n);
+      r.name = n;
+    });
     setRows(planned);
-  }, [stable, chosenGroups.length, selectedFields, columnFor, prefix, atomic]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [stable, chosenGroups, selectedFields, columnFor, prefix, atomic]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const specOf = (r: PlannedRow): Record<string, unknown> => ({
     stable: stable?.id,
@@ -172,27 +256,123 @@ export const BulkSubtablesWizard: React.FC = () => {
     recording: { mode, row_assembly: atomic ? 'ATOMIC_EVENT' : 'INDEPENDENT_EVENTS', start_recording: startRecording },
   });
 
+  const resultOf = (r: PlannedRow): BulkRowResult | undefined => results[r.name];
+  const done = (r: PlannedRow) => {
+    const st = resultOf(r)?.status;
+    return st === 'CREATED' || st === 'EXISTS';
+  };
+  // A row whose field is now recorded by the row we just created is done, not "Already recorded" (problem).
+  const blocking = (r: PlannedRow) => (done(r) ? undefined : r.problem);
+
   const run = async (dryRun: boolean) => {
-    const todo = rows.filter((r) => !r.problem && r.result?.status !== 'CREATED' && r.result?.status !== 'EXISTS');
+    const todo = rows.filter((r) => !blocking(r) && !done(r));
     if (!todo.length) return;
     setRunning(dryRun ? 'validate' : 'create');
     setRunError(null);
+    setSummary(null);
     setProgress(0);
-    const chunk = dryRun ? 50 : 20;
+    const chunk = dryRun ? 50 : 1000;
+    const tally: RunSummary = { dryRun, created: 0, exists: 0, failed: 0, invalid: 0, valid: 0, at: new Date().toLocaleTimeString() };
     try {
       for (let i = 0; i < todo.length; i += chunk) {
         const part = todo.slice(i, i + chunk);
         const res = await bulkCreateSubtables(part.map(specOf), dryRun);
-        const byName = new Map(res.items.map((it) => [it.name, it]));
-        setRows((prev) => prev.map((r) => (byName.has(r.name) ? { ...r, result: byName.get(r.name) } : r)));
+        if (!dryRun && res.job_id) {
+          // H-R4.3: the Center runs the rows in the background; follow the job (also after leaving the page).
+          writeStoredJob({ jobId: res.job_id, total: res.total ?? part.length, startedAt: new Date().toISOString(), stableId });
+          setRunning(null);
+          await followJob(res.job_id);
+          return;
+        }
+        setResults((prev) => {
+          const next = { ...prev };
+          res.items.forEach((it) => {
+            next[it.name] = it;
+          });
+          return next;
+        });
+        res.items.forEach((it) => {
+          if (it.status === 'CREATED') tally.created++;
+          else if (it.status === 'EXISTS') tally.exists++;
+          else if (it.status === 'FAILED') tally.failed++;
+          else if (it.status === 'INVALID') tally.invalid++;
+          else if (it.status === 'VALID') tally.valid++;
+        });
         setProgress(Math.min(todo.length, i + part.length));
       }
     } catch (err) {
       setRunError(err instanceof Error ? err.message : 'The request failed; already created rows are kept and are skipped on retry.');
     } finally {
       setRunning(null);
+      setSummary(tally);
+    }
+    if (!dryRun && (tally.created || tally.exists)) {
+      // Refresh the Data Models: their fields now carry "recorded in …" (statuses update without a reload).
+      setReloading(true);
+      await loadSources(false);
+      setReloading(false);
     }
   };
+
+  /** Poll a background job until it finishes; per-row results appear as rows complete (batches of 50). */
+  const followJob = async (jobId: string) => {
+    if (pollingRef.current === jobId) return;
+    pollingRef.current = jobId;
+    setJobGone(null);
+    setSummary(null);
+    try {
+      for (;;) {
+        let j: BulkJob;
+        try {
+          j = await getBulkJob(jobId);
+        } catch (err) {
+          if ((err as { status?: number }).status === 404) {
+            writeStoredJob(null);
+            setJob(null);
+            setJobGone(
+              'The Center no longer knows this bulk job (jobs are kept 1 hour after they finish and are lost when the Center restarts). Every row it created is kept: press Validate to see which subtables already exist.',
+            );
+            return;
+          }
+          await sleep(3000); // transient (busy appliance): keep following
+          continue;
+        }
+        setJob(j);
+        setResults((prev) => {
+          const next = { ...prev };
+          (j.items || []).forEach((it) => {
+            next[it.name] = it;
+          });
+          return next;
+        });
+        if (j.status === 'DONE' || j.status === 'FAILED') {
+          const sm = j.summary || {};
+          setSummary({ dryRun: false, created: sm.CREATED || 0, exists: sm.EXISTS || 0, failed: sm.FAILED || 0, invalid: sm.INVALID || 0, valid: 0, at: new Date(j.finished_at || Date.now()).toLocaleTimeString() });
+          if (j.status === 'FAILED') setRunError(`The bulk job stopped: ${j.error || 'unknown error'}. Rows already created are kept; press Create again for the rest.`);
+          writeStoredJob(null);
+          if ((sm.CREATED || 0) + (sm.EXISTS || 0) > 0) {
+            setReloading(true);
+            await loadSources(false);
+            setReloading(false);
+          }
+          return;
+        }
+        await sleep(Math.max(800, j.poll_after_ms || 1000));
+      }
+    } finally {
+      pollingRef.current = null;
+    }
+  };
+
+  // Coming back to the page while a job runs (or just finished): pick it up again.
+  useEffect(() => {
+    const stored = readStoredJob();
+    if (!stored) return;
+    if (!stableId && stored.stableId) setStableId(stored.stableId);
+    void followJob(stored.jobId);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const jobActive = !!job && (job.status === 'QUEUED' || job.status === 'RUNNING');
 
   const manifest = () => rows.map((r) => ({
     subtable: r.name,
@@ -203,9 +383,9 @@ export const BulkSubtablesWizard: React.FC = () => {
     fields: r.fields.map((f) => ({ field_path: f.leaf.field_path, target_column: f.column })),
     tags: Object.fromEntries(r.tags.map((t) => [t.tag_name, t.value])),
     recording_mode: mode,
-    status: r.result?.status || (r.problem ? 'BLOCKED' : 'NOT_RUN'),
-    operation_id: r.result?.operation_id || null,
-    error: r.result?.message || r.problem || null,
+    status: resultOf(r)?.status || (blocking(r) ? 'BLOCKED' : 'NOT_RUN'),
+    operation_id: resultOf(r)?.operation_id || null,
+    error: resultOf(r)?.message || blocking(r) || null,
   }));
 
   const downloadCsv = () => {
@@ -217,11 +397,12 @@ export const BulkSubtablesWizard: React.FC = () => {
   };
 
   const counts = rows.reduce<Record<string, number>>((acc, r) => {
-    const k = r.result?.status || (r.problem ? 'BLOCKED' : 'PLANNED');
+    const k = resultOf(r)?.status || (blocking(r) ? 'BLOCKED' : 'PLANNED');
     acc[k] = (acc[k] || 0) + 1;
     return acc;
   }, {});
-  const runnable = rows.filter((r) => !r.problem && r.result?.status !== 'CREATED' && r.result?.status !== 'EXISTS').length;
+  const runnable = rows.filter((r) => !blocking(r) && !done(r)).length;
+  const allDone = rows.length > 0 && rows.every((r) => done(r));
   const bulkStep = !stableId ? 0 : selectedModels.size === 0 ? 1 : rows.length === 0 ? 2 : 3;
 
   return (
@@ -242,6 +423,31 @@ export const BulkSubtablesWizard: React.FC = () => {
         }
       />
 
+      {jobGone && <Banner tone="warning" onClose={() => setJobGone(null)}>{jobGone}</Banner>}
+      {job && (jobActive || rows.length === 0) && (
+        <Banner tone={job.status === 'FAILED' ? 'error' : jobActive ? 'info' : 'success'}>
+          <div className="space-y-1.5">
+            <div className="font-semibold">
+              {jobActive
+                ? `Creating subtables in the background: ${job.done} of ${job.total} done (${Math.round(job.progress_pct ?? (job.total ? (job.done / job.total) * 100 : 0))} %). You can leave this page; come back to see the result.`
+                : `Bulk job ${job.status === 'FAILED' ? 'stopped' : 'finished'}: ${job.summary?.CREATED || 0} created · ${job.summary?.EXISTS || 0} already existed · ${(job.summary?.FAILED || 0) + (job.summary?.INVALID || 0)} failed.`}
+            </div>
+            <div className="h-1.5 w-full max-w-md rounded-full bg-blue-100 overflow-hidden" aria-hidden="true">
+              <div className="h-full bg-blue-500 transition-all" style={{ width: `${job.total ? Math.min(100, (job.done / job.total) * 100) : 0}%` }} />
+            </div>
+            {rows.length === 0 && (job.items || []).length > 0 && (
+              <ul className="text-[11px] max-h-40 overflow-y-auto">
+                {(job.items || []).filter((it) => it.status !== 'CREATED').slice(0, 50).map((it) => (
+                  <li key={it.name}>
+                    <span className="font-mono">{it.name}</span>: {STATUS_TEXT[it.status] || it.status}
+                    {it.message ? ` — ${it.code ? `${it.code}: ` : ''}${it.message}` : ''}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </Banner>
+      )}
       {loading && <LoadingBlock label="Loading supertables and Data Models…" />}
       {loadError && <Banner tone="error">{loadError}</Banner>}
 
@@ -356,17 +562,49 @@ export const BulkSubtablesWizard: React.FC = () => {
               <p className="text-[12px] text-[#657794]">{Object.entries(counts).map(([k, v]) => `${v} ${k.toLowerCase()}`).join(' · ')}</p>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Button variant="outline" size="sm" disabled={!!running || runnable === 0} onClick={() => run(true)}>
+              <Button variant="outline" size="sm" disabled={!!running || jobActive || runnable === 0} onClick={() => run(true)}>
                 {running === 'validate' ? `Validating ${progress}/${runnable}…` : 'Validate'}
               </Button>
-              <Button variant="primary" size="sm" disabled={!!running || runnable === 0} onClick={() => run(false)} aria-busy={running === 'create'}>
-                {running === 'create' ? `Creating ${progress}/${runnable}…` : `Create ${runnable} subtables`}
+              <Button variant="primary" size="sm" disabled={!!running || jobActive || runnable === 0} onClick={() => run(false)} aria-busy={running === 'create' || jobActive}>
+                {jobActive
+                  ? `Creating ${job!.done}/${job!.total}…`
+                  : running === 'create'
+                  ? `Submitting ${runnable}…`
+                  : runnable > 0
+                    ? `Create ${runnable} subtable${runnable === 1 ? '' : 's'}`
+                    : allDone
+                      ? 'All rows created'
+                      : 'Nothing to create'}
               </Button>
               <Button variant="outline" size="sm" icon={<Download className="w-3.5 h-3.5" />} onClick={downloadCsv}>CSV</Button>
               <Button variant="outline" size="sm" icon={<Download className="w-3.5 h-3.5" />} onClick={() => download('storage-subtables-manifest.json', 'application/json', JSON.stringify(manifest(), null, 2))}>JSON</Button>
             </div>
           </div>
           {runError && <Banner tone="error">{runError}</Banner>}
+          {summary && (
+            <Banner
+              tone={summary.failed || summary.invalid ? 'warning' : 'success'}
+              onClose={() => setSummary(null)}
+              action={
+                !summary.dryRun ? (
+                  <Link
+                    to={`/historian/storage?tab=objects&type=subtable&q=${encodeURIComponent(prefix)}`}
+                    className="shrink-0 text-[12px] font-semibold text-[#2A82E7] hover:underline whitespace-nowrap"
+                  >
+                    Open in Objects table
+                  </Link>
+                ) : undefined
+              }
+            >
+              <span className="font-semibold">
+                {summary.dryRun
+                  ? `Validation ${summary.at}: ${summary.valid} valid · ${summary.exists} already exist · ${summary.invalid + summary.failed} with problems.`
+                  : `Create finished ${summary.at}: ${summary.created} created · ${summary.exists} already existed · ${summary.failed + summary.invalid} failed.`}
+              </span>
+              {(summary.failed > 0 || summary.invalid > 0) && <span> The reason is shown on each failed row; fix it and press Create again — only the remaining rows are sent.</span>}
+              {reloading && <span className="ml-1 text-[#657794]">Refreshing Data Model fields…</span>}
+            </Banner>
+          )}
           <div className="overflow-auto max-h-[480px] border border-[#E3EAF3] rounded-lg">
             <table className="fx-table">
               <thead className="sticky top-0 z-[1]"><tr>
@@ -377,15 +615,32 @@ export const BulkSubtablesWizard: React.FC = () => {
                     <td className="font-mono text-[#111B37] whitespace-nowrap">{r.name}</td>
                     <td>{r.group.display_name}<div className="text-[11px] text-[#657794]">{r.group.resource?.name}</div></td>
                     <td className="font-mono">{r.fields.map((f) => `${f.leaf.field_path} → ${f.column || '?'}`).join(', ')}</td>
-                    <td className="font-mono text-[11px] text-[#657794]">{r.tags.map((t) => `${t.tag_name}=${t.value ? (t.value.length > 12 ? `${t.value.slice(0, 8)}…` : t.value) : '∅'}`).join(' ')}</td>
+                    <td className="text-[11px] text-[#657794]">
+                      {r.tags.map((t) => {
+                        const res = t.value && /_ref$/.test(t.tag_name) ? resById.get(t.value) : undefined;
+                        return (
+                          <div key={t.tag_name} className="whitespace-nowrap" title={t.value || ''}>
+                            <span className="font-mono">{t.tag_name}</span>={' '}
+                            {res ? <span className="text-[#334568]">{res.name}</span> : <span className="font-mono">{t.value ? (t.value.length > 12 ? `${t.value.slice(0, 8)}…` : t.value) : '∅'}</span>}
+                          </div>
+                        );
+                      })}
+                    </td>
                     <td>
-                      {r.result ? (
-                        <span className={`font-semibold ${STATUS_STYLE[r.result.status] || ''}`} title={r.result.message || (r.result.errors || []).map((e) => e.message).join('; ')}>
-                          {r.result.status === 'CREATED' && <CheckCircle2 className="w-3.5 h-3.5 inline mr-1" />}{r.result.status}
-                          {(r.result.message || r.result.errors?.length) && <div className="font-normal text-[11px] text-[#657794] max-w-[280px]">{r.result.message || r.result.errors?.[0]?.message}</div>}
+                      {resultOf(r) ? (
+                        <span className={`font-semibold ${STATUS_STYLE[resultOf(r)!.status] || ''}`} title={resultOf(r)!.message || (resultOf(r)!.errors || []).map((e) => e.message).join('; ')}>
+                          {resultOf(r)!.status === 'CREATED' && <CheckCircle2 className="w-3.5 h-3.5 inline mr-1" />}
+                          {(resultOf(r)!.status === 'FAILED' || resultOf(r)!.status === 'INVALID') && <AlertTriangle className="w-3.5 h-3.5 inline mr-1" />}
+                          {STATUS_TEXT[resultOf(r)!.status] || resultOf(r)!.status}
+                          {(resultOf(r)!.message || resultOf(r)!.errors?.length) && (
+                            <div className="font-normal text-[11px] text-[#657794] max-w-[280px]">
+                              {resultOf(r)!.code ? `${resultOf(r)!.code}: ` : ''}
+                              {resultOf(r)!.message || resultOf(r)!.errors?.map((e) => e.message).join('; ')}
+                            </div>
+                          )}
                         </span>
-                      ) : r.problem ? (
-                        <span className="text-[#F2343B]">{r.problem}</span>
+                      ) : blocking(r) ? (
+                        <span className="text-[#F2343B]">{blocking(r)}</span>
                       ) : r.tags.some((t) => !t.value) ? (
                         <span className="text-[#B76E00] font-semibold">Missing tag value</span>
                       ) : (
@@ -397,8 +652,8 @@ export const BulkSubtablesWizard: React.FC = () => {
               </tbody>
             </table>
           </div>
-          <p className="text-[11px] text-[#657794]">Rows that already exist are reported as EXISTS and never created twice. Retrying a failed run only sends the remaining rows.
-            {' '}<Link to="/historian/storage?tab=objects" className="text-[#2A82E7] font-semibold hover:underline">Open Objects table</Link></p>
+          <p className="text-[11px] text-[#657794]">Rows that already exist are reported as Exists and never created twice. Retrying a failed run only sends the remaining rows.
+            {' '}<Link to={`/historian/storage?tab=objects&type=subtable${prefix ? `&q=${encodeURIComponent(prefix)}` : ''}`} className="text-[#2A82E7] font-semibold hover:underline">Open Objects table</Link></p>
         </section>
       )}
     </div>

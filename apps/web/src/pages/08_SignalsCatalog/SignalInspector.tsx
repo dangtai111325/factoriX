@@ -17,7 +17,7 @@ import {
 import { SignalItem } from '../../types';
 import { Button } from '../../components/common/Button';
 import { StatusBadge } from '../../components/common/StatusBadge';
-import { DELAYED_HINT, QUALITY_HINT, QUALITY_LABEL, delayLabel, formatCurrentSignalValue, formatTimestamp, isDimmedValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { DELAYED_HINT, QUALITY_HINT, QUALITY_LABEL, delayLabel, formatCurrentSignalValue, formatTimestamp, isDimmedValue, normalizeQuality, serverStaleAfterMs, timeAgo } from '../../lib/format';
 import { historianLinkForSignal } from './historianLink';
 import { collectorSiteLabel } from '../05_Connections/collectorName';
 
@@ -54,8 +54,8 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
   const isEnabled = signal.enabled !== false;
   const quality = !isEnabled ? 'DISABLED' : normalizeQuality(signal.quality);
   const formattedVal = formatCurrentSignalValue(signal.value, quality);
-  // Center rule: stale after max(2 x expected interval, 12 s) without a new read.
-  const staleSec = Math.round((signal.staleAfterMs ?? Math.max(2 * (signal.expectedIntervalMs || 1000), 12000)) / 1000);
+  // Threshold evaluated by the server (signal interval, falling back to the job interval).
+  const staleSec = Math.round(serverStaleAfterMs(signal.staleAfterMs) / 1000);
   const lastRead = signal.lastAcquiredAt || signal.receivedTime || signal.lastUpdated;
   const lastChange = signal.lastValueChangedAt || signal.sourceTime;
   const delayed = delayLabel(signal.freshness, lastRead, signal.deliveryLagMs);

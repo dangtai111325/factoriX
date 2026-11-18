@@ -13,7 +13,7 @@ import {
   Loader2,
   Info,
 } from 'lucide-react';
-import { StorageWizardLayout, useWizardDraft, useStorageBackTarget } from './WizardShared';
+import { StorageWizardLayout, useWizardDraft, useStorageBackTarget, PendingDraftBanner } from './WizardShared';
 import { Button } from '../../../components/common/Button';
 import { DraftChip, EmptyState, LoadingBlock, WizardHeader } from '../../historian/hsUi';
 import {
@@ -259,8 +259,8 @@ export const EditStorageObjectWizard: React.FC = () => {
       if ((originalObject.retention_days ?? null) !== dbDraft.data.retention_days) {
         diffs.push({
           label: 'Retention Days',
-          oldVal: originalObject.retention_days ? `${originalObject.retention_days} d` : 'Unlimited',
-          newVal: dbDraft.data.retention_days ? `${dbDraft.data.retention_days} d` : 'Unlimited',
+          oldVal: originalObject.retention_days ? `${originalObject.retention_days} d` : 'not reported',
+          newVal: dbDraft.data.retention_days ? `${dbDraft.data.retention_days} d` : 'default (3650 d)',
         });
       }
     } else if (objectKind === 'stable' && isStable(originalObject)) {
@@ -522,6 +522,7 @@ export const EditStorageObjectWizard: React.FC = () => {
         error={submitError}
         submitLabel="Save Changes"
       >
+        <PendingDraftBanner draft={dbDraft.pendingDraft} onResume={dbDraft.resumeDraft} onDiscard={dbDraft.discardPendingDraft} />
         {versionConflict && (
           <div className="mb-6 p-4 bg-[#FEF2F2] border border-[#FAC6C9] rounded-xl flex items-center justify-between gap-4">
             <div className="flex items-center gap-2.5 text-[#EF1B24] text-[13px]">
@@ -617,6 +618,7 @@ export const EditStorageObjectWizard: React.FC = () => {
         error={submitError}
         submitLabel="Save supertable"
       >
+        <PendingDraftBanner draft={stableDraft.pendingDraft} onResume={stableDraft.resumeDraft} onDiscard={stableDraft.discardPendingDraft} />
         {versionConflict && (
           <div className="mb-6 p-4 bg-[#FEF2F2] border border-[#FAC6C9] rounded-xl flex items-center justify-between gap-4">
             <div className="flex items-center gap-2.5 text-[#EF1B24] text-[13px]">
@@ -725,6 +727,7 @@ export const EditStorageObjectWizard: React.FC = () => {
       error={submitError}
       submitLabel="Save subtable"
     >
+      <PendingDraftBanner draft={subtableDraft.pendingDraft} onResume={subtableDraft.resumeDraft} onDiscard={subtableDraft.discardPendingDraft} />
       {versionConflict && (
         <div className="mb-6 p-4 bg-[#FEF2F2] border border-[#FAC6C9] rounded-xl flex items-center justify-between gap-4">
           <div className="flex items-center gap-2.5 text-[#EF1B24] text-[13px]">

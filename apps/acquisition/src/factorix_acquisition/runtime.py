@@ -151,6 +151,8 @@ class AcquisitionRuntime:
         self.min_degrade_s = float(min_degrade_s)
         self.started_at = now_iso()
         self.leader_since: str | None = None
+        # Time of the last successful connection-report flush (P6: Center tells "report late" apart).
+        self.last_report_at: str | None = None
         self.job_health: dict[str, JobHealth] = {}
 
         self.revision = 0
@@ -441,6 +443,7 @@ class AcquisitionRuntime:
             "jobs_expected": len(self.specs),
             "jobs_running": sum(1 for task in self.job_tasks.values() if not task.done()),
             "connections_running": sorted(running),
+            "last_report_at": self.last_report_at,
         }
 
     # ------------------------------------------------------------------ config sync
@@ -678,6 +681,7 @@ class AcquisitionRuntime:
             heartbeat_error = exc
         if reports:
             await bounded(self.control_plane.flush_connection_reports(reports), timeout=REPORT_WRITE_TIMEOUT_S)
+        self.last_report_at = now_iso()
         if heartbeat_error is not None:
             raise heartbeat_error
 

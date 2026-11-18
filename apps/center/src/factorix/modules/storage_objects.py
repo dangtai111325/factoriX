@@ -14,26 +14,30 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Literal
-from uuid import UUID
+
+from factorix_core.tdengine.naming import DB_PREFIX_RE
+from factorix_core.tdengine.sql import IDENT_RE
+from factorix_core.tdengine.naming import TENANT_DB_PREFIX
+from factorix_core.tdengine.sql import quote_ident
 
 # ---------------------------------------------------------------------------
 # TDengine identifier rules
 # ---------------------------------------------------------------------------
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_IDENT_RE = IDENT_RE  # B-18: the shared kernel pattern (same object)
 _MAX_IDENT_LEN = 64
 MAX_DESCRIPTION_LEN = 1000
 MAX_DISPLAY_NAME_LEN = 200
-#: Database names starting with this prefix are reserved for the canonical per-tenant database
-#: that FactoriX creates itself (``fx_t_<tenant hex>``); users cannot create another one.
-TENANT_DB_PREFIX = "fx_t_"
+#: Database names starting with ``TENANT_DB_PREFIX`` (``fx_t_``, shared kernel, R2-E B7) are reserved for the
+#: canonical per-tenant database that FactoriX creates itself (``fx_t_<tenant hex>``); users cannot create another one.
 #: Physical objects FactoriX owns (operational history + model snapshots). They are read-only in
 #: the Storage UI: never a parent of a user subtable, never altered, retired or dropped by a user.
 SYSTEM_STABLES = frozenset({"op_bool", "op_float64", "op_int64", "op_string", "op_json", "model_snapshots"})
 SYSTEM_SUBTABLE_PREFIXES = ("op_", "ms_")
 #: Column types TDengine accepts for the composite (second) primary key column (3.4.3.9 verified).
 COMPOSITE_KEY_TYPES = frozenset({"INT", "INT UNSIGNED", "BIGINT", "BIGINT UNSIGNED", "VARCHAR", "BINARY", "VARBINARY"})
-_DB_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,15}$")
+_DB_PREFIX_RE = DB_PREFIX_RE  # B-18
 _RESERVED_DB_PREFIXES = {"information_schema", "performance_schema", "log", "sys"}
 _MAX_COLUMNS = 4096
 _MAX_TAGS = 128
@@ -521,9 +525,9 @@ def validate_subtable_spec(spec: SubtableSpec, stable_tags: list[TagSpec]) -> Va
 # DDL generators
 # ---------------------------------------------------------------------------
 
-def _quote(name: str) -> str:
-    validate_identifier(name)
-    return f"`{name}`"
+# R2-E B7: the kernel quote; an invalid name raises this module's StorageObjectError via validate_identifier
+# (length check first, then the same pattern), so the output and the exception are unchanged.
+_quote = partial(quote_ident, invalid=lambda name, _kind: validate_identifier(name))
 
 
 def _type_sql(td_type: str, length: int | None) -> str:

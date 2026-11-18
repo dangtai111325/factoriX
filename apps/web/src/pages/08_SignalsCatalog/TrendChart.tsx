@@ -47,7 +47,7 @@ export const TrendChart: React.FC<TrendChartProps> = ({
             const color = SERIES_COLORS[idx % SERIES_COLORS.length];
             try {
               const res = await api<{ items: ObservationPoint[] }>(
-                `/api/v1/observations/history?signal_id=${sig.id}&from=now-${timeframe}&limit=120`
+                `/api/v1/observations/history?signal_id=${sig.id}&from=now-${timeframe}&limit=120&order=newest`
               );
               const points = (res.items || [])
                 .filter((pt) => typeof pt.value === 'number')

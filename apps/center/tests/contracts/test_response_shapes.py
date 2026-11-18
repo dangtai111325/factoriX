@@ -4,6 +4,7 @@ internal-http.md). Shapes are locked as key sets; values are covered by the feat
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -106,9 +107,32 @@ async def test_collector_status_shape_in_acquisition_mode(api: Any, monkeypatch:
     response = await _get(api, "/api/v1/edges")
     (item,) = response.json()["items"]
     assert set(item) == {"id", "name", "site_id", "enrollment_status", "desired_revision", "active_revision", "last_heartbeat", "health",
-                         "effective_health", "health_raw", "diagnostic", "delivery_lag_ms", "software_version", "outbox_pending", "queues",
-                         "config_state"}
+                         "effective_health", "health_raw", "diagnostic", "delivery_lag_ms", "delayed_connections", "software_version",
+                         "outbox_pending", "queues", "config_state", "report_state"}  # additive: delayed_connections (R2-02), report_state (P6)
     assert (item["health"], item["effective_health"], item["desired_revision"]) == ("ONLINE", "ONLINE", 7)
+
+
+async def test_collector_status_degrades_during_a_delivery_stall(api: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2-02: acquisition reads the source but the newest delivered value is 40 s old -> DEGRADED + diagnostic."""
+    from factorix.application.live.freshness_service import PipelineEvidence
+    from factorix.transport.http.routers import collector_status as CS
+
+    now = datetime.now(timezone.utc)
+    ev = PipelineEvidence()
+    ev.set_source([{"id": "c1", "last_success_at": now - timedelta(seconds=1)}], reported_at=now - timedelta(seconds=1))
+    ev.note_delivery(None, now - timedelta(seconds=40), connection_id="c1")
+    monkeypatch.setattr(CS, "get_pipeline_evidence", lambda: ev)
+    monkeypatch.setattr(api, "settings", SimpleNamespace(collector_mode="acquisition"))
+
+    async def fake_fetch_all(_session: Any, _sql: str, _params: Any) -> list[dict[str, Any]]:
+        return [{"instance_id": "local-acquisition-1", "role": "acquisition", "health": "HEALTHY", "software_version": "acq-v1",
+                 "config_revision": 7, "spool_pending": 0, "fast_buffered": 0, "broker_ok": True,
+                 "last_heartbeat": now, "diagnostic": None}]
+
+    monkeypatch.setattr(api, "fetch_all", fake_fetch_all)
+    (item,) = (await _get(api, "/api/v1/edges")).json()["items"]
+    assert item["effective_health"] == "DEGRADED" and item["health"] == "ONLINE"
+    assert item["delayed_connections"] == 1 and item["diagnostic"].startswith("Data delayed")
 
 
 async def test_storage_design_operations_moved_to_their_own_path(api: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -138,3 +162,20 @@ async def test_storage_operations_list_matches_the_physical_ui(api: Any, monkeyp
     response = await _get(api, "/api/v1/storage/operations")
     body = response.json()
     assert isinstance(body, dict) and {"items", "total"} <= set(body)
+
+
+async def test_collector_status_says_not_reporting_when_the_report_is_late(api: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P6: heartbeat alive but the connection report flush failing -> DEGRADED "Collector not reporting ..."."""
+    monkeypatch.setattr(api, "settings", SimpleNamespace(collector_mode="acquisition"))
+    now = datetime.now(timezone.utc)
+    runtime = {"leader_since": (now - timedelta(hours=1)).isoformat(), "last_report_at": (now - timedelta(seconds=45)).isoformat()}
+
+    async def fake_fetch_all(_session: Any, _sql: str, _params: Any) -> list[dict[str, Any]]:
+        return [{"instance_id": "local-acquisition-1", "role": "acquisition", "health": "HEALTHY", "software_version": "acq-v1",
+                 "config_revision": 7, "spool_pending": 0, "fast_buffered": 0, "broker_ok": True, "last_heartbeat": now,
+                 "diagnostic": None, "queues_json": json.dumps({"runtime": runtime})}]
+
+    monkeypatch.setattr(api, "fetch_all", fake_fetch_all)
+    (item,) = (await _get(api, "/api/v1/edges")).json()["items"]
+    assert (item["effective_health"], item["report_state"]) == ("DEGRADED", "REPORT_LATE")
+    assert item["diagnostic"].startswith("Collector not reporting connection status")

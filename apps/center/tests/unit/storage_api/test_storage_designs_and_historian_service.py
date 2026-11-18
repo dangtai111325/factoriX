@@ -1,7 +1,8 @@
 """Unit tests for Storage Designer (S10), Storage Catalog & Lifecycle (S11), and Historian Explorer (S12).
 
 Tests the service layers (`factorix.modules.storage_designs`, `factorix.modules.historian_service`)
-and the FastAPI router (`factorix.transport.storage_api`).
+and the FastAPI router (`factorix.transport.storage_api`, split by sub-domain into
+`factorix.transport.http.routers.storage` in R2-E B3). Renamed from ``test_storage_and_historian_unit.py`` (R2-E B9).
 """
 
 from __future__ import annotations

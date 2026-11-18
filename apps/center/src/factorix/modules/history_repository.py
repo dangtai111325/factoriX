@@ -1200,20 +1200,27 @@ class TDengineHistoryRepository:
         oldest: datetime | None = None
         newest: datetime | None = None
 
+        # TDengine answers a bare COUNT(*), FIRST(ts) or LAST(ts) from block metadata (30–90 ms each
+        # for 8.4 M rows), but combining them in one SELECT, or adding a predicate on a non-timestamp
+        # column such as data_epoch, makes it scan every row (2 s idle, 5–15 s under load; run every
+        # 5 min per open Overview it was one of the periodic TDengine load spikes, R2-01). So: three
+        # metadata queries per STable, and the epoch filter only after a reset (epoch > 1), where the
+        # old-epoch rows are deleted anyway and the filter is a safety net.
+        epoch_filter = f" WHERE `data_epoch` >= {int(active_epoch)}" if int(active_epoch) > 1 else ""
         for stable in OP_STABLE_COL_TYPES:
             fq_st = quote_fq_table(db, stable)
             try:
-                rows = await self._client.query_rows(
-                    f"SELECT COUNT(*) AS `cnt`, FIRST(`ts`) AS `oldest`, LAST(`ts`) AS `newest` "
-                    f"FROM {fq_st} WHERE `data_epoch` >= {int(active_epoch)}"
-                )
+                r: dict[str, Any] = {}
+                for alias, expr in (("cnt", "COUNT(*)"), ("oldest", "FIRST(`ts`)"), ("newest", "LAST(`ts`)")):
+                    part = await self._client.query_rows(f"SELECT {expr} AS `{alias}` FROM {fq_st}{epoch_filter}")
+                    if part:
+                        r[alias] = part[0].get(alias)
             except TDEngineError as exc:
                 if _is_missing_td_object(exc):
                     continue
                 raise
-            if not rows:
+            if not r:
                 continue
-            r = rows[0]
             total_obs += int(r.get("cnt") or 0)
             o_dt = _utc(r.get("oldest"))
             n_dt = _utc(r.get("newest"))

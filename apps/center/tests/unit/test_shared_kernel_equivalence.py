@@ -4,16 +4,16 @@ Two kinds of reference:
 
 * helpers already rewired to the kernel (``platform.tdengine``, ``modules.common``, ``domain.rules.as_utc``,
   ``factorix_acquisition.timeutil.iso_ms``): a frozen copy of the pre-split implementation lives in this file;
-* duplicates that still live in modules another workstream is editing (``storage_objects``, ``storage_dsl``,
-  ``storage_topology``, ``storage_model_recorder``, ``historian_sources``): compared live, so the later one-line
-  swap to the kernel is proven safe. If such a helper is renamed meanwhile, its comparison is skipped.
+* the former duplicates in ``storage_objects``, ``storage_dsl``, ``storage_topology``, ``storage_model_recorder`` and
+  ``historian_sources`` (swapped in B7 after a live value-for-value comparison): the old names must be the kernel
+  functions themselves (or a ``functools.partial`` of one carrying the caller's error type / option).
 
 Outcomes are compared as ``("ok", value, type, repr)`` or ``("err", exception type, code, message)``.
 """
 
 from __future__ import annotations
 
-import importlib
+import functools
 import json
 import math
 import sys
@@ -189,13 +189,6 @@ def outcome(fn, *args, **kwargs):  # type: ignore[no-untyped-def]
         return ("err", type(exc), getattr(exc, "code", None), str(exc))
 
 
-def live(module: str, name: str) -> Any:
-    mod = importlib.import_module(module)
-    if not hasattr(mod, name):
-        pytest.skip(f"{module}.{name} no longer exists (changed by its owner); re-check before swapping to the kernel")
-    return getattr(mod, name)
-
-
 IDENTS: list[Any] = ["a", "_x", "A1_b", "x" * 64, "x" * 65, "1abc", "", "a-b", "a b", "ä", None, 123, "a\n", "abc`", "select"]
 STRINGS = ["", "plain", "it's", "back\\slash", "json \\u00e9", "unicode é ✓", "nul\x00byte", "quote'and\\both", "{a}"]
 DATETIMES = [
@@ -298,80 +291,87 @@ def test_utcnow_copies_are_the_kernel_function() -> None:
     assert now.tzinfo is UTC and before <= now <= datetime.now(UTC)
 
 
-# ---------------------------------------------------------------------------- duplicates still in place (live)
+# ---------------------------------------------------------------------------- former duplicates: now the kernel (B7 done)
+# Until the swap these tests compared each copy in storage_objects / storage_dsl / storage_topology /
+# storage_model_recorder / historian_sources with the kernel, value for value, on the sets above (all equal; the
+# same comparison was re-run old-code-vs-new-names after the swap, see fix_log ARCH-B "B3/B7/B8"). The old names
+# are now the kernel functions (or a ``partial`` of one with the caller's error/option), which is asserted here.
 
 
-def test_quote_ident_matches_historian_sources_q() -> None:
-    old_q = live("factorix.modules.historian_sources", "_q")
-    for name in IDENTS:
-        assert outcome(KS.quote_ident, name) == outcome(old_q, name), name
+def _is_partial_of(obj: Any, fn: Any, **keywords: Any) -> bool:
+    return isinstance(obj, functools.partial) and obj.func is fn and not obj.args and obj.keywords == keywords
 
 
-def test_quote_ident_matches_storage_objects_quote() -> None:
-    so = importlib.import_module("factorix.modules.storage_objects")
-    old_quote = live("factorix.modules.storage_objects", "_quote")
+def test_historian_sources_q_is_the_kernel_quote_ident() -> None:
+    from factorix.modules import historian_sources
 
-    def invalid(name: Any, kind: str) -> BaseException:
-        so.validate_identifier(name)  # raises the storage error (length check first, then pattern)
-        raise AssertionError("unreachable: the kernel only calls this for an invalid name")
-
-    for name in IDENTS:
-        assert outcome(KS.quote_ident, name, invalid=invalid) == outcome(old_quote, name), name
+    assert historian_sources._q is KS.quote_ident
 
 
-def test_quote_str_matches_recorder_str_literal() -> None:
-    old = live("factorix.modules.storage_model_recorder", "_str_literal")
-    for text in STRINGS:
-        assert outcome(KS.quote_str, text, reject_nul=False) == outcome(old, text), text
+def test_storage_objects_quote_is_the_kernel_quote_ident_with_the_storage_error() -> None:
+    from factorix.modules import storage_objects as so
+
+    assert isinstance(so._quote, functools.partial) and so._quote.func is KS.quote_ident and set(so._quote.keywords) == {"invalid"}
+    assert so._quote("a_1") == "`a_1`"
+    for name, code in (("x" * 65, "IDENTIFIER_TOO_LONG"), ("1abc", "INVALID_IDENTIFIER"), (None, "INVALID_IDENTIFIER")):
+        with pytest.raises(so.StorageObjectError) as err:
+            so._quote(name)
+        assert err.value.code == code
 
 
-@pytest.mark.parametrize("precision", ["ms", "us", "ns", "other"])
-def test_ts_int_literal_matches_recorder(precision: str) -> None:
-    old = live("factorix.modules.storage_model_recorder", "_ts_literal")
-    for dt in DATETIMES:
-        assert outcome(KS.ts_int_literal, dt, precision) == outcome(old, dt, precision), dt
+def test_recorder_str_literal_is_the_kernel_quote_str_keeping_nul() -> None:
+    from factorix.modules import storage_model_recorder as smr
+
+    assert _is_partial_of(smr._str_literal, KS.quote_str, reject_nul=False)
 
 
-def test_ts_iso_literal_matches_historian_sources() -> None:
-    old = live("factorix.modules.historian_sources", "ts_literal")
-    for dt in DATETIMES:
-        assert outcome(KS.ts_iso_literal, dt) == outcome(old, dt), dt
+@pytest.mark.parametrize(
+    ("precision", "expected"),
+    [("ms", "1794952800123"), ("us", "1794952800123456"), ("ns", "1794952800123456000"), ("other", "1794952800123456")],
+)
+def test_recorder_ts_literal_is_the_kernel_ts_int_literal(precision: str, expected: str) -> None:
+    from factorix.modules import storage_model_recorder as smr
+
+    assert smr._ts_literal is KS.ts_int_literal
+    assert smr._ts_literal(datetime(2026, 11, 18, 5, 0, 0, 123456, tzinfo=PLUS7), precision) == expected
 
 
-def test_parse_aware_ts_matches_recorder() -> None:
-    old = live("factorix.modules.storage_model_recorder", "_parse_ts")
-    for value in [None, *DATETIMES, *TEXT_TIMES, 0, OBJ]:
-        assert outcome(KS.parse_aware_ts, value) == outcome(old, value), value
+def test_historian_sources_ts_literal_is_the_kernel_ts_iso_literal() -> None:
+    from factorix.modules import historian_sources
+
+    assert historian_sources.ts_literal is KS.ts_iso_literal
 
 
-def test_typed_literal_matches_recorder_value_literal() -> None:
-    old = live("factorix.modules.storage_model_recorder", "value_literal")
-    rejected = live("factorix.modules.storage_model_recorder", "ValueRejected")
-    td_types = ["TIMESTAMP", "BOOL", "DOUBLE", "FLOAT", "BIGINT", "INT", "SMALLINT", "TINYINT", "BIGINT UNSIGNED", "NCHAR(10)",
-                "VARCHAR(5)", "BINARY(3)", "JSON", "", None]
-    values: list[Any] = [None, True, 1, 1.0, 1.5, -0.0, float("nan"), "x", "abc", "abcd", "éé", {"k": 1}, [1], "2026-11-18T05:00:00Z",
-                         "not a ts", "  ", *DATETIMES[:3], 2**70]
-    for td_type in td_types:
-        for length in (None, 3, 10):
-            for precision in ("ms", "us", "ns"):
-                for value in values:
-                    new = outcome(KS.typed_literal, value, td_type, length, precision, reject=rejected)
-                    ref = outcome(old, value, td_type, length, precision)
-                    assert new == ref, (value, td_type, length, precision, new, ref)
+def test_recorder_parse_ts_is_the_kernel_parse_aware_ts() -> None:
+    from factorix.modules import storage_model_recorder as smr
+
+    assert smr._parse_ts is KS.parse_aware_ts
 
 
-def test_tenant_database_name_matches_storage_dsl() -> None:
-    old = live("factorix.modules.storage_dsl", "tenant_td_database")
-    tenants: list[Any] = [UUID("00000000-0000-0000-0000-0000000000a1"), "00000000-0000-0000-0000-0000000000A1", "bad", 123, None]
-    for tenant in tenants:
-        for prefix in ["fx_t_", "A" * 16, "A" * 17, "1x", "", "fx_t_\n"]:
-            assert outcome(KN.tenant_database_name, tenant, prefix, uuid_first=True) == outcome(old, tenant, prefix), (tenant, prefix)
+def test_recorder_value_literal_is_the_kernel_typed_literal() -> None:
+    from factorix.modules import storage_model_recorder as smr
+
+    assert _is_partial_of(smr.value_literal, KS.typed_literal, reject=smr.ValueRejected)
 
 
-def test_tenant_db_prefix_and_pattern_match_storage_modules() -> None:
-    assert live("factorix.modules.storage_objects", "TENANT_DB_PREFIX") == KN.TENANT_DB_PREFIX
-    old_re = live("factorix.modules.storage_topology", "_TENANT_DB_RE")
-    names: list[Any] = ["fx_t_" + "0" * 30 + "a1", "fx_t_" + "0" * 30 + "A1", "fx_t_" + "0" * 31, "fx_t_" + "0" * 32 + "\n", "factorix", "", "fx_t_"]
-    for name in names:
-        assert KN.is_tenant_database(name) == bool(old_re.fullmatch(name)), name
-    assert old_re.pattern == KN.TENANT_DB_RE.pattern
+def test_storage_dsl_tenant_td_database_is_the_kernel_tenant_database_name() -> None:
+    """WS-H R4 (B-13): same kernel function and validation order, but the default prefix is the
+    configured ``tdengine_db_prefix`` instead of a fixed ``fx_t_``."""
+    from uuid import UUID
+
+    from factorix.modules import storage_dsl
+    from factorix.platform.settings import get_settings
+
+    tid = UUID("9ed2d4e8-1f0c-46f9-a9e0-d25a18492265")
+    assert storage_dsl.tenant_td_database(tid) == KN.tenant_database_name(
+        tid, get_settings().tdengine_db_prefix, uuid_first=True)
+    assert storage_dsl.tenant_td_database(tid, "abc_") == KN.tenant_database_name(tid, "abc_", uuid_first=True)
+    with pytest.raises(ValueError):  # tenant id is still parsed before the prefix is checked
+        storage_dsl.tenant_td_database("not-a-uuid", "1bad")
+
+
+def test_tenant_db_prefix_and_pattern_are_the_kernel_constants() -> None:
+    from factorix.modules import storage_objects, storage_topology
+
+    assert storage_objects.TENANT_DB_PREFIX is KN.TENANT_DB_PREFIX
+    assert storage_topology._TENANT_DB_RE is KN.TENANT_DB_RE

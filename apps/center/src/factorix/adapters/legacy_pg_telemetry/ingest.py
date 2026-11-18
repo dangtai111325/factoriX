@@ -9,8 +9,8 @@ from uuid import UUID, uuid4
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from factorix.application.health.health_service import note_samples
 from factorix.domain.formula import FormulaError, bind, evaluate, output_quality, parse_expression
-from factorix.domain.health import NO_DATA_PREFIX, effective_connection_health
 from factorix.domain.observation import EDGE_CLOCK_FUTURE, Observation, ObservationError, Quality, resolve_times
 from factorix.domain.quality import Origin
 from factorix.modules.common import (
@@ -28,7 +28,6 @@ from factorix.platform.errors import AppError
 
 from factorix.application.live.latest_api import (
     RejectionThrottle,
-    connection_health_payload,
     latest_stream_payload,
     logger,
     select_binding,
@@ -613,61 +612,8 @@ async def _mark_connections_live(
     a Center-inferred "no samples" degradation; an edge-reported error stays until the edge
     reports the connection UP again (no flapping between data and heartbeat).
     """
-    rows = await fetch_all(
-        session,
-        """
-        WITH prev AS (
-            SELECT id, health AS old_health
-            FROM connections
-            WHERE id = ANY(:ids)
-              AND tenant_id = :tenant_id
-              AND (CAST(:edge_id AS uuid) IS NULL OR edge_id = CAST(:edge_id AS uuid))
-              AND status = 'ACTIVE'
-            ORDER BY id
-            FOR UPDATE
-        )
-        UPDATE connections c
-        SET last_success_at = GREATEST(COALESCE(c.last_success_at, :now), :now),
-            health = CASE
-                WHEN c.health = 'UNKNOWN' THEN 'HEALTHY'
-                WHEN c.health = 'DEGRADED' AND c.last_error LIKE :no_data THEN 'HEALTHY'
-                ELSE c.health
-            END,
-            last_error = CASE WHEN c.last_error LIKE :no_data THEN NULL ELSE c.last_error END
-        FROM prev
-        WHERE c.id = prev.id
-        RETURNING c.id, c.health, c.last_error, c.last_success_at, prev.old_health
-        """,
-        {"ids": list(connection_ids), "tenant_id": tenant_id, "edge_id": edge_id, "now": now, "no_data": f"{NO_DATA_PREFIX}%"},
-    )
-    for row in rows:
-        if row["health"] == row["old_health"]:
-            continue
-        if row["old_health"] == "DEGRADED":
-            await audit(
-                session,
-                tenant_id=tenant_id,
-                event_type="CONNECTION_RECOVERED",
-                actor_id=None,
-                entity_type="connection",
-                entity_id=as_uuid(row["id"]),
-                before={"health": row["old_health"]},
-                after={"health": row["health"]},
-                correlation_id="ingest",
-            )
-        queue_stream_event(
-            session,
-            "health",
-            tenant_id,
-            connection_health_payload(
-                connection_id=row["id"],
-                health=row["health"],
-                effective_health=effective_connection_health(status="ACTIVE", health=row["health"], active_bindings=1, edge_health="ONLINE"),
-                last_error=row.get("last_error"),
-                last_success_at=row.get("last_success_at"),
-            ),
-        )
-
+    # Sample evidence -> HealthService, the single writer of connections.health (R2-E C2).
+    await note_samples(session, tenant_id, edge_id, connection_ids, now)
 
 async def _quarantine(
     session: AsyncSession,

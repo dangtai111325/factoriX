@@ -97,12 +97,12 @@ export const StorageObjectDetailPage: React.FC = () => {
             )}
             {kind === 'stable' && !locked && (
               <Button variant="primary" size="md" icon={<Plus className="w-4 h-4" />} onClick={() => go(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(ref)}`)}>
-                New subtable
+                Create subtable
               </Button>
             )}
             {kind === 'database' && (
               <Button variant="primary" size="md" icon={<Plus className="w-4 h-4" />} onClick={() => go(`/historian/storage/create?kind=stable&database=${encodeURIComponent(name)}`)}>
-                New supertable
+                Create supertable
               </Button>
             )}
             {!locked && kind !== 'database' && (
@@ -191,7 +191,8 @@ export const StorageObjectDetailPage: React.FC = () => {
           onClose={() => setLifecycle(null)}
           onDone={(msg) => {
             setLifecycle(null);
-            if (msg.startsWith('Deleted')) navigate(backTarget);
+            // The page goes away: hand the confirmation to the list page so the toast is not lost (R2-22).
+            if (msg.startsWith('Deleted')) navigate(backTarget, { state: { notice: msg } });
             else {
               showToast({ message: msg, tone: 'success' });
               setReloadKey((k) => k + 1);

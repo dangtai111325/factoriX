@@ -23,6 +23,12 @@ subset (`FACTORIX_RABBITMQ_{URL,MGMT_URL,EXCHANGE,QUEUE,DLX,DLQ,CONFIRM_TIMEOUT_
 `FACTORIX_RABBITMQ_MAX_LENGTH_BYTES` / `..._DELIVERY_LIMIT` set for the API/ingestion `Settings` are not
 seen by acquisition, which declares the same queues with the dataclass defaults.
 
+**Since R2-E C9 (ARCH-C), one owner:** the ingestion consumer declares the topology. Acquisition builds
+`BrokerConfig.from_settings(BrokerSettings(), declare_topology=False)` — the same `FACTORIX_RABBITMQ_*` section
+(`platform/settings.py::BrokerSettings`, inherited by `Settings`, CT-09) — and its publisher only runs a
+**passive** declare of the ingress exchange (`broker.passive_ingress_exchange`). Until ingestion has declared
+the topology the publisher reports "RabbitMQ topology is not provisioned yet" and the samples stay in the spool.
+
 ## 2. Routing (lane decision at publish time)
 
 `age = now - acquired_at`; `0 <= age <= 12 s` (`BrokerConfig.freshness_window_s`, publisher

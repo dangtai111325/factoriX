@@ -159,7 +159,12 @@ async def create_or_get_job(body: JobIn, principal: dict[str, Any] = Depends(adm
         raise AppError(404, "NOT_FOUND", "Connection not found.")
     job = await fetch_one(session, "SELECT id FROM acquisition_jobs WHERE connection_id = :id", {"id": conn_id})
     if job:
-        await execute(session, "UPDATE acquisition_jobs SET mode = :mode, interval_ms = :interval_ms WHERE id = :id", {"id": job["id"], "mode": body.mode, "interval_ms": body.interval_ms})
+        # CT-07: a job change is a configuration change -> bump the job's config_revision (feeds the snapshot revision).
+        await execute(
+            session,
+            "UPDATE acquisition_jobs SET mode = :mode, interval_ms = :interval_ms, config_revision = config_revision + 1 WHERE id = :id",
+            {"id": job["id"], "mode": body.mode, "interval_ms": body.interval_ms},
+        )
         await execute(
             session,
             "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",

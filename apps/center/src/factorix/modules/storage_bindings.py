@@ -345,6 +345,10 @@ class StorageBindingService:
         resources = await load_resource_index(session, tenant_id)
         bound = await bound_model_fields(session, tenant_id)
         signal_resources = await signal_resource_map(session, tenant_id)
+        signal_types = {
+            str(s["id"]).lower(): str(s.get("data_type") or "") for s in await fetch_all(
+                session, "SELECT id, data_type FROM signal_definitions WHERE tenant_id = :tenant_id", {"tenant_id": tenant_id})
+        }
         now = utcnow()
         needle = (search or "").strip().lower()
         flat_leaves: list[dict[str, Any]] = []
@@ -371,9 +375,12 @@ class StorageBindingService:
             )
             machine = context["resource"]
             field_items = []
+            mapped = mapping_signals(r.get("spec_json"))
             for leaf in model_leaf_fields(r.get("spec_json")):
                 f_path = leaf["path"]
                 found, last_value = extract_field(body, f_path) if body is not None else (False, None)
+                inferred, type_source = infer_value_type(
+                    leaf["value_type"], signal_types.get(mapped.get(f_path, "")), bool(found), last_value)
                 can_id = f"mod:{mid}:{f_path}"
                 owner = bound.get((mid, f_path))
                 leaf_item = {
@@ -393,6 +400,10 @@ class StorageBindingService:
                     "path": f"Data Models / {dname} / {f_path}",
                     "data_type": leaf["data_type"],
                     "value_type": leaf["value_type"],
+                    # R2-14: what the bulk wizard defaults to for "auto" fields (type + target column).
+                    "inferred_type": inferred,
+                    "type_source": type_source,
+                    "suggested_column": suggest_value_column(inferred, TEMPLATE_VALUE_COLUMNS) if inferred else None,
                     "field_mode": leaf["mode"],
                     "is_timestamp": leaf["is_timestamp"],
                     "unit": None,
@@ -668,6 +679,51 @@ def suggest_value_column(value_type: str, columns: list[str]) -> str | None:
         if cand in columns:
             return cand
     return None
+
+
+#: Signal data type -> Data Model value type (for "auto" fields that map one signal).
+_SIGNAL_TO_VALUE_TYPE = {"float64": "float", "float32": "float", "double": "float", "int64": "int", "int32": "int",
+                         "int": "int", "bool": "bool", "boolean": "bool", "string": "string", "enum": "string",
+                         "json": "json", "text": "string"}
+#: Typed value columns of the per-field template (guide F3), used for the default target column.
+TEMPLATE_VALUE_COLUMNS = ["value_f64", "value_i64", "value_text"]
+
+
+def mapping_signals(spec_raw: Any) -> dict[str, str]:
+    """``field path -> signal id`` (lower case) of the ``mapping`` fields of a Data Model spec."""
+    from factorix.domain.body import iter_fields
+
+    spec = _spec_dict(spec_raw)
+    out: dict[str, str] = {}
+    if not isinstance(spec.get("root"), dict):
+        return out
+    for parts, node in iter_fields(spec):
+        if node.get("mode") == "mapping":
+            sid = (node.get("ref") or {}).get("signal_id")
+            if sid:
+                out[_path_text(list(parts))] = str(sid).lower()
+    return out
+
+
+def infer_value_type(declared: str, signal_type: str | None, has_value: bool, value: Any) -> tuple[str | None, str | None]:
+    """``(value type, source)`` of a field for binding defaults (R2-14). Declared types win; an ``auto``
+    field takes the type of the signal it maps, else the type of its live value. ``(None, None)`` when
+    nothing is known (no guessing)."""
+    if declared and declared != "auto":
+        return declared, "declared"
+    if signal_type and _SIGNAL_TO_VALUE_TYPE.get(str(signal_type).lower()):
+        return _SIGNAL_TO_VALUE_TYPE[str(signal_type).lower()], "signal"
+    if has_value and value is not None:
+        if isinstance(value, bool):
+            return "bool", "live_value"
+        if isinstance(value, int):
+            return "int", "live_value"
+        if isinstance(value, float):
+            return "float", "live_value"
+        if isinstance(value, str):
+            return "string", "live_value"
+        return "json", "live_value"
+    return None, None
 
 
 async def signal_resource_map(session: AsyncSession, tenant_id: UUID) -> dict[str, str]:

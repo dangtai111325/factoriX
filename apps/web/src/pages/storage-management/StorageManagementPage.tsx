@@ -22,7 +22,7 @@ import {
   StorageDraftItem,
 } from '../../lib/storagePhysicalApi';
 
-// ------------------------------------------------------------------ "New" primary menu
+// ------------------------------------------------------------------ "Create" primary menu (old-nav wording: Create / Add)
 
 interface NewItem {
   key: string;
@@ -32,7 +32,7 @@ interface NewItem {
   to: string;
 }
 
-/** Primary red "New ▾" with the MenuButton behaviour (Esc / outside click close, arrow keys). */
+/** Primary red "Create ▾" with the MenuButton behaviour (Esc / outside click close, arrow keys). */
 const NewMenu: React.FC<{ items: NewItem[]; onPick: (to: string) => void }> = ({ items, onPick }) => {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -75,7 +75,7 @@ const NewMenu: React.FC<{ items: NewItem[]; onPick: (to: string) => void }> = ({
         aria-controls={open ? menuId : undefined}
         onClick={() => setOpen((v) => !v)}
       >
-        New <ChevronDown className={`w-3.5 h-3.5 transition-transform ${open ? 'rotate-180' : ''}`} />
+        Create <ChevronDown className={`w-3.5 h-3.5 transition-transform ${open ? 'rotate-180' : ''}`} />
       </Button>
       {open && (
         <div id={menuId} role="menu" aria-label="Create" onKeyDown={move} className="absolute right-0 top-full mt-1.5 w-64 max-w-[calc(100vw-24px)] rounded-xl bg-white border border-[#D4DFEC] shadow-xl py-1.5 z-40">
@@ -125,7 +125,8 @@ function readLocalDrafts(): LocalDraft[] {
     try {
       const raw = sessionStorage.getItem(d.key);
       if (!raw) continue;
-      const data = JSON.parse(raw) as { physical_name?: string; display_name?: string };
+      const parsed = JSON.parse(raw) as { v?: number; data?: { physical_name?: string; display_name?: string }; physical_name?: string; display_name?: string };
+      const data = parsed?.v === 2 && parsed.data ? parsed.data : parsed;
       out.push({ ...d, name: data.physical_name || data.display_name || '(no name yet)' });
     } catch {
       // ignore unreadable drafts
@@ -346,6 +347,13 @@ export const StorageManagementPage: React.FC = () => {
   }, [selectedObjectId, drawerReload]);
 
   const notice = useCallback((message: string, tone: 'info' | 'success' | 'error' = 'info') => showToast({ message, tone }), [showToast]);
+  // A confirmation handed over by a page that no longer exists (e.g. "Deleted database …" from its detail page).
+  useEffect(() => {
+    const msg = (location.state as { notice?: string } | null)?.notice;
+    if (!msg) return;
+    notice(msg, 'success');
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [location.state]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const newItems: NewItem[] = [
     { key: 'db', label: 'Database', hint: 'Precision and retention', icon: <Database className="w-4 h-4 text-[#111B37]" />, to: '/historian/storage/create?kind=database' },
@@ -390,6 +398,7 @@ export const StorageManagementPage: React.FC = () => {
               recordingActive={stats?.recording_active ?? null}
               recordingPaused={stats?.recording_paused ?? null}
               recordingError={stats?.recording_error ?? null}
+              loading={stats == null}
               draftCount={draftCount}
               activeType={activeTab === 'objects' ? typeFilter : undefined}
               onFilterType={setTypeFilter}
@@ -479,7 +488,7 @@ export const StorageManagementPage: React.FC = () => {
         onClose={() => setDraftsOpen(false)}
         local={localDrafts}
         server={serverDrafts}
-        onResume={(kind) => navigate(`/historian/storage/create?kind=${kind}`, { state: { from } })}
+        onResume={(kind) => navigate(`/historian/storage/create?kind=${kind}&resume=1`, { state: { from } })}
         onDiscard={(key) => {
           try {
             sessionStorage.removeItem(key);

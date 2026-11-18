@@ -43,6 +43,15 @@ acquisition runs nothing for, predicate re-checked in the UPDATE); `collect.py` 
 `edge_sync.py` and `telemetry._mark_connections_live` (edge mode); ingestion (edge mode, recovery from the
 "No samples" state). Target: one `HealthService` writer (Phase C2).
 
+**Since R2-E C2 (ARCH-C):** `application/health/health_service.py` is the only module with an
+`UPDATE connections … SET health|last_error|last_success_at` (`test_health_single_writer.py`). Evidence entry
+points: `apply_collector_reports` (acquisition `pg_control`, asyncpg, same lock/order/audit/NOTIFY as before),
+`apply_edge_reports` (`edge_sync`), `note_samples_pg` (ingestion edge mode), `note_samples` (legacy PG ingest),
+`sweep_no_data` (Center sweep, same atomic `last_success_at < cutoff` predicate), `set_operator_state`
+(pause → PAUSED, resume → UNKNOWN + error cleared, archive → UNKNOWN; the collector updates only status/version),
+`activate_edge_drafts`. The windowed rules stay in `domain/health.py`; the health payload is
+`health_service.health_payload` for every producer.
+
 ## 4. Commissioning (same channel family)
 
 `collect` inserts `commissioning_jobs` (`PENDING`) + NOTIFY `factorix_commissioning`; acquisition claims
@@ -50,3 +59,10 @@ acquisition runs nothing for, predicate re-checked in the UPDATE); `collect.py` 
 (`PASSED | FAILED | CANCELLED`, `stages_json`, `samples_json`, `error_code`, `diagnostic`); the API reaper
 sets rows still `PENDING`/`RUNNING` after 30 s to `FAILED` (`error_code` `EDGE_NOT_STARTED` for PENDING —
 legacy name, the text says "Collector did not start" — and `TIMEOUT` for RUNNING; the RUNNING text still says "The Edge collector …", a leftover for U3). Timeouts exist on both sides (25 s / 30 s).
+
+**P6 (ARCH-C): missing evidence is not negative evidence.** `health_service.collector_report_state` /
+`ReportContinuity`: when the acquisition heartbeat is stale, the acquisition is standby, its
+`queues_json.runtime.last_report_at` is older than 20 s (report write failing, e.g. VM freeze) or Center did
+not observe for more than 15 s, the Center sweep writes nothing (connections keep their last verdict) and the
+no-data window restarts from the moment the evidence is current again. `/api/v1/edges` exposes `report_state`
+(`REPORTING | REPORT_LATE | NOT_REPORTING`); REPORT_LATE is shown as "Collector not reporting".

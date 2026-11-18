@@ -212,8 +212,13 @@ class IngestionWorker(
             try:
                 td_ok = False
                 try:
-                    health = await self.td.health_probe()
-                    td_ok = bool(health.reachable)
+                    # Liveness only: a single round trip. The full probe (5 metadata queries incl.
+                    # ins_disk_usage) every 5 s was a constant TDengine load (R2-01, WS-P R3).
+                    if hasattr(self.td, "ping"):
+                        td_ok = bool(await self.td.ping())
+                    else:  # test doubles / older clients
+                        health = await self.td.health_probe()
+                        td_ok = bool(health.reachable)
                 except Exception:  # noqa: BLE001
                     td_ok = False
                 broker_ok = self._consumers_connected()

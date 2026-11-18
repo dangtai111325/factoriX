@@ -148,6 +148,26 @@ export function stateFromParams(p: URLSearchParams): ViewState {
   };
 }
 
+/**
+ * What was wrong with the time window of a link (R2-15): the page tells the user instead of silently
+ * replacing it. `clamped` = longer than the 366-day limit (shortened from its start); `reversed` = end before
+ * start (the page falls back to a preset); `invalid` = unreadable timestamp.
+ */
+export function rangeIssueFromParams(p: URLSearchParams): { kind: 'clamped' | 'reversed' | 'invalid'; message: string; fromMs?: number; toMs?: number } | null {
+  const rawFrom = p.get('from');
+  const rawTo = p.get('to');
+  if (!rawFrom && !rawTo) return null;
+  const from = parseTime(rawFrom);
+  const to = parseTime(rawTo);
+  if (from == null || to == null)
+    return { kind: 'invalid', message: `The link's time window (${rawFrom || '?'} → ${rawTo || '?'}) is not a valid pair of timestamps, so a preset range is shown instead.` };
+  if (to <= from)
+    return { kind: 'reversed', fromMs: from, toMs: to, message: `The link's end (${formatDateTime(to)}) is not after its start (${formatDateTime(from)}), so a preset range is shown instead. Fix the window under Custom.` };
+  if (to - from > MAX_RANGE_MS)
+    return { kind: 'clamped', fromMs: from, toMs: to, message: `The requested window (${formatDateTime(from)} → ${formatDateTime(to)}) is longer than the 366-day maximum. Showing the first 366 days, until ${formatDateTime(from + MAX_RANGE_MS)}.` };
+  return null;
+}
+
 export function paramsFromState(s: ViewState): URLSearchParams {
   const p = new URLSearchParams();
   if (s.sources.length) p.set('sources', s.sources.join(','));

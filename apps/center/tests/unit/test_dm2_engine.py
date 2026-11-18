@@ -263,7 +263,10 @@ async def test_value_at_query_uses_the_source_time_index(monkeypatch: pytest.Mon
         captured.update(sql=sql, params=params)
         return [{"idx": 0, "value_json": {"v": "SO-1"}, "quality": "GOOD", "source_time": T0, "received_time": T0}, {"idx": 1, "value_json": None, "quality": None}]
 
-    monkeypatch.setattr(E, "fetch_all", fetch_all)
+    from factorix.application.history import query_service as QS
+
+    # R2-E C3: the value_at SQL lives in HistoryQueryService (models_engine.fetch_value_at delegates).
+    monkeypatch.setattr(QS, "fetch_all", fetch_all)
     out = await E.fetch_value_at(object(), TENANT, [(SO, T0, "s"), (SIG, T0, "e")])  # type: ignore[arg-type]
     assert out[(SO, T0)] == R.Sample("SO-1", "GOOD", T0, T0) and out[(SIG, T0)] is None
     sql = captured["sql"]

@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain import rules as R
 from factorix.domain.body import BodyContext, CompiledSpec, EvalResult, compile_spec, evaluate_detailed
-from factorix.domain.signal_state import evaluate_signal_state
+from factorix.domain.signal_state import evaluate_signal_state  # noqa: F401
 from factorix.modules import storage_model_recorder
 from factorix.modules.common import execute, fetch_all, queue_stream_event, utcnow
 from factorix.platform import after_commit
@@ -208,18 +208,27 @@ def live_sample(rec: Any, status: str, last_good_source_time: datetime | None = 
     return None
 
 
-def sample_from_latest(row: Mapping[str, Any], *, now: datetime | None = None) -> tuple[R.Sample | None, str]:
-    """Apply canonical freshness before making a PostgreSQL sample available to the model."""
+def sample_from_latest(
+    row: Mapping[str, Any], *, now: datetime | None = None, freshness: Any = None
+) -> tuple[R.Sample | None, str]:
+    """Apply canonical freshness (``FreshnessService``: job-interval fallback, pipeline evidence,
+    connection health) before making a PostgreSQL sample available to the model (R2-E C1 / CT-10)."""
+    from factorix.application.live.freshness_service import freshness_service
+
     value_json = _json(row.get("value_json"))
     value = value_json.get("v") if isinstance(value_json, dict) else None
     received_at = R.as_utc(row.get("received_time"))
-    evaluation = evaluate_signal_state(
+    service = freshness or freshness_service()
+    evaluation = service.evaluate(
+        signal_id=row.get("signal_id"),
         has_observation=True,
         raw_quality=row.get("quality"),
         raw_value=value,
         event_time=received_at,
         last_acquired_at=R.as_utc(row.get("last_acquired_at")),
         expected_interval_ms=row.get("expected_interval_ms"),
+        job_interval_ms=row.get("job_interval_ms"),
+        connection_id=row.get("connection_id"),
         null_allowed=bool(row.get("nullable")),
         binding_enabled=bool(row.get("binding_enabled", True)),
         connection_paused=row.get("connection_status") == "PAUSED",
@@ -237,6 +246,15 @@ def sample_from_latest(row: Mapping[str, Any], *, now: datetime | None = None) -
     if quality not in VALID_QUALITIES and quality not in HOLD_LAST_QUALITIES:
         return None, quality
     return R.Sample(value, quality, R.as_utc(row.get("source_time")), received_at), quality
+
+
+def _evidence_kwargs(provider: Any, meta: Mapping[str, Any]) -> dict[str, Any]:
+    """connection / job interval for ``evaluate_signal`` (only for providers that accept them)."""
+    from factorix.modules.live_state import TDengineLiveStateProvider
+
+    if not isinstance(provider, TDengineLiveStateProvider):
+        return {}
+    return {"connection_id": meta.get("connection_id"), "job_interval_ms": meta.get("job_interval_ms")}
 
 
 async def load_samples(
@@ -284,11 +302,12 @@ async def load_samples(
                             SELECT s.id, s.resource_id, s.data_type, s.unit, s.expected_interval_ms, s.status AS signal_status,
                                    COALESCE(nb.nullable, FALSE) AS nullable,
                                    COALESCE(nb.enabled, TRUE) AS binding_enabled,
-                                   nb.connection_status, nb.connection_health
+                                   nb.connection_status, nb.connection_health, nb.connection_id, nb.job_interval_ms
                             FROM signal_definitions s
                             LEFT JOIN LATERAL (
                                 SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable, b.enabled,
-                                       c.status AS connection_status, c.health AS connection_health
+                                       c.status AS connection_status, c.health AS connection_health,
+                                       c.id AS connection_id, j.interval_ms AS job_interval_ms
                                 FROM signal_bindings b
                                 JOIN source_fields f ON f.id = b.source_field_id
                                 LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
@@ -385,6 +404,7 @@ async def load_samples(
                 connection_status=meta.get("connection_status"),
                 active_bindings=1 if binding_enabled else 0,
                 now=now,
+                **_evidence_kwargs(provider, meta),
             )
             rec = evaluated.record
             ev = evaluated.evaluation
@@ -401,7 +421,8 @@ async def load_samples(
                s.expected_interval_ms,
                COALESCE(b.enabled, TRUE) AND s.status = 'ACTIVE' AS binding_enabled,
                COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable,
-               c.status AS connection_status, c.health AS connection_health
+               c.status AS connection_status, c.health AS connection_health,
+               c.id AS connection_id, j.interval_ms AS job_interval_ms
         FROM latest_signal_state l
         JOIN signal_definitions s ON s.id = l.signal_id AND s.tenant_id = l.tenant_id
         LEFT JOIN LATERAL (
@@ -432,81 +453,22 @@ async def fetch_value_at(
 ) -> dict[tuple[str, datetime], R.Sample | None]:
     """Value of each signal as of an instant: ``requests`` = ``[(signal_id, at, mode)]``.
 
-    ``mode`` ``"s"`` searches by source_time; ``"e"`` by event_time. Uses TDengine
-    ``TDengineHistoryRepository`` when active, with ``active_epoch == 1`` PG fallback bridge.
+    ``mode`` ``"s"`` searches by source_time; ``"e"`` by event_time. Reads through
+    ``HistoryQueryService.value_at`` (TDengine first; PostgreSQL ``observations`` only for epoch 1 and
+    only when the PG fallback setting allows it, R2-E C3).
     """
     if not requests:
         return {}
+    from factorix.application.history.query_service import history_query_service
 
-    from factorix.modules.history_repository import _active_epoch_for, get_history_provider
-
-    hist_provider = get_history_provider() if isinstance(session, AsyncSession) else None
-    remaining = requests
-    out: dict[tuple[str, datetime], R.Sample | None] = {(sid, at): None for sid, at, _mode in requests}
-    if hist_provider is not None:
-        active_epoch = await _active_epoch_for(session, tenant_id)
-        td_res = await hist_provider.value_at_batch(
-            tenant_id,
-            requests=requests,
-            session=session,
-            active_epoch=active_epoch,
-        )
-        missing_pg: list[tuple[str, datetime, str]] = []
-        for sid, at, mode in requests:
-            hit = td_res.get((sid, at))
-            if hit is not None:
-                val, qual, src_ts, rcv_ts = hit
-                out[(sid, at)] = R.Sample(value=val, quality=qual, source_time=src_ts, received_time=rcv_ts)
-            elif active_epoch == 1:
-                missing_pg.append((sid, at, mode))
-        if active_epoch > 1 or not missing_pg:
-            return out
-        remaining = missing_pg
-
-    rows = await fetch_all(
-        session,
-        """
-        SELECT q.idx, o.value_json, o.quality, o.source_time, o.received_time
-        FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[]), CAST(:modes AS text[]), CAST(:idx AS integer[]))
-             AS q(signal_id, at, mode, idx)
-        LEFT JOIN LATERAL (
-            SELECT * FROM (
-                (SELECT o.value_json, o.quality, o.source_time, o.received_time
-                 FROM observations o
-                 WHERE q.mode = 's' AND o.tenant_id = :tenant_id AND o.signal_id = q.signal_id
-                   AND o.source_time <= q.at AND o.quality IN ('GOOD', 'UNCERTAIN')
-                 ORDER BY o.source_time DESC, o.received_time DESC
-                 LIMIT 1)
-                UNION ALL
-                (SELECT o.value_json, o.quality, o.source_time, o.received_time
-                 FROM observations o
-                 WHERE q.mode = 'e' AND o.tenant_id = :tenant_id AND o.signal_id = q.signal_id
-                   AND o.event_time <= q.at AND o.quality IN ('GOOD', 'UNCERTAIN')
-                 ORDER BY o.event_time DESC
-                 LIMIT 1)
-            ) found
-            LIMIT 1
-        ) o ON TRUE
-        """,
-        {
-            "tenant_id": tenant_id,
-            "ids": [UUID(sid) for sid, _at, _mode in remaining],
-            "ats": [at for _sid, at, _mode in remaining],
-            "modes": [mode for _sid, _at, mode in remaining],
-            "idx": list(range(len(remaining))),
-        },
-    )
-    for row in rows:
-        sid, at, _mode = remaining[int(row["idx"])]
-        if row.get("quality") is None:
+    raw = await history_query_service().value_at(session, tenant_id, requests)
+    out: dict[tuple[str, datetime], R.Sample | None] = {}
+    for key, hit in raw.items():
+        if hit is None:
+            out[key] = None
             continue
-        value_json = _json(row.get("value_json"))
-        out[(sid, at)] = R.Sample(
-            value=value_json.get("v") if isinstance(value_json, dict) else None,
-            quality=row.get("quality"),
-            source_time=R.as_utc(row.get("source_time")),
-            received_time=R.as_utc(row.get("received_time")),
-        )
+        value, quality, source_time, received_time = hit
+        out[key] = R.Sample(value=value, quality=quality, source_time=R.as_utc(source_time), received_time=R.as_utc(received_time))
     return out
 
 
@@ -910,6 +872,8 @@ class ModelEngine:
                             sampled_at=now,
                             body=result.body,
                             field_quality=storage_model_recorder.field_quality_map(model.compiled, result, qualities),
+                            # R2-20: a mapping field's own sample time (guide D2 field provenance)
+                            field_source_ts=storage_model_recorder.field_source_times(model.compiled, samples),
                         )
                     )
                 model.samples_since_prune += 1

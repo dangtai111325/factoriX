@@ -52,8 +52,9 @@ export const StorageLifecycleDialog: React.FC<{
       if (action === 'resume') await resumeStorageObject(target.id);
       if (action === 'retire') await retireStorageObject(target.id);
       if (action === 'purge') await purgeStorageObject(target.id, confirm);
+      const noun = target.kind === 'stable' ? 'supertable' : target.kind;
       onDone(
-        action === 'purge' ? `Deleted ${target.name}` : action === 'retire' ? `Retired ${target.name}` :
+        action === 'purge' ? `Deleted ${noun} ${target.name}` : action === 'retire' ? `Retired ${noun} ${target.name}` :
         action === 'pause' ? `Recording paused for ${target.name}` : `Recording started for ${target.name}`,
       );
     } catch (err) {

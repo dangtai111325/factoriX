@@ -75,20 +75,45 @@ export interface StorageWizardLayoutProps {
 // Hook: useWizardDraft
 // ============================================================================
 
+/** A saved confirmation must never come back ticked (R2-10): drafts are stored and restored without it. */
+function withoutConfirm<T extends object>(d: T): T {
+  if (d && typeof d === 'object' && 'confirmed' in (d as Record<string, unknown>)) return { ...d, confirmed: false };
+  return d;
+}
+
+/** sessionStorage entry: `{v: 2, savedAt, data}`; older entries were the bare wizard data. */
+export function readStoredDraft<T extends object>(storageKey: string): { savedAt: string | null; data: T } | null {
+  try {
+    const stored = sessionStorage.getItem(storageKey);
+    if (!stored) return null;
+    const parsed = JSON.parse(stored);
+    if (parsed && typeof parsed === 'object' && parsed.v === 2 && parsed.data && typeof parsed.data === 'object') {
+      return { savedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : null, data: withoutConfirm(parsed.data as T) };
+    }
+    if (parsed && typeof parsed === 'object') return { savedAt: null, data: withoutConfirm(parsed as T) };
+  } catch {
+    // unreadable draft: ignore
+  }
+  return null;
+}
+
+/**
+ * Wizard state + "Save draft" in this browser tab. A stored draft is NOT applied silently (R2-10): the wizard
+ * starts empty and `pendingDraft` offers "Resume draft / Discard".
+ */
 export function useWizardDraft<T extends object>(
   storageKey: string,
   initialData: T
 ) {
-  const [data, setData] = React.useState<T>(() => {
+  const [data, setData] = React.useState<T>(initialData);
+  const [pendingDraft, setPendingDraft] = React.useState<{ savedAt: string | null; data: T } | null>(() => {
+    const d = readStoredDraft<T>(storageKey);
+    if (!d) return null;
     try {
-      const stored = sessionStorage.getItem(storageKey);
-      if (stored) {
-        return JSON.parse(stored);
-      }
+      return JSON.stringify(d.data) === JSON.stringify(withoutConfirm(initialData)) ? null : d;
     } catch {
-      // ignore JSON parse error
+      return d;
     }
-    return initialData;
   });
 
   const [initialSnapshot, setInitialSnapshot] = React.useState<T>(() => initialData);
@@ -114,7 +139,8 @@ export function useWizardDraft<T extends object>(
 
   const saveDraft = React.useCallback(() => {
     try {
-      sessionStorage.setItem(storageKey, JSON.stringify(data));
+      sessionStorage.setItem(storageKey, JSON.stringify({ v: 2, savedAt: new Date().toISOString(), data: withoutConfirm(data) }));
+      setPendingDraft(null);
       const timeStr = new Date().toLocaleTimeString();
       setLastSavedAt(`${timeStr} (this browser tab)`);
       return true;
@@ -129,15 +155,38 @@ export function useWizardDraft<T extends object>(
     } catch {
       // ignore
     }
+    setPendingDraft(null);
     setData(initialSnapshot);
     setIsDirty(false);
   }, [storageKey, initialSnapshot]);
 
   const resetData = React.useCallback((newData: T) => {
-    setData(newData);
-    setInitialSnapshot(newData);
+    const clean = withoutConfirm(newData);
+    setData(clean);
+    setInitialSnapshot(clean);
     setIsDirty(false);
   }, []);
+
+  /** Apply the stored draft (the confirmation stays unticked). */
+  const resumeDraft = React.useCallback(() => {
+    setPendingDraft((p) => {
+      if (p) {
+        setData((prev) => ({ ...prev, ...p.data }));
+        if (p.savedAt) setLastSavedAt(`${new Date(p.savedAt).toLocaleTimeString()} (this browser tab)`);
+      }
+      return null;
+    });
+  }, []);
+
+  /** Forget the stored draft without applying it. */
+  const discardPendingDraft = React.useCallback(() => {
+    try {
+      sessionStorage.removeItem(storageKey);
+    } catch {
+      // ignore
+    }
+    setPendingDraft(null);
+  }, [storageKey]);
 
   return {
     data,
@@ -151,8 +200,41 @@ export function useWizardDraft<T extends object>(
     setLastSavedAt,
     resetData,
     lastSavedAt,
+    pendingDraft,
+    resumeDraft,
+    discardPendingDraft,
   };
 }
+
+/** "A draft from … exists — Resume draft / Discard" (R2-10). */
+export const PendingDraftBanner: React.FC<{
+  draft: { savedAt: string | null } | null;
+  onResume: () => void;
+  onDiscard: () => void;
+}> = ({ draft, onResume, onDiscard }) => {
+  if (!draft) return null;
+  const when = draft.savedAt ? new Date(draft.savedAt).toLocaleString() : 'an earlier session of this tab';
+  return (
+    <div className="mb-4">
+      <Banner
+        tone="info"
+        action={
+          <div className="flex gap-2 shrink-0">
+            <Button type="button" size="sm" variant="outline" onClick={onResume}>
+              Resume draft
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={onDiscard}>
+              Discard
+            </Button>
+          </div>
+        }
+      >
+        A draft saved {draft.savedAt ? 'at ' : 'in '}
+        {when} exists for this wizard. Resume it, or start fresh. (The confirmation on the Review step is never restored.)
+      </Banner>
+    </div>
+  );
+};
 
 // ============================================================================
 // Component: DirtyLeaveGuard

@@ -72,7 +72,7 @@ export const SignalSparkline: React.FC<SignalSparklineProps> = ({ signalId, qual
     const fetchHistory = async () => {
       try {
         const res = await runSparkline(
-          () => api<{ items: Array<{ value: unknown; quality?: string }> }>(`/api/v1/observations/history?signal_id=${signalId}&from=now-15m&limit=30`),
+          () => api<{ items: Array<{ value: unknown; quality?: string }> }>(`/api/v1/observations/history?signal_id=${signalId}&from=now-15m&limit=30&order=newest`),
           () => isCurrent,
         );
         if (res === null) return;

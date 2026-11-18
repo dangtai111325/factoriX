@@ -139,7 +139,12 @@ async def _table_exists(conn: asyncpg.Connection, qualified_name: str) -> bool:
     return bool(res)
 
 
-async def load_pg_snapshot(conn: asyncpg.Connection, *, prev_revision: int = 0, prev_digest: str = "") -> dict[str, Any]:
+async def load_pg_snapshot(
+    conn: asyncpg.Connection, *, prev_revision: int = 0, prev_digest: str = "", revision_floor: int = 0
+) -> dict[str, Any]:
+    """``revision_floor``: highest revision this installation already published (CT-07: the revision never
+    goes down across acquisition restarts). ``ConfigProvider`` passes its last-known-good revision / the
+    revision of the last acquisition heartbeat."""
     """Read an atomic repeatable-read configuration snapshot directly from PostgreSQL."""
     async with conn.transaction(isolation="repeatable_read", readonly=True):
         conn_rows = await conn.fetch(
@@ -309,6 +314,7 @@ async def load_pg_snapshot(conn: asyncpg.Connection, *, prev_revision: int = 0, 
         revision = prev_revision + 1
     else:
         revision = max(1, max_entity_rev)
+    revision = max(revision, int(revision_floor or 0))
     payload["revision"] = revision
     payload["structure_sha256"] = struct_hash
     payload["checksum_sha256"] = checksum(payload)
@@ -650,6 +656,20 @@ class ConfigUpdate:
     source: str = "pg"
 
 
+async def _published_revision(conn: asyncpg.Connection) -> int:
+    """Revision the acquisition last reported in its heartbeat (survives a lost LKG file)."""
+    try:
+        if not await _table_exists(conn, "public.collector_runtime_status"):
+            return 0
+        value = await conn.fetchval(
+            "SELECT COALESCE(MAX(config_revision), 0) FROM collector_runtime_status WHERE role = 'acquisition'"
+        )
+        return int(value or 0)
+    except Exception:  # noqa: BLE001 - a floor is an optimisation of monotonicity, never a reason to fail
+        logger.debug("Could not read the published config revision", exc_info=True)
+        return 0
+
+
 class ConfigProvider:
     """Loads snapshots from PostgreSQL with LKG fallback and secret-store integration."""
 
@@ -674,18 +694,33 @@ class ConfigProvider:
         self.pool = pool
         self.secrets.set_pool(pool)
 
+    async def _restart_baseline(self) -> tuple[int, str]:
+        """First load after a (re)start: continue from the last-known-good snapshot on disk (revision +
+        structure hash), so the revision is monotonic across restarts (CT-07)."""
+        loaded = await asyncio.to_thread(self.lkg.load)
+        if loaded is None:
+            return 0, ""
+        snapshot, rev, _digest = loaded
+        return int(rev or 0), str(snapshot.get("structure_sha256") or structure_digest(snapshot))
+
     async def fetch_if_changed(self) -> ConfigUpdate:
         if self.pool is None and self._loader is None:
             raise RuntimeError("PostgreSQL pool is not connected.")
+        prev_rev, prev_hash = self.revision, self.structure_hash
+        if prev_rev <= 0:
+            prev_rev, prev_hash = await self._restart_baseline()
         if self.pool is not None:
             async with self.pool.acquire() as conn:
                 if self._loader is not None:
-                    snapshot = await self._loader(conn, self.revision, self.structure_hash)
+                    snapshot = await self._loader(conn, prev_rev, prev_hash)
                 else:
-                    snapshot = await load_pg_snapshot(conn, prev_revision=self.revision, prev_digest=self.structure_hash)
+                    floor = prev_rev
+                    if self.revision <= 0:
+                        floor = max(floor, await _published_revision(conn))
+                    snapshot = await load_pg_snapshot(conn, prev_revision=prev_rev, prev_digest=prev_hash, revision_floor=floor)
         else:
             assert self._loader is not None
-            snapshot = await self._loader(None, self.revision, self.structure_hash)
+            snapshot = await self._loader(None, prev_rev, prev_hash)
         validate_snapshot(snapshot)
         struct_hash = str(snapshot.get("structure_sha256") or structure_digest(snapshot))
         digest = str(snapshot.get("checksum_sha256") or checksum(snapshot))

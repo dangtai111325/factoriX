@@ -109,32 +109,39 @@ class BrokerConfig:
     envelope_mode: str = field(default_factory=lambda: os.environ.get("FACTORIX_PUBLISH_ENVELOPE", "batch").strip().lower() or "batch")
     batch_max_obs: int = field(default_factory=lambda: _env_int("FACTORIX_PUBLISH_BATCH_MAX_OBS", 500))
     batch_max_bytes: int = field(default_factory=lambda: _env_int("FACTORIX_PUBLISH_BATCH_MAX_BYTES", 192 * 1024, minimum=4096))
+    # R2-E C9: the ingestion consumer owns the topology (declares exchanges/queues/bindings with their
+    # arguments); a publisher built with ``declare_topology=False`` (acquisition) only checks passively
+    # that the ingress exchange exists, so the two sides can never declare different queue arguments.
+    declare_topology: bool = True
 
     @classmethod
-    def from_settings(cls, settings: Any) -> "BrokerConfig":
-        if not getattr(settings, "rabbitmq_url", ""):
+    def from_settings(cls, settings: Any, **overrides: Any) -> "BrokerConfig":
+        """From ``Settings`` / ``BrokerSettings`` (every field declared there, CT-09)."""
+        if not settings.rabbitmq_url:
             raise BrokerUnavailableError("FACTORIX_RABBITMQ_URL is not configured.")
-        return cls(
+        values: dict[str, Any] = dict(
             amqp_url=str(settings.rabbitmq_url),
-            mgmt_url=str(getattr(settings, "rabbitmq_mgmt_url", "") or ""),
+            mgmt_url=str(settings.rabbitmq_mgmt_url or ""),
             exchange_name=str(settings.rabbitmq_exchange),
             queue_name=str(settings.rabbitmq_queue),
-            live_queue_name=str(getattr(settings, "rabbitmq_live_queue", "factorix.telemetry.live.q") or "factorix.telemetry.live.q"),
+            live_queue_name=str(settings.rabbitmq_live_queue),
             dlx_name=str(settings.rabbitmq_dlx),
             dlq_name=str(settings.rabbitmq_dlq),
-            binding_pattern=str(getattr(settings, "rabbitmq_binding_pattern", "telemetry.v1.*") or "telemetry.v1.*"),
-            live_binding_pattern=str(getattr(settings, "rabbitmq_live_binding_pattern", "telemetry.live.v1.*") or "telemetry.live.v1.*"),
+            binding_pattern=str(settings.rabbitmq_binding_pattern),
+            live_binding_pattern=str(settings.rabbitmq_live_binding_pattern),
             max_length_bytes=int(settings.rabbitmq_max_length_bytes),
-            live_max_length_bytes=int(getattr(settings, "rabbitmq_live_max_length_bytes", 256 * 1024 * 1024) or 256 * 1024 * 1024),
+            live_max_length_bytes=int(settings.rabbitmq_live_max_length_bytes),
             delivery_limit=int(settings.rabbitmq_delivery_limit),
             prefetch_count=int(settings.rabbitmq_prefetch),
             live_prefetch_count=int(settings.rabbitmq_live_prefetch),
-            freshness_window_s=float(getattr(settings, "rabbitmq_freshness_window_s", 12.0) or 12.0),
+            freshness_window_s=float(settings.rabbitmq_freshness_window_s),
             max_inflight_publishes=int(settings.rabbitmq_publisher_max_inflight),
             confirm_timeout_s=float(settings.rabbitmq_confirm_timeout_s),
-            consumer_concurrency=int(getattr(settings, "ingestion_consumer_concurrency", 32) or 32),
+            consumer_concurrency=int(settings.ingestion_consumer_concurrency),
             live_consumer_concurrency=int(settings.ingestion_live_consumer_concurrency),
         )
+        values.update(overrides)
+        return cls(**values)
 
 
 def tenant_routing_key(tenant_id: UUID) -> str:
@@ -287,6 +294,19 @@ async def declare_telemetry_topology(
     return TelemetryTopology(ingress, queue, dlq, live_queue)
 
 
+async def passive_ingress_exchange(channel: AbstractRobustChannel, cfg: BrokerConfig) -> Any:
+    """Publisher side of the single-owner topology (R2-E C9): the ingress exchange must already exist
+    (declared by ingestion). Raises ``BrokerUnavailableError`` with a clear reason otherwise; the
+    acquisition publisher then keeps samples in its spool and retries."""
+    try:
+        return await channel.declare_exchange(cfg.exchange_name, aio_pika.ExchangeType.TOPIC, durable=True, passive=True)
+    except Exception as exc:  # noqa: BLE001 - aio_pika raises ChannelNotFoundEntity (404) here
+        raise BrokerUnavailableError(
+            f"RabbitMQ topology is not provisioned yet: exchange {cfg.exchange_name!r} does not exist "
+            "(it is declared by the Center ingestion worker when it starts)."
+        ) from exc
+
+
 async def connect_with_backoff(
     amqp_url: str,
     *,
@@ -391,7 +411,10 @@ class RabbitMQPublisher:
                         logger.debug("Robust reconnect callback registration failed", exc_info=True)
                 self._conn = conn
             self._channel = await conn.channel(publisher_confirms=True, on_return_raises=True)  # type: ignore[assignment]
-            self._exchange, _, _ = await declare_telemetry_topology(self._channel, self.cfg)
+            if self.cfg.declare_topology:
+                self._exchange, _, _ = await declare_telemetry_topology(self._channel, self.cfg)
+            else:
+                self._exchange = await passive_ingress_exchange(self._channel, self.cfg)
 
     async def close(self) -> None:
         async with self._lock:

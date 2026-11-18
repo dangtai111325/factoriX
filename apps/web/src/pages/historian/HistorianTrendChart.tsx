@@ -80,23 +80,40 @@ function niceTicks(min: number, max: number, count = 5): { lo: number; hi: numbe
   return { lo, hi, ticks };
 }
 
-const TIME_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800].map((s) => s * 1000);
+const DAY = 86400;
+const TIME_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, DAY, 2 * DAY, 7 * DAY, 14 * DAY, 30 * DAY, 61 * DAY, 91 * DAY, 182 * DAY, 365 * DAY].map((s) => s * 1000);
+const MONTH_STEPS = new Map([[30 * DAY * 1000, 1], [61 * DAY * 1000, 2], [91 * DAY * 1000, 3], [182 * DAY * 1000, 6], [365 * DAY * 1000, 12]]);
 
 function timeTicks(start: number, end: number, width: number): { ticks: number[]; step: number } {
   const want = Math.max(3, Math.floor(width / 110));
   const span = Math.max(1, end - start);
   const step = TIME_STEPS.find((s) => span / s <= want) || TIME_STEPS[TIME_STEPS.length - 1];
+  const ticks: number[] = [];
+  const months = MONTH_STEPS.get(step);
+  if (months) {
+    // Calendar months (local time): ticks on the 1st, every `months` months.
+    const d = new Date(start);
+    d.setDate(1);
+    d.setHours(0, 0, 0, 0);
+    if (d.getTime() < start) d.setMonth(d.getMonth() + 1);
+    while (d.getMonth() % months !== 0) d.setMonth(d.getMonth() + 1);
+    for (let guard = 0; d.getTime() <= end && guard < 400; guard++) {
+      ticks.push(d.getTime());
+      d.setMonth(d.getMonth() + months);
+    }
+    return { ticks, step };
+  }
   const tzOff = new Date(start).getTimezoneOffset() * 60000;
   const first = Math.ceil((start - tzOff) / step) * step + tzOff;
-  const ticks: number[] = [];
-  for (let t = first; t <= end; t += step) ticks.push(t);
+  for (let t = first; t <= end && ticks.length < 400; t += step) ticks.push(t);
   return { ticks, step };
 }
 
 function tickLabel(t: number, step: number, span: number): string {
   const d = new Date(t);
   const md = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  if (step >= 86400e3) return md;
+  if (MONTH_STEPS.has(step)) return step >= 365 * DAY * 1000 ? String(d.getFullYear()) : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  if (step >= 86400e3) return span > 300 * DAY * 1000 ? `${d.getFullYear()}-${md}` : md;
   const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   const clock = step < 60e3 ? `${hm}:${String(d.getSeconds()).padStart(2, '0')}` : hm;
   if (span > 86400e3 || (d.getHours() === 0 && d.getMinutes() === 0 && step >= 3600e3)) return `${md} ${hm}`;
@@ -250,14 +267,23 @@ export const HistorianTrendChart: React.FC<Props> = ({
     const gapStarts = new Set(gaps.map((g) => g.startMs));
     let d = '';
     let open = false;
-    const bandTop: string[] = [];
-    const bandBot: string[] = [];
+    let bandTop: string[] = [];
+    let bandBot: string[] = [];
+    let band = '';
+    const closeBand = () => {
+      if (bandTop.length > 1) band += `M${bandTop.join('L')}L${bandBot.join('L')}Z`;
+      bandTop = [];
+      bandBot = [];
+    };
+    // Buckets of a downsampled series (main or compare): a missing bucket is a gap.
+    const bucketGap = s.downsampled && s.bucketMs ? s.bucketMs * 1.5 : null;
     const dots: [number, number][] = [];
     const pts = s.points;
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i];
       if (p.v == null) {
         open = false;
+        closeBand();
         continue;
       }
       const px = x(p.t);
@@ -274,14 +300,15 @@ export const HistorianTrendChart: React.FC<Props> = ({
       }
       if (mode === 'recorded' && pts.length <= 600) dots.push([px, py]);
       const next = pts[i + 1];
-      if (gapStarts.has(p.t)) {
-        // the source went silent after this row: never bridge the gap
+      if ((!s.compare && gapStarts.has(p.t)) || (bucketGap != null && next && next.t - p.t > bucketGap)) {
+        // the source went silent after this row: never bridge the gap (line nor envelope)
         open = false;
+        closeBand();
       } else if (step && !next && !s.compare) {
         d += `H${Math.min(x(endMs), plotW + padLeft).toFixed(1)}`;
       }
     }
-    const band = bandTop.length > 1 ? `M${bandTop.join('L')}L${bandBot.join('L')}Z` : '';
+    closeBand();
     return { d, band, dots };
   };
 

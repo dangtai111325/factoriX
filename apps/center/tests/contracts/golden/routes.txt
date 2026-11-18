@@ -87,6 +87,7 @@ GET /api/v1/historian/latest
 GET /api/v1/historian/query
 POST /api/v1/historian/query
 GET /api/v1/historian/sources
+GET /api/v1/historian/sources/recorded
 GET /api/v1/historian/views
 POST /api/v1/historian/views
 DELETE /api/v1/historian/views/{view_id}
@@ -167,10 +168,13 @@ GET /api/v1/storage/pg/relationships
 GET /api/v1/storage/pg/schemas
 GET /api/v1/storage/pg/tables
 GET /api/v1/storage/pg/tables/{schema}/{table}
+GET /api/v1/storage/recording/failures
 GET /api/v1/storage/recording/status
 POST /api/v1/storage/retention/preview
 GET /api/v1/storage/sources
 GET /api/v1/storage/td/bindings
+GET /api/v1/storage/td/bulk-jobs
+GET /api/v1/storage/td/bulk-jobs/{job_id}
 GET /api/v1/storage/td/catalog
 GET /api/v1/storage/td/databases
 POST /api/v1/storage/td/databases
@@ -204,6 +208,7 @@ GET /api/v1/storage/td/subtables/{subtable_id:path}
 GET /api/v1/storage/td/summary
 GET /api/v1/storage/td/templates
 GET /api/v1/storage/td/topology
+POST /api/v1/storage/td/validate-name
 GET /docs
 GET /docs/oauth2-redirect
 GET /health/live

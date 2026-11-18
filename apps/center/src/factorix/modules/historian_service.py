@@ -30,7 +30,9 @@ except ImportError:
     from factorix.domain.csv_safe import csv_cell, csv_row
     sanitize_csv_cell = csv_cell
 
-from factorix.domain.signal_state import canonical_stale_after_ms
+from factorix.application.history.query_service import pg_fallback_enabled
+from factorix.application.live.freshness_service import freshness_service
+from factorix.domain.signal_state import canonical_stale_after_ms  # noqa: F401
 from factorix.modules.common import (
     as_uuid,
     audit,
@@ -55,6 +57,7 @@ from factorix.modules.live_state import (
     extract_runtime_health,
     get_live_state_provider,
 )
+from factorix.modules import historian_recorded as HR
 from factorix.modules import historian_sources as HSRC
 from factorix.modules import historian_views as HV
 from factorix.modules import storage_bindings as SB
@@ -141,7 +144,11 @@ def _parse_time_bounds(
                 start_dt = start_dt.replace(tzinfo=timezone.utc)
 
     if start_dt >= end_dt:
-        start_dt = end_dt - timedelta(minutes=15)
+        # R2-15: an inverted / empty range is an input error, not "the last 15 minutes" silently.
+        raise AppError(
+            422, "INVALID_RANGE", "The start of the range must be before its end.",
+            extra={"start": _iso(start_dt), "end": _iso(end_dt)},
+        )
 
     return start_dt, end_dt
 
@@ -232,12 +239,13 @@ async def get_historian_latest(
                l.value_json, l.quality, l.reason_code, l.source_time,
                l.received_time, l.last_acquired_at, l.last_value_changed_at,
                l.data_epoch, l.source_sequence, l.event_uid,
-               c.health AS connection_health, c.status AS connection_status
+               c.health AS connection_health, c.status AS connection_status,
+               c.connection_id, c.job_interval_ms
         FROM signal_definitions s
         LEFT JOIN resources r ON r.id = s.resource_id
         LEFT JOIN latest_signal_state l ON l.signal_id = s.id AND l.tenant_id = s.tenant_id
         LEFT JOIN LATERAL (
-            SELECT c.health, c.status
+            SELECT c.health, c.status, c.id AS connection_id, j.interval_ms AS job_interval_ms
             FROM signal_bindings b
             JOIN source_fields f ON f.id = b.source_field_id
             LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
@@ -278,6 +286,21 @@ async def get_historian_latest(
         storage_health = str(r.get("storage_health") or "HEALTHY").upper()
 
         sig_key = str(r.get("key") or r.get("signal_key") or "")
+        # Server verdict (R2-E C1): additive; ``quality`` stays the stored raw quality.
+        verdict = freshness_service().evaluate(
+            signal_id=r.get("signal_id") or r.get("id"),
+            has_observation=last_acq is not None,
+            raw_quality=raw_qual if last_acq is not None else None,
+            raw_value=raw_val,
+            last_acquired_at=last_acq,
+            expected_interval_ms=r.get("expected_interval_ms"),
+            job_interval_ms=r.get("job_interval_ms"),
+            connection_id=r.get("connection_id"),
+            connection_health=r.get("connection_health"),
+            raw_reason_code=reason,
+            connection_paused=str(r.get("connection_status") or "") == "PAUSED",
+            now=now,
+        )
         items.append(
             {
                 "signal_id": str(r.get("signal_id") or r.get("id")),
@@ -298,6 +321,9 @@ async def get_historian_latest(
                 "connection_health": conn_health,
                 "broker_health": broker_health,
                 "storage_health": storage_health,
+                "effective_status": verdict.effective_status,
+                "freshness": verdict.freshness,
+                "stale_after_ms": verdict.stale_after_ms,
             }
         )
 
@@ -398,8 +424,17 @@ async def _enrich_sources(session: AsyncSession, tenant_id: UUID, sources: list[
             session,
             """
             SELECT s.id, s.key, s.display_name, s.unit, s.data_type, s.expected_interval_ms,
-                   r.id AS resource_id, r.name AS resource_name
+                   r.id AS resource_id, r.name AS resource_name, nb.connection_id, nb.job_interval_ms
             FROM signal_definitions s LEFT JOIN resources r ON r.id = s.resource_id
+            LEFT JOIN LATERAL (
+                SELECT j.connection_id, j.interval_ms AS job_interval_ms
+                FROM signal_bindings b
+                JOIN source_fields f ON f.id = b.source_field_id
+                JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+                WHERE b.signal_id = s.id AND b.valid_to IS NULL
+                ORDER BY b.enabled DESC, b.valid_from DESC
+                LIMIT 1
+            ) nb ON TRUE
             WHERE s.tenant_id = :tenant_id AND s.id = ANY(:ids)
             """,
             {"tenant_id": tenant_id, "ids": sig_ids},
@@ -414,6 +449,11 @@ async def _enrich_sources(session: AsyncSession, tenant_id: UUID, sources: list[
                 src.value_type = str(m.get("data_type") or "float64")
                 src.unit = m.get("unit")
                 src.expected_interval_ms = int(m.get("expected_interval_ms") or 0) or None
+                # Threshold evidence for the gap / quality segments: the job interval is the fallback
+                # of the signal interval (R2-E C1 / CT-10; was a fixed 1000 ms).
+                freshness_service().evidence.note_signal(
+                    src.signal_id, m.get("connection_id"), src.expected_interval_ms or m.get("job_interval_ms")
+                )
                 src.resource_id = str(m["resource_id"]) if m.get("resource_id") else None
                 src.resource_name = m.get("resource_name")
                 src.label = f"{m.get('resource_name')} \u00b7 {m['key']}" if m.get("resource_name") else str(m["key"])
@@ -527,6 +567,7 @@ async def _read_table_series(
     if value_col is None:
         return {"points": [], "total": 0, "status": "NO_VALUE_COLUMN"}
     quality_col = "quality" if "quality" in types else ("raw_quality" if "raw_quality" in types else None)
+    source_time_col = next((c for c in HSRC.SOURCE_TIME_COLUMNS if c in types and c != ts_col), None)
     epoch_col = "data_epoch" in types
     base = types[value_col]
     numeric = base in HSRC.NUMERIC_TYPES
@@ -546,14 +587,15 @@ async def _read_table_series(
     def as_raw(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         meta["times"] = [r["ts"] for r in rows]  # kept as datetimes for gap stats / quality segments
         return [_point(src, r["ts"], HSRC.decode_value(r["value"], base),
-                       (str(r["quality"]).upper() if r.get("quality") else None), record_kind) for r in rows]
+                       (str(r["quality"]).upper() if r.get("quality") else None), record_kind,
+                       {"source_time": _iso(r["source_time"])} if r.get("source_time") else None) for r in rows]
 
     if numeric and resolution == "bucket":
         return await as_buckets()
     if resolution == "raw":
         after = HSRC._utc(cursor) if cursor else None
         rows = await reader.raw(db, table, ts_col, value_col, quality_col, start_dt, end_dt, epoch_col, epoch,
-                                max_points, after=after)
+                                max_points, after=after, source_time_col=source_time_col)
         meta["points"] = as_raw(rows)
         if len(rows) >= max_points:
             meta["next_cursor"] = iso_ms(rows[-1]["ts"])
@@ -565,7 +607,7 @@ async def _read_table_series(
     if numeric and src.expected_interval_ms and span_ms / max(1, src.expected_interval_ms) > 2 * max_points:
         return await as_buckets()
     rows = await reader.raw(db, table, ts_col, value_col, quality_col, start_dt, end_dt, epoch_col, epoch,
-                            max_points + 1, newest_first=True)
+                            max_points + 1, newest_first=True, source_time_col=source_time_col)
     if len(rows) <= max_points:
         meta.update(points=as_raw(rows), total=len(rows))
         return meta
@@ -648,7 +690,10 @@ async def query_historian(
         for src in sources:
             if src.kind == "signal" and src.value_type and (provider is None or mode in ("recorded", "reconstructed")):
                 key = f"{src.key}|{window[0].isoformat()}"
-                if provider is None:
+                if provider is None and not pg_fallback_enabled():
+                    info = {"status": "NO_DATA", "points": [], "total": 0, "fidelity": "operational",
+                            "notes": ["TDengine history is not configured and the PostgreSQL observations fallback is disabled."]}
+                elif provider is None:
                     info = await _pg_signal_points(session, tenant_id, src, window[0], window[1], max_points)
                     info["fidelity"] = "postgres_fallback"
                     info["notes"] = ["TDengine history is not configured; showing PostgreSQL observations."]
@@ -674,6 +719,8 @@ async def query_historian(
         windows.append((start_dt - shift, end_dt - shift))
     infos = await asyncio.gather(*[one(src, w0, w1) for (w0, w1) in windows for src in sources])
     main = [_series_result(src, infos[i], start_dt, end_dt, mode, quality_filter) for i, src in enumerate(sources)]
+    if mode == "recorded":
+        await _add_recorded_in(session, tenant_id, sources, main)
     compare: dict[str, Any] | None = None
     if compare_ms:
         w0, w1 = windows[1]
@@ -706,6 +753,24 @@ async def query_historian(
         "next_cursor": next((sr["next_cursor"] for sr in main if sr.get("next_cursor")), None),
         "coverage_notes": [n for sr in main for n in sr["coverage_notes"]],
     }
+
+
+async def _add_recorded_in(session: AsyncSession, tenant_id: UUID, sources: list[HSRC.SeriesSource],
+                           results: list[dict[str, Any]]) -> None:
+    """R2-17: a raw signal in Recorded mode has no managed rows of its own; when a recorded table stores
+    it (directly or through the Data Model field that maps it), say where (``recorded_in`` tokens)."""
+    empty = [(src, sr) for src, sr in zip(sources, results, strict=True)
+             if src.kind == "signal" and src.signal_id is not None and not sr["points"]]
+    if not empty:
+        return
+    where = await HR.recorded_for_signals(session, tenant_id, [str(src.signal_id) for src, _ in empty])
+    for src, sr in empty:
+        hits = where.get(str(src.signal_id).lower()) or []
+        sr["recorded_in"] = hits
+        if hits:
+            sr["coverage_notes"].append(
+                "This signal is recorded in " + ", ".join(h["label"] for h in hits[:3])
+                + ("…" if len(hits) > 3 else "") + "; open that recorded table to see its rows.")
 
 
 def _z(dt: datetime) -> str:
@@ -809,7 +874,7 @@ def _series_result(src: HSRC.SeriesSource, info: dict[str, Any], start_dt: datet
     if downsampled:
         gap_threshold = int(info.get("bucket_ms") or 0) or None
     elif src.kind == "signal" and mode == "operational":
-        gap_threshold = canonical_stale_after_ms(src.expected_interval_ms or 1000)
+        gap_threshold = freshness_service().stale_after_ms(src.signal_id, expected_interval_ms=src.expected_interval_ms)
     else:
         gap_threshold = None
     gaps = HSRC.gap_stats([t for t in times if t is not None], start_dt, end_dt, gap_threshold) if status != "ERROR" else {}
@@ -835,7 +900,8 @@ def _series_result(src: HSRC.SeriesSource, info: dict[str, Any], start_dt: datet
         "next_cursor": info.get("next_cursor"), "column": info.get("column"), "stats": stats,
         "quality_segments": [] if downsampled else _build_quality_segments(
             [(t, str(p.get("quality") or "").upper()) for t, p in zip(times, points, strict=False) if t is not None and p.get("quality")],
-            start_dt, end_dt, timedelta(milliseconds=canonical_stale_after_ms(src.expected_interval_ms or 1000))),
+            start_dt, end_dt, timedelta(milliseconds=freshness_service().stale_after_ms(
+                src.signal_id, expected_interval_ms=src.expected_interval_ms))),
         "coverage_notes": notes,
     }
 
@@ -1132,8 +1198,10 @@ async def create_export_job(
     fmt = str(payload_dict.get("format") or "csv").lower()
     if fmt not in {"csv", "json"}:
         raise AppError(422, "EXPORT_FORMAT", "Supported export formats: csv, json.")
-    file_name = str(payload_dict.get("file_name") or f"historian-export-{str(job_id)[:8]}.{fmt}").strip()
-    file_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file_name)[:120] or f"historian-export.{fmt}"
+    # R2-23: the server stamps names as yyyyMMdd_HHmmss (UTC); a client name may carry "{ts}" for it.
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+    file_name = str(payload_dict.get("file_name") or f"historian_{stamp}.{fmt}").strip().replace("{ts}", stamp)
+    file_name = re.sub(r"[^A-Za-z0-9._-]+", "_", file_name)[:120] or f"historian_{stamp}.{fmt}"
     if not file_name.lower().endswith(f".{fmt}"):
         file_name = f"{file_name.rsplit('.', 1)[0]}.{fmt}"
     active_epoch_num = await _active_epoch(session, tenant_id)

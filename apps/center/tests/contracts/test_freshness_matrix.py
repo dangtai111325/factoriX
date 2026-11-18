@@ -7,6 +7,11 @@ falling back to the job ``interval_ms``, and DELAYED when acquisition still read
 Every evaluator that disagrees with the reference today is an ``xfail(strict=True)`` cell whose reason names
 the discrepancy id (docs/architecture/contracts/README.md). Fixing an evaluator turns its cell XPASS ->
 FAIL: remove the entry from ``KNOWN_MISMATCHES`` in the same change and update the contract doc.
+
+R2-E C1 (ARCH-C): every evaluator now goes through ``application.live.freshness_service.FreshnessService``
+and is called here with exactly the evidence its production caller passes (the SQL rows carry
+``connection_id`` and the job ``interval_ms``; the API process holds the pipeline evidence). CT-10/CT-11
+cells are green; ``KNOWN_MISMATCHES`` is empty.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from factorix.application.live.freshness_service import FreshnessService
 from factorix.domain import quality as Q
 from factorix.domain.signal_state import evaluate_signal_state
 from factorix.modules import models_engine
@@ -129,38 +135,63 @@ def ev_push_refresh(sc: Scenario, sid: UUID) -> tuple[str, str | None]:
     return str(out.get("effective_status")), out.get("freshness")
 
 
-def ev_ingestion_commit(sc: Scenario, sid: UUID) -> tuple[str, str | None]:
-    """What ingestion puts into the v1 NOTIFY payload at commit time (no evidence, signal interval only)."""
+def _ingestion_payload(sc: Scenario, sid: UUID) -> dict[str, Any]:
+    """The v1 NOTIFY payload ingestion builds at commit time: the catalog row carries the signal interval
+    and the job interval; ingestion has no pipeline evidence (other process)."""
     at = _t(sc.age_s)
-    p = latest_stream_payload(
+    return latest_stream_payload(
         signal_id=sid, value=1.0, quality="GOOD", reason=None, received_time=at, source_time=at,  # type: ignore[arg-type]
-        expected_interval_ms=sc.signal_interval_ms, now=NOW, include_meta=True, last_acquired_at=at,
+        expected_interval_ms=sc.signal_interval_ms, job_interval_ms=sc.job_interval_ms, now=NOW, include_meta=True,
+        last_acquired_at=at,
     )
-    return str(p["effective_status"]), p.get("freshness")
+
+
+def ev_ingestion_commit(sc: Scenario, sid: UUID) -> tuple[str, str | None]:
+    """Ingestion commit payload as clients receive it: the API bridge re-evaluates it at dispatch with the
+    API pipeline evidence (``Hub.refresher`` = ``FreshnessService.refresh_message``)."""
+    out = FreshnessService(_evidence(sc, sid)).refresh_message(_ingestion_payload(sc, sid), now=NOW)
+    return str(out["effective_status"]), out.get("freshness")
+
+
+def _pg_row(sc: Scenario, sid: UUID) -> dict[str, Any]:
+    at = _t(sc.age_s)
+    return {"signal_id": sid, "value_json": {"v": 1.0}, "quality": "GOOD", "received_time": at, "event_time": at,
+            "last_acquired_at": at, "expected_interval_ms": sc.signal_interval_ms, "job_interval_ms": sc.job_interval_ms,
+            "connection_id": CONNECTION, "source_time": at}
 
 
 def ev_models_engine_pg_fallback(sc: Scenario, sid: UUID) -> tuple[str, str | None]:
-    """``models_engine.sample_from_latest``: PG fallback of the model engine (same call shape as
-    ``data_models.signal_states`` without a provider and ``telemetry.latest_states`` without a provider)."""
-    at = _t(sc.age_s)
-    row = {"value_json": {"v": 1.0}, "quality": "GOOD", "received_time": at, "last_acquired_at": at,
-           "expected_interval_ms": sc.signal_interval_ms, "source_time": at}
-    _sample, quality = models_engine.sample_from_latest(row, now=NOW)
+    """``models_engine.sample_from_latest``: PG fallback of the model engine (row from its SQL, API evidence)."""
+    _sample, quality = models_engine.sample_from_latest(_pg_row(sc, sid), now=NOW, freshness=FreshnessService(_evidence(sc, sid)))
     return quality, None
 
 
+def ev_latest_row_pg_fallback(sc: Scenario, sid: UUID) -> tuple[str, str | None]:
+    """``FreshnessService.evaluate_latest_row``: the PG fallback of ``data_models.signal_states`` (the same
+    evaluator ``telemetry.latest_states`` uses without a live cache)."""
+    r = FreshnessService(_evidence(sc, sid)).evaluate_latest_row(_pg_row(sc, sid), now=NOW, raw_value=1.0)
+    return r.effective_status, r.freshness
+
+
 def ev_historian_catalog(sc: Scenario, sid: UUID) -> tuple[str, str | None]:
-    """Historian source catalog freshness badge (``historian_catalog._freshness``, signal interval only)."""
+    """Historian source catalog freshness badge (``historian_catalog._freshness``)."""
     mod = importlib.import_module("factorix.modules.historian_catalog")
-    fresh = mod._freshness(_t(sc.age_s), sc.signal_interval_ms, NOW)
-    return ("GOOD" if fresh == "FRESH" else "STALE"), fresh
+    fresh = mod._freshness(
+        _t(sc.age_s), sc.signal_interval_ms, NOW, signal_id=sid, job_interval_ms=sc.job_interval_ms,
+        connection_id=CONNECTION, service=FreshnessService(_evidence(sc, sid)),
+    )
+    return ("STALE" if fresh == "STALE" else "GOOD"), fresh
 
 
 def ev_quality_freshness_status(sc: Scenario, sid: UUID) -> tuple[str, str | None]:
-    """``domain.quality.freshness_status`` (no caller; kept for archival decision D3)."""
+    """``domain.quality.freshness_status`` (no production caller; compatibility wrapper of the canonical rule)."""
     at = _t(sc.age_s)
-    f = Q.freshness_status(event_time=at, received_time=at, expected_interval_ms=sc.signal_interval_ms, now=NOW, quality=Q.Quality.GOOD)
-    return ("GOOD" if f == Q.Freshness.FRESH else "STALE"), str(f)
+    f = Q.freshness_status(
+        event_time=at, received_time=at, expected_interval_ms=sc.signal_interval_ms or sc.job_interval_ms, now=NOW,
+        quality=Q.Quality.GOOD, source_ok_at=_t(sc.source_ok_age_s), source_reported_at=NOW - timedelta(seconds=1),
+        delivered_at=_t(sc.delivered_age_s),
+    )
+    return ("STALE" if f == Q.Freshness.STALE else "GOOD"), str(f)
 
 
 EVALUATORS: dict[str, Callable[[Scenario, UUID], tuple[str, str | None]]] = {
@@ -168,27 +199,14 @@ EVALUATORS: dict[str, Callable[[Scenario, UUID], tuple[str, str | None]]] = {
     "push_refresh": ev_push_refresh,
     "ingestion_commit": ev_ingestion_commit,
     "models_engine_pg_fallback": ev_models_engine_pg_fallback,
+    "latest_row_pg_fallback": ev_latest_row_pg_fallback,
     "historian_catalog": ev_historian_catalog,
     "quality_freshness_status": ev_quality_freshness_status,
 }
 
-_NO_EVIDENCE = "CT-10: evaluator gets no pipeline evidence (source_ok/delivered) -> cannot tell DELAYED from STALE"
-_NO_JOB_INTERVAL = "CT-10: evaluator falls back to 1000 ms instead of the job interval_ms -> 12 s threshold for a 30 s poll"
-_DEAD_RULE = "CT-11: quality.freshness_status uses a 5 s fallback and no 12 s floor (dead code, not the canonical rule)"
-
 # (evaluator, scenario) -> reason. Everything else must agree with the reference.
-KNOWN_MISMATCHES: dict[tuple[str, str], str] = {
-    ("ingestion_commit", "slow_poll_job_interval_only"): _NO_JOB_INTERVAL,
-    ("ingestion_commit", "delayed_in_transit"): _NO_EVIDENCE,
-    ("models_engine_pg_fallback", "slow_poll_job_interval_only"): _NO_JOB_INTERVAL,
-    ("models_engine_pg_fallback", "delayed_in_transit"): _NO_EVIDENCE,
-    ("historian_catalog", "slow_poll_job_interval_only"): _NO_JOB_INTERVAL,
-    ("historian_catalog", "delayed_in_transit"): _NO_EVIDENCE + " (and the badge has no DELAYED state)",
-    ("quality_freshness_status", "fresh_fast_poll"): _DEAD_RULE + " (1 s interval -> 2 s threshold)",
-    ("quality_freshness_status", "slow_poll_job_interval_only"): _DEAD_RULE,
-    ("quality_freshness_status", "delayed_in_transit"): _DEAD_RULE,
-    ("quality_freshness_status", "boundary_interval_5s_age_11s"): _DEAD_RULE,
-}
+# Empty since R2-E C1: CT-10 (no evidence / 1000 ms fallback) and CT-11 (dead 5 s rule) are fixed.
+KNOWN_MISMATCHES: dict[tuple[str, str], str] = {}
 
 
 def _cells() -> list[Any]:
@@ -219,9 +237,39 @@ def test_evaluator_agrees_with_reference(evaluator: str, scenario: Scenario) -> 
         assert freshness == scenario.expected_freshness, f"{evaluator}: freshness {freshness} != {scenario.expected_freshness}"
 
 
-def test_two_freshness_enums_still_differ() -> None:
-    """CT-11: two ``Freshness`` enums exist; only ``signal_state.Freshness`` is canonical."""
-    from factorix.domain.signal_state import Freshness as Canonical
+def test_one_freshness_and_one_quality_enum() -> None:
+    """CT-11 fixed: one ``Freshness`` enum and one quality enum (``SourceQuality`` is ``Quality``)."""
+    from factorix.domain import signal_state as S
 
-    assert {f.value for f in Canonical} == {"FRESH", "DELAYED", "STALE", "UNKNOWN", "NO_DATA"}
-    assert {f.value for f in Q.Freshness} == {"FRESH", "STALE", "UNKNOWN"}
+    assert S.Freshness is Q.Freshness
+    assert {f.value for f in Q.Freshness} == {"FRESH", "DELAYED", "STALE", "UNKNOWN", "NO_DATA"}
+    assert S.SourceQuality is Q.Quality
+
+
+_NEEDS_EVIDENCE = {"delayed_in_transit"}  # DELAYED needs the API pipeline evidence (other process)
+
+
+@pytest.mark.parametrize("scenario", [s for s in SCENARIOS if s.name not in _NEEDS_EVIDENCE], ids=lambda s: s.name)
+def test_ingestion_raw_payload_agrees_without_evidence(scenario: Scenario) -> None:
+    """The raw commit payload (before the bridge) already uses the job-interval fallback (CT-10)."""
+    p = _ingestion_payload(scenario, uuid4())
+    assert p["effective_status"] == scenario.expected_status
+    assert p["stale_after_ms"] == max(2 * (scenario.signal_interval_ms or scenario.job_interval_ms), 12_000)
+
+
+def test_stale_value_of_a_degraded_connection_is_connection_offline() -> None:
+    """CT-12 fixed: ``connection_health`` explains a stale value (``CONNECTION_OFFLINE``); status stays STALE."""
+    sc = next(s for s in SCENARIOS if s.name == "silent_source")
+    common = dict(has_observation=True, raw_quality="GOOD", raw_value=1.0, expected_interval_ms=1000, now=NOW)
+    r = evaluate_signal_state(**common, event_time=_t(sc.age_s), last_acquired_at=_t(sc.age_s), connection_health="DEGRADED")
+    assert (r.effective_status, r.reason_code) == ("STALE", "CONNECTION_OFFLINE")
+    healthy = evaluate_signal_state(**common, event_time=_t(sc.age_s), last_acquired_at=_t(sc.age_s), connection_health="HEALTHY")
+    assert healthy.reason_code == "NO_FRESH_ACQUISITION"
+    fresh = evaluate_signal_state(**common, event_time=NOW, last_acquired_at=NOW, connection_health="DEGRADED")
+    assert (fresh.effective_status, fresh.reason_code) == ("GOOD", "OK")  # data arriving is never degraded
+    ev = PipelineEvidence()
+    ev.note_source(CONNECTION, None, "DEGRADED")
+    msg = {"type": "latest", "signal_id": str(uuid4()), "quality": "GOOD", "effective_status": "GOOD", "reason_code": "OK",
+           "last_acquired_at": _t(sc.age_s).isoformat(), "connection_id": CONNECTION}  # type: ignore[union-attr]
+    out = FreshnessService(ev).refresh_message(msg, now=NOW)
+    assert (out["effective_status"], out["reason_code"]) == ("STALE", "CONNECTION_OFFLINE")

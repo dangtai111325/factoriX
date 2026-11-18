@@ -94,6 +94,7 @@ export interface TDDatabase {
   precision: 'ms' | 'us' | 'ns';
   retention_days?: number | null;
   vgroups?: number | null;
+  /** @deprecated not sent since H-R4.2 (kept optional for older Centers). */
   cache_mb?: number | null;
   status: StorageObjectStatus;
   stable_count: number;
@@ -102,7 +103,19 @@ export interface TDDatabase {
   tenant_id: string;
   observed_at: string;
   last_verified_at?: string | null;
+  /** @deprecated not sent since H-R4.2. */
   drift_status?: 'OK' | 'OUT_OF_SYNC' | 'UNKNOWN' | null;
+  // H-R4.2: real TDengine values of the database
+  object_id?: string;
+  keep?: string | null;
+  replica?: number | null;
+  cache_model?: string | null;
+  table_count?: number | null;
+  is_tenant_default?: boolean;
+  is_system?: boolean;
+  managed?: boolean;
+  revision?: number | null;
+  created_at?: string | null;
 }
 
 export interface TDStable {
@@ -531,8 +544,11 @@ export async function listSubtables(params?: {
   cursor?: string;
   search?: string;
   status?: StorageObjectStatus;
+  /** Page size (server default 50, max 500). */
+  limit?: number;
 }): Promise<PaginatedList<TDSubtable>> {
   const qs = new URLSearchParams();
+  if (params?.limit) qs.set('limit', String(params.limit));
   if (params?.stable) qs.set('stable', params.stable);
   if (params?.database) qs.set('database', params.database);
   if (params?.cursor) qs.set('cursor', params.cursor);
@@ -587,12 +603,37 @@ export interface BulkRowResult {
   ddl?: string[];
 }
 
-/** POST /api/v1/storage/td/subtables/bulk — at most 50 rows per call; one idempotent saga per row. */
+/** A background bulk-create job (H-R4.3): progress in memory on the Center, kept 1 h, lost on an API restart (404). */
+export interface BulkJob {
+  job_id: string;
+  status: 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | string;
+  total: number;
+  done: number;
+  progress_pct?: number;
+  summary: Record<string, number>;
+  items?: BulkRowResult[];
+  error?: string | null;
+  created_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  status_url?: string;
+  poll_after_ms?: number;
+}
+
+/**
+ * POST /api/v1/storage/td/subtables/bulk. `dry_run` (≤ 50 rows) answers in the request; a real create (≤ 1000 rows)
+ * answers 202 with a job to poll (H-R4.3). Older Centers answered every create synchronously with `items`.
+ */
 export async function bulkCreateSubtables(
   rows: Record<string, unknown>[],
   dryRun: boolean,
-): Promise<{ items: BulkRowResult[]; summary: Record<string, number>; dry_run: boolean }> {
+): Promise<{ items: BulkRowResult[]; summary: Record<string, number>; dry_run: boolean } & Partial<BulkJob>> {
   return api('/api/v1/storage/td/subtables/bulk', { method: 'POST', body: JSON.stringify({ rows, dry_run: dryRun }) });
+}
+
+/** GET /api/v1/storage/td/bulk-jobs/{id} — progress and the rows finished so far. */
+export async function getBulkJob(jobId: string): Promise<BulkJob> {
+  return api(`/api/v1/storage/td/bulk-jobs/${encodeURIComponent(jobId)}`);
 }
 
 export interface StableTemplate {
@@ -901,6 +942,8 @@ export interface HistorianSeriesResult {
   stats: HistorianSeriesStats;
   /** Merged runs of equal quality; `STALE` + `reason_code: STALE_GAP` for silences past the stale threshold; [] when downsampled. */
   quality_segments?: HistorianQualitySegment[];
+  /** H-R4.1: a raw signal with no rows in Recorded mode — the tables that record it (directly or via its Data Model field). */
+  recorded_in?: { token: string; label: string; recording?: string | null }[];
 }
 
 export interface HistorianQualitySegment {
@@ -984,6 +1027,70 @@ export async function listHistorianEvents(
   if (params.types?.length) qs.set('types', params.types.join(','));
   if (params.signal_ids?.length) qs.set('signal_ids', params.signal_ids.join(','));
   return api(`/api/v1/historian/events?${qs}`, { signal });
+}
+
+/** One machine group of GET /api/v1/historian/sources (H8). Only the parts the UI reads are typed. */
+export interface HistorianSourceGroup {
+  resource: { id: string | null; name: string; code?: string | null; type_key?: string | null } | null;
+  path?: string[];
+  subtables?: {
+    token: string;
+    label: string;
+    database: string;
+    subtable: string;
+    column?: string | null;
+    recording?: string | null;
+    /** `<signal uuid>` or `mod:<model>:<field path>` the table records. */
+    source?: string | null;
+  }[];
+}
+
+/** One bound value column of a user subtable (H-R4.1). */
+export interface RecordedSeriesItem {
+  kind: 'subtable';
+  token: string;
+  label: string;
+  database: string;
+  subtable: string;
+  stable?: string | null;
+  column?: string | null;
+  value_type?: string | null;
+  unit?: string | null;
+  recording?: string | null;
+  binding_status?: string | null;
+  source?: string | null;
+  source_kind?: string | null;
+  model_name?: string | null;
+  field_path?: string | null;
+  signal_key?: string | null;
+  machine?: { id: string; name: string; code?: string | null; type_key?: string | null } | null;
+}
+
+/**
+ * GET /api/v1/historian/sources/recorded?q&page&page_size (≤500) — the recorded-table catalogue, searchable on the
+ * server (H-R4.1, R2-03). 404 on older Centers.
+ */
+export async function listRecordedSeries(
+  params: { q?: string; page?: number; page_size?: number; machine_id?: string },
+  signal?: AbortSignal,
+): Promise<{ items: RecordedSeriesItem[]; total: number; page: number; page_size: number; has_more: boolean }> {
+  const qs = new URLSearchParams();
+  if (params.q) qs.set('q', params.q);
+  if (params.page) qs.set('page', String(params.page));
+  if (params.page_size) qs.set('page_size', String(params.page_size));
+  if (params.machine_id) qs.set('machine_id', params.machine_id);
+  return api(`/api/v1/historian/sources/recorded?${qs}`, { signal });
+}
+
+/**
+ * GET /api/v1/historian/sources?kinds=subtable[&search=] — every recorded table (no 50-row page), grouped by the
+ * machine it records, with the source it records (R2-03).
+ */
+export async function getHistorianSources(params: { kinds?: string[]; search?: string }, signal?: AbortSignal): Promise<{ items: HistorianSourceGroup[] }> {
+  const qs = new URLSearchParams();
+  if (params.kinds?.length) qs.set('kinds', params.kinds.join(','));
+  if (params.search) qs.set('search', params.search);
+  return api(`/api/v1/historian/sources?${qs}`, { signal });
 }
 
 /** What a saved view stores (free-form JSON on the server; this is the Historian UI's own shape). */

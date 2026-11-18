@@ -35,6 +35,7 @@ async def history(
     cursor: str | None = None,
     mode: str = "operational",
     dataset_id: str | None = None,
+    order: str = "oldest",
     principal: dict[str, Any] = Depends(admin),
     session: AsyncSession = Depends(db_session),
 ) -> dict[str, Any]:
@@ -72,6 +73,8 @@ async def history(
         cursor=cursor,
         mode=mode,
         dataset_id=parse_uuid(dataset_id) if dataset_id else None,
+        # ``order=newest``: the most recent ``limit`` rows of the window (sparklines), not the oldest.
+        order=order,
     )
 
 

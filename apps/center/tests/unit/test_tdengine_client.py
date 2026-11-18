@@ -262,3 +262,27 @@ async def test_operational_fast_values_render_identically_to_generic_literals(mo
             assert item.values_sql == generic
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_ping_is_one_cheap_query_and_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = TDEngineClient(TDEngineConfig(dsn="ws://localhost:6041"))
+    seen: list[tuple[str, bool]] = []
+
+    async def query_rows(sql: str, **kw: Any) -> list[dict[str, Any]]:
+        seen.append((sql, bool(kw.get("use_probe_pool"))))
+        return [{"ver": "3.4.3.9"}]
+
+    monkeypatch.setattr(client, "query_rows", query_rows)
+    try:
+        assert await client.ping() is True
+        # Liveness must not run the heavy metadata probe (ins_disk_usage etc.).
+        assert seen == [("SELECT SERVER_VERSION() AS ver", True)]
+
+        async def broken(sql: str, **kw: Any) -> list[dict[str, Any]]:
+            raise TDEngineError("TDENGINE_TIMEOUT", "timed out", retryable=True)
+
+        monkeypatch.setattr(client, "query_rows", broken)
+        assert await client.ping() is False
+    finally:
+        await client.close()

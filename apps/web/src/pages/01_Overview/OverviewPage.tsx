@@ -300,6 +300,11 @@ export const OverviewPage: React.FC = () => {
     if (collector.state === 'offline') {
       return { tone: 'error', label: 'Collector offline', hint: collector.detail };
     }
+    // P6: the collector is alive but not reporting connection status: the connection states shown are
+    // the last known ones, so this (not "N connections down") is the status.
+    if (collector.reportLate) {
+      return { tone: 'warning', label: 'Collector not reporting', hint: collector.detail };
+    }
     switch (conn.status) {
       case 'NOT_CONFIGURED':
         return { tone: 'neutral', label: 'No connections', hint: 'The collector is online. Add a data connection.' };
@@ -318,6 +323,13 @@ export const OverviewPage: React.FC = () => {
       case 'PENDING':
         return { tone: 'neutral', label: 'Waiting for first data', hint: withInactive('Waiting for the first report from the connections.') };
       default:
+        if (valuesReady && qualityCounts.delayed > 0) {
+          return {
+            tone: 'warning',
+            label: 'Data delayed',
+            hint: `${qualityCounts.delayed} of ${countText(qualityCounts.active, 'signal is', 'signals are')} read normally, but the values reach the appliance late. The last received values are shown.`,
+          };
+        }
         if (collector.state === 'degraded') return { tone: 'warning', label: 'Attention needed', hint: collector.detail };
         return { tone: 'good', label: 'Collecting normally', hint: withInactive('All active connections are delivering data.') };
     }

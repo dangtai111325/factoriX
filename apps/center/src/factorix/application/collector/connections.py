@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from factorix.application.health.health_service import set_operator_state
 from factorix.domain.health import effective_connection_health, effective_edge_health
 from factorix.modules.common import (
     as_uuid,
@@ -420,9 +421,10 @@ async def pause_connection(session: AsyncSession, tenant_id: UUID, actor: UUID, 
         raise AppError(409, "ARCHIVED", "Archived connections cannot be paused.")
     await execute(
         session,
-        "UPDATE connections SET status = 'PAUSED', health = 'PAUSED', version = version + 1, updated_at = :now WHERE id = :id",
+        "UPDATE connections SET status = 'PAUSED', version = version + 1, updated_at = :now WHERE id = :id",
         {"now": utcnow(), "id": connection_id},
     )
+    await set_operator_state(session, connection_id, "PAUSED")
     if current.get("edge_id"):
         await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
     else:
@@ -440,9 +442,10 @@ async def resume_connection(session: AsyncSession, tenant_id: UUID, actor: UUID,
     # No evidence yet: UNKNOWN until the collector reports the connection or a sample arrives.
     await execute(
         session,
-        "UPDATE connections SET status = 'ACTIVE', health = 'UNKNOWN', last_error = NULL, version = version + 1, updated_at = :now WHERE id = :id",
+        "UPDATE connections SET status = 'ACTIVE', version = version + 1, updated_at = :now WHERE id = :id",
         {"now": utcnow(), "id": connection_id},
     )
+    await set_operator_state(session, connection_id, "ACTIVE")
     if current.get("edge_id"):
         await bump_edge_release(session, tenant_id, actor, correlation_id, edge_id=as_uuid(current["edge_id"]))
     else:
@@ -571,9 +574,10 @@ async def archive_connection(session: AsyncSession, tenant_id: UUID, actor: UUID
         )
     await execute(
         session,
-        "UPDATE connections SET status = 'ARCHIVED', health = 'UNKNOWN', version = version + 1, updated_at = :now WHERE id = :id",
+        "UPDATE connections SET status = 'ARCHIVED', version = version + 1, updated_at = :now WHERE id = :id",
         {"now": utcnow(), "id": connection_id},
     )
+    await set_operator_state(session, connection_id, "ARCHIVED")
     # Signals keep their definitions and history; their bindings to the archived source stop.
     await execute(
         session,
