@@ -13,7 +13,9 @@ import {
   Loader2,
   Info,
 } from 'lucide-react';
-import { StorageWizardLayout, useWizardDraft } from './WizardShared';
+import { StorageWizardLayout, useWizardDraft, useStorageBackTarget } from './WizardShared';
+import { Button } from '../../../components/common/Button';
+import { DraftChip, EmptyState, LoadingBlock, WizardHeader } from '../../historian/hsUi';
 import {
   DatabaseBasicsStep,
   DatabaseSettingsStep,
@@ -74,6 +76,8 @@ function isDatabase(obj: TDDatabase | TDStable | TDSubtable): obj is TDDatabase 
 export const EditStorageObjectWizard: React.FC = () => {
   const { objectId } = useParams<{ objectId: string }>();
   const navigate = useNavigate();
+  // R1-44: Back returns to where the user came from (topology, objects table or detail page).
+  const backTarget = useStorageBackTarget('/historian/storage');
 
   // Loading & error state
   const [loading, setLoading] = useState(true);
@@ -345,7 +349,7 @@ export const EditStorageObjectWizard: React.FC = () => {
 
         <div className="p-4 text-[12px]">
           {diffItems.length === 0 ? (
-            <p className="text-[#8C9BAE] italic">No modifications detected compared to stored version.</p>
+            <p className="text-[#657794] italic">No modifications detected compared to stored version.</p>
           ) : (
             <div className="divide-y divide-[#F1F5FA]">
               {diffItems.map((d, idx) => (
@@ -355,7 +359,7 @@ export const EditStorageObjectWizard: React.FC = () => {
                     <span className="text-[#EF1B24] bg-[#FEF2F2] px-2 py-0.5 rounded line-through">
                       {d.oldVal}
                     </span>
-                    <span className="text-[#8C9BAE]">→</span>
+                    <span className="text-[#657794]">→</span>
                     <span className="text-[#0DBA67] bg-[#E8FAF0] px-2 py-0.5 rounded font-bold">
                       {d.newVal}
                     </span>
@@ -394,7 +398,7 @@ export const EditStorageObjectWizard: React.FC = () => {
       if (res && 'id' in res && 'operation_kind' in res) {
         const op = res as StorageOperation;
         if (op.status === 'APPLIED' || (op.status as any) === 'COMPLETED') {
-          navigate('/historian/storage?tab=objects');
+          navigate(backTarget);
           return;
         }
 
@@ -406,7 +410,7 @@ export const EditStorageObjectWizard: React.FC = () => {
           const updated = await getOperation(op.id);
           setActiveOperation(updated);
           if (updated.status === 'APPLIED' || (updated.status as any) === 'COMPLETED') {
-            navigate('/historian/storage?tab=objects');
+            navigate(backTarget);
             return;
           }
           if (updated.status === 'FAILED' || updated.status === 'CANCELLED') {
@@ -417,7 +421,7 @@ export const EditStorageObjectWizard: React.FC = () => {
         }
       }
 
-      navigate('/historian/storage?tab=objects');
+      navigate(backTarget);
     } catch (err: unknown) {
       if (err instanceof ApiError && (err.status === 409 || err.code === 'VERSION_CONFLICT')) {
         setVersionConflict(true);
@@ -438,35 +442,16 @@ export const EditStorageObjectWizard: React.FC = () => {
   // ==========================================================================
 
   if (loading) {
-    return (
-      <div className="min-h-screen bg-[#F6F8FC] flex items-center justify-center p-6">
-        <div className="flex flex-col items-center gap-3">
-          <Loader2 className="w-8 h-8 text-[#EF1B24] animate-spin" />
-          <div className="text-[14px] font-semibold text-[#111B37]">
-            Loading storage object "{objectId}"...
-          </div>
-        </div>
-      </div>
-    );
+    return <LoadingBlock label={`Loading ${objectId}…`} />;
   }
 
   if (loadError || !originalObject || !objectKind) {
     return (
-      <div className="min-h-screen bg-[#F6F8FC] flex items-center justify-center p-6">
-        <div className="bg-white border border-[#E3EAF3] rounded-2xl p-8 max-w-md w-full text-center space-y-4 shadow-sm">
-          <AlertTriangle className="w-10 h-10 text-[#EF1B24] mx-auto" />
-          <h2 className="text-[18px] font-bold text-[#111B37]">Object Not Found</h2>
-          <p className="text-[13px] text-[#657794]">
-            {loadError || `Unable to load physical object for ID "${objectId}".`}
-          </p>
-          <button
-            type="button"
-            onClick={() => navigate('/historian/storage?tab=objects')}
-            className="w-full py-2.5 px-4 bg-[#EF1B24] text-white rounded-xl text-[13px] font-semibold hover:bg-[#D9141D] transition-colors"
-          >
-            Back to Storage Management
-          </button>
-        </div>
+      <div className="space-y-4">
+        <WizardHeader backLabel="Storage Management" onBack={() => navigate(backTarget)} title="Edit storage object" />
+        <EmptyState icon={<AlertTriangle className="w-6 h-6" />} title="Object not found" action={<Button variant="primary" size="sm" onClick={() => navigate(backTarget)}>Back to Storage Management</Button>}>
+          {loadError || `Unable to load the object "${objectId}".`}
+        </EmptyState>
       </div>
     );
   }
@@ -477,12 +462,16 @@ export const EditStorageObjectWizard: React.FC = () => {
   const isSystemObject = isSystemStorageName(physicalName) || (objectKind === 'database' && physicalName.startsWith('fx_t_'));
   if (isSystemObject) {
     return (
-      <div className="max-w-xl mx-auto py-10 px-4">
-        <div className="bg-white border border-[#E3EAF3] rounded-xl p-6 space-y-3">
-          <h1 className="text-[18px] font-bold text-[#111B37]">Read-only system object</h1>
-          <p className="text-[13px] text-[#334568]"><span className="font-mono">{physicalName}</span> is managed by FactoriX (operational history). Its schema cannot be edited here.</p>
-          <button type="button" onClick={() => navigate(-1)} className="h-9 px-4 rounded-lg border border-[#D4DFEC] text-[13px] font-semibold text-[#334568]">Back</button>
-        </div>
+      <div className="space-y-4">
+        <WizardHeader backLabel="Storage Management" onBack={() => navigate(backTarget)} title={physicalName} chip={<DraftChip state="draft" label="Read-only system object" />} />
+        <section className="max-w-3xl bg-white border border-[#CBD5E1] rounded-xl p-5 space-y-3">
+          <p className="text-[13px] text-[#334568]">
+            <span className="font-mono">{physicalName}</span> is managed by FactoriX (operational history). Its schema cannot be edited here.
+          </p>
+          <div className="pt-3 border-t border-slate-100">
+            <Button variant="outline" size="sm" onClick={() => navigate(backTarget)}>Back</Button>
+          </div>
+        </section>
       </div>
     );
   }
@@ -492,7 +481,7 @@ export const EditStorageObjectWizard: React.FC = () => {
   // ==========================================================================
 
   if (objectKind === 'database') {
-    const DB_STEPS = ['Identity', 'Settings', 'Review & Diff'];
+    const DB_STEPS = ['Name', 'Settings', 'Review changes'];
 
     const handleNext = () => {
       const errs: Record<string, string> = {};
@@ -517,14 +506,9 @@ export const EditStorageObjectWizard: React.FC = () => {
 
     return (
       <StorageWizardLayout
-        title={`Edit Database: ${originalObject.physical_name}`}
+        title={`Edit database ${originalObject.physical_name}`}
         subtitle="Modify database metadata, retention periods, and vgroups allocation."
-        badge={
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-[#FFFBEB] text-[#D97706] border border-[#FDE68A]">
-            <Pencil className="w-3 h-3" />
-            Edit Mode
-          </span>
-        }
+        badge={<DraftChip state="edit" />}
         currentStep={currentStep}
         steps={DB_STEPS}
         onStepClick={(s) => setCurrentStep(s)}
@@ -617,14 +601,9 @@ export const EditStorageObjectWizard: React.FC = () => {
 
     return (
       <StorageWizardLayout
-        title={`Edit Supertable: ${originalObject.physical_name}`}
+        title={`Edit supertable ${originalObject.physical_name}`}
         subtitle="Update column schemas, tags, and recording policies."
-        badge={
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-[#FFFBEB] text-[#D97706] border border-[#FDE68A]">
-            <Pencil className="w-3 h-3" />
-            Edit Mode
-          </span>
-        }
+        badge={<DraftChip state="edit" />}
         currentStep={currentStep}
         steps={STABLE_STEPS}
         onStepClick={(s) => setCurrentStep(s)}
@@ -636,7 +615,7 @@ export const EditStorageObjectWizard: React.FC = () => {
         lastSavedAt={stableDraft.lastSavedAt}
         loading={submitting}
         error={submitError}
-        submitLabel="Save Supertable"
+        submitLabel="Save supertable"
       >
         {versionConflict && (
           <div className="mb-6 p-4 bg-[#FEF2F2] border border-[#FAC6C9] rounded-xl flex items-center justify-between gap-4">
@@ -730,14 +709,9 @@ export const EditStorageObjectWizard: React.FC = () => {
 
   return (
     <StorageWizardLayout
-      title={`Edit Subtable: ${originalObject.physical_name}`}
+      title={`Edit subtable ${originalObject.physical_name}`}
       subtitle="Modify static tag values, signal bindings, or row assembly policy."
-      badge={
-        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-[#FFFBEB] text-[#D97706] border border-[#FDE68A]">
-          <Pencil className="w-3 h-3" />
-          Edit Mode
-        </span>
-      }
+        badge={<DraftChip state="edit" />}
       currentStep={currentStep}
       steps={SUBTABLE_STEPS}
       onStepClick={(s) => setCurrentStep(s)}
@@ -749,7 +723,7 @@ export const EditStorageObjectWizard: React.FC = () => {
       lastSavedAt={subtableDraft.lastSavedAt}
       loading={submitting}
       error={submitError}
-      submitLabel="Save Subtable"
+      submitLabel="Save subtable"
     >
       {versionConflict && (
         <div className="mb-6 p-4 bg-[#FEF2F2] border border-[#FAC6C9] rounded-xl flex items-center justify-between gap-4">

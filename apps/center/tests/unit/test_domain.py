@@ -295,9 +295,9 @@ def test_email_is_stored_as_lowercase_and_reset_mail_omits_the_smtp_secret() -> 
     configured = Settings.model_construct(
         smtp_host="smtp.gmail.com",
         smtp_port=587,
-        smtp_user="tai.dang@avenue-net.com",
+        smtp_user="alerts@example.local",
         smtp_password="not-the-real-secret",
-        smtp_from="tai.dang@avenue-net.com",
+        smtp_from="alerts@example.local",
     )
     mailer = SmtpMailer(configured)
     rendered = mailer.message("plant.lead@avenue-net.com", "123456").as_string()

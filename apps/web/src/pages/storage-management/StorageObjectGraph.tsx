@@ -14,148 +14,132 @@ import {
   ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import {
-  Database,
-  Layers,
-  Table,
-  Search,
-  Maximize,
-  Filter,
-  Eye,
-  EyeOff,
-  RotateCw,
-  ExternalLink,
-  ChevronRight,
-  Shield,
-  Activity,
-} from 'lucide-react';
-import { TopologyNode, TopologyEdge, EdgeKind, StorageObjectStatus } from '../../lib/storagePhysicalApi';
+import { ChevronDown, ChevronRight, Eye, EyeOff, Map as MapIcon, Maximize, Shield } from 'lucide-react';
+import { Button } from '../../components/common/Button';
+import { TopologyNode, TopologyEdge, StorageObjectStatus } from '../../lib/storagePhysicalApi';
+import { EmptyState, SearchInput, selectCls } from '../historian/hsUi';
+import { StorageStatusBadge, StorageTypeIcon } from './objectViews';
 
-// Custom node components
+/**
+ * Topology canvas (R1-37): readable by default. The first view shows databases and supertables only
+ * (node text 12–14 px at the fitted zoom); each supertable carries a "+N subtables" toggle that expands
+ * its children lazily. Search expands the supertables whose subtables match. One Fit button, minimap off.
+ */
+
 interface NodeDataProps {
   label: string;
-  type: string;
   physicalName: string;
   status: StorageObjectStatus;
   subtableCount?: number;
+  shownChildren?: number;
   columnCount?: number;
   tagCount?: number;
   isSystem?: boolean;
   selected?: boolean;
+  expanded?: boolean;
+  more?: boolean;
   onSelect?: () => void;
+  onToggle?: () => void;
+  [key: string]: unknown;
 }
 
-const DatabaseNodeComponent: React.FC<{ data: NodeDataProps }> = ({ data }) => {
-  return (
-    <div
-      onClick={data.onSelect}
-      className={`px-4 py-3 bg-white border-2 rounded-xl shadow-sm min-w-[200px] cursor-pointer transition-all hover:shadow-md ${
-        data.selected ? 'border-[#EF1B24] ring-2 ring-[#EF1B24]/20' : 'border-[#E3EAF3] hover:border-[#CBD5E1]'
-      }`}
-    >
-      <Handle type="source" position={Position.Right} className="!bg-[#EF1B24] !w-2.5 !h-2.5" />
-      <div className="flex items-center gap-2 mb-1.5">
-        <div className="p-1.5 bg-[#FEF2F2] rounded-lg">
-          <Database className="w-4 h-4 text-[#EF1B24]" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="text-[10px] font-semibold tracking-wider text-[#EF1B24] uppercase">Database</div>
-          <div className="text-[13px] font-bold text-[#111B37] truncate" title={data.physicalName}>
-            {data.physicalName}
-          </div>
-        </div>
-      </div>
-      <div className="flex items-center justify-between text-[11px] text-[#657794] pt-1.5 border-t border-[#F1F5FA]">
-        <span>{data.subtableCount ?? 0} stables</span>
-        <span
-          className={`px-1.5 py-0.2 rounded text-[10px] font-semibold ${
-            data.status === 'ACTIVE' ? 'bg-[#E8FAF0] text-[#0DBA67]' : 'bg-[#FEF2F2] text-[#EF1B24]'
-          }`}
+const nodeBox = (selected?: boolean) =>
+  `bg-white border rounded-xl shadow-sm cursor-pointer transition-all hover:shadow-md ${
+    selected ? 'border-[#111B37] ring-2 ring-[#111B37]/15' : 'border-[#CBD5E1] hover:border-[#94A3B8]'
+  }`;
+
+const DatabaseNode: React.FC<{ data: NodeDataProps }> = ({ data }) => (
+  <div onClick={data.onSelect} className={`px-4 py-3 w-[260px] ${nodeBox(data.selected)}`}>
+    <Handle type="source" position={Position.Right} className="!bg-[#94A3B8] !w-2 !h-2" />
+    <div className="flex items-center gap-2">
+      <StorageTypeIcon kind="database" />
+      <span className="text-[11px] font-bold tracking-wider text-[#657794] uppercase">Database</span>
+    </div>
+    <div className="text-[14px] font-bold text-[#111B37] truncate mt-1 font-mono" title={data.physicalName}>
+      {data.physicalName}
+    </div>
+    <div className="flex items-center justify-between text-[12px] text-[#657794] mt-1.5">
+      <span>{data.subtableCount ?? 0} supertables</span>
+      <StorageStatusBadge status={data.status} />
+    </div>
+  </div>
+);
+
+const StableNode: React.FC<{ data: NodeDataProps }> = ({ data }) => (
+  <div onClick={data.onSelect} className={`px-4 py-3 w-[270px] ${nodeBox(data.selected)}`}>
+    <Handle type="target" position={Position.Left} className="!bg-[#94A3B8] !w-2 !h-2" />
+    <Handle type="source" position={Position.Right} className="!bg-[#94A3B8] !w-2 !h-2" />
+    <div className="flex items-center gap-2">
+      <StorageTypeIcon kind="stable" />
+      <span className="text-[11px] font-bold tracking-wider text-[#657794] uppercase">Supertable</span>
+      {data.isSystem && (
+        <span className="ml-auto px-1.5 py-0.5 bg-[#F1F5F9] text-[#64748B] text-[10px] font-bold rounded inline-flex items-center gap-0.5" title="FactoriX system object (read-only)">
+          <Shield className="w-3 h-3" /> System
+        </span>
+      )}
+    </div>
+    <div className="text-[14px] font-bold text-[#111B37] truncate mt-1 font-mono" title={data.physicalName}>
+      {data.physicalName}
+    </div>
+    <div className="flex items-center justify-between gap-2 text-[12px] text-[#657794] mt-1.5">
+      <span>
+        {data.columnCount ?? 0} cols · {data.tagCount ?? 0} tags
+      </span>
+      {(data.subtableCount ?? 0) > 0 ? (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            data.onToggle?.();
+          }}
+          aria-expanded={!!data.expanded}
+          className="nodrag inline-flex items-center gap-1 h-6 px-2 rounded-md border border-[#D4DFEC] bg-white text-[12px] font-semibold text-[#334568] hover:bg-[#F1F5FA]"
+          title={data.expanded ? 'Hide subtables' : 'Show subtables'}
         >
-          {data.status}
-        </span>
-      </div>
+          {data.expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+          {data.expanded ? 'Hide' : `+${data.subtableCount}`} subtables
+        </button>
+      ) : (
+        <span>0 subtables</span>
+      )}
     </div>
-  );
-};
+  </div>
+);
 
-const StableNodeComponent: React.FC<{ data: NodeDataProps }> = ({ data }) => {
-  return (
-    <div
-      onClick={data.onSelect}
-      className={`px-4 py-3 bg-white border-2 rounded-xl shadow-sm min-w-[210px] cursor-pointer transition-all hover:shadow-md ${
-        data.selected ? 'border-[#0284C7] ring-2 ring-[#0284C7]/20' : 'border-[#E3EAF3] hover:border-[#CBD5E1]'
-      }`}
-    >
-      <Handle type="target" position={Position.Left} className="!bg-[#0284C7] !w-2.5 !h-2.5" />
-      <Handle type="source" position={Position.Right} className="!bg-[#0284C7] !w-2.5 !h-2.5" />
-      <div className="flex items-center gap-2 mb-1.5">
-        <div className="p-1.5 bg-[#F0F9FF] rounded-lg">
-          <Layers className="w-4 h-4 text-[#0284C7]" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5">
-            <span className="text-[10px] font-semibold tracking-wider text-[#0284C7] uppercase">Supertable</span>
-            {data.isSystem && (
-              <span className="px-1 py-0.2 bg-[#F1F5F9] text-[#64748B] text-[9px] font-bold rounded flex items-center gap-0.5">
-                <Shield className="w-2.5 h-2.5" /> SYS
-              </span>
-            )}
-          </div>
-          <div className="text-[13px] font-bold text-[#111B37] truncate" title={data.physicalName}>
-            {data.physicalName}
-          </div>
-        </div>
+const SubtableNode: React.FC<{ data: NodeDataProps }> = ({ data }) => {
+  const label = data.label || data.physicalName;
+  const differs = data.physicalName && data.physicalName !== label;
+  if (data.more) {
+    return (
+      <div className="px-3 py-2 w-[260px] rounded-lg border border-dashed border-[#CBD5E1] bg-white/80 text-[12px] text-[#657794]">
+        <Handle type="target" position={Position.Left} className="!opacity-0" />
+        <div className="font-semibold text-[#334568]">{label}</div>
+        <div>{data.physicalName}</div>
       </div>
-      <div className="flex items-center justify-between text-[11px] text-[#657794] pt-1.5 border-t border-[#F1F5FA]">
-        <span>
-          {data.columnCount ?? 0} cols · {data.tagCount ?? 0} tags
-        </span>
-        <span className="font-semibold text-[#0284C7]">{data.subtableCount ?? 0} subtables</span>
-      </div>
-    </div>
-  );
-};
-
-const SubtableNodeComponent: React.FC<{ data: NodeDataProps }> = ({ data }) => {
-  const displayLabel = data.label || data.physicalName;
-  const isDifferent = data.physicalName && data.physicalName !== displayLabel;
+    );
+  }
   return (
-    <div
-      onClick={data.onSelect}
-      className={`px-3 py-2 bg-white border-2 rounded-lg shadow-xs min-w-[200px] max-w-[280px] cursor-pointer transition-all hover:shadow-sm ${
-        data.selected ? 'border-[#7C3AED] ring-2 ring-[#7C3AED]/20' : 'border-[#E3EAF3] hover:border-[#CBD5E1]'
-      }`}
-    >
-      <Handle type="target" position={Position.Left} className="!bg-[#7C3AED] !w-2 !h-2" />
+    <div onClick={data.onSelect} className={`px-3 py-2 w-[260px] ${nodeBox(data.selected)} rounded-lg shadow-xs`}>
+      <Handle type="target" position={Position.Left} className="!bg-[#94A3B8] !w-2 !h-2" />
       <div className="flex items-center gap-2">
-        <Table className="w-3.5 h-3.5 text-[#7C3AED] shrink-0" />
+        <StorageTypeIcon kind="subtable" className="w-3.5 h-3.5" />
         <div className="min-w-0 flex-1">
-          <div className="text-[12px] font-semibold text-[#111B37] truncate" title={displayLabel}>
-            {displayLabel}
+          <div className="text-[12px] font-semibold text-[#111B37] truncate" title={label}>
+            {label}
           </div>
-          {isDifferent && (
-            <div className="text-[10px] text-[#657794] font-mono truncate" title={data.physicalName}>
+          {differs && (
+            <div className="text-[11px] text-[#657794] font-mono truncate" title={data.physicalName}>
               {data.physicalName}
             </div>
           )}
         </div>
-        <span
-          className={`w-2 h-2 rounded-full shrink-0 ${
-            data.status === 'ACTIVE' ? 'bg-[#0DBA67]' : 'bg-[#F59E0B]'
-          }`}
-          title={data.status}
-        />
+        <span className={`w-2 h-2 rounded-full shrink-0 ${data.status === 'ACTIVE' ? 'bg-[#0DBA67]' : 'bg-[#94A3B8]'}`} title={String(data.status)} />
       </div>
     </div>
   );
 };
 
-const nodeTypes = {
-  database: DatabaseNodeComponent,
-  stable: StableNodeComponent,
-  subtable: SubtableNodeComponent,
-};
+const nodeTypes = { database: DatabaseNode, stable: StableNode, subtable: SubtableNode };
 
 interface StorageObjectGraphProps {
   nodes: TopologyNode[];
@@ -164,316 +148,252 @@ interface StorageObjectGraphProps {
   onSelectObject: (objectId: string) => void;
   onRefresh: () => void;
   loading?: boolean;
+  onShowObjects?: () => void;
 }
+
+const nameOf = (n: TopologyNode) => n.physical_name || (n as unknown as { label?: string }).label || '';
 
 export const StorageObjectGraph: React.FC<StorageObjectGraphProps> = ({
   nodes: inputNodes = [],
   edges: inputEdges = [],
   selectedObjectId,
   onSelectObject,
-  onRefresh,
   loading = false,
+  onShowObjects,
 }) => {
   const rawNodes = useMemo(() => (Array.isArray(inputNodes) ? inputNodes : []), [inputNodes]);
   const rawEdges = useMemo(() => (Array.isArray(inputEdges) ? inputEdges : []), [inputEdges]);
 
   const [search, setSearch] = useState('');
   const [showBindings, setShowBindings] = useState(false);
-  const [showMinimap, setShowMinimap] = useState(true);
+  const [showMinimap, setShowMinimap] = useState(false);
   const [selectedDb, setSelectedDb] = useState<string>('all');
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null);
 
-  // Extract database options
-  const databases = useMemo(() => {
-    return rawNodes.filter((n) => n.object_type === 'database');
-  }, [rawNodes]);
-
-  // Filter nodes & edges based on search and selectedDb
-  const filteredNodes = useMemo(() => {
-    return rawNodes.filter((node) => {
-      if (!node) return false;
-      const physicalName = node.physical_name || (node as any).label || (node as any).name || '';
-      const displayName = node.display_name || physicalName;
-      if (search) {
-        const query = search.toLowerCase();
-        const matches =
-          physicalName.toLowerCase().includes(query) ||
-          displayName.toLowerCase().includes(query);
-        if (!matches) return false;
+  const databases = useMemo(() => rawNodes.filter((n) => n.object_type === 'database'), [rawNodes]);
+  const [focusId, setFocusId] = useState<string | null>(null);
+  const toggle = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else {
+        next.add(id);
+        setFocusId(id);
       }
-      if (selectedDb !== 'all') {
-        if (node.object_type === 'database') return node.node_id === selectedDb;
-        if (node.parent_id) {
-          const parent = rawNodes.find((n) => n.node_id === node.parent_id);
-          if (parent && parent.object_type === 'database') return parent.node_id === selectedDb;
-        }
-      }
-      return true;
+      return next;
     });
-  }, [rawNodes, search, selectedDb]);
+  }, []);
 
-  // Convert rawNodes to React Flow Node objects with simple hierarchy positioning
   const rfNodes: Node[] = useMemo(() => {
-    // Group by layer: databases -> stables -> subtables
-    const dbs = filteredNodes.filter((n) => n.object_type === 'database');
-    const stables = filteredNodes.filter((n) => n.object_type === 'stable');
-    const subtables = filteredNodes.filter((n) => n.object_type === 'subtable');
+    const q = search.trim().toLowerCase();
+    const matches = (n: TopologyNode) => !q || nameOf(n).toLowerCase().includes(q) || String(n.display_name || '').toLowerCase().includes(q);
+    const dbs = databases.filter((db) => selectedDb === 'all' || db.node_id === selectedDb);
+    const stables = rawNodes.filter((n) => n.object_type === 'stable');
+    const subtables = rawNodes.filter((n) => n.object_type === 'subtable');
+    const childrenOf = (st: TopologyNode) =>
+      subtables.filter((sub) => sub.parent_id === st.node_id || (sub.metadata?.stable_name as string) === st.physical_name);
 
     const result: Node[] = [];
-    let dbY = 50;
-
-    dbs.forEach((db, dbIdx) => {
-      const dbX = 60;
-      const curDbY = dbY;
+    let dbY = 40;
+    dbs.forEach((db) => {
+      const dbX = 40;
+      const dbStables = stables.filter((s) => s.parent_id === db.node_id || (s.metadata?.database_name as string) === db.physical_name);
+      // A search keeps a supertable when it or one of its subtables matches.
+      const visibleStables = dbStables.filter((st) => !q || matches(st) || childrenOf(st).some(matches));
+      if (q && !matches(db) && visibleStables.length === 0) return;
       result.push({
         id: db.node_id,
         type: 'database',
-        position: db.position || { x: dbX, y: curDbY },
+        position: { x: dbX, y: dbY },
         data: {
           label: db.physical_name,
           physicalName: db.physical_name,
           status: db.status,
-          subtableCount: (db.metadata?.stable_count as number) || 0,
+          subtableCount: (db.metadata?.stable_count as number) ?? dbStables.length,
           selected: db.node_id === selectedObjectId,
           onSelect: () => onSelectObject(db.node_id),
         },
       });
-
-      // Find children stables
-      const childStables = stables.filter(
-        (s) => s.parent_id === db.node_id || (s.metadata?.database_name as string) === db.physical_name
-      );
-
-      let stableY = curDbY;
-      childStables.forEach((st, stIdx) => {
-        const stX = dbX + 300;
-        const curStY = stableY;
+      let stY = dbY;
+      // Nothing expanded: supertables in a compact grid (readable at zoom 1); otherwise one column.
+      const anyOpen = visibleStables.some((st) => expanded.has(st.node_id)) || q.length > 0;
+      const gridCols = anyOpen ? 1 : Math.min(3, Math.max(1, Math.ceil(visibleStables.length / 3)));
+      visibleStables.forEach((st, idx) => {
+        const col = gridCols > 1 ? idx % gridCols : 0;
+        const stX = dbX + 340 + col * 300;
+        if (gridCols > 1) stY = dbY + Math.floor(idx / gridCols) * 112;
+        const kids = childrenOf(st);
+        const matchingKids = q ? kids.filter(matches) : kids;
+        const isOpen = expanded.has(st.node_id) || (q.length > 0 && matchingKids.length > 0 && !matches(st));
+        const total = (st.metadata?.subtable_count as number) ?? kids.length;
         result.push({
           id: st.node_id,
           type: 'stable',
-          position: st.position || { x: stX, y: curStY },
+          position: { x: stX, y: stY },
           data: {
             label: st.physical_name,
             physicalName: st.physical_name,
             status: st.status,
             columnCount: (st.metadata?.column_count as number) || 0,
             tagCount: (st.metadata?.tag_count as number) || 0,
-            subtableCount: (st.metadata?.subtable_count as number) || 0,
+            subtableCount: total,
             isSystem: Boolean(st.metadata?.is_system),
+            expanded: isOpen,
             selected: st.node_id === selectedObjectId,
             onSelect: () => onSelectObject(st.node_id),
+            onToggle: () => toggle(st.node_id),
           },
         });
-
-        // Find child subtables (limit to first 10 for canvas clarity per §4)
-        const childSubtables = subtables
-          .filter((sub) => sub.parent_id === st.node_id || (sub.metadata?.stable_name as string) === st.physical_name)
-          .slice(0, 10);
-
-        let subY = curStY;
-        childSubtables.forEach((sub, subIdx) => {
-          const subX = stX + 310;
-          result.push({
-            id: sub.node_id,
-            type: 'subtable',
-            position: sub.position || { x: subX, y: subY },
-            data: {
-              label:
-                sub.label ||
-                sub.display_name ||
-                (sub.metadata?.display_name as string) ||
-                sub.physical_name,
-              physicalName:
-                (sub.metadata?.physical_name as string) ||
-                sub.physical_name,
-              status: sub.status,
-              selected: sub.node_id === selectedObjectId,
-              onSelect: () => onSelectObject(sub.node_id),
-            },
+        let subY = stY;
+        if (isOpen) {
+          const shown = matchingKids;
+          shown.forEach((sub) => {
+            result.push({
+              id: sub.node_id,
+              type: 'subtable',
+              position: { x: stX + 340, y: subY },
+              data: {
+                label: sub.label || sub.display_name || (sub.metadata?.display_name as string) || sub.physical_name,
+                physicalName: (sub.metadata?.physical_name as string) || sub.physical_name,
+                status: sub.status,
+                selected: sub.node_id === selectedObjectId,
+                onSelect: () => onSelectObject(sub.node_id),
+              },
+            });
+            subY += 54;
           });
-          subY += 56;
-        });
-        const totalChildren = (st.metadata?.subtable_count as number) || 0;
-        if (totalChildren > childSubtables.length) {
-          // Honest totals (G-08 / R1-37): the canvas draws a few children, the rest is counted here.
-          result.push({
-            id: `${st.node_id}::more`,
-            type: 'subtable',
-            position: { x: stX + 310, y: subY },
-            data: {
-              label: `+${totalChildren - childSubtables.length} more — see Objects table`,
-              physicalName: `${totalChildren} subtables in total`,
-              status: 'ACTIVE',
-              selected: false,
-              onSelect: () => undefined,
-            },
-          });
-          subY += 56;
+          if (!q && total > shown.length) {
+            // Honest totals (G-08 / R1-37): the canvas draws the first children, the rest is counted.
+            result.push({
+              id: `${st.node_id}::more`,
+              type: 'subtable',
+              position: { x: stX + 340, y: subY },
+              data: { label: `+${total - shown.length} more`, physicalName: `${total} in total · see Objects table`, status: 'ACTIVE', more: true },
+            });
+            subY += 54;
+          }
         }
-
-        stableY = Math.max(curStY + 120, subY + 20);
+        if (gridCols === 1) stY = Math.max(stY + 112, subY + 16);
       });
-
-      dbY = Math.max(curDbY + 160, stableY + 40);
+      const rows = gridCols > 1 ? Math.ceil(visibleStables.length / gridCols) : 0;
+      if (gridCols > 1) stY = dbY + rows * 112;
+      dbY = Math.max(dbY + 150, stY + 30);
     });
-
     return result;
-  }, [filteredNodes, selectedObjectId, onSelectObject]);
+  }, [rawNodes, databases, search, selectedDb, expanded, selectedObjectId, onSelectObject, toggle]);
 
-  // Convert rawEdges to React Flow Edge objects
-  // Solid for CONTAINS and INHERITS_SCHEMA, dashed for others per plan.md §2.2
   const rfEdges: Edge[] = useMemo(() => {
-    return rawEdges
-      .filter((edge) => {
-        if (!showBindings && edge.edge_kind === 'BINDS_SOURCE') return false;
-        // Verify both nodes exist in filtered nodes
-        const hasSource = filteredNodes.some((n) => n.node_id === edge.source_node_id);
-        const hasTarget = filteredNodes.some((n) => n.node_id === edge.target_node_id);
-        return hasSource && hasTarget;
-      })
+    const present = new Set(rfNodes.map((n) => n.id));
+    const out: Edge[] = rawEdges
+      .filter((edge) => (showBindings || edge.edge_kind !== 'BINDS_SOURCE') && present.has(edge.source_node_id) && present.has(edge.target_node_id))
       .map((edge) => {
-        const isPhysical = edge.edge_kind === 'CONTAINS' || edge.edge_kind === 'INHERITS_SCHEMA';
+        const physical = edge.edge_kind === 'CONTAINS' || edge.edge_kind === 'INHERITS_SCHEMA';
         return {
           id: edge.edge_id,
           source: edge.source_node_id,
           target: edge.target_node_id,
           type: 'smoothstep',
           animated: edge.edge_kind === 'BINDS_SOURCE',
-          style: {
-            stroke: isPhysical ? '#94A3B8' : '#3B82F6',
-            strokeWidth: isPhysical ? 1.5 : 1,
-            strokeDasharray: isPhysical ? undefined : '5,5',
-          },
-          markerEnd: {
-            type: MarkerType.ArrowClosed,
-            width: 14,
-            height: 14,
-            color: isPhysical ? '#94A3B8' : '#3B82F6',
-          },
+          style: { stroke: physical ? '#94A3B8' : '#2A82E7', strokeWidth: physical ? 1.5 : 1, strokeDasharray: physical ? undefined : '5,5' },
+          markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14, color: physical ? '#94A3B8' : '#2A82E7' },
         };
       });
-  }, [rawEdges, filteredNodes, showBindings]);
+    rfNodes.filter((n) => n.id.endsWith('::more')).forEach((n) => {
+      const parent = n.id.replace(/::more$/, '');
+      out.push({ id: `${n.id}-e`, source: parent, target: n.id, type: 'smoothstep', style: { stroke: '#CBD5E1', strokeDasharray: '4,4' } });
+    });
+    return out;
+  }, [rawEdges, rfNodes, showBindings]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState(rfNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(rfEdges);
+  useEffect(() => setNodes(rfNodes), [rfNodes, setNodes]);
+  useEffect(() => setEdges(rfEdges), [rfEdges, setEdges]);
 
-  useEffect(() => {
-    setNodes(rfNodes);
-  }, [rfNodes, setNodes]);
-
-  useEffect(() => {
-    setEdges(rfEdges);
-  }, [rfEdges, setEdges]);
-
-  const handleFitView = useCallback(() => {
-    rfInstance?.fitView({ padding: 0.15, duration: 400 });
+  // Readable default: fit, but never zoom out below 0.7 (text stays ≥ ~12 px); never zoom in above 1.
+  const fit = useCallback(() => {
+    rfInstance?.fitView({ padding: 0.12, duration: 300, minZoom: 0.7, maxZoom: 1 });
   }, [rfInstance]);
+  const nodeCount = rfNodes.length;
+  // Opening a supertable puts it at the top-left at a readable zoom; otherwise fit the whole view, and when
+  // that would be too small (< 0.7) anchor the first database at the top-left at zoom 0.85 instead.
+  useEffect(() => {
+    if (!rfInstance) return;
+    const t = window.setTimeout(() => {
+      const focus = focusId ? rfNodes.find((n) => n.id === focusId) : null;
+      if (focus) {
+        const z = 0.9;
+        rfInstance.setViewport({ x: -(focus.position.x - 24) * z, y: -(focus.position.y - 80) * z, zoom: z }, { duration: 300 });
+        setFocusId(null);
+        return;
+      }
+      if (expanded.size > 0) return;
+      void Promise.resolve(rfInstance.fitView({ padding: 0.12, maxZoom: 1 })).then(() => {
+        if (rfInstance.getViewport().zoom >= 0.7) return;
+        const first = rfNodes[0];
+        const z = 0.85;
+        rfInstance.setViewport({ x: -((first?.position.x ?? 0) - 24) * z, y: -((first?.position.y ?? 0) - 60) * z, zoom: z });
+      });
+    }, 60);
+    return () => window.clearTimeout(t);
+  }, [rfInstance, nodeCount, selectedDb]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className="relative w-full h-[640px] bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl overflow-hidden shadow-xs">
-      {/* Canvas top toolbar */}
-      <div className="absolute top-3 left-3 right-3 z-10 flex items-center justify-between pointer-events-none">
-        <div className="flex items-center gap-2 pointer-events-auto">
-          {/* Search */}
-          <div className="relative">
-            <Search className="w-3.5 h-3.5 text-[#94A3B8] absolute left-2.5 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              placeholder="Search objects..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="pl-8 pr-3 py-1.5 bg-white/95 backdrop-blur border border-[#E3EAF3] rounded-lg text-[12px] text-[#111B37] placeholder-[#94A3B8] shadow-xs focus:outline-none focus:border-[#EF1B24] w-48"
-            />
-          </div>
-
-          {/* Database filter */}
-          {databases.length > 0 && (
-            <div className="flex items-center bg-white/95 backdrop-blur border border-[#E3EAF3] rounded-lg px-2 py-1 shadow-xs">
-              <Filter className="w-3 h-3 text-[#94A3B8] mr-1.5" />
-              <select
-                value={selectedDb}
-                onChange={(e) => setSelectedDb(e.target.value)}
-                className="bg-transparent text-[12px] font-medium text-[#111B37] focus:outline-none cursor-pointer"
-              >
-                <option value="all">All Databases</option>
-                {databases.map((db) => (
-                  <option key={db.node_id} value={db.node_id}>
-                    {db.physical_name}
-                  </option>
-                ))}
-              </select>
-            </div>
+    <div className="relative w-full h-[480px] sm:h-[600px] bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl overflow-hidden">
+      <div className="absolute top-3 left-3 right-3 z-10 flex flex-wrap items-center gap-2 pointer-events-none">
+        <div className="flex flex-wrap items-center gap-2 pointer-events-auto min-w-0">
+          <SearchInput className="w-48 sm:w-56" value={search} onChange={setSearch} placeholder="Search objects" ariaLabel="Search the topology" />
+          {databases.length > 1 && (
+            <select aria-label="Database" value={selectedDb} onChange={(e) => setSelectedDb(e.target.value)} className={selectCls}>
+              <option value="all">All databases</option>
+              {databases.map((db) => (
+                <option key={db.node_id} value={db.node_id}>
+                  {db.physical_name}
+                </option>
+              ))}
+            </select>
           )}
-
-          {/* Show Bindings toggle */}
-          <button
-            type="button"
-            onClick={() => setShowBindings(!showBindings)}
-            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium border shadow-xs transition-colors ${
-              showBindings
-                ? 'bg-[#EFF6FF] border-[#BFDBFE] text-[#1D4ED8]'
-                : 'bg-white/95 border-[#E3EAF3] text-[#657794] hover:text-[#111B37]'
-            }`}
-          >
-            {showBindings ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-            <span>Lineage</span>
-          </button>
+          <Button size="sm" variant="outline" aria-pressed={showBindings} icon={showBindings ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />} onClick={() => setShowBindings((v) => !v)} title="Show source lineage edges">
+            Lineage
+          </Button>
+          {expanded.size > 0 && (
+            <Button size="sm" variant="ghost" onClick={() => setExpanded(new Set())}>
+              Collapse all
+            </Button>
+          )}
         </div>
-
-        {/* Canvas right controls */}
-        <div className="flex items-center gap-2 pointer-events-auto">
-          <button
-            type="button"
-            onClick={handleFitView}
-            className="p-1.5 bg-white/95 backdrop-blur border border-[#E3EAF3] rounded-lg text-[#657794] hover:text-[#111B37] shadow-xs transition-colors"
-            title="Fit to view"
-          >
-            <Maximize className="w-4 h-4" />
-          </button>
-          <button
-            type="button"
-            onClick={() => setShowMinimap(!showMinimap)}
-            className={`px-2 py-1 bg-white/95 backdrop-blur border border-[#E3EAF3] rounded-lg text-[11px] font-semibold shadow-xs ${
-              showMinimap ? 'text-[#EF1B24]' : 'text-[#657794]'
-            }`}
-            title="Toggle minimap"
-          >
+        <div className="flex items-center gap-1.5 ml-auto pointer-events-auto">
+          <Button size="sm" variant="outline" icon={<Maximize className="w-3.5 h-3.5" />} onClick={fit} title="Fit to view">
+            Fit
+          </Button>
+          <Button size="sm" variant="ghost" aria-pressed={showMinimap} icon={<MapIcon className="w-3.5 h-3.5" />} onClick={() => setShowMinimap((v) => !v)} title="Toggle minimap">
             Map
-          </button>
-          <button
-            type="button"
-            onClick={onRefresh}
-            disabled={loading}
-            className="p-1.5 bg-white/95 backdrop-blur border border-[#E3EAF3] rounded-lg text-[#657794] hover:text-[#111B37] shadow-xs transition-colors"
-            title="Refresh topology"
-          >
-            <RotateCw className={`w-4 h-4 ${loading ? 'animate-spin text-[#EF1B24]' : ''}`} />
-          </button>
+          </Button>
         </div>
       </div>
 
-      {/* Legend overlay at bottom left */}
-      <div className="absolute bottom-3 left-3 z-10 flex items-center gap-3 px-3 py-1.5 bg-white/90 backdrop-blur border border-[#E3EAF3] rounded-lg text-[11px] text-[#657794] shadow-xs pointer-events-none">
-        <div className="flex items-center gap-1.5">
+      <div className="hidden sm:flex absolute bottom-3 left-3 z-10 items-center gap-3 px-3 py-1.5 bg-white/90 border border-[#E3EAF3] rounded-lg text-[11px] text-[#657794] pointer-events-none">
+        <span className="flex items-center gap-1.5">
           <span className="w-3 h-0.5 bg-[#94A3B8] inline-block" />
-          <span>Physical Contains / Inherits</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <span className="w-3 h-0.5 border-b border-dashed border-[#3B82F6] inline-block" />
-          <span>Source Lineage</span>
-        </div>
+          Contains
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-3 border-b border-dashed border-[#2A82E7] inline-block" />
+          Source lineage
+        </span>
+        {onShowObjects && (
+          <button type="button" className="pointer-events-auto font-semibold text-[#2A82E7] hover:underline" onClick={onShowObjects}>
+            All objects as a table
+          </button>
+        )}
       </div>
 
-      {/* Empty state */}
       {rfNodes.length === 0 && !loading && (
-        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-white/80 backdrop-blur pointer-events-none">
-          <Database className="w-12 h-12 text-[#CBD5E1] mb-3" />
-          <h3 className="text-[15px] font-bold text-[#111B37] mb-1">No Storage Objects Found</h3>
-          <p className="text-[13px] text-[#657794] max-w-sm text-center">
-            {search
-              ? 'No objects match your search filter.'
-              : 'Create a TDengine Database to begin organizing your time-series tables.'}
-          </p>
+        <div className="absolute inset-0 z-10 flex items-center justify-center p-6 pointer-events-none">
+          <EmptyState title={search ? 'Nothing matches the search' : 'No storage objects yet'} className="pointer-events-auto max-w-md">
+            {search ? 'Try another name.' : 'Create a TDengine database to start.'}
+          </EmptyState>
         </div>
       )}
 
@@ -484,23 +404,19 @@ export const StorageObjectGraph: React.FC<StorageObjectGraphProps> = ({
         onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
         onInit={setRfInstance}
-        fitView
         minZoom={0.2}
         maxZoom={1.5}
+        nodesConnectable={false}
         defaultEdgeOptions={{ animated: false }}
         proOptions={{ hideAttribution: true }}
       >
         <Background color="#CBD5E1" gap={20} size={1} />
-        <Controls showInteractive={false} position="bottom-right" className="!bottom-3 !right-3" />
+        <Controls showInteractive={false} showFitView={false} position="bottom-right" />
         {showMinimap && (
           <MiniMap
             position="top-right"
             className="!top-12 !right-3 !border !border-[#E3EAF3] !rounded-lg !overflow-hidden"
-            nodeColor={(n) => {
-              if (n.type === 'database') return '#EF1B24';
-              if (n.type === 'stable') return '#0284C7';
-              return '#7C3AED';
-            }}
+            nodeColor={(n) => (n.type === 'database' ? '#111B37' : n.type === 'stable' ? '#2A82E7' : '#8858EA')}
           />
         )}
       </ReactFlow>

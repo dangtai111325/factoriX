@@ -472,6 +472,88 @@ class StorageTopologyInspector:
         start = (page - 1) * page_size
         return rows[start:start + page_size], len(rows)
 
+    async def summarize(self, tenant_id: UUID, session: Any) -> dict[str, Any]:
+        """Compact per-database / per-supertable counts for overview screens (no subtable listing).
+
+        TDengine gives the physical counts; the registry adds what FactoriX manages: registered
+        subtables by recording status, active bindings, and the writer outbox (pending / failed /
+        last confirmed write in the outbox retention window).
+        """
+        from factorix.modules.common import fetch_all, iso_ms
+        from factorix.modules.storage_objects import is_system_stable
+
+        dbs = await self.list_databases(tenant_id, await registered_databases(session, tenant_id))
+        reg = await fetch_all(
+            session,
+            """
+            SELECT o.physical_db, o.parent_name, o.status, COUNT(*) AS n,
+                   COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM storage_bindings b WHERE b.tenant_id = o.tenant_id
+                       AND b.physical_db = o.physical_db AND b.physical_subtable = o.physical_name AND b.status = 'ACTIVE')) AS bound
+            FROM storage_objects o
+            WHERE o.tenant_id = :tenant_id AND o.object_type = 'subtable' AND o.status <> 'PURGED'
+            GROUP BY o.physical_db, o.parent_name, o.status
+            """,
+            {"tenant_id": tenant_id},
+        )
+        outbox = await fetch_all(
+            session,
+            """
+            SELECT o.physical_db, so.parent_name,
+                   COUNT(*) FILTER (WHERE o.status = 'PENDING') AS pending,
+                   COUNT(*) FILTER (WHERE o.status = 'FAILED') AS failed,
+                   MAX(o.confirmed_at) AS last_write_at
+            FROM storage_record_outbox o
+            LEFT JOIN storage_objects so ON so.tenant_id = o.tenant_id AND so.object_type = 'subtable'
+             AND so.physical_db = o.physical_db AND so.physical_name = o.physical_subtable AND so.status <> 'PURGED'
+            WHERE o.tenant_id = :tenant_id
+            GROUP BY o.physical_db, so.parent_name
+            """,
+            {"tenant_id": tenant_id},
+        )
+        managed_stables = {
+            (str(r["physical_db"]), str(r["physical_name"])) for r in await fetch_all(
+                session,
+                "SELECT physical_db, physical_name FROM storage_objects WHERE tenant_id = :tenant_id "
+                "AND object_type = 'stable' AND status <> 'PURGED'",
+                {"tenant_id": tenant_id},
+            )
+        }
+        out_dbs = []
+        for db in dbs:
+            counts = await self._subtable_counts(db.name)
+            names = await self._td_query(f"SELECT stable_name FROM information_schema.ins_stables WHERE db_name = '{db.name}'")
+            stables = []
+            for row in names:
+                st = _safe_str(row, "stable_name", 0)
+                rec: dict[str, int] = {}
+                bound = 0
+                for r in reg:
+                    if r["physical_db"] == db.name and r["parent_name"] == st:
+                        rec[str(r["status"])] = rec.get(str(r["status"]), 0) + int(r["n"])
+                        bound += int(r["bound"] or 0)
+                ob = next((r for r in outbox if r["physical_db"] == db.name and r["parent_name"] == st), None)
+                stables.append({
+                    "name": st,
+                    "id": f"stable:{db.name}.{st}",
+                    "is_system": is_system_stable(st),
+                    "managed": (db.name, st) in managed_stables,
+                    "subtable_count": counts.get(st, 0),
+                    "registered_subtables": rec,
+                    "bound_subtables": bound,
+                    "writer": {
+                        "pending": int(ob["pending"]) if ob else 0,
+                        "failed": int(ob["failed"]) if ob else 0,
+                        "last_write_at": iso_ms(ob["last_write_at"]) if ob and ob.get("last_write_at") else None,
+                    },
+                })
+            stables.sort(key=lambda x: (x["is_system"], x["name"]))
+            out_dbs.append({
+                "name": db.name, "id": f"db:{db.name}", "precision": db.precision, "keep": db.keep,
+                "is_tenant_default": db.is_tenant, "stable_count": db.stable_count,
+                "subtable_count": db.subtable_count, "stables": stables,
+            })
+        return {"databases": out_dbs}
+
     async def get_topology(
         self,
         tenant_id: UUID,

@@ -19,7 +19,9 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from factorix.modules import historian_catalog as HC
 from factorix.modules import historian_service as HS
+from factorix.modules import historian_views as HV
 from factorix.modules import postgres_explorer as PE
 from factorix.modules import storage_bindings as SB
 from factorix.modules import storage_designs as SD
@@ -615,8 +617,54 @@ def build_router(
         principal: dict[str, Any] = Depends(admin_dep),
         session: AsyncSession = Depends(db_dep),
     ) -> list[dict[str, Any]]:
+        tenant_id, actor = ids(principal)
+        return await HV.list_views(session, tenant_id, actor, q=q, limit=limit)
+
+    @router.get("/api/v1/historian/views/{view_id}", tags=["historian"])
+    async def get_view(
+        view_id: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        tenant_id, actor = ids(principal)
+        return await HV.get_view(session, tenant_id, parse_uuid(view_id), actor)
+
+    @router.patch("/api/v1/historian/views/{view_id}", tags=["historian"])
+    async def patch_view(
+        view_id: str,
+        body: dict[str, Any] = Body(...),
+        if_match: str | None = Header(None, alias="If-Match"),
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Rename / change query, chart options, visibility or default; needs the edited version."""
+        tenant_id, actor = ids(principal)
+        return await HV.update_view(session, tenant_id, actor, parse_uuid(view_id), body, if_match=if_match)
+
+    @router.post("/api/v1/historian/views/{view_id}/duplicate", status_code=201, tags=["historian"])
+    async def duplicate_view(
+        view_id: str,
+        body: dict[str, Any] = Body(default_factory=dict),
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        tenant_id, actor = ids(principal)
+        return await HV.duplicate_view(session, tenant_id, actor, parse_uuid(view_id), body.get("name"))
+
+    @router.get("/api/v1/historian/sources", tags=["historian"])
+    async def historian_sources(
+        search: str | None = Query(None, max_length=200),
+        kinds: str | None = Query(None, description="comma list of signal,model_field,subtable"),
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Picker data grouped by machine: signals, Data Model fields and recorded subtables, each with
+        its Historian series token, quality and freshness."""
         tenant_id, _actor = ids(principal)
-        return await HS.list_saved_views(session, tenant_id, q=q, limit=limit)
+        wanted = {k.strip() for k in kinds.split(",") if k.strip()} if kinds else None
+        if wanted and not wanted <= {"signal", "model_field", "subtable"}:
+            raise AppError(422, "INVALID_KINDS", "kinds must be a comma list of signal, model_field, subtable.")
+        return await HC.sources_by_machine(session, tenant_id, search=search, kinds=wanted)
 
     @router.post("/api/v1/historian/views", status_code=201, tags=["historian"])
     async def create_view(
@@ -1499,6 +1547,53 @@ def build_router(
             summary[r["status"]] = summary.get(r["status"], 0) + 1
         return {"items": results, "summary": summary, "dry_run": dry_run}
 
+    @router.get("/api/v1/storage/td/summary", tags=["storage"])
+    async def storage_summary(
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Per database / supertable counts: physical subtables, registered by recording status,
+        bound subtables and writer health — for overview screens (no subtable listing)."""
+        tenant_id, _actor = ids(principal)
+        return {**(await topology_inspector.summarize(tenant_id, session)),
+                "recording": await SMR.recording_status(session, tenant_id), "observed_at": iso_ms(utcnow())}
+
+    @router.delete("/api/v1/storage/td/drafts/{draft_id}", tags=["storage"])
+    async def discard_td_draft(
+        draft_id: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        tenant_id, _actor = ids(principal)
+        n = await SR.discard_draft(session, tenant_id, parse_uuid(draft_id))
+        if not n:
+            raise AppError(404, "NOT_FOUND", f"Draft '{draft_id}' not found")
+        return {"id": draft_id, "state": "CANCELLED"}
+
+    @router.post("/api/v1/storage/td/objects/{object_id:path}/alter", tags=["storage"])
+    async def alter_td_stable(
+        object_id: str,
+        body: dict[str, Any] = Body(...),
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Additive schema change of a USER supertable: ``add_columns`` / ``add_tags``; ``dry_run``
+        returns the ALTER statements without executing them."""
+        tenant_id, actor_id = ids(principal)
+        obj_kind, db_name, name = ST.parse_canonical_object_id(object_id)
+        if not db_name or not name:
+            raise AppError(404, "NOT_FOUND", f"Storage object '{object_id}' not found")
+        await _require_db(session, tenant_id, db_name, f"Storage object '{object_id}'")
+        kind = await _resolve_kind(db_name, name, obj_kind)
+        if kind != "stable":
+            raise AppError(422, "NOT_A_SUPERTABLE", "Columns and tags are added to a supertable; its subtables inherit them.")
+        _assert_user_object("stable", db_name, name, tenant_id, "alter")
+        try:
+            return await revision_service.alter_stable(
+                session, tenant_id, actor_id, db_name, name, body, dry_run=bool(body.get("dry_run")))
+        except StorageObjectError as exc:
+            raise _storage_error(exc) from exc
+
     @router.get("/api/v1/storage/td/drafts", tags=["storage"])
     async def list_td_drafts(
         kind: str | None = None,
@@ -1710,8 +1805,9 @@ def build_router(
         raise AppError(
             422,
             "SCHEMA_CHANGE_NOT_SUPPORTED",
-            "Changing the columns, tags or bindings of an existing object is not supported yet. "
-            "Use Duplicate to create a corrected copy, then retire the old object.",
+            "This route changes display name and description only. Add columns or tags with "
+            "POST /api/v1/storage/td/objects/<id>/alter; other schema or binding changes need a corrected "
+            "copy (Duplicate) and retiring the old object.",
         )
 
     async def _lifecycle(

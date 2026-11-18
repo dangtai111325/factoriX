@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import sys
+from dataclasses import replace
 
 from factorix.modules.ingestion_worker import DEFAULT_INSTANCE_ID, IngestionWorker, PgIngestionStore
 from factorix.modules.live_state import TDengineLiveStateProvider, configure_live_state_provider
@@ -36,6 +37,14 @@ async def run_forever() -> None:
         raise RuntimeError("FACTORIX_RABBITMQ_URL must be configured to run factorix.ingestion.")
 
     broker_cfg = BrokerConfig.from_settings(settings)
+    # Prefetch counts are AMQP *messages*; with v2 envelopes one message carries up to ~500
+    # observations. Keep the replay lane's in-flight window small (replay must not flood the
+    # shared event loop) and the live window moderate.
+    broker_cfg = replace(
+        broker_cfg,
+        prefetch_count=max(1, min(broker_cfg.prefetch_count, _env_int("FACTORIX_INGESTION_REPLAY_PREFETCH", 16))),
+        live_prefetch_count=max(1, min(broker_cfg.live_prefetch_count, _env_int("FACTORIX_INGESTION_LIVE_PREFETCH", 64))),
+    )
     td_client = TDEngineClient(
         TDEngineConfig(
             dsn=settings.tdengine_dsn,
@@ -70,6 +79,7 @@ async def run_forever() -> None:
         db_dsn_for_notify=settings.database_url,
         # Acquisition owns source health through its direct connection reports.
         update_connection_liveness=settings.collector_mode != "acquisition",
+        replay_batch_size=max(1, _env_int("FACTORIX_INGESTION_REPLAY_BATCH_OBS", 500)),
     )
 
     stop_ev = asyncio.Event()

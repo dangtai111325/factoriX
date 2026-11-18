@@ -166,6 +166,9 @@ class FakeResetAndMigrationSession:
                 self.reset_operation_id = UUID(str(p["op_id"]))
             return _FakeResult([], rowcount=1)
 
+        # Structural fingerprint queries (ordered id lists): empty configuration lists.
+        if low.rstrip().endswith(("order by id", "order by f.id")):
+            return _FakeResult([])
         if "select count(*) as cnt from observations" in low:
             return _FakeResult([{"cnt": self.runtime_counts["observations"]}])
         if "select count(*) as cnt from latest_signal_state" in low:

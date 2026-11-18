@@ -14,7 +14,10 @@ import {
   Radio,
   FileCode,
 } from 'lucide-react';
-import { StorageWizardLayout, useWizardDraft } from './WizardShared';
+import { StorageWizardLayout, useWizardDraft, useStorageBackTarget } from './WizardShared';
+import { Button } from '../../../components/common/Button';
+import { ActionToast, useActionToast } from '../../../components/common/ActionToast';
+import { WizardHeader, DraftChip } from '../../historian/hsUi';
 import {
   DatabaseBasicsStep,
   DatabaseSettingsStep,
@@ -156,6 +159,8 @@ export const CreateStorageObjectWizard: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const kind = searchParams.get('kind'); // 'database' | 'stable' | 'subtable'
+  const backTarget = useStorageBackTarget('/historian/storage');
+  const { toast, show: showToast, dismiss: dismissToast } = useActionToast();
 
   // Wizard Step index
   const [currentStep, setCurrentStep] = useState(0);
@@ -280,14 +285,21 @@ export const CreateStorageObjectWizard: React.FC = () => {
 
     const finish = (op: StorageOperation) => {
       const key = String((op as unknown as { object_key?: string }).object_key || op.object_name || '');
-      setCreated({ kind: kind || 'object', name: key, objectId: kind === 'database' ? `db:${key}` : `${kind}:${key}` });
+      const objectId = kind === 'database' ? `db:${key}` : `${kind}:${key}`;
+      setCreated({ kind: kind || 'object', name: key, objectId });
+      const noun = kind === 'stable' ? 'supertable' : kind || 'object';
+      showToast({
+        tone: 'success',
+        message: `Created ${noun} ${key.split('.').pop() || key}`,
+        action: { label: 'View', run: () => navigate(`/historian/storage/object/${encodeURIComponent(objectId)}`) },
+      });
       setSubmitting(false);
       setActiveOperation(null);
     };
     try {
       const initialOp = await opPromise;
       if (!initialOp || !initialOp.id) {
-        navigate('/historian/storage?tab=objects');
+        navigate(backTarget);
         return;
       }
 
@@ -327,7 +339,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
   // Database Wizard Handlers
   // ==========================================================================
 
-  const DB_STEPS = ['Identity', 'Settings', 'Review'];
+  const DB_STEPS = ['Name', 'Settings', 'Review'];
 
   const validateDbStep = (step: number): boolean => {
     const errs: Record<string, string> = {};
@@ -388,14 +400,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
   // Supertable Wizard Handlers
   // ==========================================================================
 
-  const STABLE_STEPS = [
-    'Target & Name',
-    'Columns Schema',
-    'Metadata Tags',
-    'Source Mapping',
-    'Recording Policy',
-    'Review',
-  ];
+  const STABLE_STEPS = ['Name', 'Columns', 'Tags', 'Source mapping', 'Recording', 'Review'];
 
   const validateStableStep = (step: number): boolean => {
     const errs: Record<string, string> = {};
@@ -495,13 +500,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
   // Subtable Wizard Handlers
   // ==========================================================================
 
-  const SUBTABLE_STEPS = [
-    'Identity',
-    'Tag Values',
-    'Bind Sources',
-    'Row Assembly',
-    'Review',
-  ];
+  const SUBTABLE_STEPS = ['Name', 'Tag values', 'Bind field', 'How rows are written', 'Review'];
 
   const validateSubtableStep = (step: number): boolean => {
     const errs: Record<string, string> = {};
@@ -561,121 +560,34 @@ export const CreateStorageObjectWizard: React.FC = () => {
   // ==========================================================================
 
   if (!kind || !['database', 'stable', 'subtable'].includes(kind)) {
+    const cards = [
+      { k: 'database', icon: <Database className="w-5 h-5" />, title: 'Database', text: 'A TDengine database with its own timestamp precision and retention (KEEP). Usually one is enough.' },
+      { k: 'stable', icon: <Layers className="w-5 h-5" />, title: 'Supertable', text: 'The shared schema (columns + tags) for a family of identical tables, e.g. one per field and machine.' },
+      { k: 'subtable', icon: <Table className="w-5 h-5" />, title: 'Subtable', text: 'One table of a supertable with its tag values, bound to a Data Model field that it records.' },
+    ];
     return (
-      <div className="min-h-screen bg-[#F6F8FC] py-10 px-4 sm:px-6">
-        <div className="max-w-4xl mx-auto space-y-8">
-          {/* Header */}
-          <div className="flex items-center gap-4">
-            <button
-              type="button"
-              onClick={() => navigate('/historian/storage?tab=objects')}
-              className="p-2 rounded-lg border border-[#D4DFEC] hover:bg-white text-[#334568] transition-colors"
-              title="Back"
-            >
-              <ArrowLeft className="w-5 h-5" />
-            </button>
-            <div>
-              <h1 className="text-[22px] font-bold text-[#111B37] tracking-tight">
-                Create Storage Object
-              </h1>
-              <p className="text-[13px] text-[#657794] mt-0.5">
-                Choose the physical TDengine storage archetype you want to instantiate.
-              </p>
-            </div>
-          </div>
-
-          {/* Cards Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            {/* Database Card */}
-            <div className="bg-white border border-[#E3EAF3] rounded-2xl p-6 shadow-xs hover:shadow-md transition-all flex flex-col justify-between group">
+      <div className="space-y-4">
+        <WizardHeader backLabel="Storage Management" onBack={() => navigate(backTarget)} title="Create storage object" chip={<DraftChip state="new" />} />
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 max-w-5xl">
+          {cards.map((c) => (
+            <div key={c.k} className="bg-white border border-[#CBD5E1] rounded-xl p-5 flex flex-col justify-between gap-4">
               <div>
-                <div className="w-12 h-12 rounded-xl bg-[#FFF5F5] border border-[#FAC6C9] flex items-center justify-center text-[#EF1B24] mb-4">
-                  <Database className="w-6 h-6" />
-                </div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-[16px] font-bold text-[#111B37]">Database</h2>
-                  <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-[#EAEFF5] text-[#334568]">
-                    Root
-                  </span>
-                </div>
-                <p className="text-[13px] text-[#657794] mt-2 leading-relaxed">
-                  Provision an isolated time-series database with configurable timestamp precision,
-                  automatic retention pruning (KEEP), and multi-core vgroups.
-                </p>
+                <div className="w-10 h-10 rounded-xl bg-[#EEF5FF] text-[#134074] flex items-center justify-center mb-3">{c.icon}</div>
+                <h2 className="text-[15px] font-bold text-[#111B37]">{c.title}</h2>
+                <p className="text-[13px] text-[#657794] mt-1.5 leading-relaxed">{c.text}</p>
               </div>
-
-              <div className="pt-6">
-                <button
-                  type="button"
-                  onClick={() => setSearchParams({ kind: 'database' })}
-                  className="w-full py-2.5 px-4 bg-white border border-[#D4DFEC] hover:border-[#EF1B24] hover:bg-[#FFF5F5] text-[#111B37] hover:text-[#EF1B24] rounded-xl text-[13px] font-semibold transition-all flex items-center justify-center gap-2 shadow-2xs"
-                >
-                  <span>Create Database</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
+              <Button variant="outline" size="md" onClick={() => setSearchParams({ kind: c.k })}>
+                Create {c.title.toLowerCase()} <ArrowRight className="w-4 h-4" />
+              </Button>
             </div>
-
-            {/* Supertable Card */}
-            <div className="bg-white border border-[#E3EAF3] rounded-2xl p-6 shadow-xs hover:shadow-md transition-all flex flex-col justify-between group">
-              <div>
-                <div className="w-12 h-12 rounded-xl bg-[#F0F9FF] border border-[#BAE6FD] flex items-center justify-center text-[#0284C7] mb-4">
-                  <Layers className="w-6 h-6" />
-                </div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-[16px] font-bold text-[#111B37]">Supertable (STable)</h2>
-                  <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-[#E0F2FE] text-[#0284C7]">
-                    Template
-                  </span>
-                </div>
-                <p className="text-[13px] text-[#657794] mt-2 leading-relaxed">
-                  Define a time-series metric schema and metadata tag dimensions for a family of
-                  identical machines, sensors, or industrial devices.
-                </p>
-              </div>
-
-              <div className="pt-6">
-                <button
-                  type="button"
-                  onClick={() => setSearchParams({ kind: 'stable' })}
-                  className="w-full py-2.5 px-4 bg-white border border-[#D4DFEC] hover:border-[#0284C7] hover:bg-[#F0F9FF] text-[#111B37] hover:text-[#0284C7] rounded-xl text-[13px] font-semibold transition-all flex items-center justify-center gap-2 shadow-2xs"
-                >
-                  <span>Create Supertable</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            {/* Subtable Card */}
-            <div className="bg-white border border-[#E3EAF3] rounded-2xl p-6 shadow-xs hover:shadow-md transition-all flex flex-col justify-between group">
-              <div>
-                <div className="w-12 h-12 rounded-xl bg-[#F5F3FF] border border-[#DDD6FE] flex items-center justify-center text-[#7C3AED] mb-4">
-                  <Table className="w-6 h-6" />
-                </div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-[16px] font-bold text-[#111B37]">Subtable</h2>
-                  <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-[#EDE9FE] text-[#7C3AED]">
-                    Instance
-                  </span>
-                </div>
-                <p className="text-[13px] text-[#657794] mt-2 leading-relaxed">
-                  Instantiate a physical table from an existing Supertable. Assign device-specific
-                  static tag values and bind real-time streaming signals.
-                </p>
-              </div>
-
-              <div className="pt-6">
-                <button
-                  type="button"
-                  onClick={() => setSearchParams({ kind: 'subtable' })}
-                  className="w-full py-2.5 px-4 bg-white border border-[#D4DFEC] hover:border-[#7C3AED] hover:bg-[#F5F3FF] text-[#111B37] hover:text-[#7C3AED] rounded-xl text-[13px] font-semibold transition-all flex items-center justify-center gap-2 shadow-2xs"
-                >
-                  <span>Create Subtable</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-          </div>
+          ))}
+        </div>
+        <div className="max-w-5xl text-[12px] text-[#657794]">
+          Many subtables at once? Use{' '}
+          <button type="button" className="font-semibold text-[#2A82E7] hover:underline" onClick={() => navigate('/historian/storage/bulk')}>
+            Subtables from Data Models
+          </button>
+          .
         </div>
       </div>
     );
@@ -692,13 +604,13 @@ export const CreateStorageObjectWizard: React.FC = () => {
       <div className="fixed inset-0 z-50 bg-[#111B37]/40 backdrop-blur-xs flex items-center justify-center p-4">
         <div className="bg-white rounded-2xl border border-[#E3EAF3] shadow-2xl max-w-md w-full p-6 space-y-4">
           <div className="flex items-center gap-3">
-            <Loader2 className="w-6 h-6 text-[#EF1B24] animate-spin flex-shrink-0" />
+            <Loader2 className="w-6 h-6 text-[#657794] animate-spin flex-shrink-0" />
             <div>
               <h3 className="text-[16px] font-bold text-[#111B37]">
-                Executing Storage Operation
+                Creating in TDengine…
               </h3>
               <p className="text-[12px] text-[#657794]">
-                Deploying changes directly to the physical storage engine...
+                The object is created, read back and registered. This takes a few seconds.
               </p>
             </div>
           </div>
@@ -714,11 +626,11 @@ export const CreateStorageObjectWizard: React.FC = () => {
             </div>
             <div className="flex justify-between">
               <span className="text-[#657794]">Status:</span>
-              <span className="font-semibold text-[#EF1B24]">{activeOperation.status}</span>
+              <span className="font-semibold text-[#111B37]">{activeOperation.status}</span>
             </div>
           </div>
 
-          <p className="text-[11px] text-[#8C9BAE] text-center">
+          <p className="text-[11px] text-[#657794] text-center">
             Polling status every 2 seconds. Please do not close your browser.
           </p>
         </div>
@@ -743,22 +655,23 @@ export const CreateStorageObjectWizard: React.FC = () => {
       }
     };
     return (
-      <div className="max-w-2xl mx-auto py-10 px-4">
-        <div className="bg-white border border-[#E3EAF3] rounded-xl p-6 space-y-4">
+      <div className="space-y-4">
+        <ActionToast toast={toast} onDismiss={dismissToast} />
+        <WizardHeader backLabel="Storage Management" onBack={() => navigate(backTarget)} title={`Created ${created.kind === 'stable' ? 'supertable' : created.kind}`} chip={<DraftChip state="saved" />} />
+        <section className="max-w-3xl bg-white border border-[#CBD5E1] rounded-xl p-5 space-y-4">
           <div className="flex items-center gap-3">
-            <CheckCircle2 className="w-6 h-6 text-[#0DBA67]" />
-            <div>
-              <h1 className="text-[18px] font-bold text-[#111B37]">Created {created.kind}</h1>
-              <p className="text-[13px] text-[#657794] font-mono">{created.name}</p>
-            </div>
+            <CheckCircle2 className="w-6 h-6 text-[#0DBA67] shrink-0" />
+            <p className="text-[14px] font-bold text-[#111B37] font-mono break-all">{created.name}</p>
           </div>
           <p className="text-[13px] text-[#334568]">The object exists in TDengine, its schema and tags were read back, and it is registered.</p>
-          <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={again} className="h-9 px-4 rounded-lg bg-[#EF1B24] text-white text-[13px] font-semibold">Create another</button>
-            <Link to={`/historian/storage/object/${encodeURIComponent(created.objectId)}`} className="h-9 px-4 inline-flex items-center rounded-lg border border-[#D4DFEC] text-[13px] font-semibold text-[#334568]">Open {created.kind}</Link>
-            <Link to="/historian/storage?tab=objects" className="h-9 px-4 inline-flex items-center rounded-lg text-[13px] font-semibold text-[#657794] hover:bg-[#F1F5FA]">Back to Storage Management</Link>
+          <div className="flex flex-wrap gap-2 pt-3 border-t border-slate-100">
+            <Button variant="primary" size="sm" onClick={again}>Create another</Button>
+            <Button variant="outline" size="sm" onClick={() => navigate(`/historian/storage/object/${encodeURIComponent(created.objectId)}`, { state: { from: backTarget } })}>
+              Open {created.kind === 'stable' ? 'supertable' : created.kind}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => navigate(backTarget)}>Back to Storage Management</Button>
           </div>
-        </div>
+        </section>
       </div>
     );
   }
@@ -771,15 +684,10 @@ export const CreateStorageObjectWizard: React.FC = () => {
     return (
       <>
         {renderOperationModal()}
+        <ActionToast toast={toast} onDismiss={dismissToast} />
         <StorageWizardLayout
-          title="Create TDengine Database"
-          subtitle="Define time-series database parameters, timestamp precision, and retention."
-          badge={
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-[#FFF5F5] text-[#EF1B24] border border-[#FAC6C9]">
-              <Database className="w-3 h-3" />
-              Database
-            </span>
-          }
+          title="Create database"
+          subtitle="Timestamp precision and retention of a new TDengine database."
           currentStep={currentStep}
           steps={DB_STEPS}
           onStepClick={(step) => {
@@ -795,7 +703,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
           lastSavedAt={dbDraft.lastSavedAt}
           loading={submitting}
           error={submitError}
-          submitLabel="Create Database"
+          submitLabel="Create database"
         >
           {currentStep === 0 && (
             <DatabaseBasicsStep
@@ -831,15 +739,11 @@ export const CreateStorageObjectWizard: React.FC = () => {
     return (
       <>
         {renderOperationModal()}
+        <ActionToast toast={toast} onDismiss={dismissToast} />
         <StorageWizardLayout
-          title="Create Supertable (STable)"
-          subtitle="Define shared schema columns, static metadata tags, and recording policies."
-          badge={
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-[#F0F9FF] text-[#0284C7] border border-[#BAE6FD]">
-              <Layers className="w-3 h-3" />
-              Supertable
-            </span>
-          }
+          wide={currentStep === 1 || currentStep === 3 || currentStep === 5}
+          title="Create supertable"
+          subtitle="Columns and tags shared by a family of subtables."
           currentStep={currentStep}
           steps={STABLE_STEPS}
           onStepClick={(step) => {
@@ -855,7 +759,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
           lastSavedAt={stableDraft.lastSavedAt}
           loading={submitting}
           error={submitError}
-          submitLabel="Deploy Supertable"
+          submitLabel="Create supertable"
         >
           {currentStep === 0 && (
             <StableTargetStep
@@ -911,15 +815,11 @@ export const CreateStorageObjectWizard: React.FC = () => {
   return (
     <>
       {renderOperationModal()}
+      <ActionToast toast={toast} onDismiss={dismissToast} />
       <StorageWizardLayout
-        title="Create Subtable"
+        wide={currentStep === 2 || currentStep === 4}
+        title="Create subtable"
         subtitle="One subtable of a supertable, bound to a Data Model field."
-        badge={
-          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-[#F5F3FF] text-[#7C3AED] border border-[#DDD6FE]">
-            <Table className="w-3 h-3" />
-            Subtable
-          </span>
-        }
         currentStep={currentStep}
         steps={SUBTABLE_STEPS}
         onStepClick={(step) => {
@@ -935,7 +835,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
         lastSavedAt={subtableDraft.lastSavedAt}
         loading={submitting}
         error={submitError}
-        submitLabel="Create Subtable"
+        submitLabel="Create subtable"
       >
         {currentStep === 0 && (
           <SubtableIdentityStep

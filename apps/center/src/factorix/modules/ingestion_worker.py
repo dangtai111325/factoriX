@@ -85,7 +85,9 @@ NOTIFY_CHUNK_MAX_BYTES = 7800
 MAX_FORMULA_DEPTH = 4
 # Replay (history) lane yields to pending/busy live work for at most this long per batch,
 # so live latest-state is never stuck behind a replay batch, yet replay is never starved.
-REPLAY_YIELD_MAX_S = 0.25
+REPLAY_YIELD_MAX_S = 0.5
+# CPU-bound loops over a batch yield to the event loop every N items.
+YIELD_EVERY_ITEMS = 250
 LANE_LIVE = "live"
 LANE_LEGACY = "legacy"
 
@@ -155,12 +157,20 @@ class RecentUidLru:
 
 
 class LatencyHistogram:
-    """Bounded sliding sample tracker for p50/p95/max ingest & commit SLI reporting."""
+    """Bounded sliding sample tracker for p50/p95/max ingest & commit SLI reporting.
+
+    SLIs are kept per lane. ``sli_acq_to_commit_*`` / ``sli_ingest_to_commit_*`` describe the
+    LIVE lane only (what operators read as "how fresh is the UI"); replayed history (spool
+    backlog, hours old by design) is reported separately as ``sli_replay_*`` so it cannot
+    pollute the live numbers.
+    """
 
     def __init__(self, max_samples: int = 2048) -> None:
         self.max_samples = max(64, int(max_samples))
-        self._acq_to_commit_ms: list[float] = []
-        self._ingest_to_commit_ms: list[float] = []
+        self._acq_to_commit_ms: deque[float] = deque(maxlen=self.max_samples)
+        self._ingest_to_commit_ms: deque[float] = deque(maxlen=self.max_samples)
+        self._replay_acq_to_commit_ms: deque[float] = deque(maxlen=self.max_samples)
+        self._replay_ingest_to_commit_ms: deque[float] = deque(maxlen=self.max_samples)
         self._events: dict[UUID, list[float]] = {}
         self._conn_events: dict[UUID, list[float]] = {}
         self._batch_stages: dict[str, deque[float]] = {}
@@ -171,20 +181,24 @@ class LatencyHistogram:
             samples = self._batch_stages[stage] = deque(maxlen=256)
         samples.append((time.monotonic() - started_at) * 1000)
 
-    def record(self, tenant_id: UUID, sli: LatencySLIs, *, connection_id: UUID | None = None) -> None:
+    def record(
+        self,
+        tenant_id: UUID,
+        sli: LatencySLIs,
+        *,
+        connection_id: UUID | None = None,
+        lane: str = "live",
+    ) -> None:
         now = time.monotonic()
         bucket = self._events.setdefault(tenant_id, [])
         bucket.append(now)
         if connection_id is not None:
             self._conn_events.setdefault(connection_id, []).append(now)
+        replay = lane != "live"
         if sli.acquisition_to_commit_ms is not None:
-            self._acq_to_commit_ms.append(sli.acquisition_to_commit_ms)
-            if len(self._acq_to_commit_ms) > self.max_samples:
-                del self._acq_to_commit_ms[: len(self._acq_to_commit_ms) - self.max_samples]
+            (self._replay_acq_to_commit_ms if replay else self._acq_to_commit_ms).append(sli.acquisition_to_commit_ms)
         if sli.ingest_to_commit_ms is not None:
-            self._ingest_to_commit_ms.append(sli.ingest_to_commit_ms)
-            if len(self._ingest_to_commit_ms) > self.max_samples:
-                del self._ingest_to_commit_ms[: len(self._ingest_to_commit_ms) - self.max_samples]
+            (self._replay_ingest_to_commit_ms if replay else self._ingest_to_commit_ms).append(sli.ingest_to_commit_ms)
 
     def tenant_rates_per_min(self) -> dict[str, int]:
         cutoff = time.monotonic() - 60.0
@@ -225,6 +239,12 @@ class LatencyHistogram:
             "sli_acq_to_commit_max_ms": round(max(self._acq_to_commit_ms), 3) if self._acq_to_commit_ms else None,
             "sli_ingest_to_commit_p50_ms": self._pct(self._ingest_to_commit_ms, 0.50),
             "sli_ingest_to_commit_p95_ms": self._pct(self._ingest_to_commit_ms, 0.95),
+            "sli_replay_acq_to_commit_p50_ms": self._pct(self._replay_acq_to_commit_ms, 0.50),
+            "sli_replay_acq_to_commit_max_ms": (
+                round(max(self._replay_acq_to_commit_ms), 3) if self._replay_acq_to_commit_ms else None
+            ),
+            "sli_replay_ingest_to_commit_p50_ms": self._pct(self._replay_ingest_to_commit_ms, 0.50),
+            "sli_replay_ingest_to_commit_p95_ms": self._pct(self._replay_ingest_to_commit_ms, 0.95),
             "batch_stage_timings_ms": {
                 stage: {"samples": len(values), "p50": self._pct(values, 0.50), "p95": self._pct(values, 0.95)}
                 for stage, values in self._batch_stages.items()
@@ -283,6 +303,7 @@ class _PreparedObs:
     reason_code: str | None
     owned: dict[str, Any]
     ingested_at: datetime
+    lane: str = "live"
 
 
 @dataclass(slots=True)
@@ -298,6 +319,7 @@ class _PendingEnvelope:
     payload: Mapping[str, Any] | None = None
     batch_tenant: UUID | None = None
     delivery_count: int = 0
+    lane: str = "live"
 
 
 class _WakeAll:
@@ -1235,12 +1257,16 @@ class IngestionWorker:
         db_dsn_for_notify: str | None = None,
         enable_gap_sweep: bool = True,
         update_connection_liveness: bool = True,
+        replay_batch_size: int = 500,
     ) -> None:
         self.pg = pg_store
         self.td = tdengine
         self.broker_cfg = broker_cfg
         self.instance_id = instance_id
         self.batch_size = max(1, min(MAX_BATCH_ITEMS, int(batch_size)))
+        # Replay batches are kept small: the event loop is shared with the live lane, and a
+        # large CPU-bound replay batch (decode + SQL building) would delay live commits.
+        self.replay_batch_size = max(1, int(replay_batch_size))
         self._legacy_wake_size = self.batch_size
         self._live_wake_size = self.batch_size
         if broker_cfg is not None:
@@ -1478,6 +1504,7 @@ class IngestionWorker:
                         payload=item,
                         batch_tenant=batch.tenant_id,
                         delivery_count=delivery_count,
+                        lane=lane,
                     )
                 )
             # Each additional item is an observation received inside this message.
@@ -1492,6 +1519,7 @@ class IngestionWorker:
                     ingested_at=ingested_at,
                     future=loop.create_future(),
                     delivery_count=delivery_count,
+                    lane=lane,
                 )
             )
 
@@ -1611,7 +1639,8 @@ class IngestionWorker:
 
     def _take_lane_batch(self, lane: str) -> list[_PendingEnvelope]:
         queue = self._lane_queue(lane)
-        count = min(len(queue), self.batch_size)
+        limit = self.batch_size if lane == LANE_LIVE else min(self.batch_size, self.replay_batch_size)
+        count = min(len(queue), limit)
         return [queue.popleft() for _ in range(count)]
 
     async def _batcher_loop(self) -> None:
@@ -1803,7 +1832,10 @@ class IngestionWorker:
 
         # 1. Envelope decode, validation, origin filter
         decoded_candidates: list[tuple[_PendingEnvelope, CanonicalObservation, datetime, datetime, datetime | None, str, str | None]] = []
-        for env in batch:
+        for index, env in enumerate(batch):
+            if index and index % YIELD_EVERY_ITEMS == 0:
+                # Cooperative yield: let the other lane / consumer callbacks run between chunks.
+                await asyncio.sleep(0)
             try:
                 if env.payload is not None:
                     obs = CanonicalObservation.from_dict(env.payload)
@@ -1973,6 +2005,7 @@ class IngestionWorker:
                 reason_code=reason_code,
                 owned=owned,
                 ingested_at=env.ingested_at,
+                lane=env.lane,
             )
             parsed_per_tenant.setdefault(obs.tenant_id, []).append((env, prep))
 
@@ -2751,7 +2784,7 @@ class IngestionWorker:
             )
             conn_raw = prep.owned.get("connection_id")
             conn_uuid = conn_raw if isinstance(conn_raw, UUID) else (intern_uuid(conn_raw) if conn_raw else None)
-            self.hist.record(tenant_id, sli, connection_id=conn_uuid)
+            self.hist.record(tenant_id, sli, connection_id=conn_uuid, lane=prep.lane)
             self.metrics.acked_total += 1
             if not env.future.done():
                 env.future.set_result(ConsumeOutcome.ACK)

@@ -543,3 +543,101 @@ async def test_operational_history_newest_order_returns_the_end_of_the_window():
     assert [p.value for p in page.items] == [8.0, 9.0]  # R1-A P1-10: not the oldest minutes
     assert "ORDER BY `ts` DESC" in client.query_rows.call_args.args[0]
     assert page.next_cursor is None and page.coverage_notes
+
+
+# ---------------------------------------------------------------------------------------------
+# Round 2
+# ---------------------------------------------------------------------------------------------
+
+def test_model_machine_is_derived_from_rule_references_when_resource_id_is_empty():
+    machine, line = str(uuid4()), str(uuid4())
+    resources = {machine: {"id": machine, "parent_id": line, "name": "AA10-01", "code": "AA10-01", "type_key": "machine"},
+                 line: {"id": line, "parent_id": None, "name": "Line A1", "code": "A1", "type_key": "line"}}
+    spec = {"version": 2, "root": {"type": "object", "children": [
+        {"type": "field", "key": "line_name", "mode": "calculated", "expr": f"{{{{res:{machine}}}}}.@line.@name", "value_type": "string"},
+        {"type": "field", "key": "machine_name", "mode": "calculated", "expr": f"{{{{res:{machine}}}}}.@name", "value_type": "string"},
+    ]}}
+    assert SB.model_resource_id(spec, resources, {}) == machine
+    ctx = SB.resource_context(resources, machine)
+    assert ctx["ancestors"][0]["type_key"] == "line"
+    assert SB.model_resource_id({"version": 2, "root": {"type": "object", "children": []}}, resources, {}) is None
+
+
+def test_parent_given_as_db_dot_stable_wins_over_defaulted_database():
+    sub = SR.subtable_spec_from({"database": "fx_t_default", "stable": "zz_db.st_a", "name": "s"})
+    assert (sub.database, sub.stable) == ("zz_db", "st_a")
+
+
+def test_alter_stable_plan_is_additive_and_validated():
+    service = SR.StorageRevisionService(None)
+    existing = ([SO.ColumnSpec("ts", "TIMESTAMP", role="time_key"), SO.ColumnSpec("v", "DOUBLE")], [SO.TagSpec("m", "VARCHAR", 36)])
+    ddl, errors, _c, _t = service.plan_alter_stable(DB, "st_a", existing, {
+        "add_columns": [{"name": "value_text", "td_type": "VARCHAR(256)"}], "add_tags": [{"name": "zone_ref", "td_type": "VARCHAR", "length": 36}]})
+    assert not errors
+    assert ddl == [f"ALTER STABLE `{DB}`.`st_a` ADD COLUMN `value_text` VARCHAR(256)",
+                   f"ALTER STABLE `{DB}`.`st_a` ADD TAG `zone_ref` VARCHAR(36)"]
+    _ddl, errors, _c, _t = service.plan_alter_stable(DB, "op_int64", existing, {"add_columns": [{"name": "v", "td_type": "DOUBLE"},
+                                                                                              {"name": "x", "td_type": "VARCHAR"}]})
+    assert {e["code"] for e in errors} >= {"SYSTEM_OBJECT", "DUPLICATE_NAME", "LENGTH_REQUIRED"}
+
+
+@pytest.mark.asyncio
+async def test_subtable_plan_can_use_the_parent_spec_before_the_parent_exists(fakedb):
+    service = SR.StorageRevisionService(FakeTd(existing=set()))
+    service.describe = lambda *_a: _empty()  # type: ignore[assignment]
+    spec = _sub_spec(parent_stable_spec={"columns": E1_COLUMNS, "tags": TAGS})
+    plan = await service.plan_draft(FakeSession(), TENANT, None, custom_spec={"kind": "subtable", "spec": spec})
+    assert plan["ddl"][0].startswith(f"CREATE TABLE `{DB}`.`state_aa10_01_status` USING")
+    assert plan["bindings"][0]["target_column"] == "value_i64" and not plan["warnings"]
+
+
+async def _empty():
+    return [], []
+
+
+def test_gap_stats_and_compare_offsets():
+    times = [T0 + timedelta(seconds=s) for s in (0, 1, 2, 30, 31)]
+    g = HSRC.gap_stats(times, T0, T0 + timedelta(seconds=32), 12_000)
+    assert g["gap_count"] == 1 and g["longest_gap_ms"] == 28_000 and 0 < g["coverage_pct"] < 20
+    assert HSRC.gap_stats(times, T0, T0 + timedelta(seconds=32), None)["gap_count"] is None
+    assert HSRC.parse_offset_ms("1d") == 86_400_000 and HSRC.parse_offset_ms("7d") == 604_800_000
+    with pytest.raises(ValueError):
+        HSRC.parse_offset_ms("yesterday")
+
+
+def test_saved_view_query_spec_keeps_tokens_and_drops_sql():
+    from factorix.modules import historian_views as HV
+    from factorix.platform.errors import AppError
+
+    sid = uuid4()
+    spec = HV.normalize_query_spec({"signal_ids": [f"sig:{sid}"], "range": "24h", "sql": "DROP TABLE x", "mode": "recorded"})
+    assert spec == {"range": "24h", "mode": "recorded", "sources": [str(sid)]}
+    with pytest.raises(AppError):
+        HV.normalize_query_spec({"sources": ["not a token;"]})
+
+
+@pytest.mark.asyncio
+async def test_historian_compare_period_shifts_previous_window(monkeypatch):
+    from factorix.modules import historian_service as HS
+
+    sid = uuid4()
+
+    async def fetch_all(_s, sql, p):
+        if "from signal_definitions" in sql.lower():
+            return [{"id": sid, "key": "speed_1", "display_name": "speed_1", "unit": None, "data_type": "float64",
+                     "expected_interval_ms": 1000, "resource_id": None, "resource_name": None}]
+        return []
+
+    async def epoch(_s, _t):
+        return 1
+
+    monkeypatch.setattr(HS, "fetch_all", fetch_all)
+    monkeypatch.setattr(HS, "_active_epoch", epoch)
+    res = await HS.query_historian(object(), TENANT, {"signal_ids": [str(sid)], "start": "2026-11-18T01:00:00Z",
+                                                      "end": "2026-11-18T01:05:00Z", "compare_offset": "1d"},
+                                   history_provider=FakeProvider(FakeHistClient(3)))
+    prev = res["compare"]
+    assert prev["offset_ms"] == 86_400_000 and prev["start"].startswith("2026-11-17T01:00:00")
+    pt = prev["series_list"][0]["points"][0]
+    assert pt["original_ts"] != pt["ts"]
+    assert "gap_count" in res["series_list"][0]["stats"]

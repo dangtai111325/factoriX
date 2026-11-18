@@ -1,7 +1,7 @@
-# ADR-002: TDengine 3.3.6.13 Data Plane, Per-Tenant DBs & Registry Ownership
+# ADR-002: TDengine 3.4 Data Plane, Per-Tenant DBs & Registry Ownership
 
 - **Status:** Accepted
-- **Date:** 2026-11-10
+- **Date:** 2026-11-10 (corrected 2026-11-18, see "Correction")
 - **Decision Drivers:** High-compression TSDB storage replacing 24 GB PG `observations` bloat, strict multi-tenant isolation, safe `CLEAR_TELEMETRY_ONLY` resets, AGPL-3.0 compliance.
 
 ## Context
@@ -15,7 +15,14 @@ Storing all telemetry in monthly PostgreSQL `observations` partitions grew Postg
    - System Operational History STables (`op_float64`, `op_int64`, `op_bool`, `op_string`, `op_json`) auto-populated for live sparklines and model lookbacks.
    - User-managed Storage Design STables/subtables compiled from `factorix.io/storage/v1` AST.
 3. **PG `storage_physical_registry` Ownership:** Every TDengine database/STable/subtable created by FactoriX is registered in PostgreSQL (`tenant_id`, `design_version_id`, `dataset_id`, `signal_id`, `td_database`, `td_stable`, `td_subtable`, `status`). Telemetry resets enumerate exact registered subtables rather than wildcards.
-4. **Network Service Boundary:** Interact exclusively via `taos-ws-py` WebSocket (`:6041`) to a standalone `tdengine:3.3.6.13` Community container.
+4. **Network Service Boundary:** Interact exclusively via `taos-ws-py` WebSocket (`:6041`) to a standalone TDengine Community container (production image `tdengine/tsdb:3.4.3.9`).
+
+## Correction (2026-11-18)
+
+- Production runs **`tdengine/tsdb:3.4.3.9`**; the original text said 3.3.6.13 (still pinned by `docker-compose.test.yml`
+  as `tdengine/tdengine:3.3.6.13`, CT-15).
+- Physical objects are registered in `storage_objects` (ADR-012); the logical `storage_physical_registry` of point 3
+  is still written by the design publish path. Unifying the two registries is Phase C5 (ADR-017).
 
 ## Consequences
 

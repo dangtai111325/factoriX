@@ -91,6 +91,7 @@ class SeriesSource:
     resource_name: str | None = None
     notes: list[str] = field(default_factory=list)
     snapshot_group: UUID | None = None
+    expected_interval_ms: int | None = None
 
 
 def parse_source_token(token: Any, kind_hint: str | None = None) -> SeriesSource | None:
@@ -266,3 +267,43 @@ def snapshot_points(records: list[Any], path: str, start: datetime, end: datetim
         out.append({"ts": ts, "value": value, "quality": "BAD" if bad else None})
     out.sort(key=lambda r: r["ts"])
     return out
+
+
+_OFFSET = re.compile(r"^\s*(\d+)\s*(s|m|h|d|w)\s*$", re.IGNORECASE)
+_UNIT_MS = {"s": 1_000, "m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
+
+
+def parse_offset_ms(raw: Any) -> int | None:
+    """``"1d"``, ``"7d"``, ``"1h"``, ``"30m"`` or milliseconds -> milliseconds (compare periods)."""
+    if raw in (None, "", 0):
+        return None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return int(raw) if raw > 0 else None
+    m = _OFFSET.match(str(raw))
+    if not m:
+        raise ValueError(f"'{raw}' is not an offset like 1h, 1d or 7d")
+    return int(m.group(1)) * _UNIT_MS[m.group(2).lower()]
+
+
+def gap_stats(times: list[datetime], start: datetime, end: datetime, threshold_ms: int | None) -> dict[str, Any]:
+    """Gaps = intervals between consecutive points (and the window edges) longer than ``threshold_ms``.
+
+    ``coverage_pct`` is the share of the window not inside a gap. Returns ``None`` values when no
+    threshold applies (sparse change-only series have no notion of "missing samples").
+    """
+    if not threshold_ms:
+        return {"gap_count": None, "longest_gap_ms": None, "coverage_pct": None}
+    window_ms = max(1.0, (end - start).total_seconds() * 1000.0)
+    edges = [start, *sorted(times), end]
+    gaps = []
+    for a, b in zip(edges, edges[1:], strict=False):
+        d = (b - a).total_seconds() * 1000.0
+        if d > threshold_ms:
+            gaps.append(d)
+    if not times:
+        return {"gap_count": 1, "longest_gap_ms": int(window_ms), "coverage_pct": 0.0}
+    return {
+        "gap_count": len(gaps),
+        "longest_gap_ms": int(max(gaps)) if gaps else 0,
+        "coverage_pct": round(max(0.0, 100.0 * (1.0 - sum(gaps) / window_ms)), 1),
+    }

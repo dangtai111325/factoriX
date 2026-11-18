@@ -153,6 +153,12 @@ async def test_corrupt_and_backpressure_rows_handled_cleanly(spool: AcquisitionS
     assert acked == 1 and failed is True
     assert spool.count_by_state() == {"ACKED": 1, "QUARANTINED": 1, "PENDING": 1}
 
+    # Backpressure makes the replay controller back off instead of hammering the full queue.
+    assert await pub.flush_once(budget_s=0) == (0, False)
+    assert pub.replay.controller.reason == "broker backpressure"
+    pub.ingest_backpressure = False
+    pub.replay.controller.paused_until = 0.0
+    pub.replay.controller.tokens = 1000.0
     acked2, failed2 = await pub.flush_once(budget_s=5)
     assert acked2 == 0 and failed2 is True
     # Queue-full backpressure is never an outage and never turns a pending row DEAD.

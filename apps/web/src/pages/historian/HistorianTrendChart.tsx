@@ -1,754 +1,596 @@
-import React, { useMemo, useRef, useState } from 'react';
+/**
+ * Historian trend chart (plain SVG, like the other charts of the app — no chart library).
+ *
+ * - One Y axis per unit: overlay (axes alternate left/right) or "split by unit" lanes with a shared time axis.
+ * - Numbers: line for raw readings, step-after for recorded/reconstructed and integer (state/counter) series,
+ *   min/max band for downsampled buckets, dots on recorded rows; lines break at gaps (never bridged).
+ * - Text / boolean / JSON: a state band (value per period), never a fake numeric line.
+ * - Per-series quality lane (Good / Uncertain / Stale / Bad / no data) and an events lane.
+ * - Hover crosshair + tooltip with every series' value and quality; drag to zoom (brush); click a point to inspect.
+ * - Compare period: the same series shifted onto this axis, dashed.
+ */
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
-  Activity,
-  AlertTriangle,
-  CheckCircle2,
-  Clock,
-  GitCommit,
-  Info,
-  Layers,
-  ShieldAlert,
-} from 'lucide-react';
-import { StatusBadge } from '../../components/common/StatusBadge';
-import { formatTimestamp, formatValue } from '../../lib/format';
-import {
-  HistorianEventItem,
+  ChartLayout,
+  formatClock,
+  formatDateTime,
+  formatNumber,
+  formatValue,
+  Gap,
   HistorianMode,
-  HistorianPoint,
-  HistorianSeriesData,
-  QualitySegment,
-} from './types';
+  Pt,
+  qualitySegments,
+  Series,
+  TZ_LABEL,
+  valueAt,
+} from './historianModel';
 
-interface HistorianTrendChartProps {
-  seriesList: HistorianSeriesData[];
-  events: HistorianEventItem[];
-  mode: HistorianMode;
-  startMs: number;
-  endMs: number;
-  loading: boolean;
-  hiddenSignalIds: Set<string>;
-  onToggleSeriesVisibility: (signalId: string) => void;
-  onSelectPoint?: (pt: HistorianPoint) => void;
+export interface ChartMarker {
+  t: number;
+  kind: 'reset' | 'quality' | 'gap' | 'storage';
+  label: string;
 }
 
-const QUALITY_BAR_COLOR: Record<QualitySegment['quality'], string> = {
+interface Props {
+  series: Series[];
+  compareSeries: Series[];
+  compareLabel?: string;
+  mode: HistorianMode;
+  layout: ChartLayout;
+  startMs: number;
+  endMs: number;
+  markers: ChartMarker[];
+  gapsBySeries: Map<string, Gap[]>;
+  loading?: boolean;
+  onBrush: (startMs: number, endMs: number) => void;
+  onPick: (s: Series, p: Pt) => void;
+}
+
+export const QUALITY_COLORS: Record<string, string> = {
   GOOD: '#0DBA67',
   UNCERTAIN: '#F59E0B',
-  STALE: '#64748B',
+  STALE: '#94A3B8',
   BAD: '#EF4444',
+  GAP: '#E2E8F0',
 };
+const QUALITY_NAMES: Record<string, string> = { GOOD: 'Good', UNCERTAIN: 'Uncertain', STALE: 'Stale', BAD: 'Bad', GAP: 'No data' };
+const MARKER_COLORS: Record<ChartMarker['kind'], string> = { reset: '#EF1B24', quality: '#F59E0B', gap: '#94A3B8', storage: '#2A82E7' };
+const STATE_FILLS = ['#DBEAFE', '#DCFCE7', '#FEF3C7', '#F3E8FF', '#CFFAFE', '#FCE7F3', '#ECFCCB', '#FFE4E6', '#E0E7FF', '#F1F5F9'];
 
-export const HistorianTrendChart: React.FC<HistorianTrendChartProps> = ({
-  seriesList,
-  events,
+function hashIdx(s: string, n: number): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h) % n;
+}
+
+function niceTicks(min: number, max: number, count = 5): { lo: number; hi: number; ticks: number[] } {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return { lo: 0, hi: 1, ticks: [0, 1] };
+  if (min === max) {
+    const d = Math.abs(min) * 0.1 || 1;
+    min -= d;
+    max += d;
+  }
+  const raw = (max - min) / Math.max(1, count - 1);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw) || 10 * mag;
+  const lo = Math.floor(min / step) * step;
+  const hi = Math.ceil(max / step) * step;
+  const ticks: number[] = [];
+  for (let v = lo; v <= hi + step / 2; v += step) ticks.push(Number(v.toPrecision(12)));
+  return { lo, hi, ticks };
+}
+
+const TIME_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800].map((s) => s * 1000);
+
+function timeTicks(start: number, end: number, width: number): { ticks: number[]; step: number } {
+  const want = Math.max(3, Math.floor(width / 110));
+  const span = Math.max(1, end - start);
+  const step = TIME_STEPS.find((s) => span / s <= want) || TIME_STEPS[TIME_STEPS.length - 1];
+  const tzOff = new Date(start).getTimezoneOffset() * 60000;
+  const first = Math.ceil((start - tzOff) / step) * step + tzOff;
+  const ticks: number[] = [];
+  for (let t = first; t <= end; t += step) ticks.push(t);
+  return { ticks, step };
+}
+
+function tickLabel(t: number, step: number, span: number): string {
+  const d = new Date(t);
+  const md = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  if (step >= 86400e3) return md;
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const clock = step < 60e3 ? `${hm}:${String(d.getSeconds()).padStart(2, '0')}` : hm;
+  if (span > 86400e3 || (d.getHours() === 0 && d.getMinutes() === 0 && step >= 3600e3)) return `${md} ${hm}`;
+  return clock;
+}
+
+interface Axis {
+  unit: string;
+  color: string;
+  lo: number;
+  hi: number;
+  ticks: number[];
+  side: 'left' | 'right';
+  slot: number;
+}
+
+interface Lane {
+  kind: 'numeric' | 'state';
+  top: number;
+  height: number;
+  axes: Axis[];
+  axisOf: Map<string, Axis>;
+  series: Series[];
+}
+
+export const HistorianTrendChart: React.FC<Props> = ({
+  series,
+  compareSeries,
+  compareLabel,
   mode,
+  layout,
   startMs,
   endMs,
+  markers,
+  gapsBySeries,
   loading,
-  hiddenSignalIds,
-  onToggleSeriesVisibility,
-  onSelectPoint,
+  onBrush,
+  onPick,
 }) => {
-  const svgRef = useRef<SVGSVGElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(900);
   const [hoverX, setHoverX] = useState<number | null>(null);
-  const [hoverTimeMs, setHoverTimeMs] = useState<number | null>(null);
-  const [selectedEvent, setSelectedEvent] = useState<HistorianEventItem | null>(null);
+  const [hoverY, setHoverY] = useState<number>(0);
+  const [drag, setDrag] = useState<{ x0: number; x1: number } | null>(null);
 
-  const visibleSeries = useMemo(
-    () => seriesList.filter((s) => !hiddenSignalIds.has(s.signal.id)),
-    [seriesList, hiddenSignalIds],
-  );
+  useLayoutEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const apply = () => setWidth(Math.max(300, Math.floor(el.clientWidth)));
+    apply();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
-  const width = 920;
-  const height = 280;
-  const padLeft = 58;
-  const padRight = 54;
-  const padTop = 22;
-  const padBottom = 30;
-  const plotWidth = width - padLeft - padRight;
-  const plotHeight = height - padTop - padBottom;
+  const narrow = width < 640;
+  const axisW = narrow ? 42 : 54;
+  const numeric = series.filter((s) => !s.discrete);
+  const discrete = series.filter((s) => s.discrete);
 
-  const effStartMs = useMemo(() => {
-    const allPts = seriesList.flatMap((s) => s.points);
-    if (allPts.length === 0) return startMs;
-    return Math.min(startMs, ...allPts.map((p) => p.timestampMs));
-  }, [seriesList, startMs]);
-
-  const effEndMs = useMemo(() => {
-    const allPts = seriesList.flatMap((s) => s.points);
-    if (allPts.length === 0) return endMs;
-    return Math.max(endMs, ...allPts.map((p) => p.timestampMs));
-  }, [seriesList, endMs]);
-
-  const timeSpan = Math.max(1000, effEndMs - effStartMs);
-
-  const getX = (ms: number) => {
-    const clamped = Math.max(effStartMs, Math.min(effEndMs, ms));
-    return padLeft + ((clamped - effStartMs) / timeSpan) * plotWidth;
-  };
-
-  // Multi-axis scaling by unit group so series with different units don't distort each other
-  const unitAxes = useMemo(() => {
-    const map = new Map<
-      string,
-      { unit: string; min: number; max: number; span: number; isDiscrete: boolean; discreteLabels: string[] }
-    >();
-
-    for (const s of visibleSeries) {
-      const unitKey = s.isDiscrete ? `__discrete_${s.signal.id}` : (s.signal.unit || 'default');
-      if (s.isDiscrete) {
-        const distinct = Array.from(
-          new Set(
-            s.points
-              .filter((p) => p.value !== null && p.value !== undefined)
-              .map((p) => String(p.value)),
-          ),
-        );
-        if (distinct.length === 0) distinct.push('false', 'true');
-        map.set(unitKey, {
-          unit: s.signal.unit || 'state',
-          min: 0,
-          max: Math.max(1, distinct.length - 1),
-          span: Math.max(1, distinct.length - 1),
-          isDiscrete: true,
-          discreteLabels: distinct,
+  const layoutInfo = useMemo(() => {
+    // Unit groups (series with the same unit share one axis; never one axis for different units).
+    const groups = new Map<string, Series[]>();
+    for (const s of numeric) {
+      const k = s.unit || '(no unit)';
+      groups.set(k, [...(groups.get(k) || []), s]);
+    }
+    const groupList = Array.from(groups.entries());
+    const range = (list: Series[]) => {
+      let lo = Infinity;
+      let hi = -Infinity;
+      const all = [...list, ...compareSeries.filter((c) => list.some((s) => s.token === c.token))];
+      for (const s of all)
+        for (const p of s.points) {
+          if (p.t < startMs || p.t > endMs) continue;
+          const a = p.min != null ? p.min : p.v;
+          const b = p.max != null ? p.max : p.v;
+          if (a != null && a < lo) lo = a;
+          if (b != null && b > hi) hi = b;
+        }
+      return lo === Infinity ? { lo: 0, hi: 1 } : { lo, hi };
+    };
+    const lanes: Lane[] = [];
+    let top = 22;
+    let leftSlots = 0;
+    let rightSlots = 0;
+    if (groupList.length) {
+      if (layout === 'overlay' || groupList.length === 1) {
+        const h = narrow ? 230 : 300;
+        const axes: Axis[] = groupList.map(([unit, list], i) => {
+          const r = range(list);
+          const nt = niceTicks(r.lo, r.hi, narrow ? 4 : 6);
+          const side: Axis['side'] = i % 2 === 0 ? 'left' : 'right';
+          const slot = Math.floor(i / 2);
+          if (side === 'left') leftSlots = Math.max(leftSlots, slot + 1);
+          else rightSlots = Math.max(rightSlots, slot + 1);
+          return { unit, color: list[0].color, ...nt, side, slot };
         });
+        const axisOf = new Map<string, Axis>();
+        groupList.forEach(([, list], i) => list.forEach((s) => axisOf.set(s.token, axes[i])));
+        lanes.push({ kind: 'numeric', top, height: h, axes, axisOf, series: numeric });
+        top += h + 14;
       } else {
-        const nums = s.points
-          .filter((p) => p.numericValue !== null && Number.isFinite(p.numericValue))
-          .map((p) => p.numericValue as number);
-        if (nums.length === 0) continue;
-        const sMin = Math.min(...nums);
-        const sMax = Math.max(...nums);
-        const existing = map.get(unitKey);
-        if (!existing) {
-          const pad = sMax === sMin ? Math.max(1, Math.abs(sMin) * 0.1) : (sMax - sMin) * 0.08;
-          const min = sMin - pad;
-          const max = sMax + pad;
-          map.set(unitKey, {
-            unit: s.signal.unit || '',
-            min,
-            max,
-            span: Math.max(1e-6, max - min),
-            isDiscrete: false,
-            discreteLabels: [],
-          });
-        } else {
-          const rawMin = Math.min(existing.min, sMin);
-          const rawMax = Math.max(existing.max, sMax);
-          const span = Math.max(1e-6, rawMax - rawMin);
-          map.set(unitKey, {
-            ...existing,
-            min: rawMin,
-            max: rawMax,
-            span,
-          });
+        leftSlots = 1;
+        const h = groupList.length <= 2 ? (narrow ? 180 : 210) : narrow ? 140 : 160;
+        for (const [unit, list] of groupList) {
+          const r = range(list);
+          const nt = niceTicks(r.lo, r.hi, 4);
+          const ax: Axis = { unit, color: list[0].color, ...nt, side: 'left', slot: 0 };
+          lanes.push({ kind: 'numeric', top, height: h, axes: [ax], axisOf: new Map(list.map((s) => [s.token, ax])), series: list });
+          top += h + 28;
         }
       }
     }
-    return map;
-  }, [visibleSeries]);
-
-  const primaryAxis = useMemo(() => {
-    for (const ax of unitAxes.values()) {
-      if (!ax.isDiscrete) return ax;
+    for (const s of discrete) {
+      lanes.push({ kind: 'state', top: top + 6, height: 30, axes: [], axisOf: new Map(), series: [s] });
+      top += 30 + 14;
     }
-    const first = unitAxes.values().next().value;
-    return (
-      first || {
-        unit: '',
-        min: 0,
-        max: 100,
-        span: 100,
-        isDiscrete: false,
-        discreteLabels: [],
+    if (!leftSlots) leftSlots = discrete.length ? 1 : 0;
+    const padLeft = 10 + Math.max(1, leftSlots) * axisW;
+    const padRight = 14 + rightSlots * axisW;
+    const qualityTop = top + 4;
+    const qualityRow = 7;
+    const qualityH = series.length * (qualityRow + 3);
+    const eventsTop = qualityTop + qualityH + 6;
+    const eventsH = 16;
+    const xAxisTop = eventsTop + eventsH + 2;
+    const height = xAxisTop + 26;
+    return { lanes, padLeft, padRight, qualityTop, qualityRow, eventsTop, eventsH, xAxisTop, height };
+  }, [numeric, discrete, compareSeries, layout, narrow, axisW, series.length, startMs, endMs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const { lanes, padLeft, padRight, qualityTop, qualityRow, eventsTop, eventsH, xAxisTop, height } = layoutInfo;
+  const plotW = Math.max(50, width - padLeft - padRight);
+  const span = Math.max(1, endMs - startMs);
+  const x = (t: number) => padLeft + ((t - startMs) / span) * plotW;
+  const tAt = (px: number) => startMs + ((px - padLeft) / plotW) * span;
+  const yOf = (lane: Lane, ax: Axis, v: number) => lane.top + lane.height - ((v - ax.lo) / Math.max(1e-12, ax.hi - ax.lo)) * lane.height;
+  const plotBottom = lanes.length ? lanes[lanes.length - 1].top + lanes[lanes.length - 1].height : qualityTop;
+
+  const xt = timeTicks(startMs, endMs, plotW);
+
+  const stepFor = (s: Series) => mode !== 'operational' || s.integer || s.token.startsWith('mod:') || s.token.startsWith('subtable:');
+
+  /** Path for one numeric series; breaks at nulls and gaps. */
+  const linePath = (lane: Lane, s: Series): { d: string; band: string; dots: [number, number][] } => {
+    const ax = lane.axisOf.get(s.token);
+    if (!ax) return { d: '', band: '', dots: [] };
+    const step = stepFor(s);
+    const gaps = gapsBySeries.get(s.token) || [];
+    const gapStarts = new Set(gaps.map((g) => g.startMs));
+    let d = '';
+    let open = false;
+    const bandTop: string[] = [];
+    const bandBot: string[] = [];
+    const dots: [number, number][] = [];
+    const pts = s.points;
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      if (p.v == null) {
+        open = false;
+        continue;
       }
-    );
-  }, [unitAxes]);
-
-  const secondaryAxis = useMemo(() => {
-    let count = 0;
-    for (const ax of unitAxes.values()) {
-      if (!ax.isDiscrete) {
-        count += 1;
-        if (count === 2) return ax;
+      const px = x(p.t);
+      const py = yOf(lane, ax, p.v);
+      if (!open) {
+        d += `M${px.toFixed(1)},${py.toFixed(1)}`;
+        open = true;
+      } else if (step) {
+        d += `H${px.toFixed(1)}V${py.toFixed(1)}`;
+      } else d += `L${px.toFixed(1)},${py.toFixed(1)}`;
+      if (p.min != null && p.max != null) {
+        bandTop.push(`${px.toFixed(1)},${yOf(lane, ax, p.max).toFixed(1)}`);
+        bandBot.unshift(`${px.toFixed(1)},${yOf(lane, ax, p.min).toFixed(1)}`);
+      }
+      if (mode === 'recorded' && pts.length <= 600) dots.push([px, py]);
+      const next = pts[i + 1];
+      if (gapStarts.has(p.t)) {
+        // the source went silent after this row: never bridge the gap
+        open = false;
+      } else if (step && !next && !s.compare) {
+        d += `H${Math.min(x(endMs), plotW + padLeft).toFixed(1)}`;
       }
     }
-    return null;
-  }, [unitAxes]);
-
-  const getPointY = (s: HistorianSeriesData, pt: HistorianPoint): number | null => {
-    if (pt.value === null || pt.value === undefined) return null;
-    const unitKey = s.isDiscrete ? `__discrete_${s.signal.id}` : (s.signal.unit || 'default');
-    const axis = unitAxes.get(unitKey) || primaryAxis;
-    if (s.isDiscrete) {
-      const idx = Math.max(0, axis.discreteLabels.indexOf(String(pt.value)));
-      const norm = axis.discreteLabels.length <= 1 ? 0.5 : idx / (axis.discreteLabels.length - 1);
-      return padTop + plotHeight - norm * plotHeight;
-    }
-    if (pt.numericValue === null || !Number.isFinite(pt.numericValue)) return null;
-    const norm = (pt.numericValue - axis.min) / axis.span;
-    return padTop + plotHeight - Math.max(0, Math.min(1, norm)) * plotHeight;
+    const band = bandTop.length > 1 ? `M${bandTop.join('L')}L${bandBot.join('L')}Z` : '';
+    return { d, band, dots };
   };
 
-  // Build SVG path per series with truthful gap handling and step-after for discrete / reconstructed
-  const renderedPaths = useMemo(() => {
-    return visibleSeries.map((s) => {
-      const sorted = [...s.points].sort((a, b) => a.timestampMs - b.timestampMs);
-      const useStep = s.isDiscrete || mode === 'reconstructed';
-      const segments: string[] = [];
-      const circles: Array<{
-        pt: HistorianPoint;
-        x: number;
-        y: number;
-      }> = [];
-
-      let prevX: number | null = null;
-      let prevY: number | null = null;
-
-      for (const pt of sorted) {
-        const upperQ = (pt.quality || 'GOOD').toUpperCase();
-        const isGap =
-          pt.value === null ||
-          pt.value === undefined ||
-          upperQ === 'STALE' ||
-          upperQ === 'BAD' ||
-          pt.recordKind === 'gap_marker';
-
-        if (isGap) {
-          // If step-hold reconstructed transitions into a gap, extend horizontal hold up to gap timestamp, then break!
-          if (useStep && prevX !== null && prevY !== null) {
-            const gapX = getX(pt.timestampMs);
-            segments.push(`L ${gapX.toFixed(1)} ${prevY.toFixed(1)}`);
-          }
-          prevX = null;
-          prevY = null;
-          continue;
-        }
-
-        const y = getPointY(s, pt);
-        if (y === null) {
-          prevX = null;
-          prevY = null;
-          continue;
-        }
-        const x = getX(pt.timestampMs);
-        if (prevX === null || prevY === null) {
-          segments.push(`M ${x.toFixed(1)} ${y.toFixed(1)}`);
-        } else if (useStep) {
-          segments.push(`L ${x.toFixed(1)} ${prevY.toFixed(1)} L ${x.toFixed(1)} ${y.toFixed(1)}`);
-        } else {
-          segments.push(`L ${x.toFixed(1)} ${y.toFixed(1)}`);
-        }
-        prevX = x;
-        prevY = y;
-        circles.push({ pt, x, y });
-      }
-
-      return {
-        series: s,
-        pathD: segments.join(' '),
-        circles,
-        useStep,
-      };
-    });
-  }, [visibleSeries, mode, effStartMs, effEndMs, unitAxes]);
-
-  // Nearest point per visible series at hoverTimeMs
-  const hoverDetails = useMemo(() => {
-    if (hoverTimeMs === null) return [];
-    return visibleSeries.map((s) => {
-      if (s.points.length === 0) return { series: s, point: null };
-      let best = s.points[0];
-      let bestDist = Math.abs(best.timestampMs - hoverTimeMs);
-      for (const pt of s.points) {
-        const dist = Math.abs(pt.timestampMs - hoverTimeMs);
-        if (dist < bestDist) {
-          best = pt;
-          bestDist = dist;
-        }
-      }
-      return { series: s, point: best };
-    });
-  }, [hoverTimeMs, visibleSeries]);
-
-  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    const svg = svgRef.current;
-    if (!svg) return;
-    const rect = svg.getBoundingClientRect();
-    const relX = ((e.clientX - rect.left) / rect.width) * width;
-    if (relX < padLeft || relX > width - padRight) {
-      setHoverX(null);
-      setHoverTimeMs(null);
+  // ------------------------------------------------------------------ interaction
+  const localXY = (e: React.PointerEvent) => {
+    const r = (e.currentTarget as SVGElement).closest('svg')!.getBoundingClientRect();
+    return { px: e.clientX - r.left, py: e.clientY - r.top };
+  };
+  const onDown = (e: React.PointerEvent<SVGRectElement>) => {
+    if (e.button !== 0) return;
+    const { px } = localXY(e);
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    setDrag({ x0: px, x1: px });
+  };
+  const onMove = (e: React.PointerEvent<SVGRectElement>) => {
+    const { px, py } = localXY(e);
+    setHoverX(Math.max(padLeft, Math.min(padLeft + plotW, px)));
+    setHoverY(py);
+    if (drag) setDrag({ ...drag, x1: Math.max(padLeft, Math.min(padLeft + plotW, px)) });
+  };
+  const onUp = (e: React.PointerEvent<SVGRectElement>) => {
+    const { px, py } = localXY(e);
+    const d = drag;
+    setDrag(null);
+    if (!d) return;
+    if (Math.abs(px - d.x0) > 6) {
+      const a = tAt(Math.min(px, d.x0));
+      const b = tAt(Math.max(px, d.x0));
+      if (b - a >= 1000) onBrush(Math.round(a), Math.round(b));
       return;
     }
-    setHoverX(relX);
-    const ratio = (relX - padLeft) / plotWidth;
-    setHoverTimeMs(Math.round(effStartMs + ratio * timeSpan));
-  };
-
-  const handleMouseLeave = () => {
-    setHoverX(null);
-    setHoverTimeMs(null);
-  };
-
-  // Shaded BAD / STALE gap bands across the chart
-  const gapBands = useMemo(() => {
-    const bands: Array<{ startX: number; width: number; quality: 'STALE' | 'BAD' }> = [];
-    for (const s of visibleSeries) {
-      for (const seg of s.qualitySegments) {
-        if (seg.quality === 'STALE' || seg.quality === 'BAD') {
-          const x1 = getX(seg.startMs);
-          const x2 = getX(seg.endMs);
-          if (x2 - x1 >= 2) {
-            bands.push({ startX: x1, width: x2 - x1, quality: seg.quality });
-          }
-        }
-      }
+    // Click: inspect the nearest point of the lane under the pointer.
+    const t = tAt(px);
+    const lane = lanes.find((l) => py >= l.top - 6 && py <= l.top + l.height + 6) || lanes[0];
+    if (!lane) return;
+    let best: { s: Series; p: Pt; dist: number } | null = null;
+    for (const s of lane.series) {
+      const p = valueAt(s, t, lane.kind === 'state' || stepFor(s));
+      if (!p) continue;
+      const ax = lane.axisOf.get(s.token);
+      const dist = lane.kind === 'state' || !ax || p.v == null ? Math.abs(x(p.t) - px) : Math.hypot(x(p.t) - px, yOf(lane, ax, p.v) - py);
+      if (!best || dist < best.dist) best = { s, p, dist };
     }
-    return bands.slice(0, 40);
-  }, [visibleSeries, effStartMs, effEndMs]);
+    if (best) onPick(best.s, best.p);
+  };
+
+  useEffect(() => {
+    if (!drag) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') setDrag(null);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [drag]);
+
+  const hoverT = hoverX != null ? tAt(hoverX) : null;
+  const tooltipRows =
+    hoverT != null && !drag
+      ? series.map((s) => {
+          const p = valueAt(s, hoverT, s.discrete || stepFor(s));
+          const c = compareSeries.find((cs) => cs.token === s.token);
+          const cp = c ? valueAt(c, hoverT, s.discrete || stepFor(s)) : null;
+          return { s, p, cp };
+        })
+      : [];
+
+  const tipLeft = hoverX != null ? (hoverX > width - 300 ? Math.max(4, hoverX - 290) : hoverX + 14) : 0;
+  const svgLabel = `Trend of ${series.length} series from ${formatDateTime(startMs)} to ${formatDateTime(endMs)} (${TZ_LABEL}). Use the Records tab for the values as a table.`;
 
   return (
-    <div className="space-y-3">
-      {/* Main Multi-Series Trend Chart Card */}
-      <div className="bg-white border border-[#E3EAF3] rounded-xl p-4 shadow-xs space-y-3">
-        {/* Legend & Series Toggles */}
-        <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-[#E3EAF3]">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-[13px] font-bold text-[#111B37] mr-1">Multi-Series Trend</span>
-            {seriesList.map((s) => {
-              const hidden = hiddenSignalIds.has(s.signal.id);
-              const sigLabel = s.signal.displayName || s.signal.name || s.signal.key || s.signal.id;
-              return (
-                <button
-                  key={s.signal.id}
-                  type="button"
-                  onClick={() => onToggleSeriesVisibility(s.signal.id)}
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold border transition-all ${
-                    hidden
-                      ? 'bg-slate-50 text-[#94A3B8] border-slate-200 line-through'
-                      : 'bg-[#F6F8FC] text-[#111B37] border-[#D4DFEC] hover:border-[#94A3B8]'
-                  }`}
-                  title={hidden ? `Show ${sigLabel}` : `Hide ${sigLabel}`}
-                >
-                  <span
-                    className="w-2.5 h-2.5 rounded-full shrink-0"
-                    style={{ backgroundColor: hidden ? '#CBD5E1' : s.color }}
-                  />
-                  <span className="truncate max-w-[160px]">{sigLabel}</span>
-                  <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-white border border-[#E3EAF3] text-[#657794]">
-                    {s.isDiscrete ? 'STEP' : mode === 'reconstructed' ? 'STEP-HOLD' : 'LINE'}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="flex items-center gap-2 text-[11px] text-[#657794]">
-            {secondaryAxis && (
-              <span className="px-2 py-0.5 rounded bg-blue-50 text-blue-700 font-semibold border border-blue-200">
-                Multi-Axis ({primaryAxis.unit || 'num'} / {secondaryAxis.unit || 'num'})
-              </span>
-            )}
-            <span className="font-mono">
-              {new Date(effStartMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-              {' – '}
-              {new Date(effEndMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-            </span>
-          </div>
-        </div>
-
-        {/* SVG Canvas */}
-        {seriesList.length === 0 ? (
-          <div className="h-64 flex flex-col items-center justify-center text-center p-6 bg-[#F6F8FC] rounded-lg border border-dashed border-[#D4DFEC]">
-            <Activity className="w-8 h-8 text-[#94A3B8] mb-2" />
-            <div className="text-[13px] font-bold text-[#111B37]">No Series Selected</div>
-            <p className="text-[12px] text-[#657794] max-w-md mt-1">
-              Select up to 8 signals or a published storage dataset from the left picker to inspect historical trends,
-              quality lanes, and state transitions.
-            </p>
-          </div>
-        ) : (
-          <div className="relative">
-            <svg
-              ref={svgRef}
-              viewBox={`0 0 ${width} ${height}`}
-              className="w-full h-[270px] select-none cursor-crosshair overflow-visible"
-              onMouseMove={handleMouseMove}
-              onMouseLeave={handleMouseLeave}
-            >
-              {/* Shaded STALE / BAD intervals (HIS-02: never fabricate continuous GOOD across gaps) */}
-              {gapBands.map((band, idx) => (
-                <rect
-                  key={idx}
-                  x={band.startX}
-                  y={padTop}
-                  width={band.width}
-                  height={plotHeight}
-                  fill={band.quality === 'BAD' ? 'rgba(239, 68, 68, 0.08)' : 'rgba(100, 116, 139, 0.08)'}
-                />
-              ))}
-
-              {/* Horizontal Gridlines & Primary Y-Axis Labels */}
-              {[0, 0.25, 0.5, 0.75, 1].map((pct, idx) => {
-                const y = padTop + plotHeight - pct * plotHeight;
-                const label = primaryAxis.isDiscrete
-                  ? primaryAxis.discreteLabels[Math.round(pct * (primaryAxis.discreteLabels.length - 1))] || ''
-                  : (primaryAxis.min + pct * primaryAxis.span).toFixed(1);
-                const rightLabel = secondaryAxis
-                  ? (secondaryAxis.min + pct * secondaryAxis.span).toFixed(1)
-                  : null;
-
-                return (
-                  <g key={idx}>
-                    <line
-                      x1={padLeft}
-                      y1={y}
-                      x2={width - padRight}
-                      y2={y}
-                      stroke="#E3EAF3"
-                      strokeDasharray={idx === 0 || idx === 4 ? undefined : '4 4'}
-                    />
-                    <text
-                      x={padLeft - 8}
-                      y={y + 3}
-                      textAnchor="end"
-                      fill="#657794"
-                      fontSize="10"
-                      fontFamily="monospace"
-                    >
-                      {label}
-                    </text>
-                    {rightLabel && (
+    <div ref={wrapRef} className="relative w-full select-none" onPointerLeave={() => setHoverX(null)}>
+      <svg width={width} height={height} role="img" aria-label={svgLabel} className="block">
+        {/* lanes */}
+        {lanes.map((lane, li) => (
+          <g key={li}>
+            {lane.kind === 'numeric' && (
+              <>
+                <rect x={padLeft} y={lane.top} width={plotW} height={lane.height} fill="#FFFFFF" stroke="#E3EAF3" />
+                {/* grid + axes */}
+                {lane.axes.map((ax, ai) => {
+                  const ax0 = ax.side === 'left' ? padLeft - ax.slot * axisW : padLeft + plotW + ax.slot * axisW;
+                  return (
+                    <g key={ai}>
+                      {ax.ticks.map((tv) => {
+                        const y = yOf(lane, ax, tv);
+                        if (y < lane.top - 1 || y > lane.top + lane.height + 1) return null;
+                        return (
+                          <g key={tv}>
+                            {ai === 0 && <line x1={padLeft} x2={padLeft + plotW} y1={y} y2={y} stroke="#F1F5FA" />}
+                            <text
+                              x={ax.side === 'left' ? ax0 - 6 : ax0 + 6}
+                              y={y + 3.5}
+                              textAnchor={ax.side === 'left' ? 'end' : 'start'}
+                              fontSize={11}
+                              fill={lane.axes.length > 1 ? ax.color : '#657794'}
+                              className="tabular-nums"
+                            >
+                              {formatNumber(tv)}
+                            </text>
+                          </g>
+                        );
+                      })}
+                      <line x1={ax0} x2={ax0} y1={lane.top} y2={lane.top + lane.height} stroke={lane.axes.length > 1 ? ax.color : '#CBD5E1'} strokeOpacity={0.6} />
                       <text
-                        x={width - padRight + 8}
-                        y={y + 3}
-                        textAnchor="start"
-                        fill="#657794"
-                        fontSize="10"
-                        fontFamily="monospace"
+                        x={ax.side === 'left' ? ax0 - 6 : ax0 + 6}
+                        y={lane.top - 8}
+                        textAnchor={ax.side === 'left' ? 'end' : 'start'}
+                        fontSize={10}
+                        fontWeight={700}
+                        fill={lane.axes.length > 1 ? ax.color : '#657794'}
                       >
-                        {rightLabel}
+                        {ax.unit}
                       </text>
-                    )}
+                    </g>
+                  );
+                })}
+                {/* vertical time grid */}
+                {xt.ticks.map((t) => (
+                  <line key={t} x1={x(t)} x2={x(t)} y1={lane.top} y2={lane.top + lane.height} stroke="#F5F7FA" />
+                ))}
+                <clipPath id={`clip-${li}`}>
+                  <rect x={padLeft} y={lane.top - 2} width={plotW} height={lane.height + 4} />
+                </clipPath>
+                <g clipPath={`url(#clip-${li})`}>
+                  {/* compare period (dashed, behind) */}
+                  {compareSeries
+                    .filter((c) => lane.axisOf.has(c.token))
+                    .map((c) => {
+                      const { d } = linePath(lane, c);
+                      return d ? <path key={`cmp-${c.token}`} d={d} fill="none" stroke={c.color} strokeWidth={1.4} strokeDasharray="5 4" strokeOpacity={0.55} /> : null;
+                    })}
+                  {lane.series.map((s) => {
+                    const { d, band, dots } = linePath(lane, s);
+                    return (
+                      <g key={s.token}>
+                        {band && <path d={band} fill={s.color} fillOpacity={0.12} stroke="none" />}
+                        {d && <path d={d} fill="none" stroke={s.color} strokeWidth={1.8} strokeLinejoin="round" />}
+                        {dots.map(([cx, cy], i) => (
+                          <circle key={i} cx={cx} cy={cy} r={2.4} fill="#FFFFFF" stroke={s.color} strokeWidth={1.3} />
+                        ))}
+                      </g>
+                    );
+                  })}
+                </g>
+              </>
+            )}
+            {lane.kind === 'state' &&
+              lane.series.map((s) => {
+                const pts = s.points;
+                // Free text where nearly every row differs (timestamps, ids): colour per value would be noise.
+                const distinct = new Set(pts.map((p) => (typeof p.raw === 'object' ? JSON.stringify(p.raw) : String(p.raw)))).size;
+                const busy = distinct > 12 && distinct > pts.length * 0.3;
+                return (
+                  <g key={s.token}>
+                    <rect x={padLeft} y={lane.top} width={plotW} height={lane.height} fill="#F8FAFC" stroke="#E3EAF3" />
+                    {pts.map((p, i) => {
+                      const a = Math.max(padLeft, x(p.t));
+                      const nextT = i + 1 < pts.length ? pts[i + 1].t : endMs;
+                      const b = Math.min(padLeft + plotW, x(nextT));
+                      if (b <= a) return null;
+                      const text = p.raw === null || p.raw === undefined ? '—' : typeof p.raw === 'object' ? JSON.stringify(p.raw) : String(p.raw);
+                      const fill = p.raw == null ? '#FFFFFF' : busy ? (i % 2 ? '#EEF2F7' : '#F8FAFC') : STATE_FILLS[hashIdx(text, STATE_FILLS.length)];
+                      return (
+                        <g key={i}>
+                          <rect x={a} y={lane.top + 1} width={b - a} height={lane.height - 2} fill={fill} stroke="#FFFFFF" strokeWidth={0.5} />
+                          {b - a > (busy ? 120 : 46) && (
+                            <text x={a + 4} y={lane.top + lane.height / 2 + 4} fontSize={11} fill="#334568" className="pointer-events-none">
+                              {text.length > Math.floor((b - a - 8) / 6.5) ? `${text.slice(0, Math.max(1, Math.floor((b - a - 8) / 6.5) - 1))}…` : text}
+                            </text>
+                          )}
+                        </g>
+                      );
+                    })}
+                    <rect x={padLeft - 4} y={lane.top} width={3} height={lane.height} fill={s.color} />
+                    <text x={padLeft - 8} y={lane.top + lane.height / 2 + 4} textAnchor="end" fontSize={10} fill="#657794">
+                      {narrow ? '' : 'text'}
+                    </text>
+                    <text x={padLeft} y={lane.top - 3} fontSize={10} fill="#657794">
+                      {`${s.label}${busy ? ` · ${distinct.toLocaleString()} different values (hover or see Records)` : ''}`}
+                    </text>
                   </g>
                 );
               })}
+          </g>
+        ))}
 
-              {/* X-Axis Time Labels */}
-              {[0, 0.25, 0.5, 0.75, 1].map((pct, idx) => {
-                const tMs = effStartMs + pct * timeSpan;
-                const x = padLeft + pct * plotWidth;
-                const label = new Date(tMs).toLocaleTimeString([], {
-                  hour: '2-digit',
-                  minute: '2-digit',
-                  second: '2-digit',
-                });
+        {/* reset markers across the plot */}
+        {markers
+          .filter((m) => m.kind === 'reset' && m.t >= startMs && m.t <= endMs)
+          .map((m, i) => (
+            <line key={`rl-${i}`} x1={x(m.t)} x2={x(m.t)} y1={10} y2={plotBottom} stroke={MARKER_COLORS.reset} strokeDasharray="3 3" strokeOpacity={0.7} />
+          ))}
+
+        {/* quality lane: one thin row per series */}
+        <text x={padLeft - 8} y={qualityTop + 7} textAnchor="end" fontSize={10} fill="#657794">
+          {narrow ? 'Q' : 'Quality'}
+        </text>
+        {series.map((s, i) => {
+          const y = qualityTop + i * (qualityRow + 3);
+          const segs = qualitySegments(s, mode, startMs, endMs);
+          return (
+            <g key={`q-${s.token}`}>
+              <rect x={padLeft} y={y} width={plotW} height={qualityRow} fill="#F8FAFC" />
+              {segs.map((g, k) => {
+                const a = Math.max(padLeft, x(g.startMs));
+                const b = Math.min(padLeft + plotW, x(g.endMs));
+                if (b - a < 0.5) return null;
                 return (
-                  <text
-                    key={idx}
-                    x={x}
-                    y={height - 8}
-                    textAnchor={idx === 0 ? 'start' : idx === 4 ? 'end' : 'middle'}
-                    fill="#657794"
-                    fontSize="10"
-                    fontFamily="monospace"
-                  >
-                    {label}
-                  </text>
+                  <rect key={k} x={a} y={y} width={b - a} height={qualityRow} fill={QUALITY_COLORS[g.q]}>
+                    <title>{`${s.label}: ${QUALITY_NAMES[g.q]} ${formatClock(g.startMs)}–${formatClock(g.endMs)}`}</title>
+                  </rect>
                 );
               })}
+              <rect x={padLeft - 4} y={y} width={3} height={qualityRow} fill={s.color} />
+            </g>
+          );
+        })}
 
-              {/* Series Paths & Points */}
-              {renderedPaths.map(({ series, pathD, circles }) => (
-                <g key={series.signal.id}>
-                  {pathD && (
-                    <path
-                      d={pathD}
-                      fill="none"
-                      stroke={series.color}
-                      strokeWidth="2.2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  )}
-                  {circles.map(({ pt, x, y }, i) => (
-                    <circle
-                      key={pt.id || i}
-                      cx={x}
-                      cy={y}
-                      r={pt.virtual ? 3.5 : circles.length < 40 ? 3 : 1.75}
-                      fill={pt.virtual ? '#FFFFFF' : series.color}
-                      stroke={series.color}
-                      strokeWidth={pt.virtual ? '2' : '1'}
-                      className="cursor-pointer"
-                      onClick={() => onSelectPoint?.(pt)}
-                    />
-                  ))}
-                </g>
-              ))}
+        {/* events lane */}
+        <text x={padLeft - 8} y={eventsTop + 11} textAnchor="end" fontSize={10} fill="#657794">
+          {narrow ? 'E' : 'Events'}
+        </text>
+        <line x1={padLeft} x2={padLeft + plotW} y1={eventsTop + eventsH / 2} y2={eventsTop + eventsH / 2} stroke="#E3EAF3" />
+        {markers
+          .filter((m) => m.t >= startMs && m.t <= endMs)
+          .slice(0, 400)
+          .map((m, i) => {
+            const cx = x(m.t);
+            const cy = eventsTop + eventsH / 2;
+            return (
+              <path key={`ev-${i}`} d={`M${cx},${cy - 5}L${cx + 5},${cy}L${cx},${cy + 5}L${cx - 5},${cy}Z`} fill={MARKER_COLORS[m.kind]} stroke="#FFFFFF" strokeWidth={1}>
+                <title>{`${formatDateTime(m.t)} · ${m.label}`}</title>
+              </path>
+            );
+          })}
 
-              {/* Crosshair Line */}
-              {hoverX !== null && (
-                <line
-                  x1={hoverX}
-                  y1={padTop}
-                  x2={hoverX}
-                  y2={height - padBottom}
-                  stroke="#111B37"
-                  strokeWidth="1"
-                  strokeDasharray="3 3"
-                />
-              )}
-            </svg>
+        {/* time axis */}
+        <line x1={padLeft} x2={padLeft + plotW} y1={xAxisTop} y2={xAxisTop} stroke="#CBD5E1" />
+        {xt.ticks.map((t) => (
+          <g key={`xt-${t}`}>
+            <line x1={x(t)} x2={x(t)} y1={xAxisTop} y2={xAxisTop + 4} stroke="#CBD5E1" />
+            <text x={x(t)} y={xAxisTop + 17} textAnchor="middle" fontSize={11} fill="#657794" className="tabular-nums">
+              {tickLabel(t, xt.step, span)}
+            </text>
+          </g>
+        ))}
 
-            {loading && (
-              <div className="absolute inset-0 bg-white/65 backdrop-blur-[1px] flex items-center justify-center rounded-lg">
-                <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-white border border-[#E3EAF3] shadow-sm text-[12px] font-semibold text-[#111B37]">
-                  <span className="w-3.5 h-3.5 border-2 border-[#EF1B24] border-t-transparent rounded-full animate-spin" />
-                  Querying TDengine time-series…
-                </div>
-              </div>
-            )}
-
-            {/* Interactive Crosshair Tooltip */}
-            {hoverTimeMs !== null && hoverDetails.some((d) => d.point !== null) && (
-              <div
-                data-testid="historian-crosshair-tooltip"
-                className="mt-2 p-3 rounded-xl bg-[#111B37] text-white shadow-lg border border-slate-700 text-[11px] space-y-2"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-slate-700">
-                  <div className="flex items-center gap-1.5 font-mono text-slate-200">
-                    <Clock className="w-3.5 h-3.5 text-slate-400" />
-                    <span>Cursor: {formatTimestamp(new Date(hoverTimeMs).toISOString())}</span>
-                  </div>
-                  <span className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-semibold">
-                    Mode: {mode}
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
-                  {hoverDetails.map(({ series, point }) => {
-                    if (!point) return null;
-                    const name =
-                      series.signal.displayName || series.signal.name || series.signal.key || series.signal.id;
-                    return (
-                      <div
-                        key={series.signal.id}
-                        className="p-2 rounded-lg bg-slate-800/90 border border-slate-700 flex flex-col gap-1"
-                      >
-                        <div className="flex items-center justify-between gap-1.5">
-                          <div className="flex items-center gap-1.5 min-w-0">
-                            <span
-                              className="w-2 h-2 rounded-full shrink-0"
-                              style={{ backgroundColor: series.color }}
-                            />
-                            <span className="font-bold truncate text-white">{name}</span>
-                          </div>
-                          <StatusBadge status={point.quality} />
-                        </div>
-                        <div className="flex items-baseline justify-between gap-2 mt-0.5">
-                          <span className="font-mono text-[13px] font-extrabold text-white">
-                            {formatValue(point.value)}
-                          </span>
-                          {point.virtual && (
-                            <span className="text-[9px] font-mono uppercase px-1.5 py-0.2 rounded bg-indigo-500/30 text-indigo-200 border border-indigo-400/40">
-                              virtual step-hold
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-[10px] font-mono text-slate-400 truncate">
-                          acq: {formatTimestamp(point.acquiredAt)}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
+        {/* hover crosshair */}
+        {hoverX != null && !drag && <line x1={hoverX} x2={hoverX} y1={8} y2={xAxisTop} stroke="#111B37" strokeOpacity={0.35} strokeDasharray="2 3" />}
+        {/* brush */}
+        {drag && Math.abs(drag.x1 - drag.x0) > 2 && (
+          <rect x={Math.min(drag.x0, drag.x1)} y={8} width={Math.abs(drag.x1 - drag.x0)} height={xAxisTop - 8} fill="#2A82E7" fillOpacity={0.12} stroke="#2A82E7" strokeOpacity={0.6} />
         )}
-      </div>
+        {/* interaction surface */}
+        <rect
+          x={padLeft}
+          y={4}
+          width={plotW}
+          height={Math.max(10, xAxisTop - 4)}
+          fill="transparent"
+          style={{ cursor: drag ? 'col-resize' : 'crosshair', touchAction: 'pan-y' }}
+          onPointerDown={onDown}
+          onPointerMove={onMove}
+          onPointerUp={onUp}
+          onPointerCancel={() => setDrag(null)}
+        />
+      </svg>
 
-      {/* Synchronized Quality & Freshness Lane */}
-      <div
-        data-testid="quality-freshness-lane"
-        className="bg-white border border-[#E3EAF3] rounded-xl p-3.5 shadow-xs space-y-2.5"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <Layers className="w-4 h-4 text-[#334568]" />
-            <span className="text-[12px] font-bold text-[#111B37]">
-              Synchronized Quality &amp; Freshness Lane
-            </span>
-            <span className="text-[11px] text-[#657794]">
-              Truthful signal validity timeline (`canonical_stale_after_ms` gap detection)
-            </span>
+      {/* tooltip */}
+      {hoverT != null && !drag && tooltipRows.length > 0 && (
+        <div
+          className="absolute z-10 pointer-events-none w-[280px] rounded-lg border border-[#D4DFEC] bg-white/95 shadow-lg px-3 py-2 text-[11px]"
+          style={{ left: tipLeft, top: Math.max(4, Math.min(hoverY - 20, height - 40 - tooltipRows.length * 30)) }}
+        >
+          <div className="font-semibold text-[#111B37] tabular-nums mb-1">
+            {formatDateTime(hoverT, span < 120e3)} <span className="font-normal text-[#94A3B8]">{TZ_LABEL.split(' ')[1] || ''}</span>
           </div>
-          <div className="flex items-center gap-3 text-[11px] font-semibold">
-            <span className="inline-flex items-center gap-1 text-emerald-800">
-              <span className="w-2.5 h-2.5 rounded-xs bg-[#0DBA67]" /> GOOD
-            </span>
-            <span className="inline-flex items-center gap-1 text-amber-800">
-              <span className="w-2.5 h-2.5 rounded-xs bg-[#F59E0B]" /> UNCERTAIN
-            </span>
-            <span className="inline-flex items-center gap-1 text-slate-700">
-              <span className="w-2.5 h-2.5 rounded-xs bg-[#64748B]" /> STALE
-            </span>
-            <span className="inline-flex items-center gap-1 text-red-800">
-              <span className="w-2.5 h-2.5 rounded-xs bg-[#EF4444]" /> BAD
-            </span>
-          </div>
-        </div>
-
-        {visibleSeries.length === 0 ? (
-          <div className="text-[11px] text-[#657794] py-1">Select a signal to view quality timeline segments.</div>
-        ) : (
-          <div className="space-y-1.5">
-            {visibleSeries.map((s) => {
-              const name = s.signal.displayName || s.signal.name || s.signal.key || s.signal.id;
-              return (
-                <div key={s.signal.id} className="flex items-center gap-3">
-                  <div className="w-36 shrink-0 flex items-center gap-1.5 text-[11px] font-semibold text-[#334568] truncate">
-                    <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: s.color }} />
-                    <span className="truncate" title={name}>
-                      {name}
-                    </span>
-                  </div>
-                  <div className="flex-1 h-4 bg-slate-100 rounded-md overflow-hidden relative border border-[#E3EAF3]">
-                    {s.qualitySegments.length === 0 ? (
-                      <div className="w-full h-full flex items-center justify-center text-[9px] font-mono text-[#94A3B8]">
-                        NO SAMPLES IN WINDOW
-                      </div>
-                    ) : (
-                      s.qualitySegments.map((seg, i) => {
-                        const leftPct = Math.max(0, Math.min(100, ((seg.startMs - effStartMs) / timeSpan) * 100));
-                        const widthPct = Math.max(
-                          0.5,
-                          Math.min(100 - leftPct, ((seg.endMs - seg.startMs) / timeSpan) * 100),
-                        );
-                        return (
-                          <div
-                            key={i}
-                            style={{
-                              left: `${leftPct}%`,
-                              width: `${widthPct}%`,
-                              backgroundColor: QUALITY_BAR_COLOR[seg.quality],
-                            }}
-                            title={`${seg.quality}${seg.reasonCode ? ` (${seg.reasonCode})` : ''}: ${new Date(
-                              seg.startMs,
-                            ).toLocaleTimeString()} – ${new Date(seg.endMs).toLocaleTimeString()}`}
-                            className="absolute top-0 bottom-0 transition-opacity hover:opacity-85"
-                          />
-                        );
-                      })
+          <ul className="space-y-1">
+            {tooltipRows.map(({ s, p, cp }) => (
+              <li key={s.token} className="min-w-0">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: s.color }} aria-hidden="true" />
+                  <span className="truncate text-[#334568] flex-1">{s.label}</span>
+                  <span className="font-semibold text-[#111B37] tabular-nums whitespace-nowrap">{p ? formatValue(p.raw, s.unit) : '—'}</span>
+                </div>
+                {(p || cp) && (
+                  <div className="pl-3.5 flex flex-wrap gap-x-2 text-[10px] text-[#657794]">
+                    {p && p.q && (
+                      <span style={{ color: QUALITY_COLORS[p.q] && p.q !== 'GOOD' ? (p.q === 'STALE' ? '#64748B' : QUALITY_COLORS[p.q]) : '#0A9855' }}>{QUALITY_NAMES[p.q] || p.q}</span>
+                    )}
+                    {p && p.min != null && p.max != null && (
+                      <span>
+                        avg of {p.count ?? '?'} · {formatNumber(p.min)}–{formatNumber(p.max)}
+                      </span>
+                    )}
+                    {p && <span className="tabular-nums">at {formatClock(p.t, span < 120e3)}</span>}
+                    {cp && (
+                      <span className="tabular-nums">
+                        {compareLabel || 'compare'}: {formatValue(cp.raw, s.unit)}
+                      </span>
                     )}
                   </div>
-                  <div className="w-16 shrink-0 text-right font-mono text-[11px] font-bold text-[#111B37]">
-                    {s.stats.goodPct.toFixed(0)}% Good
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* Synchronized Events & Operations Lane */}
-      <div
-        data-testid="events-operations-lane"
-        className="bg-white border border-[#E3EAF3] rounded-xl p-3.5 shadow-xs space-y-2.5"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <GitCommit className="w-4 h-4 text-[#334568]" />
-            <span className="text-[12px] font-bold text-[#111B37]">
-              Synchronized Events &amp; Operations Lane
-            </span>
-            <span className="text-[11px] text-[#657794]">
-              Quality transitions, storage publish/pause operations, and telemetry epoch reset markers
-            </span>
-          </div>
-          <span className="text-[11px] font-mono font-semibold text-[#657794]">
-            {events.length} event{events.length === 1 ? '' : 's'} in range
-          </span>
+                )}
+              </li>
+            ))}
+          </ul>
         </div>
-
-        {/* Timeline Marker Strip */}
-        <div className="relative h-7 bg-[#F6F8FC] border border-[#E3EAF3] rounded-lg overflow-hidden">
-          {events.length === 0 ? (
-            <div className="w-full h-full flex items-center justify-center text-[11px] text-[#94A3B8]">
-              No quality transitions, storage operations, or epoch boundary events in this window
-            </div>
-          ) : (
-            events.map((ev) => {
-              const leftPct = Math.max(2, Math.min(98, ((ev.timestampMs - effStartMs) / timeSpan) * 100));
-              const isReset = ev.kind === 'EPOCH_RESET' || ev.summary.toUpperCase().includes('EPOCH');
-              const isBad = ev.toQuality === 'BAD' || ev.toQuality === 'STALE';
-              const markerColor = isReset ? '#EF1B24' : isBad ? '#F59E0B' : '#0DBA67';
-              return (
-                <button
-                  key={ev.id}
-                  type="button"
-                  onClick={() => setSelectedEvent(selectedEvent?.id === ev.id ? null : ev)}
-                  style={{ left: `${leftPct}%` }}
-                  title={`${formatTimestamp(ev.timestamp)} — ${ev.summary}`}
-                  className="absolute top-1 bottom-1 -translate-x-1/2 px-1.5 rounded flex items-center gap-1 text-[10px] font-bold text-white shadow-xs cursor-pointer transition-transform hover:scale-105"
-                >
-                  <span
-                    className="w-2.5 h-2.5 rounded-full border border-white shadow-xs"
-                    style={{ backgroundColor: markerColor }}
-                  />
-                </button>
-              );
-            })
-          )}
-        </div>
-
-        {/* Event Pills / Details */}
-        {events.length > 0 && (
-          <div className="flex flex-wrap items-center gap-1.5 max-h-24 overflow-y-auto pt-0.5">
-            {events.slice(0, 12).map((ev) => {
-              const isReset = ev.kind === 'EPOCH_RESET';
-              const isOp = ev.kind === 'STORAGE_OPERATION';
-              return (
-                <button
-                  key={ev.id}
-                  type="button"
-                  onClick={() => setSelectedEvent(selectedEvent?.id === ev.id ? null : ev)}
-                  className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] border transition-colors ${
-                    selectedEvent?.id === ev.id
-                      ? 'bg-[#111B37] text-white border-[#111B37]'
-                      : isReset
-                        ? 'bg-[#FEF2F2] text-[#9B1C1C] border-[#FECACA]'
-                        : isOp
-                          ? 'bg-blue-50 text-blue-800 border-blue-200'
-                          : 'bg-[#F6F8FC] text-[#334568] border-[#E3EAF3] hover:bg-slate-100'
-                  }`}
-                >
-                  {isReset ? (
-                    <ShieldAlert className="w-3 h-3 text-[#EF1B24] shrink-0" />
-                  ) : isOp ? (
-                    <Info className="w-3 h-3 text-blue-600 shrink-0" />
-                  ) : ev.toQuality === 'GOOD' ? (
-                    <CheckCircle2 className="w-3 h-3 text-[#0DBA67] shrink-0" />
-                  ) : (
-                    <AlertTriangle className="w-3 h-3 text-amber-500 shrink-0" />
-                  )}
-                  <span className="font-mono text-[10px] opacity-80">
-                    {new Date(ev.timestampMs).toLocaleTimeString([], {
-                      hour: '2-digit',
-                      minute: '2-digit',
-                      second: '2-digit',
-                    })}
-                  </span>
-                  <span className="font-semibold truncate max-w-[240px]">{ev.summary}</span>
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </div>
+      )}
+      {loading && <div className="absolute inset-x-0 top-0 h-0.5 bg-[#2A82E7]/60 animate-pulse" aria-hidden="true" />}
     </div>
   );
 };

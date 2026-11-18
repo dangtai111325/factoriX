@@ -1,447 +1,204 @@
-import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate, Link } from 'react-router-dom';
-import {
-  ArrowLeft,
-  Database,
-  Layers,
-  Table,
-  Edit,
-  Trash2,
-  Play,
-  Pause,
-  Columns,
-  Tag,
-  Link2,
-  FileCode,
-  Shield,
-  Activity,
-  CheckCircle2,
-  AlertCircle,
-  ExternalLink,
-  Plus,
-} from 'lucide-react';
-import {
-  getStorageObject,
-  TDDatabase,
-  TDStable,
-  TDSubtable,
-  StorageObjectStatus,
-} from '../../lib/storagePhysicalApi';
-import { RemoteErrorState, RemoteLoadingState } from '../../components/common/RemoteResourceState';
+import React, { useState, useEffect, useCallback } from 'react';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { Activity, Copy, Edit, MoreHorizontal, Plus, Rows3, Settings2 } from 'lucide-react';
+import { Button } from '../../components/common/Button';
+import { Tabs } from '../../components/common/Tabs';
+import { MenuButton, MenuItem } from '../../components/common/MenuButton';
+import { ActionToast, useActionToast } from '../../components/common/ActionToast';
+import { getStorageObject, TDStable, TDSubtable } from '../../lib/storagePhysicalApi';
+import { ErrorBanner, LoadingBlock, WizardHeader, cardCls } from '../historian/hsUi';
 import { StorageLifecycleDialog, LifecycleTarget, lifecycleTargetOf, isProtectedTarget } from './StorageLifecycleDialog';
+import { useStorageBackTarget } from './wizards/WizardShared';
+import {
+  BindingsList,
+  ColumnsTable,
+  DdlBlock,
+  KIND_LABEL,
+  PropGrid,
+  StorageObjectData,
+  StorageStatusBadge,
+  StorageTypeIcon,
+  TagsTable,
+  historianLinkFor,
+  kindOfId,
+  propItems,
+} from './objectViews';
+
+type DetailTab = 'overview' | 'schema' | 'bindings' | 'ddl';
 
 export const StorageObjectDetailPage: React.FC = () => {
-  const { objectId } = useParams<{ objectId: string }>();
+  const { objectId = '' } = useParams<{ objectId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
+  const here = `${location.pathname}${location.search}`;
+  const backTarget = useStorageBackTarget('/historian/storage?tab=objects');
+  const { toast, show: showToast, dismiss: dismissToast } = useActionToast();
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown | null>(null);
-  const [objectData, setObjectData] = useState<
-    ((TDDatabase | TDStable | TDSubtable) & { object_type: 'database' | 'stable' | 'subtable' }) | null
-  >(null);
-  const [activeTab, setActiveTab] = useState<'overview' | 'schema' | 'subtables' | 'bindings' | 'ddl'>('overview');
+  const [objectData, setObjectData] = useState<StorageObjectData | null>(null);
+  const [activeTab, setActiveTab] = useState<DetailTab>('overview');
   const [lifecycle, setLifecycle] = useState<LifecycleTarget | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
-  const fetchObject = () => {
+  const fetchObject = useCallback(() => {
     if (!objectId) return;
     setLoading(true);
     setError(null);
     getStorageObject(objectId)
-      .then((obj) => {
-        const isDb = objectId.startsWith('db:') || objectId.startsWith('db/');
-        const isStable = objectId.startsWith('stable:') || objectId.startsWith('stable/');
-        const type: 'database' | 'stable' | 'subtable' = isDb ? 'database' : isStable ? 'stable' : 'subtable';
-        setObjectData({ ...obj, object_type: type });
-      })
+      .then((obj) => setObjectData({ ...obj, object_type: kindOfId(objectId) } as StorageObjectData))
       .catch((err) => {
-        console.error('Failed to load storage object:', err);
         setError(err);
         setObjectData(null);
       })
       .finally(() => setLoading(false));
-  };
+  }, [objectId]);
 
   useEffect(() => {
     fetchObject();
-  }, [objectId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fetchObject, reloadKey]);
 
-  if (loading) {
-    return <RemoteLoadingState subject="storage object" />;
+  const kind = objectData?.object_type || kindOfId(objectId);
+  const target = lifecycleTargetOf(objectId, objectData?.status);
+  const locked = isProtectedTarget(target);
+  const ref = objectId.replace(/^(db|stable|subtable):/, '');
+  const name = objectData?.physical_name || target.name;
+  const go = (to: string) => navigate(to, { state: { from: here } });
+
+  const header = (
+    <WizardHeader
+      backLabel="Storage Management"
+      onBack={() => navigate(backTarget)}
+      title={
+        <span className="inline-flex items-center gap-2 min-w-0">
+          <StorageTypeIcon kind={kind} className="w-5 h-5" />
+          <span className="font-mono truncate">{name}</span>
+        </span>
+      }
+      chip={
+        <>
+          <span className="text-[10px] px-2 py-0.5 rounded bg-[#EFF6FF] text-[#134074] font-bold">{KIND_LABEL[kind]}</span>
+          {objectData && <StorageStatusBadge status={objectData.status} />}
+          {locked && <span className="text-[11px] text-[#657794]">FactoriX system object · read-only</span>}
+        </>
+      }
+      stepper={
+        objectData ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {kind === 'subtable' && (
+              <Button variant="outline" size="md" icon={<Activity className="w-4 h-4" />} onClick={() => navigate(historianLinkFor(objectId))}>
+                Open in Historian
+              </Button>
+            )}
+            {!locked && (
+              <Button variant="outline" size="md" icon={<Edit className="w-4 h-4" />} onClick={() => go(`/historian/storage/edit/${encodeURIComponent(objectId)}`)}>
+                Edit
+              </Button>
+            )}
+            {kind === 'stable' && !locked && (
+              <Button variant="primary" size="md" icon={<Plus className="w-4 h-4" />} onClick={() => go(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(ref)}`)}>
+                New subtable
+              </Button>
+            )}
+            {kind === 'database' && (
+              <Button variant="primary" size="md" icon={<Plus className="w-4 h-4" />} onClick={() => go(`/historian/storage/create?kind=stable&database=${encodeURIComponent(name)}`)}>
+                New supertable
+              </Button>
+            )}
+            {!locked && kind !== 'database' && (
+              <MenuButton
+                label="More"
+                icon={<MoreHorizontal className="w-4 h-4" />}
+                ariaLabel="More actions"
+                items={
+                  [
+                    kind === 'stable'
+                      ? { key: 'bulk', label: 'Subtables from Data Models', icon: <Rows3 className="w-3.5 h-3.5" />, onSelect: () => go(`/historian/storage/bulk?stable=${encodeURIComponent(ref)}`) }
+                      : null,
+                    { key: 'dup', label: 'Duplicate', icon: <Copy className="w-3.5 h-3.5" />, onSelect: () => go(`/historian/storage/create?kind=${kind}&duplicate=${encodeURIComponent(objectId)}`) },
+                    { key: 'life', label: 'Pause / Retire / Delete…', icon: <Settings2 className="w-3.5 h-3.5" />, danger: true, onSelect: () => setLifecycle(target) },
+                  ].filter(Boolean) as MenuItem[]
+                }
+              />
+            )}
+          </div>
+        ) : undefined
+      }
+    />
+  );
+
+  if (loading && !objectData) {
+    return (
+      <div className="space-y-4">
+        {header}
+        <LoadingBlock label={`Loading ${name}…`} />
+      </div>
+    );
   }
 
   if (error || !objectData) {
     return (
       <div className="space-y-4">
-        <div className="flex items-center gap-2 text-[12px] font-medium text-[#657794] pb-2 border-b border-[#E3EAF3]">
-          <Link to="/historian/storage" className="hover:text-[#111B37] flex items-center gap-1">
-            <ArrowLeft className="w-3.5 h-3.5" />
-            <span>Back to Storage Management</span>
-          </Link>
-        </div>
-        <RemoteErrorState
-          error={error || new Error('Storage object not found')}
-          subject={`Storage Object "${objectId}"`}
-          onRetry={fetchObject}
-        />
+        {header}
+        <ErrorBanner error={error || new Error('Storage object not found')} subject={name} onRetry={fetchObject} />
       </div>
     );
   }
 
-  const stableObj = objectData.object_type === 'stable' ? (objectData as unknown as TDStable) : null;
-  const subtableObj = objectData.object_type === 'subtable' ? (objectData as unknown as TDSubtable) : null;
-  const dbObj = objectData.object_type === 'database' ? (objectData as unknown as TDDatabase) : null;
+  const stableObj = kind === 'stable' ? (objectData as unknown as TDStable) : null;
+  const subObj = kind === 'subtable' ? (objectData as unknown as TDSubtable) : null;
+  const tabs = [
+    { id: 'overview', label: 'Overview' },
+    ...(stableObj || subObj ? [{ id: 'schema', label: stableObj ? 'Columns & Tags' : 'Tags' }] : []),
+    ...(subObj ? [{ id: 'bindings', label: 'Bindings', count: subObj.bindings?.length ?? 0 }] : []),
+    { id: 'ddl', label: 'DDL' },
+  ];
 
   return (
-    <div className="space-y-4 max-w-6xl mx-auto">
-      {/* Back button & Breadcrumbs */}
-      <div className="flex items-center gap-2 text-[12px] font-medium text-[#657794]">
-        <Link to="/historian/storage" className="hover:text-[#EF1B24] transition-colors flex items-center gap-1">
-          <ArrowLeft className="w-3.5 h-3.5" />
-          <span>Storage Management</span>
-        </Link>
-        <span>/</span>
-        <span className="capitalize">{objectData.object_type}</span>
-        <span>/</span>
-        <span className="text-[#111B37] font-semibold">{objectData.physical_name}</span>
-      </div>
+    <div className="space-y-4">
+      <ActionToast toast={toast} onDismiss={dismissToast} />
+      {header}
+      {objectData.description && <p className="text-[13px] text-[#657794] whitespace-pre-wrap">{objectData.description}</p>}
+      <Tabs tabs={tabs} activeTab={activeTab} onChange={(id) => setActiveTab(id as DetailTab)} />
 
-      {/* Main card header */}
-      <div className="bg-white border border-[#E3EAF3] rounded-xl shadow-xs p-6">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl">
-              {objectData.object_type === 'database' && <Database className="w-6 h-6 text-[#EF1B24]" />}
-              {objectData.object_type === 'stable' && <Layers className="w-6 h-6 text-[#2A82E7]" />}
-              {objectData.object_type === 'subtable' && <Table className="w-6 h-6 text-[#7C3AED]" />}
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-[20px] font-bold text-[#111B37]">{objectData.physical_name}</h1>
-                <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-[#E8FAF0] text-[#0DBA67]">
-                  {objectData.status}
-                </span>
-                <span className="text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 bg-[#F1F5F9] text-[#64748B] rounded">
-                  {objectData.object_type}
-                </span>
-              </div>
-              <div className="text-[13px] text-[#657794] mt-1">
-                {objectData.description || 'No description provided.'}
-              </div>
-            </div>
-          </div>
-
-          {/* Action buttons */}
-          {(() => {
-            const target = lifecycleTargetOf(objectData.id, (objectData as { status?: string }).status);
-            const locked = isProtectedTarget(target);
-            const ref = objectData.id.replace(/^(stable|subtable):/, '');
-            return (
-              <div className="flex flex-wrap items-center gap-2">
-                {locked ? (
-                  <span className="text-[12px] text-[#657794] px-2">FactoriX system object · read-only</span>
-                ) : (
-                  <>
-                    <button type="button" onClick={() => navigate(`/historian/storage/edit/${encodeURIComponent(objectData.id)}`)}
-                      className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
-                      <Edit className="w-4 h-4" /><span>Edit details</span>
-                    </button>
-                    {objectData.object_type !== 'database' && (
-                      <button type="button" onClick={() => navigate(`/historian/storage/create?kind=${objectData.object_type}&duplicate=${encodeURIComponent(objectData.id)}`)}
-                        className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
-                        <span>Duplicate</span>
-                      </button>
-                    )}
-                    <button type="button" onClick={() => setLifecycle(target)}
-                      className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
-                      <span>Pause / Retire / Delete</span>
-                    </button>
-                  </>
-                )}
-                {objectData.object_type === 'database' && (
-                  <button type="button" onClick={() => navigate(`/historian/storage/create?kind=stable&database=${encodeURIComponent(objectData.physical_name)}`)}
-                    className="flex items-center gap-1.5 h-10 px-5 bg-[#EF1B24] text-white rounded-lg text-[14px] font-semibold hover:bg-[#D9141D] shadow-sm">
-                    <Plus className="w-4 h-4" /><span>New Supertable</span>
-                  </button>
-                )}
-                {objectData.object_type === 'stable' && !locked && (
-                  <>
-                    <button type="button" onClick={() => navigate(`/historian/storage/bulk?stable=${encodeURIComponent(ref)}`)}
-                      className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
-                      <Plus className="w-4 h-4" /><span>Subtables from Data Models</span>
-                    </button>
-                    <button type="button" onClick={() => navigate(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(ref)}`)}
-                      className="flex items-center gap-1.5 h-10 px-5 bg-[#EF1B24] text-white rounded-lg text-[14px] font-semibold hover:bg-[#D9141D] shadow-sm">
-                      <Plus className="w-4 h-4" /><span>New Subtable</span>
-                    </button>
-                  </>
-                )}
-                {objectData.object_type === 'subtable' && (
-                  <button type="button" onClick={() => navigate(`/historian/historian?source_id=${encodeURIComponent(objectData.id.startsWith('subtable:') ? objectData.id : `subtable:${objectData.id}`)}&kind=subtable&range=24h`)}
-                    className="flex items-center gap-1.5 h-10 px-5 bg-[#EF1B24] text-white rounded-lg text-[14px] font-semibold hover:bg-[#D9141D] shadow-sm">
-                    <Activity className="w-4 h-4" /><span>Open in Historian</span>
-                  </button>
-                )}
-              </div>
-            );
-          })()}
-        </div>
-        {notice && (
-          <div role="status" className="mt-3 px-3 py-2 rounded-lg border border-[#E3EAF3] bg-[#F9FAFD] text-[12px] text-[#334568]">{notice}</div>
-        )}
-        {lifecycle && (
-          <StorageLifecycleDialog target={lifecycle} onClose={() => setLifecycle(null)}
-            onDone={(msg) => {
-              setLifecycle(null);
-              setNotice(msg);
-              if (msg.startsWith('Deleted')) navigate('/historian/storage?tab=objects');
-              else setReloadKey((k) => k + 1);
-            }} />
-        )}
-
-        {/* Tabs */}
-        <div className="flex border-b border-[#E3EAF3] mt-6 -mb-6 text-[13px]">
-          <button
-            type="button"
-            onClick={() => setActiveTab('overview')}
-            className={`py-3 px-4 font-semibold border-b-2 transition-colors ${
-              activeTab === 'overview'
-                ? 'border-[#EF1B24] text-[#EF1B24]'
-                : 'border-transparent text-[#657794] hover:text-[#111B37]'
-            }`}
-          >
-            Overview
-          </button>
-
-          {(stableObj || subtableObj) && (
-            <button
-              type="button"
-              onClick={() => setActiveTab('schema')}
-              className={`py-3 px-4 font-semibold border-b-2 transition-colors ${
-                activeTab === 'schema'
-                  ? 'border-[#EF1B24] text-[#EF1B24]'
-                  : 'border-transparent text-[#657794] hover:text-[#111B37]'
-              }`}
-            >
-              Schema & Tags
-            </button>
-          )}
-
-          {subtableObj && (
-            <button
-              type="button"
-              onClick={() => setActiveTab('bindings')}
-              className={`py-3 px-4 font-semibold border-b-2 transition-colors ${
-                activeTab === 'bindings'
-                  ? 'border-[#EF1B24] text-[#EF1B24]'
-                  : 'border-transparent text-[#657794] hover:text-[#111B37]'
-              }`}
-            >
-              Source Bindings
-            </button>
-          )}
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('ddl')}
-            className={`py-3 px-4 font-semibold border-b-2 transition-colors ${
-              activeTab === 'ddl'
-                ? 'border-[#EF1B24] text-[#EF1B24]'
-                : 'border-transparent text-[#657794] hover:text-[#111B37]'
-            }`}
-          >
-            Physical DDL
-          </button>
-        </div>
-      </div>
-
-      {/* Tab contents */}
-      <div className="bg-white border border-[#E3EAF3] rounded-xl shadow-xs p-6">
-        {activeTab === 'overview' && (
-          <div className="space-y-6">
-            <h3 className="text-[15px] font-bold text-[#111B37]">Properties & Physical Metadata</h3>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-                <div className="text-[11px] font-semibold text-[#657794] uppercase">Observed At</div>
-                <div className="text-[13px] font-mono font-medium text-[#111B37] mt-1">
-                  {new Date(objectData.observed_at).toLocaleString()}
-                </div>
-              </div>
-
-              <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-                <div className="text-[11px] font-semibold text-[#657794] uppercase">Tenant Scope</div>
-                <div className="text-[13px] font-medium text-[#111B37] mt-1">{objectData.tenant_id}</div>
-              </div>
-
-              {dbObj && (
-                <>
-                  <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-                    <div className="text-[11px] font-semibold text-[#657794] uppercase">Precision</div>
-                    <div className="text-[13px] font-bold text-[#EF1B24] mt-1">{dbObj.precision}</div>
-                  </div>
-                  <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-                    <div className="text-[11px] font-semibold text-[#657794] uppercase">Retention Days</div>
-                    <div className="text-[13px] font-bold text-[#111B37] mt-1">
-                      {dbObj.retention_days ?? 'Unlimited'}
-                    </div>
-                  </div>
-                </>
-              )}
-
-              {stableObj && (
-                <>
-                  <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-                    <div className="text-[11px] font-semibold text-[#657794] uppercase">Database</div>
-                    <div className="text-[13px] font-bold text-[#111B37] mt-1 truncate">{stableObj.database_name}</div>
-                  </div>
-                  <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-                    <div className="text-[11px] font-semibold text-[#657794] uppercase">Subtables</div>
-                    <div className="text-[13px] font-bold text-[#2A82E7] mt-1">{stableObj.subtable_count}</div>
-                  </div>
-                </>
-              )}
-
-              {subtableObj && (
-                <>
-                  <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-                    <div className="text-[11px] font-semibold text-[#657794] uppercase">Parent STable</div>
-                    <div className="text-[13px] font-bold text-[#111B37] mt-1 truncate">{subtableObj.stable_name}</div>
-                  </div>
-                  <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-                    <div className="text-[11px] font-semibold text-[#657794] uppercase">Row Assembly</div>
-                    <div className="text-[13px] font-bold text-[#7C3AED] mt-1 truncate">
-                      {subtableObj.row_assembly_policy || 'INDEPENDENT_EVENTS'}
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        )}
-
+      <section className={`${cardCls} p-4 sm:p-5 space-y-4 min-w-0`}>
+        {activeTab === 'overview' && <PropGrid items={propItems(objectData)} cols="grid-cols-2 md:grid-cols-4" />}
         {activeTab === 'schema' && stableObj && (
-          <div className="space-y-6">
-            <div>
-              <h3 className="text-[15px] font-bold text-[#111B37] mb-3 flex items-center gap-2">
-                <Columns className="w-4 h-4 text-[#2A82E7]" />
-                <span>Columns ({stableObj.columns.length})</span>
-              </h3>
-              <table className="w-full text-left text-[13px] border border-[#E3EAF3] rounded-lg overflow-hidden">
-                <thead className="bg-[#F8FAFC] text-[#657794] font-semibold border-b border-[#E3EAF3]">
-                  <tr>
-                    <th className="py-2.5 px-4">Column Name</th>
-                    <th className="py-2.5 px-4">TD Type</th>
-                    <th className="py-2.5 px-4">Role</th>
-                    <th className="py-2.5 px-4">Nullable</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#F1F5FA]">
-                  {stableObj.columns.map((c) => (
-                    <tr key={c.name} className="hover:bg-[#F8FAFC]">
-                      <td className="py-2.5 px-4 font-mono font-semibold text-[#111B37]">
-                        {c.name}
-                        {c.immutable && (
-                          <span className="ml-2 px-1.5 py-0.5 bg-[#FEF2F2] text-[#EF1B24] rounded text-[10px] font-bold">
-                            PRIMARY TS
-                          </span>
-                        )}
-                      </td>
-                      <td className="py-2.5 px-4 font-mono text-[#2A82E7]">{c.td_type}</td>
-                      <td className="py-2.5 px-4 text-[#657794] capitalize">{c.role}</td>
-                      <td className="py-2.5 px-4 text-[#657794]">{c.nullable ? 'YES' : 'NO'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] gap-4">
+            <div className="space-y-2 min-w-0">
+              <h2 className="text-[14px] font-bold text-[#111B37]">Columns ({stableObj.columns?.length || 0})</h2>
+              <ColumnsTable stable={stableObj} />
             </div>
-
-            <div>
-              <h3 className="text-[15px] font-bold text-[#111B37] mb-3 flex items-center gap-2">
-                <Tag className="w-4 h-4 text-[#2A82E7]" />
-                <span>Tags ({stableObj.tags.length})</span>
-              </h3>
-              <table className="w-full text-left text-[13px] border border-[#E3EAF3] rounded-lg overflow-hidden">
-                <thead className="bg-[#F8FAFC] text-[#657794] font-semibold border-b border-[#E3EAF3]">
-                  <tr>
-                    <th className="py-2.5 px-4">Tag Name</th>
-                    <th className="py-2.5 px-4">TD Type</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#F1F5FA]">
-                  {stableObj.tags.map((t) => (
-                    <tr key={t.name} className="hover:bg-[#F8FAFC]">
-                      <td className="py-2.5 px-4 font-mono font-semibold text-[#111B37]">{t.name}</td>
-                      <td className="py-2.5 px-4 font-mono text-[#2A82E7]">{t.td_type}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="space-y-2 min-w-0">
+              <h2 className="text-[14px] font-bold text-[#111B37]">Tags ({stableObj.tags?.length || 0})</h2>
+              <TagsTable tags={stableObj.tags || []} />
             </div>
           </div>
         )}
-
-        {activeTab === 'bindings' && subtableObj && (
-          <div className="space-y-4">
-            <h3 className="text-[15px] font-bold text-[#111B37] flex items-center gap-2">
-              <Link2 className="w-4 h-4 text-[#7C3AED]" />
-              <span>Source Bindings ({subtableObj.bindings.length})</span>
-            </h3>
-            {subtableObj.bindings.length === 0 ? (
-              <p className="text-[13px] text-[#657794]">No data sources currently bound to this subtable.</p>
-            ) : (
-              <div className="space-y-2">
-                {subtableObj.bindings.map((raw) => {
-                  const b = raw as typeof raw & { column_name?: string; model_name?: string; model_field_path?: string; signal_key?: string };
-                  return (
-                    <div key={b.id} className="p-3 bg-white border border-[#E3EAF3] rounded-lg text-[13px]">
-                      <div className="flex items-center justify-between font-semibold text-[#111B37] mb-1">
-                        <span>Column <span className="font-mono">{b.column_name || b.destination_column}</span></span>
-                        <span className="text-[11px] font-semibold text-[#657794]">{b.status} · {b.recording_mode || 'ON_CHANGE'}</span>
-                      </div>
-                      <div className="text-[12px] text-[#657794]">
-                        {b.source_kind === 'model_field' ? 'Data Model field' : 'Signal'}:{' '}
-                        <span className="text-[#334568]">{b.model_name || b.signal_key || ''}</span>{' '}
-                        <span className="font-mono text-[#334568]">{b.model_field_path || b.source_path}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+        {activeTab === 'schema' && subObj && (
+          <div className="space-y-2 max-w-3xl">
+            <h2 className="text-[14px] font-bold text-[#111B37]">Tag values</h2>
+            <TagsTable tags={subObj.tag_values || []} withValues />
           </div>
         )}
+        {activeTab === 'bindings' && subObj && <BindingsList subtable={subObj} />}
+        {activeTab === 'ddl' && <DdlBlock obj={objectData} />}
+      </section>
 
-        {activeTab === 'ddl' && (
-          <div className="space-y-3">
-            <h3 className="text-[15px] font-bold text-[#111B37] flex items-center gap-2">
-              <FileCode className="w-4 h-4 text-[#EF1B24]" />
-              <span>Schema as DDL (reconstructed from DESCRIBE)</span>
-            </h3>
-            <pre className="p-4 bg-[#111B37] text-white rounded-xl font-mono text-[12px] overflow-x-auto leading-relaxed">
-              {objectData.object_type === 'database' && (
-                `CREATE DATABASE \`${objectData.physical_name}\` PRECISION '${dbObj?.precision || 'us'}';`
-              )}
-              {objectData.object_type === 'stable' && stableObj && (
-                `CREATE STABLE \`${stableObj.database_name}\`.\`${stableObj.physical_name}\` (\n` +
-                `  ts TIMESTAMP,\n` +
-                stableObj.columns
-                  .filter((c) => c.name !== 'ts')
-                  .map((c) => `  \`${c.name}\` ${c.td_type}${c.length && ['VARCHAR', 'NCHAR', 'BINARY', 'VARBINARY'].includes(String(c.td_type).toUpperCase()) ? `(${c.length})` : ''}${c.primary_key ? ' COMPOSITE KEY' : ''}`)
-                  .join(',\n') +
-                `\n) TAGS (\n` +
-                stableObj.tags.map((t) => `  \`${t.name}\` ${t.td_type}${t.length && ['VARCHAR', 'NCHAR', 'BINARY'].includes(String(t.td_type).toUpperCase()) ? `(${t.length})` : ''}`).join(',\n') +
-                `\n);`
-              )}
-              {objectData.object_type === 'subtable' && subtableObj && (
-                `CREATE TABLE \`${subtableObj.physical_name}\` USING \`${subtableObj.stable_name}\` TAGS (\n` +
-                subtableObj.tag_values.map((t) => `  '${t.value || ''}'`).join(',\n') +
-                `\n);`
-              )}
-            </pre>
-          </div>
-        )}
-      </div>
+      {lifecycle && (
+        <StorageLifecycleDialog
+          target={lifecycle}
+          onClose={() => setLifecycle(null)}
+          onDone={(msg) => {
+            setLifecycle(null);
+            if (msg.startsWith('Deleted')) navigate(backTarget);
+            else {
+              showToast({ message: msg, tone: 'success' });
+              setReloadKey((k) => k + 1);
+            }
+          }}
+        />
+      )}
     </div>
   );
 };

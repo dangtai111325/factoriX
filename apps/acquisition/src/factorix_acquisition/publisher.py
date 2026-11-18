@@ -44,12 +44,13 @@ from factorix.domain.quality import Origin, Quality
 from factorix.platform.broker import (
     BrokerBackpressureError,
     BrokerError,
-    BrokerUnavailableError,
+    BrokerTimeoutError,
     tenant_live_routing_key,
     tenant_routing_key,
 )
 from factorix_acquisition.jobs import JobSpec
 from factorix_acquisition.mapping import Sample, coerce, field_address
+from factorix_acquisition.replay import ReplayController, ReplayLimits, ReplayPump
 from factorix_acquisition.spool import AcquisitionSpool, SpoolRow
 from factorix_acquisition.timeutil import iso_ms, now_iso
 
@@ -76,6 +77,15 @@ FLUSH_BUDGET_S = 1.0
 MAX_MEMORY_QUEUE = 50_000
 ADMISSION_WAIT_S = _env_float("FACTORIX_PUBLISH_ADMISSION_WAIT_S", 2.0)
 REPLAY_MAX_OBS_S = _env_float("FACTORIX_REPLAY_MAX_OBS_S", 2000.0)
+# A broker that is connected but has not confirmed anything for this long is treated as
+# unavailable (spool); shorter confirm timeouts are "slow" and retried from RAM.
+SLOW_TO_DOWN_S = _env_float("FACTORIX_PUBLISH_SLOW_TO_DOWN_S", 30.0)
+
+
+def _background_replay_default() -> bool:
+    if os.environ.get("FACTORIX_ENVIRONMENT") == "test":
+        return False
+    return os.environ.get("FACTORIX_REPLAY_BACKGROUND", "on").strip().lower() not in {"off", "0", "false", "no"}
 EXPIRE_INTERVAL_S = 60.0
 BACKPRESSURE_PAUSE_MIN_S = 0.05
 BACKPRESSURE_PAUSE_MAX_S = 2.0
@@ -170,6 +180,7 @@ class ObservationPublisher:
         freshness_window_s: float = DEFAULT_FRESHNESS_WINDOW_S,
         admission_wait_s: float = ADMISSION_WAIT_S,
         replay_max_obs_s: float = REPLAY_MAX_OBS_S,
+        background_replay: bool | None = None,
         on_wake: Any = None,
         on_broker_restored: Any = None,
     ) -> None:
@@ -200,13 +211,25 @@ class ObservationPublisher:
         self.ingest_backpressure = False
         self._backpressure_pause_s = 0.0
         self._backpressure_until = 0.0
-        self._replay_tokens = max(float(BATCH_ROWS), self.replay_max_obs_s)
-        self._replay_refill_at = time.monotonic()
+        self.broker_slow = False
+        self._slow_since: float | None = None
+        self.slow_events = 0
         self._next_expire_at = 0.0
+        self.background_replay = _background_replay_default() if background_replay is None else bool(background_replay)
+        self.replay = ReplayPump(
+            self,
+            ReplayController(
+                ReplayLimits(
+                    max_rate=self.replay_max_obs_s,
+                    initial_rate=min(self.replay_max_obs_s, _env_float("FACTORIX_REPLAY_INITIAL_OBS_S", 500.0)),
+                )
+            ),
+        )
         self.published_fast = 0
         self.published_replay = 0
         self.spilled = 0
         self.publish_failed = 0
+        self.publish_failed_by_lane: Counter[str] = Counter()
         self.backpressure_events = 0
         self.admission_waits = 0
         self.admission_wait_seconds = 0.0
@@ -288,10 +311,15 @@ class ObservationPublisher:
     def fast_buffered(self) -> int:
         return len(self._fast_queue)
 
+    def fast_head_age_s(self) -> float | None:
+        """Age of the oldest live observation still waiting in RAM (None when empty)."""
+        if not self._fast_queue:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - self._fast_queue[0].acquired_at).total_seconds())
+
     def publish_metrics(self) -> dict[str, Any]:
-        queue_age = None
-        if self._fast_queue:
-            queue_age = round(max(0.0, (datetime.now(timezone.utc) - self._fast_queue[0].acquired_at).total_seconds()), 3)
+        head_age = self.fast_head_age_s()
+        queue_age = round(head_age, 3) if head_age is not None else None
         metrics: dict[str, Any] = {
             "published_fast": self.published_fast,
             "published_replay": self.published_replay,
@@ -301,8 +329,12 @@ class ObservationPublisher:
             "spool_full": self._spool_is_full(),
             "spool_occupied_bytes": self.spool.occupied_bytes() if hasattr(self.spool, "occupied_bytes") else None,
             "publish_failed": self.publish_failed,
+            "publish_failed_by_lane": dict(self.publish_failed_by_lane),
             "last_publish_failure": self.last_publish_failure,
             "ingest_backpressure": self.ingest_backpressure,
+            "broker_slow": self.broker_slow,
+            "slow_events": self.slow_events,
+            "replay": {**self.replay.controller.snapshot(), "background": self.background_replay},
             "backpressure_events": self.backpressure_events,
             "admission_waits": self.admission_waits,
             "admission_wait_s": round(self.admission_wait_seconds, 3),
@@ -324,9 +356,10 @@ class ObservationPublisher:
         self._stage_calls[stage] += 1
         self._stage_seconds[stage] += time.monotonic() - started
 
-    def _note_publish_failures(self, failed: list[tuple[CanonicalObservation, BrokerError]]) -> None:
+    def _note_publish_failures(self, failed: list[tuple[CanonicalObservation, BrokerError]], *, lane: str = "live") -> None:
         if failed:
             self.publish_failed += len(failed)
+            self.publish_failed_by_lane[lane] += len(failed)
             error = failed[-1][1]
             self.last_publish_failure = type(error.__cause__ or error).__name__
 
@@ -498,6 +531,8 @@ class ObservationPublisher:
                 return None
             self._spool_error = None
             self.spilled += written
+            if written:
+                self.replay.wake()
             return written
 
         # Keep the write alive if a job stops while waiting for SQLite.
@@ -659,25 +694,6 @@ class ObservationPublisher:
             return BATCH_ROWS * PIPELINE_BATCHES
         return BATCH_ROWS
 
-    def _replay_allowance(self, wanted: int) -> int:
-        now = time.monotonic()
-        capacity = max(float(BATCH_ROWS), self.replay_max_obs_s)
-        elapsed = max(0.0, now - self._replay_refill_at)
-        self._replay_tokens = min(capacity, self._replay_tokens + elapsed * self.replay_max_obs_s)
-        self._replay_refill_at = max(now, self._replay_refill_at)
-        return max(0, min(int(wanted), int(self._replay_tokens)))
-
-    async def _wait_for_replay_tokens(self, max_wait_s: float) -> None:
-        needed = max(1.0, float(CONTENDED_REPLAY_ROWS)) - self._replay_tokens
-        wait_s = min(max_wait_s, max(0.0, needed / self.replay_max_obs_s))
-        if wait_s <= 0:
-            return
-        self._ram_event.clear()
-        try:
-            await asyncio.wait_for(self._ram_event.wait(), timeout=wait_s)
-        except asyncio.TimeoutError:
-            pass
-
     def _note_backpressure(self) -> None:
         self.ingest_backpressure = True
         self.backpressure_events += 1
@@ -698,15 +714,18 @@ class ObservationPublisher:
         await asyncio.to_thread(self.spool.expire_stale)
 
     async def flush_once(self, budget_s: float = FLUSH_BUDGET_S) -> tuple[int, bool]:
-        """Publish buffered live observations first, then rate-limited spool replay.
+        """Publish buffered live observations (the live lane).
 
-        Returns ``(published_count, failed_or_broker_unavailable)``.
+        Spool replay is a separate lane (:mod:`factorix_acquisition.replay`): in background mode
+        it runs in its own task and never delays this method; in inline mode (unit tests, or
+        ``FACTORIX_REPLAY_BACKGROUND=off``) one controller-limited replay step follows the live
+        lane. Returns ``(published_count, failed_or_broker_unavailable)``.
         """
         flush_started = time.monotonic()
         self._inflight_flushes += 1
         try:
             published = 0
-            # Paced retry while the broker reports queue-full backpressure.
+            # Paced retry while the broker reports queue-full backpressure or slow confirms.
             pause = self._backpressure_until - time.monotonic()
             if pause > 0:
                 await asyncio.sleep(min(pause, max(budget_s, BACKPRESSURE_PAUSE_MIN_S)))
@@ -714,11 +733,15 @@ class ObservationPublisher:
             # spool first so latest-per-signal ordering stays monotonic across disk + RAM.
             if self._broker_down:
                 await self._spill_buffered()
+            if self.spool.pending_count() > 0:
+                if self.background_replay:
+                    self.replay.start()
+                    self.replay.wake()
+                else:
+                    await self._maybe_expire()
 
             if not self._fast_queue and self.spool.pending_count() <= 0:
                 return 0, False
-            if self.spool.pending_count() > 0:
-                await self._maybe_expire()
 
             deadline = time.monotonic() + max(0.0, budget_s)
             while True:
@@ -742,52 +765,51 @@ class ObservationPublisher:
                     if time.monotonic() >= deadline:
                         break
 
-                # 2. Replay lane: newest-per-signal slice, then one FIFO history slice. While
-                # the broker is down this doubles as the recovery probe.
-                if self.spool.pending_count() > 0:
+                # 2. Inline replay step (only when replay has no task of its own).
+                if not self.background_replay and self.spool.pending_count() > 0:
                     wanted = CONTENDED_REPLAY_ROWS if self._fast_queue else BATCH_ROWS
-                    lanes: list[list[Any]] = []
-                    limit = self._replay_allowance(wanted)
-                    if limit > 0:
-                        read_started = time.monotonic()
-                        latest = await asyncio.to_thread(self.spool.latest_pending, limit)
-                        self._record_stage("spool_read", read_started)
-                        if latest:
-                            lanes.append(latest)
-                            self._replay_tokens -= len(latest)
-                        history_limit = self._replay_allowance(wanted)
-                        if history_limit > 0:
-                            read_started = time.monotonic()
-                            history = await asyncio.to_thread(
-                                self.spool.pending, history_limit, {int(r["seq"]) for r in latest}
-                            )
-                            self._record_stage("spool_read", read_started)
-                            if history:
-                                lanes.append(history)
-                                self._replay_tokens -= len(history)
-                    for lane_rows in lanes:
-                        count, ok = await self._replay_rows(lane_rows)
-                        published += count
-                        progressed = True
-                        if not ok:
-                            return published, True
+                    count, ok, attempted = await self.replay.replay_once(wanted)
+                    published += count
+                    progressed = progressed or attempted
+                    if not ok:
+                        return published, True
 
                 if not progressed:
                     if self.spool.pending_count() > 0 and not self._fast_queue and not self._broker_down:
-                        # Replay is rate-limited: wait for tokens, but wake at once for live data,
-                        # so the runtime's flush loop does not spin while the bucket refills.
-                        await self._wait_for_replay_tokens(max(budget_s, 0.01))
+                        # Nothing live to send and replay is paced/elsewhere: wait for live data
+                        # (bounded) so the runtime's flush loop does not spin on has_pending().
+                        wait_s = max(budget_s, 0.01)
+                        if not self.background_replay:
+                            wait_s = min(wait_s, self.replay.controller.seconds_until(CONTENDED_REPLAY_ROWS))
+                        await self._wait_for_live(wait_s)
                     break
                 if time.monotonic() >= deadline:
                     break
-                if not self._fast_queue and self.spool.pending_count() <= 0:
+                if not self._fast_queue and (self.background_replay or self.spool.pending_count() <= 0):
                     break
             return published, False
         finally:
             self._inflight_flushes = max(0, self._inflight_flushes - 1)
             self._record_stage("flush", flush_started)
 
+    async def _wait_for_live(self, max_wait_s: float) -> None:
+        if max_wait_s <= 0:
+            return
+        self._ram_event.clear()
+        try:
+            await asyncio.wait_for(self._ram_event.wait(), timeout=max_wait_s)
+        except asyncio.TimeoutError:
+            pass
+
     async def _publish_or_spill(self, batch: list[CanonicalObservation]) -> tuple[int, bool]:
+        """Publish one live batch; classify failures as backpressure / slow / unavailable.
+
+        * backpressure (queue full) and slow (confirm timeout on an open connection): the
+          observations go back to the front of the RAM queue and publishing is paced; this is
+          not an outage and never feeds the spool (no spill → replay feedback loop);
+        * slow for longer than ``SLOW_TO_DOWN_S``, or a connection/channel failure: the broker
+          is unavailable → unconfirmed observations go to the outage spool.
+        """
         broker = self.broker
         gen = self._broker_gen
         if broker is None:
@@ -802,7 +824,8 @@ class ObservationPublisher:
             await self._spill_or_restore(batch)
             raise
         self._record_stage("fast_publish", publish_started)
-        self._note_publish_failures(failed)
+        self.replay.controller.note_live_publish(time.monotonic() - publish_started)
+        self._note_publish_failures(failed, lane="live")
         self.published_fast += len(confirmed)
         same_gen = gen == self._broker_gen
         if not failed:
@@ -810,14 +833,25 @@ class ObservationPublisher:
                 self._broker_down = False
                 self.broker_ok = True
                 self._clear_backpressure()
+                self._clear_slow()
             return len(confirmed), (not same_gen and self.broker is None)
 
+        self.replay.controller.note_live_failure(type(failed[-1][1]).__name__)
         backpressured = [obs for obs, err in failed if isinstance(err, BrokerBackpressureError)]
-        unavailable = [obs for obs, err in failed if not isinstance(err, BrokerBackpressureError)]
+        slow = [obs for obs, err in failed if isinstance(err, BrokerTimeoutError)]
+        unavailable = [obs for obs, err in failed if not isinstance(err, (BrokerBackpressureError, BrokerTimeoutError))]
+        if slow and self._note_slow():
+            # Silent for too long while "connected": treat as unavailable from now on.
+            unavailable.extend(slow)
+            slow = []
+        retry_in_ram = backpressured + slow
         if backpressured:
             # Queue full = Center is behind, not an outage: keep the data in RAM and pace.
             self._note_backpressure()
-            self._fast_queue.extendleft(reversed(backpressured))
+        if retry_in_ram:
+            order = {id(obs): i for i, obs in enumerate(batch)}
+            retry_in_ram.sort(key=lambda o: order.get(id(o), 0))
+            self._fast_queue.extendleft(reversed(retry_in_ram))
         if unavailable:
             if same_gen:
                 # Confirmed deliveries show the broker accepted work. Keep the
@@ -827,74 +861,33 @@ class ObservationPublisher:
             await self._spill_or_restore(unavailable)
         return len(confirmed), True
 
+    def _note_slow(self) -> bool:
+        """Record a confirm timeout; True once the broker has been slow for ``SLOW_TO_DOWN_S``."""
+        now = time.monotonic()
+        if self._slow_since is None:
+            self._slow_since = now
+        self.broker_slow = True
+        self.slow_events += 1
+        self._backpressure_pause_s = min(
+            BACKPRESSURE_PAUSE_MAX_S, max(BACKPRESSURE_PAUSE_MIN_S, self._backpressure_pause_s * 2)
+        )
+        self._backpressure_until = now + self._backpressure_pause_s
+        return now - self._slow_since >= SLOW_TO_DOWN_S
+
+    def _clear_slow(self) -> None:
+        self.broker_slow = False
+        self._slow_since = None
+
     async def _replay_rows(self, rows: list[Any]) -> tuple[int, bool]:
-        broker = self.broker
-        gen = self._broker_gen
-        if broker is None:
-            self._broker_down = True
-            self.broker_ok = False
-            return 0, False
-        valid_obs: list[CanonicalObservation] = []
-        corrupt_uids: list[str] = []
-        stale_epochs: set[str] = set()
-        decode_started = time.monotonic()
-        for row in rows:
-            uid = str(row["event_uid"])
-            tid = str(row["tenant_id"])
-            if int(row["data_epoch"]) < self.active_epoch(tid):
-                stale_epochs.add(tid)
-                continue
-            try:
-                obs = CanonicalObservation.from_json_bytes(row["payload"])
-            except ObservationError:
-                corrupt_uids.append(uid)
-                continue
-            if obs.data_epoch < self.active_epoch(str(obs.tenant_id)):
-                stale_epochs.add(str(obs.tenant_id))
-                continue
-            valid_obs.append(obs)
-        self._record_stage("replay_decode", decode_started)
-        if corrupt_uids:
-            await asyncio.to_thread(self.spool.mark_state, corrupt_uids, "QUARANTINED")
-        if stale_epochs:
-            await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
-        if not valid_obs:
-            return 0, True
-
-        publish_started = time.monotonic()
-        confirmed, failed = await broker.publish_observations_partial(valid_obs)
-        self._record_stage("replay_publish", publish_started)
-        self._note_publish_failures(failed)
-        if confirmed:
-            mark_started = time.monotonic()
-            await asyncio.to_thread(self.spool.mark_sent, confirmed)
-            self._record_stage("spool_mark_sent", mark_started)
-            self.published_replay += len(confirmed)
-        same_gen = gen == self._broker_gen
-        if not failed:
-            if same_gen:
-                self._broker_down = False
-                self.broker_ok = True
-                self._clear_backpressure()
-            return len(confirmed), (same_gen or self.broker is not None)
-
-        backpressure_uids = [obs.event_uid for obs, err in failed if isinstance(err, BrokerBackpressureError)]
-        unavailable = len(failed) - len(backpressure_uids)
-        if backpressure_uids:
-            # Count the attempt for diagnostics, but a full queue never turns a pending row DEAD.
-            self._note_backpressure()
-            await asyncio.to_thread(self.spool.note_attempt, backpressure_uids, None)
-        if unavailable and same_gen:
-            self.broker_ok = bool(confirmed)
-            self._broker_down = not self.broker_ok
-        # BrokerUnavailableError items remain PENDING without counting against max_attempts
-        return len(confirmed), False
+        """Compatibility shim: replay one list of spool rows (see :class:`ReplayPump`)."""
+        return await self.replay.replay_rows(rows)
 
     def has_pending(self) -> bool:
         return bool(self._fast_queue) or self._inflight_flushes > 0 or self.spool.pending_count() > 0
 
     async def drain_and_close(self, *, timeout_s: float = 5.0) -> None:
         """Flush buffered observations on shutdown; spill any unconfirmed items cleanly."""
+        await self.replay.stop()
         deadline = time.monotonic() + timeout_s
         while self._fast_queue and time.monotonic() < deadline and not self._broker_down:
             batch = self._pop_fast_batch(self._fast_batch_rows())

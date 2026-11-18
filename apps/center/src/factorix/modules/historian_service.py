@@ -54,6 +54,7 @@ from factorix.modules.live_state import (
     get_live_state_provider,
 )
 from factorix.modules import historian_sources as HSRC
+from factorix.modules import historian_views as HV
 from factorix.modules import storage_bindings as SB
 from factorix.modules.storage_dsl import tenant_td_database
 from factorix.platform.errors import AppError
@@ -121,7 +122,9 @@ def _parse_time_bounds(
             try:
                 end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
             except ValueError:
-                end_dt = now
+                raise AppError(422, "INVALID_TIME", f"'{end_raw}' is not an ISO-8601 timestamp.") from None
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
 
     start_dt: datetime = end_dt - timedelta(minutes=15)
     if start_raw:
@@ -131,7 +134,9 @@ def _parse_time_bounds(
             try:
                 start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
             except ValueError:
-                start_dt = end_dt - timedelta(minutes=15)
+                raise AppError(422, "INVALID_TIME", f"'{start_raw}' is not an ISO-8601 timestamp.") from None
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
 
     if start_dt >= end_dt:
         start_dt = end_dt - timedelta(minutes=15)
@@ -140,36 +145,14 @@ def _parse_time_bounds(
 
 
 async def _active_epoch(session: AsyncSession, tenant_id: UUID) -> int:
-    try:
-        row = await fetch_one(
-            session,
-            """
-            SELECT active_epoch
-            FROM telemetry_generations
-            WHERE tenant_id = :tenant_id
-            """,
-            {"tenant_id": tenant_id},
-        )
-        if row and row.get("active_epoch") is not None:
-            return int(row["active_epoch"])
-    except Exception:
-        pass
-
-    try:
-        row = await fetch_one(
-            session,
-            """
-            SELECT max(active_epoch) AS active_epoch
-            FROM telemetry_reset_operations
-            WHERE tenant_id = :tenant_id AND status = 'SUCCEEDED'
-            """,
-            {"tenant_id": tenant_id},
-        )
-        if row and row.get("active_epoch") is not None:
-            return int(row["active_epoch"])
-    except Exception:
-        pass
-
+    """Active telemetry epoch of the tenant (single source: ``telemetry_generations``)."""
+    row = await fetch_one(
+        session,
+        "SELECT active_epoch FROM telemetry_generations WHERE tenant_id = :tenant_id",
+        {"tenant_id": tenant_id},
+    )
+    if row and row.get("active_epoch") is not None:
+        return max(1, int(row["active_epoch"]))
     return 1
 
 
@@ -428,6 +411,7 @@ async def _enrich_sources(session: AsyncSession, tenant_id: UUID, sources: list[
                     continue
                 src.value_type = str(m.get("data_type") or "float64")
                 src.unit = m.get("unit")
+                src.expected_interval_ms = int(m.get("expected_interval_ms") or 0) or None
                 src.resource_id = str(m["resource_id"]) if m.get("resource_id") else None
                 src.resource_name = m.get("resource_name")
                 src.label = f"{m.get('resource_name')} \u00b7 {m['key']}" if m.get("resource_name") else str(m["key"])
@@ -614,6 +598,10 @@ async def query_historian(
     bucket_ms = int(payload_dict["bucket_ms"]) if payload_dict.get("bucket_ms") else None
     if bucket_ms is not None and not 1000 <= bucket_ms <= 86_400_000:
         raise AppError(422, "BUCKET", "Bucket must be between 1 second and 1 day.")
+    try:
+        compare_ms = HSRC.parse_offset_ms(payload_dict.get("compare_offset"))
+    except ValueError as exc:
+        raise AppError(422, "INVALID_COMPARE_OFFSET", str(exc)) from exc
     resolution = str(payload_dict.get("resolution") or ("bucket" if bucket_ms else "auto")).lower()
     if resolution not in {"auto", "raw", "bucket"}:
         resolution = "auto"
@@ -730,6 +718,15 @@ async def query_historian(
             good_pct = round(good_count / len(known) * 100.0, 1) if known else None
             count = len(points)
         last_pt = points[-1] if points else None
+        times = [HSRC._utc(p["ts"]) for p in points if p.get("ts")]
+        times = [t for t in times if t is not None]
+        if info.get("downsampled"):
+            gap_threshold = int(info.get("bucket_ms") or 0) or None  # a missing bucket = a gap
+        elif src.kind == "signal" and mode == "operational":
+            gap_threshold = canonical_stale_after_ms(src.expected_interval_ms or 1000)
+        else:
+            gap_threshold = None  # change-only / event series: silence is not a gap
+        gaps = HSRC.gap_stats(times, start_dt, end_dt, gap_threshold) if status != "ERROR" else {}
         stats = {
             "signal_id": src.key,
             "series_key": src.key,
@@ -747,6 +744,12 @@ async def query_historian(
             "good_count": good_count,
             "good_pct": good_pct,
             "fidelity": fidelity,
+            "first": points[0]["value"] if points else None,
+            "first_ts": points[0]["ts"] if points else None,
+            "gap_count": gaps.get("gap_count"),
+            "longest_gap_ms": gaps.get("longest_gap_ms"),
+            "coverage_pct": gaps.get("coverage_pct"),
+            "gap_threshold_ms": gap_threshold,
         }
         quality_segments = [] if info.get("downsampled") else _build_quality_segments(
             [p for p in points if p.get("quality")], start_dt, end_dt,
@@ -792,10 +795,31 @@ async def query_historian(
         agg=agg,
         limit=max_points,
     )
+    compare: dict[str, Any] | None = None
+    if compare_ms:
+        # Same series and settings over the earlier window; points are shifted forward by the offset
+        # so both periods share one time axis (``original_ts`` keeps the real timestamp).
+        shift = timedelta(milliseconds=compare_ms)
+        prev = await query_historian(
+            session, tenant_id,
+            {**payload_dict, "compare_offset": None, "range": None, "cursor": None,
+             "start": (start_dt - shift).isoformat(), "end": (end_dt - shift).isoformat()},
+            history_provider=history_provider,
+        )
+        for sr in prev["series_list"]:
+            for pt in sr["points"]:
+                pt["original_ts"] = pt["ts"]
+                moved = HSRC._utc(pt["ts"])
+                if moved is not None:
+                    pt["ts"] = pt["event_time"] = iso_ms(moved + shift)
+        compare = {"offset_ms": compare_ms, "start": prev["start"], "end": prev["end"],
+                   "series_list": prev["series_list"], "stats": prev["stats"]}
+
     return {
         "mode": mode,
         "start": start_dt.isoformat().replace("+00:00", "Z"),
         "end": end_dt.isoformat().replace("+00:00", "Z"),
+        "compare": compare,
         "resolution": resolution,
         "bucket_ms": bucket_ms,
         "agg": agg,
@@ -820,12 +844,11 @@ async def _pg_signal_points(session: AsyncSession, tenant_id: UUID, src: HSRC.Se
     obs_rows = await fetch_all(
         session,
         """
-        SELECT id, signal_id, signal_key, acquired_at, event_time, source_time,
-               value_json, value_type, unit, raw_quality, reason_code, data_epoch
+        SELECT id, signal_id, received_time, event_time, source_time, value_json, value_type, unit, quality
         FROM observations
         WHERE tenant_id = :tenant_id AND signal_id = :signal_id
-          AND acquired_at >= :start_dt AND acquired_at < :end_dt
-        ORDER BY acquired_at ASC
+          AND event_time >= :start_dt AND event_time < :end_dt
+        ORDER BY event_time ASC
         LIMIT :lim
         """,
         {"tenant_id": tenant_id, "signal_id": src.signal_id, "start_dt": start_dt, "end_dt": end_dt,
@@ -833,13 +856,12 @@ async def _pg_signal_points(session: AsyncSession, tenant_id: UUID, src: HSRC.Se
     )
     pts = []
     for o in obs_rows:
-        ts = o.get("acquired_at") or o.get("event_time")
+        ts = o.get("event_time") or o.get("received_time")
         if ts is None:
             continue
-        v_val = _safe_json_dict(o.get("value_json")).get("v") if o.get("value_json") else o.get("value")
-        pts.append(_point(src, ts, v_val, str(o.get("raw_quality") or "").upper() or None, "RAW_OPERATIONAL",
-                          {"source_time": iso_ms(o["source_time"]) if o.get("source_time") else None,
-                           "reason_code": o.get("reason_code"), "data_epoch": o.get("data_epoch")}))
+        v_val = _safe_json_dict(o.get("value_json")).get("v") if o.get("value_json") else None
+        pts.append(_point(src, ts, v_val, str(o.get("quality") or "").upper() or None, "RAW_OPERATIONAL",
+                          {"source_time": iso_ms(o["source_time"]) if o.get("source_time") else None}))
     pts.sort(key=lambda p: p["ts"])
     return {"points": pts, "total": len(pts), "truncated": len(pts) >= max_points}
 
@@ -1060,115 +1082,16 @@ async def list_historian_events(
 
 
 async def list_saved_views(
-    session: AsyncSession,
-    tenant_id: UUID,
-    *,
-    q: str | None = None,
-    limit: int = 100,
+    session: AsyncSession, tenant_id: UUID, *, q: str | None = None, limit: int = 100, actor_id: UUID | None = None,
 ) -> list[dict[str, Any]]:
-    """List saved queries / views for tenant."""
-    clauses = ["tenant_id = :tenant_id"]
-    params: dict[str, Any] = {"tenant_id": tenant_id, "lim": min(max(int(limit), 1), 500)}
-    if q and q.strip():
-        clauses.append("(name ILIKE :q OR description ILIKE :q)")
-        params["q"] = f"%{q.strip()}%"
-
-    where_sql = " AND ".join(clauses)
-    rows = await fetch_all(
-        session,
-        f"""
-        SELECT id, name, description, query_spec_json, chart_options_json, is_default, version, created_at, updated_at
-        FROM saved_queries
-        WHERE {where_sql}
-        ORDER BY is_default DESC, updated_at DESC
-        LIMIT :lim
-        """,
-        params,
-    )
-    return [
-        {
-            "id": str(r["id"]),
-            "name": str(r["name"]),
-            "description": str(r.get("description") or ""),
-            "query_spec": _safe_json_dict(r.get("query_spec_json")),
-            "query_spec_json": _safe_json_dict(r.get("query_spec_json")),
-            "chart_options": _safe_json_dict(r.get("chart_options_json")),
-            "chart_options_json": _safe_json_dict(r.get("chart_options_json")),
-            "is_default": bool(r.get("is_default")),
-            "version": int(r.get("version") or 1),
-            "created_at": iso_ms(r["created_at"]),
-            "updated_at": iso_ms(r["updated_at"]),
-        }
-        for r in rows
-    ]
+    """Saved views (see :mod:`factorix.modules.historian_views`)."""
+    return await HV.list_views(session, tenant_id, actor_id, q=q, limit=limit)
 
 
 async def create_saved_view(
-    session: AsyncSession,
-    tenant_id: UUID,
-    actor_id: UUID | None,
-    payload: Mapping[str, Any],
-    correlation_id: str = "",
+    session: AsyncSession, tenant_id: UUID, actor_id: UUID | None, payload: Mapping[str, Any], correlation_id: str = "",
 ) -> dict[str, Any]:
-    """Create a new Historian Saved View backed by saved_queries table."""
-    payload_dict = dict(payload)
-    name = str(payload_dict.get("name") or "Saved View").strip()
-    if not name:
-        raise AppError(422, "MISSING_NAME", "View name is required.")
-
-    query_spec = payload_dict.get("query_spec") or payload_dict.get("query_spec_json") or {}
-    chart_opts = payload_dict.get("chart_options") or payload_dict.get("chart_options_json") or {}
-    is_default = bool(payload_dict.get("is_default"))
-
-    now = utcnow()
-    view_id = uuid4()
-
-    if is_default:
-        await execute(
-            session,
-            "UPDATE saved_queries SET is_default = FALSE WHERE tenant_id = :tenant_id",
-            {"tenant_id": tenant_id},
-        )
-
-    await execute(
-        session,
-        """
-        INSERT INTO saved_queries (
-            id, tenant_id, name, description, selected_signals_json, aggregation_json,
-            visibility, owner_id, query_spec_json, chart_options_json, is_default,
-            version, created_at, updated_at
-        ) VALUES (
-            :id, :tenant_id, :name, :description, CAST(:sel_sigs AS jsonb), CAST(:agg_json AS jsonb),
-            'PRIVATE', :actor_id, CAST(:query_spec AS jsonb), CAST(:chart_opts AS jsonb), :is_default,
-            1, :now, :now
-        )
-        """,
-        {
-            "id": view_id,
-            "tenant_id": tenant_id,
-            "name": name,
-            "description": str(payload_dict.get("description") or ""),
-            "sel_sigs": _dump_json(query_spec.get("signal_ids") or []),
-            "agg_json": _dump_json({"bucket_ms": query_spec.get("bucket_ms"), "agg": query_spec.get("agg")}),
-            "actor_id": actor_id,
-            "query_spec": _dump_json(query_spec),
-            "chart_opts": _dump_json(chart_opts),
-            "is_default": is_default,
-            "now": now,
-        },
-    )
-
-    return {
-        "id": str(view_id),
-        "name": name,
-        "description": str(payload_dict.get("description") or ""),
-        "query_spec": query_spec,
-        "chart_options": chart_opts,
-        "is_default": is_default,
-        "version": 1,
-        "created_at": iso_ms(now),
-        "updated_at": iso_ms(now),
-    }
+    return await HV.create_view(session, tenant_id, actor_id, payload)
 
 
 async def delete_saved_view(
@@ -1180,15 +1103,8 @@ async def delete_saved_view(
     actor_id: UUID | None = None,
     correlation_id: str = "",
 ) -> None:
-    """Delete a saved view."""
-    target_view_id = view_id if view_id is not None else view_id_or_actor
-    deleted = await execute_rowcount(
-        session,
-        "DELETE FROM saved_queries WHERE tenant_id = :tenant_id AND id = :id",
-        {"tenant_id": tenant_id, "id": target_view_id},
-    )
-    if not deleted:
-        raise AppError(404, "NOT_FOUND", f"Saved view {target_view_id} not found.")
+    actor = view_id_or_actor if view_id is not None else actor_id
+    await HV.delete_view(session, tenant_id, actor, view_id if view_id is not None else view_id_or_actor)
 
 
 # ==============================================================================
@@ -1296,7 +1212,10 @@ async def create_export_job(
             "id": job_id,
             "tenant_id": tenant_id,
             "actor_id": actor_id,
-            "query_json": _dump_json(payload_dict),
+            "query_json": _dump_json({**payload_dict, "_result": {
+                "series": [sr["display_name"] for sr in query_res.get("series_list", [])],
+                "truncated_series": truncated_series, "start": query_res.get("start"), "end": query_res.get("end"),
+            }}),
             "status": "COMPLETED",
             "format": fmt,
             "row_count": row_count,
@@ -1316,6 +1235,10 @@ async def create_export_job(
         "status": "COMPLETED",
         "format": fmt,
         "truncated_series": truncated_series,
+        "progress_pct": 100,
+        "series": [sr["display_name"] for sr in query_res.get("series_list", [])],
+        "start": query_res.get("start"),
+        "end": query_res.get("end"),
         "file_name": file_name,
         "row_count": row_count,
         "byte_size": byte_size,
@@ -1328,6 +1251,51 @@ async def create_export_job(
     }
 
 
+_EXPORT_COLUMNS = """
+        SELECT id, status, format, file_name, row_count, byte_size, query_json,
+               error_code, error_message, data_epoch, created_at, started_at, completed_at, expires_at
+        FROM export_jobs
+"""
+
+
+def _export_item(r: Mapping[str, Any], now: datetime) -> dict[str, Any]:
+    exp_at = r.get("expires_at")
+    status_val = str(r.get("status") or "COMPLETED").upper()
+    if exp_at and exp_at < now and status_val != "EXPIRED":
+        status_val = "EXPIRED"
+    spec = _safe_json_dict(r.get("query_json"))
+    result = spec.pop("_result", {}) if isinstance(spec.get("_result"), dict) else {}
+    series = result.get("series") or []
+    title = (
+        f"{len(series)} series · {result.get('start') or spec.get('start') or spec.get('range') or ''}"
+        f" → {result.get('end') or spec.get('end') or ''} · {spec.get('mode') or 'operational'}"
+    )
+    return {
+        "id": str(r["id"]),
+        "status": status_val,
+        "progress_pct": 100 if status_val in ("COMPLETED", "READY", "FAILED", "EXPIRED", "CANCELLED") else 0,
+        "title": title,
+        "series": series,
+        "start": result.get("start"),
+        "end": result.get("end"),
+        "mode": spec.get("mode") or "operational",
+        "truncated_series": result.get("truncated_series") or [],
+        "format": str(r.get("format") or "csv").lower(),
+        "file_name": str(r.get("file_name") or f"export-{str(r['id'])[:8]}.csv"),
+        "row_count": int(r["row_count"]) if r.get("row_count") is not None else None,
+        "byte_size": int(r["byte_size"]) if r.get("byte_size") is not None else None,
+        "query_spec": spec,
+        "error_code": r.get("error_code"),
+        "error_message": r.get("error_message"),
+        "data_epoch": int(r.get("data_epoch") or 1),
+        "created_at": iso_ms(r.get("created_at") or now),
+        "started_at": iso_ms(r["started_at"]) if r.get("started_at") else None,
+        "completed_at": iso_ms(r["completed_at"]) if r.get("completed_at") else None,
+        "expires_at": iso_ms(exp_at) if exp_at else None,
+        "download_url": f"/api/v1/historian/exports/{r['id']}/download" if status_val in ("COMPLETED", "READY") else None,
+    }
+
+
 async def list_export_jobs(
     session: AsyncSession,
     tenant_id: UUID,
@@ -1335,54 +1303,19 @@ async def list_export_jobs(
     status: str | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    """List export jobs for tenant."""
-    params: dict[str, Any] = {"tenant_id": tenant_id, "lim": min(max(int(limit), 1), 200)}
-    where_sql = "WHERE tenant_id = :tenant_id"
-    if status:
-        where_sql += " AND UPPER(status) = :status"
-        params["status"] = str(status).strip().upper()
-
+    """Export jobs of the tenant, newest first, with progress and a readable title."""
     rows = await fetch_all(
         session,
-        f"""
-        SELECT id, status, format, file_name, row_count, byte_size, query_json,
-               error_code, error_message, data_epoch, created_at, started_at, completed_at, expires_at
-        FROM export_jobs
-        {where_sql}
+        _EXPORT_COLUMNS + """
+        WHERE tenant_id = :tenant_id AND (CAST(:status AS text) IS NULL OR UPPER(status) = :status)
         ORDER BY created_at DESC
         LIMIT :lim
         """,
-        params,
+        {"tenant_id": tenant_id, "lim": min(max(int(limit), 1), 200),
+         "status": str(status).strip().upper() if status else None},
     )
     now = utcnow()
-    items: list[dict[str, Any]] = []
-
-    for r in rows:
-        exp_at = r.get("expires_at")
-        status_val = str(r.get("status") or "COMPLETED").upper()
-        if exp_at and exp_at < now and status_val != "EXPIRED":
-            status_val = "EXPIRED"
-
-        items.append(
-            {
-                "id": str(r["id"]),
-                "status": status_val,
-                "format": str(r.get("format") or "csv").lower(),
-                "file_name": str(r.get("file_name") or f"export-{str(r['id'])[:8]}.csv"),
-                "row_count": int(r["row_count"]) if r.get("row_count") is not None else None,
-                "byte_size": int(r["byte_size"]) if r.get("byte_size") is not None else None,
-                "query_spec": _safe_json_dict(r.get("query_json")),
-                "error_code": r.get("error_code"),
-                "error_message": r.get("error_message"),
-                "data_epoch": int(r.get("data_epoch") or 1),
-                "created_at": iso_ms(r.get("created_at") or r.get("now") or now),
-                "started_at": iso_ms(r["started_at"]) if r.get("started_at") else None,
-                "completed_at": iso_ms(r["completed_at"]) if r.get("completed_at") else None,
-                "expires_at": iso_ms(exp_at) if exp_at else None,
-                "download_url": f"/api/v1/historian/exports/{r['id']}/download",
-            }
-        )
-    return items
+    return [_export_item(r, now) for r in rows]
 
 
 async def get_export_job(
@@ -1392,42 +1325,11 @@ async def get_export_job(
     *,
     correlation_id: str = "",
 ) -> dict[str, Any]:
-    """Get metadata for an export job."""
-    r = await fetch_one(
-        session,
-        """
-        SELECT id, status, format, file_name, row_count, byte_size, query_json,
-               error_code, error_message, data_epoch, created_at, started_at, completed_at, expires_at
-        FROM export_jobs
-        WHERE tenant_id = :tenant_id AND id = :id
-        """,
-        {"tenant_id": tenant_id, "id": export_id},
-    )
+    r = await fetch_one(session, _EXPORT_COLUMNS + " WHERE tenant_id = :tenant_id AND id = :id",
+                        {"tenant_id": tenant_id, "id": export_id})
     if not r:
         raise AppError(404, "NOT_FOUND", f"Export job {export_id} not found.")
-
-    exp_at = r.get("expires_at")
-    status_val = str(r.get("status") or "COMPLETED").upper()
-    if exp_at and exp_at < utcnow() and status_val != "EXPIRED":
-        status_val = "EXPIRED"
-
-    return {
-        "id": str(r["id"]),
-        "status": status_val,
-        "format": str(r.get("format") or "csv").lower(),
-        "file_name": str(r.get("file_name") or f"export-{str(r['id'])[:8]}.csv"),
-        "row_count": int(r["row_count"]) if r.get("row_count") is not None else None,
-        "byte_size": int(r["byte_size"]) if r.get("byte_size") is not None else None,
-        "query_spec": _safe_json_dict(r.get("query_json")),
-        "error_code": r.get("error_code"),
-        "error_message": r.get("error_message"),
-        "data_epoch": int(r.get("data_epoch") or 1),
-        "created_at": iso_ms(r.get("created_at") or r.get("now") or utcnow()),
-        "started_at": iso_ms(r["started_at"]) if r.get("started_at") else None,
-        "completed_at": iso_ms(r["completed_at"]) if r.get("completed_at") else None,
-        "expires_at": iso_ms(exp_at) if exp_at else None,
-        "download_url": f"/api/v1/historian/exports/{r['id']}/download",
-    }
+    return _export_item(r, utcnow())
 
 
 async def cancel_export_job(

@@ -7,8 +7,8 @@ prioritization and data_epoch fencing so reset-fenced old data never replays int
 
 Budgets (count and bytes) are enforced by *refusing new spills* (the publisher records an
 explicit acquisition gap); pending rows are never evicted to make room. The optional TTL
-(``FACTORIX_SPOOL_TTL_HOURS``, default 24 h, 0 disables) is an explicit, counted and logged
-retention policy, not a silent drop.
+(``FACTORIX_SPOOL_TTL_HOURS``; default 0 = disabled since v6 R2, so an outage backlog is
+never aged out) is an explicit, counted and logged retention policy, not a silent drop.
 """
 
 from __future__ import annotations
@@ -86,11 +86,11 @@ class AcquisitionSpool:
         if os.environ.get("FACTORIX_ENVIRONMENT") == "test":
             return 0
         if max_age_hours is None:
-            raw_env = os.environ.get("FACTORIX_SPOOL_TTL_HOURS", "24")
+            raw_env = os.environ.get("FACTORIX_SPOOL_TTL_HOURS", "0")
             try:
                 max_age_hours = float(raw_env)
             except ValueError:
-                max_age_hours = 24.0
+                max_age_hours = 0.0
         if max_age_hours <= 0:
             return 0
         from datetime import datetime, timezone, timedelta

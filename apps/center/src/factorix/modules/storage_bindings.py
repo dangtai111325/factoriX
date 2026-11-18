@@ -344,6 +344,7 @@ class StorageBindingService:
         )
         resources = await load_resource_index(session, tenant_id)
         bound = await bound_model_fields(session, tenant_id)
+        signal_resources = await signal_resource_map(session, tenant_id)
         now = utcnow()
         needle = (search or "").strip().lower()
         flat_leaves: list[dict[str, Any]] = []
@@ -365,7 +366,9 @@ class StorageBindingService:
                     body = json.loads(str(r["body_text"]))
                 except ValueError:
                     body = None
-            context = resource_context(resources, r.get("resource_id"))
+            context = resource_context(
+                resources, r.get("resource_id") or model_resource_id(r.get("spec_json"), resources, signal_resources)
+            )
             machine = context["resource"]
             field_items = []
             for leaf in model_leaf_fields(r.get("spec_json")):
@@ -665,3 +668,40 @@ def suggest_value_column(value_type: str, columns: list[str]) -> str | None:
         if cand in columns:
             return cand
     return None
+
+
+async def signal_resource_map(session: AsyncSession, tenant_id: UUID) -> dict[str, str]:
+    """signal id (lower-case) -> resource id, for every signal of the tenant."""
+    rows = await fetch_all(
+        session,
+        "SELECT id, resource_id FROM signal_definitions WHERE tenant_id = :tenant_id AND resource_id IS NOT NULL",
+        {"tenant_id": tenant_id},
+    )
+    return {str(r["id"]).lower(): str(r["resource_id"]) for r in rows}
+
+
+def model_resource_id(
+    spec_raw: Any, resources: dict[str, dict[str, Any]], signal_resources: dict[str, str]
+) -> str | None:
+    """The machine a Data Model belongs to when ``output_groups.resource_id`` is not set (v2 models).
+
+    Evidence, strongest first: resources referenced by the model's rules (``{{res:<id>}}``, e.g. the
+    ``machine_name`` / ``line_name`` context fields), then the resources owning the mapped signals.
+    The most frequent resource wins; a resource whose type key contains ``machine`` is preferred.
+    Returns None when the model references nothing (no guessing).
+    """
+    from collections import Counter
+
+    from factorix.domain.body import spec_refs
+
+    spec = _spec_dict(spec_raw)
+    if not isinstance(spec.get("root"), dict):
+        return None
+    signals, refs = spec_refs(spec)
+    counts: Counter[str] = Counter(str(r) for r in refs if str(r) in resources)
+    if not counts:
+        counts = Counter(signal_resources[s] for s in signals if s in signal_resources and signal_resources[s] in resources)
+    if not counts:
+        return None
+    machines = [rid for rid, _n in counts.most_common() if "machine" in resources[rid]["type_key"].lower()]
+    return machines[0] if machines else counts.most_common(1)[0][0]

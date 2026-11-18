@@ -892,7 +892,7 @@ async def test_s12_historian_latest_query_and_events() -> None:
             "value_json": {"v": 70.0 + i},
             "value_type": "float64",
             "unit": "°C",
-            "raw_quality": "GOOD",
+            "quality": "GOOD",  # observations.quality (real column)
             "reason_code": "NORMAL",
             "data_epoch": 1,
         }
@@ -984,7 +984,7 @@ async def test_s12_csv_exports_and_formula_injection_safety() -> None:
             "value_json": {"v": "=cmd|' /C calc'!A0"},
             "value_type": "string",
             "unit": None,
-            "raw_quality": "GOOD",
+            "quality": "GOOD",  # observations.quality (real column)
             "reason_code": "NORMAL",
             "data_epoch": 1,
         }

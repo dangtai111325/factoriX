@@ -65,6 +65,15 @@ class BrokerBackpressureError(BrokerError):
     """Broker rejected a publish, for example because a queue reached its limit."""
 
 
+class BrokerTimeoutError(BrokerUnavailableError):
+    """No publisher confirm within ``confirm_timeout_s`` while the connection is still open.
+
+    Under CPU starvation this means "slow", not "lost": callers keep such observations in RAM
+    and retry (idempotent by event_uid) instead of spooling them, unless the broker stays
+    silent long enough to be treated as unavailable.
+    """
+
+
 class ConsumeOutcome(StrEnum):
     ACK = "ACK"
     RETRY = "RETRY"
@@ -151,6 +160,7 @@ class BrokerMetrics:
     published_ok: int = 0
     publish_backpressure: int = 0
     publish_errors: int = 0
+    publish_timeouts: int = 0
     last_confirm_latency_ms: float | None = None
     consumed_ack: int = 0
     consumed_retry: int = 0
@@ -603,9 +613,30 @@ class RabbitMQPublisher:
 
     def _not_attempted(self, env: _Envelope, cause: BrokerError) -> BrokerError:
         self.metrics.publish_errors += 1
-        error = BrokerUnavailableError(f"RabbitMQ unavailable; envelope {env.message_id} not attempted: {cause}")
+        error_cls = BrokerTimeoutError if isinstance(cause, BrokerTimeoutError) else BrokerUnavailableError
+        error = error_cls(f"RabbitMQ unavailable; envelope {env.message_id} not attempted: {cause}")
         error.__cause__ = cause.__cause__ or cause
         return error
+
+    async def queue_depths(self) -> dict[str, int] | None:
+        """Ready-message counts of the live and legacy (replay) queues via passive declare.
+
+        Cheap (one RPC per queue on the publisher channel). Used by the acquisition replay
+        controller to clock replay on Center's actual consumption. ``None`` when unavailable.
+        """
+        channel = self._channel
+        if channel is None or channel.is_closed:
+            return None
+        out: dict[str, int] = {}
+        try:
+            for lane, name in (("live", self.cfg.live_queue_name), ("legacy", self.cfg.queue_name)):
+                declared = await asyncio.wait_for(channel.declare_queue(name, passive=True), timeout=2.0)
+                result = getattr(declared, "declaration_result", None)
+                out[lane] = int(getattr(result, "message_count", 0) or 0)
+        except Exception as exc:  # noqa: BLE001 - advisory signal only
+            logger.debug("Queue depth probe failed: %s", scrub_secrets(exc))
+            return None
+        return out
 
     async def publish_bytes(
         self,
@@ -668,7 +699,13 @@ class RabbitMQPublisher:
         except aiormq.exceptions.DeliveryError as exc:
             self.metrics.publish_backpressure += 1
             raise BrokerBackpressureError(f"RabbitMQ rejected message {message_id}: {scrub_secrets(exc)}") from exc
-        except (TimeoutError, aio_pika.exceptions.AMQPError, aiormq.exceptions.AMQPException, OSError) as exc:
+        except TimeoutError as exc:
+            self.metrics.publish_errors += 1
+            self.metrics.publish_timeouts += 1
+            raise BrokerTimeoutError(
+                f"RabbitMQ did not confirm {message_id} within {self.cfg.confirm_timeout_s:.1f}s"
+            ) from exc
+        except (aio_pika.exceptions.AMQPError, aiormq.exceptions.AMQPException, OSError) as exc:
             self.metrics.publish_errors += 1
             raise BrokerUnavailableError(f"RabbitMQ publish failed for {message_id}: {scrub_secrets(exc)}") from exc
         self.metrics.published_ok += 1

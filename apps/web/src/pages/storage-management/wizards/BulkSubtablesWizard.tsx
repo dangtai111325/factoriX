@@ -21,6 +21,9 @@ import {
   listStables,
 } from '../../../lib/storagePhysicalApi';
 import { autoTagValues, suggestColumn, typeCompatible, valueColumns } from './SubtableWizardSteps';
+import { useStorageBackTarget } from './WizardShared';
+import { Button } from '../../../components/common/Button';
+import { Banner, DraftChip, LoadingBlock, WizardHeader, WizardStepper, selectCls } from '../../historian/hsUi';
 
 interface PlannedRow {
   key: string;
@@ -61,6 +64,7 @@ const STATUS_STYLE: Record<string, string> = {
 
 export const BulkSubtablesWizard: React.FC = () => {
   const navigate = useNavigate();
+  const backTarget = useStorageBackTarget('/historian/storage');
   const [params] = useSearchParams();
   const [stables, setStables] = useState<TDStable[]>([]);
   const [groups, setGroups] = useState<ModelSourceGroup[]>([]);
@@ -218,30 +222,36 @@ export const BulkSubtablesWizard: React.FC = () => {
     return acc;
   }, {});
   const runnable = rows.filter((r) => !r.problem && r.result?.status !== 'CREATED' && r.result?.status !== 'EXISTS').length;
+  const bulkStep = !stableId ? 0 : selectedModels.size === 0 ? 1 : rows.length === 0 ? 2 : 3;
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <button type="button" onClick={() => navigate('/historian/storage?tab=objects')} aria-label="Back to Storage Management"
-            className="h-9 w-9 inline-flex items-center justify-center rounded-lg border border-[#D4DFEC] bg-white text-[#334568]"><ArrowLeft className="w-4 h-4" /></button>
-          <div>
-            <h1 className="text-[20px] font-bold text-[#111B37]">Generate subtables from Data Models</h1>
-            <p className="text-[13px] text-[#657794]">One subtable per machine and field, through the same checks as the single wizard.</p>
-          </div>
-        </div>
-      </div>
+      <WizardHeader
+        backLabel="Storage Management"
+        onBack={() => navigate(backTarget)}
+        title="Subtables from Data Models"
+        chip={<DraftChip state={counts.CREATED ? 'saved' : 'new'} label={counts.CREATED ? `${counts.CREATED} created` : undefined} />}
+        note={<span>One subtable per machine and field, through the same checks as the single wizard.</span>}
+        stepper={
+          <WizardStepper
+            steps={[{ id: 'st', label: 'Supertable' }, { id: 'models', label: 'Data Models' }, { id: 'fields', label: 'Fields' }, { id: 'review', label: 'Review' }]}
+            current={bulkStep}
+            maxReachable={3}
+            onGo={(i) => document.getElementById(`bulk-step-${i}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+          />
+        }
+      />
 
-      {loading && <p className="text-[13px] text-[#657794] flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />Loading…</p>}
-      {loadError && <p className="text-[13px] text-[#F2343B]">{loadError}</p>}
+      {loading && <LoadingBlock label="Loading supertables and Data Models…" />}
+      {loadError && <Banner tone="error">{loadError}</Banner>}
 
       {!loading && !loadError && (
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
           {/* 1. Supertable + recording */}
-          <section className="bg-white border border-[#E3EAF3] rounded-xl p-4 space-y-3">
+          <section id="bulk-step-0" className="bg-white border border-[#CBD5E1] rounded-xl p-4 space-y-3 scroll-mt-24">
             <h2 className="text-[14px] font-bold text-[#111B37]">1. Supertable</h2>
             <select aria-label="Parent supertable" value={stableId} onChange={(e) => { setStableId(e.target.value); setPrefix(''); setColumnFor({}); }}
-              className="w-full h-9 px-2 rounded-lg border border-[#D4DFEC] bg-white text-[13px]">
+              className={`${selectCls} w-full h-9 text-[13px]`}>
               <option value="">{stables.length ? 'Select a supertable…' : 'Create a supertable first'}</option>
               {stables.map((s) => <option key={s.id} value={s.id}>{s.physical_name} · {s.database_name}</option>)}
             </select>
@@ -251,8 +261,8 @@ export const BulkSubtablesWizard: React.FC = () => {
                 <div>Tags: <span className="font-mono text-[#334568]">{stable.tags.map((t) => t.name).join(', ')}</span></div>
               </div>
             )}
-            <label className="block text-[12px] font-semibold text-[#111B37]">Name prefix
-              <input value={prefix} onChange={(e) => setPrefix(slug(e.target.value))} className="mt-1 w-full h-9 px-2 rounded-lg border border-[#D4DFEC] text-[13px] font-mono" />
+            <label className="block text-[12px] font-semibold text-[#334568]">Name prefix
+              <input value={prefix} onChange={(e) => setPrefix(slug(e.target.value))} className="mt-1 w-full h-9 px-2 rounded-lg border border-[#D4DFEC] text-[13px] font-mono focus:outline-none focus:border-blue-500" />
             </label>
             <p className="text-[11px] text-[#657794]">Name = <span className="font-mono">{atomic ? `${prefix || 'prefix'}_<machine>` : `${prefix || 'prefix'}_<machine>_<field>`}</span>, e.g. <span className="font-mono">{atomic ? `${prefix}_aa10_01` : `${prefix}_aa10_01_status`}</span></p>
             <div className="space-y-1.5">
@@ -270,12 +280,12 @@ export const BulkSubtablesWizard: React.FC = () => {
           </section>
 
           {/* 2. Models */}
-          <section className="bg-white border border-[#E3EAF3] rounded-xl p-4 space-y-3 flex flex-col">
+          <section id="bulk-step-1" className="bg-white border border-[#CBD5E1] rounded-xl p-4 space-y-3 flex flex-col min-w-0 scroll-mt-24">
             <h2 className="text-[14px] font-bold text-[#111B37]">2. Data Models ({selectedModels.size} selected)</h2>
             <div className="relative">
               <Search className="w-3.5 h-3.5 text-[#94A3B8] absolute left-2.5 top-1/2 -translate-y-1/2" />
               <input value={modelSearch} onChange={(e) => setModelSearch(e.target.value)} placeholder="Filter, e.g. State"
-                className="w-full pl-8 h-9 rounded-lg border border-[#D4DFEC] text-[13px]" />
+                className="w-full pl-8 h-8 rounded-lg border border-[#D4DFEC] text-[12px] focus:outline-none focus:border-blue-500" />
             </div>
             <div className="flex gap-2 text-[12px]">
               <button type="button" className="font-semibold text-[#2A82E7]" onClick={() => setSelectedModels(new Set([...selectedModels, ...shownModels.map((g) => g.id)]))}>Select shown ({shownModels.length})</button>
@@ -298,7 +308,7 @@ export const BulkSubtablesWizard: React.FC = () => {
           </section>
 
           {/* 3. Fields x column */}
-          <section className="bg-white border border-[#E3EAF3] rounded-xl p-4 space-y-3 flex flex-col">
+          <section id="bulk-step-2" className="bg-white border border-[#CBD5E1] rounded-xl p-4 space-y-3 flex flex-col min-w-0 scroll-mt-24">
             <h2 className="text-[14px] font-bold text-[#111B37]">3. Fields ({selectedFields.size} selected)</h2>
             <div className="flex gap-2 text-[12px]">
               <button type="button" className="font-semibold text-[#2A82E7]" onClick={() => setSelectedFields(new Set(fieldUnion.filter((f) => !f.is_timestamp).map((f) => f.field_path as string)))}>Select all value fields</button>
@@ -339,39 +349,36 @@ export const BulkSubtablesWizard: React.FC = () => {
 
       {/* 4. Preview + run */}
       {rows.length > 0 && (
-        <section className="bg-white border border-[#E3EAF3] rounded-xl p-4 space-y-3">
+        <section id="bulk-step-3" className="bg-white border border-[#CBD5E1] rounded-xl p-4 space-y-3 min-w-0 scroll-mt-24">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-[14px] font-bold text-[#111B37]">4. Review {rows.length} subtables</h2>
               <p className="text-[12px] text-[#657794]">{Object.entries(counts).map(([k, v]) => `${v} ${k.toLowerCase()}`).join(' · ')}</p>
             </div>
             <div className="flex flex-wrap gap-2">
-              <button type="button" disabled={!!running || runnable === 0} onClick={() => run(true)}
-                className="h-9 px-4 rounded-lg border border-[#D4DFEC] bg-white text-[13px] font-semibold text-[#334568] disabled:opacity-50">
+              <Button variant="outline" size="sm" disabled={!!running || runnable === 0} onClick={() => run(true)}>
                 {running === 'validate' ? `Validating ${progress}/${runnable}…` : 'Validate'}
-              </button>
-              <button type="button" disabled={!!running || runnable === 0} onClick={() => run(false)}
-                className="h-9 px-4 rounded-lg bg-[#EF1B24] text-white text-[13px] font-semibold disabled:bg-[#E3EAF3] disabled:text-[#94A3B8]">
+              </Button>
+              <Button variant="primary" size="sm" disabled={!!running || runnable === 0} onClick={() => run(false)} aria-busy={running === 'create'}>
                 {running === 'create' ? `Creating ${progress}/${runnable}…` : `Create ${runnable} subtables`}
-              </button>
-              <button type="button" onClick={downloadCsv} className="h-9 px-3 rounded-lg border border-[#D4DFEC] bg-white text-[13px] font-semibold text-[#334568] inline-flex items-center gap-1.5"><Download className="w-4 h-4" />CSV</button>
-              <button type="button" onClick={() => download('storage-subtables-manifest.json', 'application/json', JSON.stringify(manifest(), null, 2))}
-                className="h-9 px-3 rounded-lg border border-[#D4DFEC] bg-white text-[13px] font-semibold text-[#334568] inline-flex items-center gap-1.5"><Download className="w-4 h-4" />JSON</button>
+              </Button>
+              <Button variant="outline" size="sm" icon={<Download className="w-3.5 h-3.5" />} onClick={downloadCsv}>CSV</Button>
+              <Button variant="outline" size="sm" icon={<Download className="w-3.5 h-3.5" />} onClick={() => download('storage-subtables-manifest.json', 'application/json', JSON.stringify(manifest(), null, 2))}>JSON</Button>
             </div>
           </div>
-          {runError && <p className="text-[12px] text-[#F2343B] flex items-center gap-1"><AlertTriangle className="w-3.5 h-3.5" />{runError}</p>}
-          <div className="overflow-x-auto max-h-[480px]">
-            <table className="w-full text-[12px]">
-              <thead className="sticky top-0 bg-[#F6F8FC]"><tr className="text-left text-[#657794] uppercase text-[11px]">
-                <th className="p-2">Subtable</th><th>Model</th><th>Field → column</th><th>Tags</th><th>Status</th></tr></thead>
+          {runError && <Banner tone="error">{runError}</Banner>}
+          <div className="overflow-auto max-h-[480px] border border-[#E3EAF3] rounded-lg">
+            <table className="fx-table">
+              <thead className="sticky top-0 z-[1]"><tr>
+                <th>Subtable</th><th>Model</th><th>Field → column</th><th>Tags</th><th>Status</th></tr></thead>
               <tbody>
                 {rows.map((r) => (
-                  <tr key={r.key} className="border-t border-[#E3EAF3] align-top">
-                    <td className="p-2 font-mono text-[#111B37]">{r.name}</td>
-                    <td className="py-2">{r.group.display_name}<div className="text-[11px] text-[#657794]">{r.group.resource?.name}</div></td>
-                    <td className="py-2 font-mono">{r.fields.map((f) => `${f.leaf.field_path} → ${f.column || '?'}`).join(', ')}</td>
-                    <td className="py-2 font-mono text-[11px] text-[#657794]">{r.tags.map((t) => `${t.tag_name}=${t.value ? (t.value.length > 12 ? `${t.value.slice(0, 8)}…` : t.value) : '∅'}`).join(' ')}</td>
-                    <td className="py-2">
+                  <tr key={r.key} className="align-top">
+                    <td className="font-mono text-[#111B37] whitespace-nowrap">{r.name}</td>
+                    <td>{r.group.display_name}<div className="text-[11px] text-[#657794]">{r.group.resource?.name}</div></td>
+                    <td className="font-mono">{r.fields.map((f) => `${f.leaf.field_path} → ${f.column || '?'}`).join(', ')}</td>
+                    <td className="font-mono text-[11px] text-[#657794]">{r.tags.map((t) => `${t.tag_name}=${t.value ? (t.value.length > 12 ? `${t.value.slice(0, 8)}…` : t.value) : '∅'}`).join(' ')}</td>
+                    <td>
                       {r.result ? (
                         <span className={`font-semibold ${STATUS_STYLE[r.result.status] || ''}`} title={r.result.message || (r.result.errors || []).map((e) => e.message).join('; ')}>
                           {r.result.status === 'CREATED' && <CheckCircle2 className="w-3.5 h-3.5 inline mr-1" />}{r.result.status}
@@ -380,7 +387,7 @@ export const BulkSubtablesWizard: React.FC = () => {
                       ) : r.problem ? (
                         <span className="text-[#F2343B]">{r.problem}</span>
                       ) : r.tags.some((t) => !t.value) ? (
-                        <span className="text-[#FFAA23]">Missing tag value</span>
+                        <span className="text-[#B76E00] font-semibold">Missing tag value</span>
                       ) : (
                         <span className="text-[#657794]">Planned</span>
                       )}
@@ -391,7 +398,7 @@ export const BulkSubtablesWizard: React.FC = () => {
             </table>
           </div>
           <p className="text-[11px] text-[#657794]">Rows that already exist are reported as EXISTS and never created twice. Retrying a failed run only sends the remaining rows.
-            {' '}<Link to="/historian/storage?tab=objects" className="text-[#2A82E7] font-semibold">Open Objects table</Link></p>
+            {' '}<Link to="/historian/storage?tab=objects" className="text-[#2A82E7] font-semibold hover:underline">Open Objects table</Link></p>
         </section>
       )}
     </div>

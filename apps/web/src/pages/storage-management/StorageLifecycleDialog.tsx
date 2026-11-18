@@ -4,8 +4,9 @@
  * (operational history, model snapshots, the tenant database) are read-only and say so.
  */
 import React, { useState } from 'react';
-import { AlertTriangle, Loader2, X } from 'lucide-react';
-import { ModalPortal } from '../../components/modals/ModalPortal';
+import { AlertTriangle } from 'lucide-react';
+import { Button } from '../../components/common/Button';
+import { Banner, Dialog } from '../historian/hsUi';
 import {
   isSystemStorageName,
   pauseStorageObject,
@@ -62,48 +63,38 @@ export const StorageLifecycleDialog: React.FC<{
     }
   };
 
+  const title = `Manage ${target.kind === 'stable' ? 'supertable' : target.kind}`;
   return (
-    <ModalPortal>
-      <div className="fixed inset-0 z-50 bg-[#111B37]/40 flex items-center justify-center p-4" onKeyDown={(e) => e.key === 'Escape' && onClose()}>
-        <div role="dialog" aria-modal="true" aria-label={`Manage ${target.name}`} className="bg-white rounded-xl border border-[#E3EAF3] shadow-xl w-full max-w-md p-5 space-y-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-[16px] font-bold text-[#111B37]">Manage {target.kind}</h2>
-              <p className="text-[13px] font-mono text-[#334568] break-all">{target.name}</p>
-            </div>
-            <button type="button" onClick={onClose} aria-label="Close" className="text-[#657794] hover:text-[#111B37]"><X className="w-4 h-4" /></button>
-          </div>
-          {locked ? (
-            <p className="text-[13px] text-[#334568]">This is a FactoriX system object (operational history). It is read-only here and cannot be paused, retired or deleted.</p>
-          ) : (
-            <>
-              {target.kind !== 'database' && (
-                <div className="flex flex-wrap gap-2">
-                  <button type="button" disabled={!!busy} onClick={() => run(target.status === 'ACTIVE' ? 'pause' : 'resume')}
-                    className="h-9 px-4 rounded-lg border border-[#D4DFEC] bg-white text-[13px] font-semibold text-[#334568] disabled:opacity-50">
-                    {busy === 'pause' || busy === 'resume' ? <Loader2 className="w-4 h-4 animate-spin inline" /> : target.status === 'ACTIVE' ? 'Pause recording' : 'Start recording'}
-                  </button>
-                  <button type="button" disabled={!!busy} onClick={() => run('retire')}
-                    className="h-9 px-4 rounded-lg border border-[#D4DFEC] bg-white text-[13px] font-semibold text-[#334568] disabled:opacity-50">
-                    {busy === 'retire' ? <Loader2 className="w-4 h-4 animate-spin inline" /> : 'Retire (keep data)'}
-                  </button>
-                </div>
-              )}
-              <div className="p-3 rounded-lg border border-[#FAC6C9] bg-[#FFF7F8] space-y-2">
-                <p className="text-[12px] text-[#334568] flex gap-1.5"><AlertTriangle className="w-4 h-4 text-[#F2343B] shrink-0" />
-                  Delete permanently drops the {target.kind} and all its rows in TDengine. Type its name to confirm.</p>
-                <input value={confirm} onChange={(e) => setConfirm(e.target.value)} aria-label="Type the name to confirm"
-                  className="w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] font-mono" placeholder={target.name} />
-                <button type="button" disabled={!!busy || confirm !== target.name} onClick={() => run('purge')}
-                  className="h-9 px-4 rounded-lg bg-white border border-[#FAC6C9] text-[#F2343B] text-[13px] font-semibold disabled:opacity-50">
-                  {busy === 'purge' ? <Loader2 className="w-4 h-4 animate-spin inline" /> : 'Delete permanently'}
-                </button>
+    <Dialog open title={title} subtitle={<span className="font-mono break-all">{target.name}</span>} onClose={onClose} busy={!!busy} width="sm"
+      footer={<Button variant="outline" size="sm" onClick={onClose} disabled={!!busy}>Close</Button>}>
+      <div className="space-y-4">
+        {locked ? (
+          <p className="text-[13px] text-[#334568]">This is a FactoriX system object (operational history). It is read-only here and cannot be paused, retired or deleted.</p>
+        ) : (
+          <>
+            {target.kind !== 'database' && (
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" size="md" disabled={!!busy} loading={busy === 'pause' || busy === 'resume'} onClick={() => run(target.status === 'ACTIVE' ? 'pause' : 'resume')}>
+                  {target.status === 'ACTIVE' ? 'Pause recording' : 'Start recording'}
+                </Button>
+                <Button variant="outline" size="md" disabled={!!busy} loading={busy === 'retire'} onClick={() => run('retire')}>
+                  Retire (keep data)
+                </Button>
               </div>
-            </>
-          )}
-          {error && <p className="text-[12px] text-[#F2343B]">{error}</p>}
-        </div>
+            )}
+            <div className="p-3 rounded-lg border border-red-200 bg-red-50/60 space-y-2">
+              <p className="text-[12px] text-[#334568] flex gap-1.5"><AlertTriangle className="w-4 h-4 text-[#F2343B] shrink-0" />
+                Delete permanently drops the {target.kind} and all its rows in TDengine. Type its name to confirm.</p>
+              <input value={confirm} onChange={(e) => setConfirm(e.target.value)} aria-label="Type the name to confirm"
+                className="w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] font-mono bg-white focus:outline-none focus:border-blue-500" placeholder={target.name} />
+              <Button variant="danger" size="md" disabled={!!busy || confirm !== target.name} loading={busy === 'purge'} onClick={() => run('purge')}>
+                Delete permanently
+              </Button>
+            </div>
+          </>
+        )}
+        {error && <Banner tone="error">{error}</Banner>}
       </div>
-    </ModalPortal>
+    </Dialog>
   );
 };

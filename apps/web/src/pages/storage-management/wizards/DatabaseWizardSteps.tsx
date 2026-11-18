@@ -45,7 +45,7 @@ export const DatabaseBasicsStep: React.FC<StepProps> = ({ data, onChange, errors
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-[16px] font-bold text-[#111B37]">Database Identity</h2>
+        <h2 className="text-[15px] font-bold text-[#111B37]">Name</h2>
         <p className="text-[13px] text-[#657794] mt-1">
           Specify the physical TDengine database name and optional descriptive labels.
         </p>
@@ -54,7 +54,7 @@ export const DatabaseBasicsStep: React.FC<StepProps> = ({ data, onChange, errors
       <div className="space-y-4 max-w-xl">
         {/* Physical Name */}
         <div>
-          <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
+          <label className="block text-[12px] font-semibold text-[#334568] mb-1">
             Database Name <span className="text-[#EF1B24]">*</span>
           </label>
           <div className="relative">
@@ -65,18 +65,18 @@ export const DatabaseBasicsStep: React.FC<StepProps> = ({ data, onChange, errors
               placeholder="e.g. factory_telemetry_db"
               className={`w-full h-9 px-3 rounded-lg border text-[13px] font-mono transition-colors focus:outline-none focus:ring-2 ${
                 errors.physical_name
-                  ? 'border-[#EF1B24] focus:ring-[#EF1B24]/20'
-                  : 'border-[#D4DFEC] focus:border-[#EF1B24] focus:ring-[#EF1B24]/10'
+                  ? 'border-[#EF1B24] focus:ring-red-100'
+                  : 'border-[#D4DFEC] focus:border-blue-500 focus:ring-blue-100'
               }`}
             />
           </div>
           {errors.physical_name ? (
-            <p className="text-[12px] text-[#EF1B24] mt-1 flex items-center gap-1">
+            <p className="text-[11px] text-red-700 mt-1 flex items-center gap-1">
               <AlertTriangle className="w-3.5 h-3.5" />
               <span>{errors.physical_name}</span>
             </p>
           ) : (
-            <p className="text-[11px] text-[#8C9BAE] mt-1">
+            <p className="text-[11px] text-[#657794] mt-1">
               Physical name in TDengine. Lowercase letters, numbers, and underscores only. Starts with a letter (1–63 chars).
             </p>
           )}
@@ -84,7 +84,7 @@ export const DatabaseBasicsStep: React.FC<StepProps> = ({ data, onChange, errors
 
         {/* Display Name */}
         <div>
-          <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
+          <label className="block text-[12px] font-semibold text-[#334568] mb-1">
             Display Name
           </label>
           <input
@@ -92,16 +92,16 @@ export const DatabaseBasicsStep: React.FC<StepProps> = ({ data, onChange, errors
             value={data.display_name}
             onChange={(e) => onChange({ display_name: e.target.value })}
             placeholder="e.g. Plant 1 Factory Telemetry"
-            className="w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] transition-colors focus:outline-none focus:border-[#EF1B24] focus:ring-2 focus:ring-[#EF1B24]/10"
+            className="w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] transition-colors focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
           />
-          <p className="text-[11px] text-[#8C9BAE] mt-1">
+          <p className="text-[11px] text-[#657794] mt-1">
             Human-friendly label shown throughout the FactoriX web workspace.
           </p>
         </div>
 
         {/* Description */}
         <div>
-          <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
+          <label className="block text-[12px] font-semibold text-[#334568] mb-1">
             Description
           </label>
           <textarea
@@ -109,14 +109,14 @@ export const DatabaseBasicsStep: React.FC<StepProps> = ({ data, onChange, errors
             onChange={(e) => onChange({ description: e.target.value })}
             rows={3}
             placeholder="Document what data streams this database holds, retention expectations, and plant context..."
-            className="w-full p-3 rounded-lg border border-[#D4DFEC] text-[13px] transition-colors focus:outline-none focus:border-[#EF1B24] focus:ring-2 focus:ring-[#EF1B24]/10 resize-none"
+            className="w-full p-3 rounded-lg border border-[#D4DFEC] text-[13px] transition-colors focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 resize-none"
           />
         </div>
       </div>
 
       {/* Naming Convention Card */}
       <div className="p-4 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl flex items-start gap-3 max-w-xl">
-        <Info className="w-5 h-5 text-[#0284C7] flex-shrink-0 mt-0.5" />
+        <Info className="w-5 h-5 text-[#2A82E7] flex-shrink-0 mt-0.5" />
         <div className="text-[12px] text-[#334568] space-y-1">
           <div className="font-semibold text-[#111B37]">TDengine Naming Rules</div>
           <div>
@@ -139,7 +139,7 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-[16px] font-bold text-[#111B37]">Storage Engine Parameters</h2>
+        <h2 className="text-[15px] font-bold text-[#111B37]">Settings</h2>
         <p className="text-[13px] text-[#657794] mt-1">
           Configure timestamp precision, retention limits, and performance caching for this database.
         </p>
@@ -194,14 +194,14 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
               );
             })}
           </div>
-          <p className="text-[11px] text-[#8C9BAE] mt-1.5">
+          <p className="text-[11px] text-[#657794] mt-1.5">
             Important: Precision cannot be altered after database creation in TDengine.
           </p>
         </div>
 
         {/* Retention Days */}
         <div>
-          <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
+          <label className="block text-[12px] font-semibold text-[#334568] mb-1">
             Data Retention (Days)
           </label>
           <div className="relative max-w-xs">
@@ -218,18 +218,18 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
               placeholder="Default: 3650 days"
               className={`w-full h-9 px-3 rounded-lg border text-[13px] transition-colors focus:outline-none focus:ring-2 ${
                 errors.retention_days
-                  ? 'border-[#EF1B24] focus:ring-[#EF1B24]/20'
-                  : 'border-[#D4DFEC] focus:border-[#EF1B24] focus:ring-[#EF1B24]/10'
+                  ? 'border-[#EF1B24] focus:ring-red-100'
+                  : 'border-[#D4DFEC] focus:border-blue-500 focus:ring-blue-100'
               }`}
             />
           </div>
           {errors.retention_days ? (
-            <p className="text-[12px] text-[#EF1B24] mt-1 flex items-center gap-1">
+            <p className="text-[11px] text-red-700 mt-1 flex items-center gap-1">
               <AlertTriangle className="w-3.5 h-3.5" />
               <span>{errors.retention_days}</span>
             </p>
           ) : (
-            <p className="text-[11px] text-[#8C9BAE] mt-1">
+            <p className="text-[11px] text-[#657794] mt-1">
               Corresponds to TDengine <code className="font-mono text-[#334568]">KEEP</code> option. Minimum 30 days (KEEP &gt;= 3 x DURATION). Data older than this threshold will be pruned automatically.
             </p>
           )}
@@ -258,9 +258,9 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
                   })
                 }
                 placeholder="Auto-assigned (e.g. 4)"
-                className="w-full h-8 px-2.5 rounded-lg border border-[#D4DFEC] bg-white text-[12px] focus:outline-none focus:border-[#EF1B24]"
+                className="w-full h-8 px-2.5 rounded-lg border border-[#D4DFEC] bg-white text-[12px] focus:outline-none focus:border-blue-500"
               />
-              <p className="text-[10px] text-[#8C9BAE] mt-1">
+              <p className="text-[10px] text-[#657794] mt-1">
                 Number of virtual vnodes for parallel ingest across CPU cores.
               </p>
             </div>
@@ -280,9 +280,9 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
                   })
                 }
                 placeholder="Default: 16 MB"
-                className="w-full h-8 px-2.5 rounded-lg border border-[#D4DFEC] bg-white text-[12px] focus:outline-none focus:border-[#EF1B24]"
+                className="w-full h-8 px-2.5 rounded-lg border border-[#D4DFEC] bg-white text-[12px] focus:outline-none focus:border-blue-500"
               />
-              <p className="text-[10px] text-[#8C9BAE] mt-1">
+              <p className="text-[10px] text-[#657794] mt-1">
                 Memory write buffer size allocated per vnode.
               </p>
             </div>
@@ -362,7 +362,7 @@ export const DatabaseReviewStep: React.FC<StepProps> = ({ data, onChange, errors
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-[16px] font-bold text-[#111B37]">Review & Physical DDL</h2>
+        <h2 className="text-[15px] font-bold text-[#111B37]">Review</h2>
         <p className="text-[13px] text-[#657794] mt-1">
           Verify configuration before executing physical database creation in TDengine.
         </p>
@@ -478,7 +478,7 @@ export const DatabaseReviewStep: React.FC<StepProps> = ({ data, onChange, errors
           </button>
         </div>
 
-        <pre className="p-4 bg-[#111B37] text-[#38BDF8] rounded-xl font-mono text-[13px] overflow-x-auto leading-relaxed selection:bg-[#EF1B24] selection:text-white">
+        <pre className="p-4 bg-[#111B37] text-white rounded-lg font-mono text-[13px] overflow-x-auto leading-relaxed selection:bg-[#EF1B24] selection:text-white">
           {ddl}
         </pre>
       </div>

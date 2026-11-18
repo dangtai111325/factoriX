@@ -136,76 +136,29 @@ def _tenant_advisory_lock_key(tenant_id: UUID) -> int:
 
 
 async def _collect_structural_fingerprint(session: AsyncSession, tenant_id: UUID) -> str:
-    """Compute a deterministic cryptographic fingerprint of structural configurations."""
+    """Deterministic fingerprint of the protected configuration (connections, signals, models,
+    storage objects, resources, formulas). Any query error propagates: a fingerprint that silently
+    skips a part would let a preview hash match a changed configuration."""
     p = {"tenant_id": tenant_id}
     parts: list[str] = []
-
-    try:
-        conn_rows = await fetch_all(
-            session,
-            "SELECT id, name, protocol FROM connections WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
-            p,
-        )
-        parts.append(",".join(f"{r['id']}:{r['name']}:{r['protocol']}" for r in conn_rows))
-    except Exception:
-        pass
-
-    try:
-        sig_rows = await fetch_all(
-            session,
-            "SELECT id, key, data_type FROM signal_definitions WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
-            p,
-        )
-        parts.append(",".join(f"{r['id']}:{r['key']}:{r['data_type']}" for r in sig_rows))
-    except Exception:
-        pass
-
-    try:
-        mod_rows = await fetch_all(
-            session,
-            "SELECT id, name FROM output_groups WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
-            p,
-        )
-        parts.append(",".join(f"{r['id']}:{r['name']}" for r in mod_rows))
-    except Exception:
-        pass
-
-    try:
-        so_rows = await fetch_all(
-            session,
-            "SELECT id, physical_name, object_type FROM storage_objects WHERE tenant_id = CAST(:tenant_id AS uuid) AND status != 'PURGED' ORDER BY id",
-            p,
-        )
-        parts.append(",".join(f"{r['id']}:{r['physical_name']}:{r['object_type']}" for r in so_rows))
-    except Exception:
-        pass
-
-    try:
-        res_rows = await fetch_all(
-            session,
-            "SELECT id, code FROM resources WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
-            p,
-        )
-        parts.append(",".join(f"{r['id']}:{r['code']}" for r in res_rows))
-    except Exception:
-        pass
-
-    try:
-        f_rows = await fetch_all(
-            session,
-            """
-            SELECT f.id, f.expression
-            FROM formula_definitions f
-            JOIN signal_definitions s ON s.id = f.signal_id
-            WHERE s.tenant_id = CAST(:tenant_id AS uuid)
-            ORDER BY f.id
-            """,
-            p,
-        )
-        parts.append(",".join(f"{r['id']}:{r.get('expression') or ''}" for r in f_rows))
-    except Exception:
-        pass
-
+    for sql, fmt in (
+        ("SELECT id, name, protocol FROM connections WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
+         lambda r: f"{r['id']}:{r['name']}:{r['protocol']}"),
+        ("SELECT id, key, data_type FROM signal_definitions WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
+         lambda r: f"{r['id']}:{r['key']}:{r['data_type']}"),
+        ("SELECT id, display_name, version FROM output_groups WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
+         lambda r: f"{r['id']}:{r['display_name']}:{r['version']}"),
+        ("SELECT id, physical_name, object_type FROM storage_objects "
+         "WHERE tenant_id = CAST(:tenant_id AS uuid) AND status != 'PURGED' ORDER BY id",
+         lambda r: f"{r['id']}:{r['physical_name']}:{r['object_type']}"),
+        ("SELECT id, code FROM resources WHERE tenant_id = CAST(:tenant_id AS uuid) ORDER BY id",
+         lambda r: f"{r['id']}:{r['code']}"),
+        ("SELECT f.id, f.expression_source, f.revision FROM formula_definitions f "
+         "JOIN signal_definitions s ON s.id = f.signal_id WHERE s.tenant_id = CAST(:tenant_id AS uuid) ORDER BY f.id",
+         lambda r: f"{r['id']}:{r['revision']}:{r['expression_source']}"),
+    ):
+        rows = await fetch_all(session, sql, p)
+        parts.append(",".join(fmt(r) for r in rows))
     raw_payload = "|".join(parts)
     return hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
 

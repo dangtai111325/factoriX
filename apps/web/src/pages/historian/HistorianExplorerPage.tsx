@@ -1,1239 +1,1072 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+/**
+ * Historian — explore time-series values, state changes and stored records (plan §8.3).
+ *
+ * Layout follows the other navs: page header with actions, one toolbar card, a Factory Model source picker
+ * on the left and the trend workspace on the right (Trend · Records · Events · Exports tabs).
+ * The full state (series, range or absolute window, mode, live, compare, layout, hidden, tab) lives in the
+ * URL, so a copied link reopens exactly the same view; saved views store the same state on the server.
+ */
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
-  LineChart as LineChartIcon,
-  Table as TableIcon,
-  Activity,
-  Download,
-  Search,
-  RefreshCw,
-  Plus,
-  X,
-  CheckCircle2,
-  AlertCircle,
-  AlertTriangle,
-  FileSpreadsheet,
-  Clock,
-  ExternalLink,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
-  ChevronDown,
-  Check,
+  Columns3,
+  Download,
+  Eye,
+  EyeOff,
+  FileJson,
+  FileSpreadsheet,
+  FolderOpen,
+  History,
   Info,
-  Shield,
-  Layers,
+  LineChart as LineChartIcon,
+  Link2,
+  Radio,
+  RefreshCw,
+  Rows3,
+  Save,
+  X,
+  ZoomOut,
 } from 'lucide-react';
-import { HistorianTrendChart } from './HistorianTrendChart';
+import { Button } from '../../components/common/Button';
+import { MenuButton } from '../../components/common/MenuButton';
+import { Tabs } from '../../components/common/Tabs';
+import { ActionToast, useActionToast } from '../../components/common/ActionToast';
+import { useApp } from '../../store/AppContext';
 import {
-  HistorianMode,
-  HistorianPoint,
-  HistorianSeriesData,
-  HistorianEventItem,
-  TimeRangePreset,
-  SERIES_COLORS,
-  MAX_SELECTED_SERIES,
-  HISTORIAN_MODES,
-  QualitySegment,
-  SeriesStats,
-} from './types';
-import { SignalItem } from '../../types';
-import {
-  getSources,
-  listSubtables,
-  queryHistorianSeries,
-  HistorianSeriesResult,
-  listSavedViews,
-  listExportJobs,
   createExportJob,
-  saveView,
-  SourceRef,
-  SourceView,
-  TDSubtable,
-  SavedView,
+  deleteView,
   ExportJob,
-  HistorianRow,
+  HistorianQueryResponse,
+  listExportJobs,
+  listHistorianEvents,
+  HistorianEvent,
+  listSavedViews,
+  queryHistorianSeries,
+  retryExportJob,
+  SavedView,
+  saveView,
+  updateView,
 } from '../../lib/storagePhysicalApi';
+import { HistorianTrendChart, ChartMarker } from './HistorianTrendChart';
+import { SeriesPicker, PickItem } from './SeriesPicker';
+import { EventRow, EventsList, ExportsPanel, PointInspector, RecordsTable, SaveViewDialog, StatsTable, ViewsDialog } from './HistorianPanels';
 import {
-  RemoteErrorState,
-  RemoteLoadingState,
-  RemoteEmptyState,
-} from '../../components/common/RemoteResourceState';
+  COMPARE_OPTIONS,
+  compareOffsetMs,
+  CompareOffset,
+  findGaps,
+  formatBytes,
+  formatClock,
+  formatDateTime,
+  formatDuration,
+  fromLocalInput,
+  Gap,
+  HistorianTab,
+  indexResponse,
+  kindOfToken,
+  liveIntervalMs,
+  MAX_RANGE_MS,
+  MAX_SERIES,
+  MODES,
+  normalizeSeries,
+  paramsFromState,
+  Pt,
+  RANGE_PRESETS,
+  RangeState,
+  rangeLabel,
+  resolveRange,
+  safeFilePart,
+  Series,
+  SERIES_COLORS,
+  shiftSeries,
+  specFromState,
+  stateFromParams,
+  stateFromSpec,
+  statusText,
+  toLocalInput,
+  TZ_LABEL,
+  ViewState,
+} from './historianModel';
+import { Banner, EmptyState, errorText, ErrorBanner, PageHeader, Segmented, selectCls, Skeleton } from './hsUi';
 
-/** Stable token the backend understands for a picked source (signal | model field | subtable). */
-function sourceToken(src: SourceRef): string {
-  if (src.kind === 'model_field' && src.model_id && src.field_path) return `mod:${src.model_id}:${src.field_path}`;
-  if (src.kind === 'subtable' || src.kind === 'resource_context') return src.id.startsWith('subtable:') ? src.id : `subtable:${src.id}`;
-  return src.id.startsWith('sig:') ? src.id.slice(4) : src.id;
+const LAST_SELECTION_KEY = 'fx.historian.lastSelection';
+
+function readLastSelection(): string[] {
+  try {
+    const v = JSON.parse(window.localStorage.getItem(LAST_SELECTION_KEY) || '[]');
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string').slice(0, MAX_SERIES) : [];
+  } catch {
+    return [];
+  }
 }
 
-function tokenToSource(token: string, kind?: string | null): SourceRef {
-  const t = token.trim();
-  if (t.startsWith('mod:')) {
-    const [, mid, ...rest] = t.split(':');
-    return { id: t, kind: 'model_field', model_id: mid, field_path: rest.join(':'), display_name: rest.join(':'), path: t, status: 'ACTIVE' };
-  }
-  if (t.startsWith('subtable:') || kind === 'subtable') {
-    const id = t.startsWith('subtable:') ? t : `subtable:${t}`;
-    return { id, kind: 'subtable', display_name: id.split('.').pop() || id, path: id, status: 'ACTIVE' };
-  }
-  const id = t.startsWith('sig:') ? t.slice(4) : t;
-  return { id, kind: 'signal', display_name: id, path: id, status: 'ACTIVE' };
+function sameState(a: ViewState, b: ViewState): boolean {
+  return paramsFromState(a).toString() === paramsFromState(b).toString();
 }
 
-const PRESETS: Record<string, number> = { '5m': 5 * 60e3, '15m': 15 * 60e3, '1h': 3600e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3, '7d': 7 * 24 * 3600e3 };
+interface QueryResult {
+  res: HistorianQueryResponse;
+  compare: HistorianQueryResponse | null;
+  compareShiftMs: number;
+  startMs: number;
+  endMs: number;
+  fetchedAt: number;
+}
 
 export const HistorianExplorerPage: React.FC = () => {
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [params, setParams] = useSearchParams();
+  const { signals, resources } = useApp();
+  const { toast, show: showToast, dismiss } = useActionToast();
 
-  // Active view tab: 'trend' | 'records' | 'events' | 'exports'
-  const [activeTab, setActiveTab] = useState<'trend' | 'records' | 'events' | 'exports'>('trend');
+  // ------------------------------------------------------------------ state <-> URL
+  const [state, setState] = useState<ViewState>(() => stateFromParams(params));
+  const written = useRef<string>('');
+  useEffect(() => {
+    const next = paramsFromState(state);
+    const s = next.toString();
+    written.current = s;
+    if (s !== params.toString()) setParams(next, { replace: true });
+  }, [state]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    // An external navigation (e.g. "Open in Historian" while this page is open, Back/Forward).
+    const s = params.toString();
+    if (s === written.current) return;
+    const next = stateFromParams(params);
+    setState((prev) => (sameState(prev, next) ? prev : next));
+  }, [params]);
+  const patch = useCallback((p: Partial<ViewState>) => setState((prev) => ({ ...prev, ...p })), []);
 
-  // Mode: recorded (strict raw events) vs reconstructed (interpolated timeline) vs operational
-  const [mode, setMode] = useState<HistorianMode>(() => {
-    const m = searchParams.get('mode');
-    return m === 'recorded' || m === 'reconstructed' ? m : 'operational';
-  });
+  useEffect(() => {
+    if (!state.sources.length) return;
+    try {
+      window.localStorage.setItem(LAST_SELECTION_KEY, JSON.stringify(state.sources));
+    } catch {
+      /* private mode */
+    }
+  }, [state.sources]);
 
-  // Time range preset (a deep link without range starts at 15 minutes, plan §8.3)
-  const [timePreset, setTimePreset] = useState<TimeRangePreset>(() => {
-    const r = searchParams.get('range');
-    if (r && r in PRESETS) return r as TimeRangePreset;
-    return searchParams.get('source_id') || searchParams.get('signalId') || searchParams.get('signal_id') || searchParams.get('sources') ? '15m' : '1h';
-  });
-  const [selectionNotice, setSelectionNotice] = useState<string | null>(null);
-  const [coverage, setCoverage] = useState<{ downsampled: boolean; notes: string[]; available: boolean }>({ downsampled: false, notes: [], available: true });
-
-  // Computed start/end in ms
-  const [timeRange, setTimeRange] = useState(() => {
-    const end = Date.now();
-    return { startMs: end - 3600 * 1000, endMs: end };
-  });
-
-  // Source picker on left
-  const [pickerView, setPickerView] = useState<SourceView | 'tables'>('hierarchy');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [sourcesList, setSourcesList] = useState<SourceRef[]>([]);
-  const [groupsList, setGroupsList] = useState<
-    { id: string; name: string; protocol?: string; signals: SourceRef[]; signals_count: number }[]
-  >([]);
-  const [expandedGroupIds, setExpandedGroupIds] = useState<Set<string>>(new Set());
-  const [tablesList, setTablesList] = useState<TDSubtable[]>([]);
-  const [loadingSources, setLoadingSources] = useState(false);
-  const [sourcesError, setSourcesError] = useState<unknown | null>(null);
-
-  const toggleGroupExpand = (groupId: string) => {
-    setExpandedGroupIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupId)) {
-        next.delete(groupId);
-      } else {
-        next.add(groupId);
+  // ------------------------------------------------------------------ labels & colours
+  const catalog = useRef(new Map<string, PickItem>());
+  const [catalogVersion, setCatalogVersion] = useState(0);
+  const onCatalog = useCallback((items: PickItem[]) => {
+    items.forEach((it) => catalog.current.set(it.token, it));
+    setCatalogVersion((v) => v + 1);
+  }, []);
+  const resByIdCode = useMemo(() => new Map(resources.map((r) => [r.id, r.code || r.name])), [resources]);
+  const labelOf = useCallback(
+    (token: string): string => {
+      const c = catalog.current.get(token);
+      if (c) return c.label;
+      if (kindOfToken(token) === 'signal') {
+        const s = signals.find((x) => x.id === token);
+        if (s) return `${resByIdCode.get(s.resourceId) || 'Signal'} · ${s.key || s.name}`;
       }
-      return next;
-    });
+      if (token.startsWith('subtable:')) return token.slice(9);
+      if (token.startsWith('mod:')) return token.split(':').slice(2).join(':') || token;
+      return token.slice(0, 8);
+    },
+    [signals, resByIdCode, catalogVersion], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  const colorRef = useRef(new Map<string, string>());
+  const colorOf = useCallback(
+    (token: string): string => {
+      const m = colorRef.current;
+      for (const k of Array.from(m.keys())) if (!state.sources.includes(k)) m.delete(k);
+      if (!m.has(token)) {
+        const used = new Set(m.values());
+        m.set(token, SERIES_COLORS.find((c) => !used.has(c)) || SERIES_COLORS[m.size % SERIES_COLORS.length]);
+      }
+      return m.get(token)!;
+    },
+    [state.sources],
+  );
+  state.sources.forEach((t) => colorOf(t));
+
+  // ------------------------------------------------------------------ query
+  const [result, setResult] = useState<QueryResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [slow, setSlow] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [events, setEvents] = useState<HistorianEvent[]>([]);
+  const abortRef = useRef<AbortController | null>(null);
+  const seq = useRef(0);
+  const rangeKey = state.range.kind === 'preset' ? state.range.preset : `${state.range.startMs}-${state.range.endMs}`;
+  const queryKey = `${state.sources.join(',')}|${state.mode}|${rangeKey}|${state.compare}`;
+
+  const run = useCallback(
+    async (opts: { silent?: boolean } = {}) => {
+      abortRef.current?.abort();
+      const sources = state.sources;
+      if (!sources.length) {
+        setResult(null);
+        setError(null);
+        setLoading(false);
+        return;
+      }
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      const my = ++seq.current;
+      const { startMs, endMs } = resolveRange(state.range);
+      const offset = compareOffsetMs(state.compare, endMs - startMs);
+      if (!opts.silent) setLoading(true);
+      setError(null);
+      setSlow(false);
+      const slowTimer = window.setTimeout(() => my === seq.current && setSlow(true), 4000);
+      const base = { sources, mode: state.mode, resolution: 'auto' as const, max_points: 1500 };
+      try {
+        const res = await queryHistorianSeries(
+          { ...base, start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString(), ...(offset ? { compare_offset: offset } : {}) },
+          ctrl.signal,
+        );
+        let compare: HistorianQueryResponse | null = null;
+        let compareShiftMs = 0;
+        if (offset) {
+          if (res.compare && Array.isArray(res.compare.series_list)) {
+            compare = { ...res, series_list: res.compare.series_list, compare: null };
+          } else {
+            // Older Center: query the earlier window ourselves and shift it onto this axis.
+            compare = await queryHistorianSeries(
+              { ...base, start: new Date(startMs - offset).toISOString(), end: new Date(endMs - offset).toISOString() },
+              ctrl.signal,
+            );
+            compareShiftMs = offset;
+          }
+        }
+        if (my !== seq.current) return;
+        setResult({ res, compare, compareShiftMs, startMs, endMs, fetchedAt: Date.now() });
+        res.series_list.forEach((sr) => {
+          if (sr.display_name && !catalog.current.has(sr.series_key))
+            catalog.current.set(sr.series_key, {
+              token: sr.series_key,
+              kind: sr.source_kind,
+              label: sr.display_name,
+              name: sr.display_name,
+              sub: '',
+              unit: sr.unit || '',
+              valueType: sr.value_type || '',
+              resourceId: sr.resource_id || null,
+            });
+        });
+      } catch (e) {
+        if (ctrl.signal.aborted || my !== seq.current) return;
+        setError(e);
+      } finally {
+        window.clearTimeout(slowTimer);
+        if (my === seq.current) {
+          setLoading(false);
+          setSlow(false);
+        }
+      }
+      // Appliance-wide events of the window (resets, storage changes); optional, never blocks the chart.
+      listHistorianEvents({ start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString(), types: ['EPOCH_RESET', 'STORAGE_OPERATION'] }, ctrl.signal)
+        .then((r) => my === seq.current && setEvents(r.items || []))
+        .catch(() => my === seq.current && setEvents([]));
+    },
+    [queryKey], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  // Auto-query (debounced so ticking several series in a row sends one request).
+  useEffect(() => {
+    const t = window.setTimeout(() => void run(), state.sources.length ? 300 : 0);
+    return () => window.clearTimeout(t);
+  }, [run]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  // Live follow: re-query after each answer (never overlapping), paused while the tab is hidden.
+  const liveOn = state.live && state.range.kind === 'preset' && state.sources.length > 0;
+  useEffect(() => {
+    if (!liveOn || loading || error) return;
+    const span = result ? result.endMs - result.startMs : 3600e3;
+    const t = window.setTimeout(function tick() {
+      if (document.hidden) {
+        window.setTimeout(tick, 2000);
+        return;
+      }
+      void run({ silent: true });
+    }, liveIntervalMs(span));
+    return () => window.clearTimeout(t);
+  }, [liveOn, loading, error, result, run]);
+
+  const cancel = () => {
+    abortRef.current?.abort();
+    seq.current++;
+    setLoading(false);
+    setSlow(false);
+    showToast({ message: 'Query cancelled. The chart keeps the previous result.' });
   };
 
-  // Selected series (up to 8)
-  const [selectedSeries, setSelectedSeries] = useState<SourceRef[]>([]);
-  const [hiddenSeriesIds, setHiddenSeriesIds] = useState<Set<string>>(new Set());
+  // ------------------------------------------------------------------ derived series
+  // An absolute window (zoom, pan, custom) applies at once to the points already loaded; a relative one
+  // follows the last answer so "last 15 min" does not drift between refreshes.
+  const win =
+    state.range.kind === 'abs'
+      ? { startMs: state.range.startMs, endMs: state.range.endMs }
+      : result
+        ? { startMs: result.startMs, endMs: result.endMs }
+        : resolveRange(state.range);
+  const byToken = useMemo(() => indexResponse(result?.res), [result]);
+  const allSeries: Series[] = useMemo(
+    () =>
+      state.sources.map((tok) => {
+        const sr = byToken.get(tok);
+        if (!sr)
+          return {
+            token: tok,
+            label: labelOf(tok),
+            unit: catalog.current.get(tok)?.unit || '',
+            valueType: catalog.current.get(tok)?.valueType || '',
+            color: colorOf(tok),
+            discrete: false,
+            integer: false,
+            status: 'LOADING',
+            fidelity: '',
+            total: 0,
+            downsampled: false,
+            bucketMs: null,
+            truncated: false,
+            notes: [],
+            points: [],
+            serverStats: null,
+          } as Series;
+        return normalizeSeries(sr, colorOf(tok), labelOf(tok));
+      }),
+    [state.sources, byToken, labelOf, colorOf],
+  );
+  const visible = allSeries.filter((s) => !state.hidden.includes(s.token) && s.status !== 'LOADING');
+  const compareSeries: Series[] = useMemo(() => {
+    if (!result?.compare) return [];
+    const idx = indexResponse(result.compare);
+    return state.sources
+      .filter((t) => !state.hidden.includes(t))
+      .map((t) => idx.get(t))
+      .filter((sr): sr is NonNullable<typeof sr> => Boolean(sr))
+      .map((sr) => {
+        const s = normalizeSeries(sr, colorOf(sr.series_key), labelOf(sr.series_key), true);
+        return result.compareShiftMs ? shiftSeries(s, result.compareShiftMs) : s;
+      });
+  }, [result, state.sources, state.hidden, colorOf, labelOf]);
+  const compareLabel = COMPARE_OPTIONS.find((c) => c.id === state.compare)?.label.toLowerCase();
 
-  // Chart data
-  const [seriesData, setSeriesData] = useState<HistorianSeriesData[]>([]);
-  const [eventsData, setEventsData] = useState<HistorianEventItem[]>([]);
-  const [queryLoading, setQueryLoading] = useState(false);
-  const [queryError, setQueryError] = useState<unknown | null>(null);
+  const gapsBySeries = useMemo(() => {
+    const m = new Map<string, Gap[]>();
+    for (const s of allSeries) m.set(s.token, findGaps(s, state.mode, win.startMs, win.endMs));
+    for (const c of compareSeries) m.set(`cmp:${c.token}`, []);
+    return m;
+  }, [allSeries, compareSeries, state.mode, win.startMs, win.endMs]);
 
-  // Records view data
-  const [recordsRows, setRecordsRows] = useState<HistorianRow[]>([]);
-  const [recordsTotal, setRecordsTotal] = useState(0);
-
-  // Value Inspector
-  const [inspectedPoint, setInspectedPoint] = useState<HistorianPoint | null>(null);
-
-  // Saved Views & Exports
-  const [savedViews, setSavedViews] = useState<SavedView[]>([]);
-  const [exportJobs, setExportJobs] = useState<ExportJob[]>([]);
-  const [exportSubmitting, setExportSubmitting] = useState(false);
-  const [exportError, setExportError] = useState<string | null>(null);
-
-  // Update timeRange when preset changes
-  useEffect(() => {
-    const end = Date.now();
-    let ms = 3600 * 1000;
-    if (timePreset === '5m') ms = 5 * 60 * 1000;
-    if (timePreset === '15m') ms = 15 * 60 * 1000;
-    if (timePreset === '1h') ms = 60 * 60 * 1000;
-    if (timePreset === '6h') ms = 6 * 3600 * 1000;
-    if (timePreset === '24h') ms = 24 * 3600 * 1000;
-    if (timePreset === '7d') ms = 7 * 24 * 3600 * 1000;
-    setTimeRange({ startMs: end - ms, endMs: end });
-  }, [timePreset]);
-
-  // Load sources for left panel - strictly real data
-  const fetchSources = useCallback(() => {
-    setLoadingSources(true);
-    setSourcesError(null);
-
-    if (pickerView === 'tables') {
-      listSubtables({ search: searchQuery || undefined })
-        .then((res) => {
-          setTablesList(res?.items || []);
-          setGroupsList([]);
-          setSourcesList([]);
-        })
-        .catch((err) => {
-          console.error('Failed to list subtables for Historian:', err);
-          setSourcesError(err);
-          setTablesList([]);
-          setGroupsList([]);
-          setSourcesList([]);
-        })
-        .finally(() => setLoadingSources(false));
-    } else {
-      getSources({ view: pickerView, search: searchQuery || undefined })
-        .then((res: any) => {
-          const rawItems = res?.items || [];
-          const leaves: SourceRef[] = res?.leaves || res?.sources || [];
-          if (rawItems.length > 0 && (rawItems[0].signals || rawItems[0].fields)) {
-            const normalizedGroups = rawItems.map((g: any) => ({
-              id: String(g.id),
-              name: String(g.display_name || g.name || 'Unnamed Group'),
-              protocol: g.protocol,
-              signals: (g.signals || g.fields || []) as SourceRef[],
-              signals_count: (g.signals || g.fields || []).length,
-            }));
-            setGroupsList(normalizedGroups);
-            const autoExpand = new Set<string>(
-              searchQuery
-                ? normalizedGroups.map((g: any) => g.id)
-                : normalizedGroups.slice(0, 4).map((g: any) => g.id)
-            );
-            setExpandedGroupIds(autoExpand);
-          } else {
-            setGroupsList([]);
-          }
-          setSourcesList(leaves.length > 0 ? leaves : rawItems);
-          setTablesList([]);
-        })
-        .catch((err) => {
-          console.error('Failed to get sources for Historian:', err);
-          setSourcesError(err);
-          setGroupsList([]);
-          setSourcesList([]);
-        })
-        .finally(() => setLoadingSources(false));
+  const eventRows: EventRow[] = useMemo(() => {
+    const out: EventRow[] = [];
+    for (const s of allSeries) {
+      let prev = '';
+      for (const p of s.points) {
+        if (!p.q) continue;
+        if (prev && p.q !== prev) out.push({ id: `q-${s.token}-${p.t}`, t: p.t, kind: 'quality', series: s, title: `Quality ${prev} → ${p.q}`, detail: p.reason || undefined });
+        prev = p.q;
+      }
+      for (const g of gapsBySeries.get(s.token) || [])
+        out.push({ id: `g-${s.token}-${g.startMs}`, t: g.startMs, kind: 'gap', series: s, title: `No data for ${formatDuration(g.endMs - g.startMs)}`, detail: `${formatClock(g.startMs)} → ${formatClock(g.endMs)}` });
     }
-  }, [pickerView, searchQuery]);
+    for (const e of events) {
+      const t = Date.parse(e.ts);
+      if (!Number.isFinite(t)) continue;
+      out.push({ id: `e-${e.id}`, t, kind: e.kind === 'EPOCH_RESET' ? 'reset' : 'storage', title: e.summary, detail: e.message });
+    }
+    return out.sort((a, b) => b.t - a.t);
+  }, [allSeries, gapsBySeries, events]);
 
-  useEffect(() => {
-    fetchSources();
-  }, [fetchSources]);
+  const markers: ChartMarker[] = useMemo(
+    () =>
+      eventRows
+        .filter((e) => e.kind !== 'storage' && (!e.series || !state.hidden.includes(e.series.token)))
+        .map((e) => ({ t: e.t, kind: e.kind, label: `${e.series ? `${e.series.label}: ` : ''}${e.title}` })),
+    [eventRows, state.hidden],
+  );
 
-  // Deep links: ?source_id=<id>&kind=signal|model_field|subtable, legacy ?signalId= / ?signal_id=,
-  // and ?sources=<token>,<token> (the selection is kept in the URL so Back/refresh restore it).
-  useEffect(() => {
-    if (selectedSeries.length > 0) return;
-    const many = searchParams.get('sources');
-    const one = searchParams.get('source_id') || searchParams.get('signalId') || searchParams.get('signal_id');
-    const tokens = many ? many.split(',').filter(Boolean) : one ? [one] : [];
-    if (tokens.length) setSelectedSeries(tokens.slice(0, MAX_SELECTED_SERIES).map((t) => tokenToSource(t, searchParams.get('kind'))));
-  }, [searchParams]); // eslint-disable-line react-hooks/exhaustive-deps
+  const totalRows = allSeries.reduce((a, s) => a + (s.total || 0), 0);
+  const allNoData = result && allSeries.length > 0 && allSeries.every((s) => s.status !== 'OK' && s.status !== 'LOADING');
+  const notes = Array.from(new Set(allSeries.flatMap((s) => s.notes))).slice(0, 6);
+  const downsampled = allSeries.some((s) => s.downsampled);
 
-  useEffect(() => {
-    const next = new URLSearchParams(searchParams);
-    ['source_id', 'signalId', 'signal_id', 'kind'].forEach((k) => next.delete(k));
-    if (selectedSeries.length) next.set('sources', selectedSeries.map(sourceToken).join(','));
-    else next.delete('sources');
-    next.set('range', timePreset);
-    next.set('mode', mode);
-    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true });
-  }, [selectedSeries, timePreset, mode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Load trend/record data for selected series - strictly real queries, NO Math.sin fallback!
-  // Re-query only when the SET of series changes (label updates from the backend must not refetch).
-  const selectionKey = selectedSeries.map(sourceToken).join(',');
-  const selectedRef = React.useRef(selectedSeries);
-  selectedRef.current = selectedSeries;
-  const fetchData = useCallback(async () => {
-    const selectedSeries = selectedRef.current;
-    if (selectedSeries.length === 0) {
-      setSeriesData([]);
-      setRecordsRows([]);
-      setRecordsTotal(0);
-      setEventsData([]);
-      setQueryError(null);
+  // ------------------------------------------------------------------ actions
+  const toggleSource = (it: PickItem) => {
+    if (state.sources.includes(it.token)) {
+      patch({ sources: state.sources.filter((t) => t !== it.token), hidden: state.hidden.filter((h) => h !== it.token) });
       return;
     }
-
-    setQueryLoading(true);
-    setQueryError(null);
-    try {
-      const fromTs = new Date(timeRange.startMs).toISOString();
-      const toTs = new Date(timeRange.endMs).toISOString();
-
-      const newSeriesList: HistorianSeriesData[] = [];
-      const allRows: HistorianRow[] = [];
-      const extractedEvents: HistorianEventItem[] = [];
-
-      const res = await queryHistorianSeries({
-        sources: selectedSeries.map(sourceToken),
-        start: fromTs,
-        end: toTs,
-        mode,
-        resolution: 'auto',
-        max_points: 1500,
-      });
-      const byKey = new Map<string, HistorianSeriesResult>(res.series_list.map((sr) => [sr.series_key, sr]));
-      setCoverage({ downsampled: res.downsampled, notes: res.coverage_notes || [], available: res.history_available });
-      // Show the backend's real display names (a deep link only knows the id).
-      setSelectedSeries((prev) => {
-        let changed = false;
-        const next = prev.map((p) => {
-          const sr = byKey.get(sourceToken(p));
-          if (sr && sr.display_name && sr.display_name !== p.display_name) { changed = true; return { ...p, display_name: sr.display_name, unit: sr.unit ?? p.unit, data_type: sr.value_type ?? p.data_type }; }
-          return p;
-        });
-        return changed ? next : prev;
-      });
-
-      for (let i = 0; i < selectedSeries.length; i++) {
-        const src = selectedSeries[i];
-        const color = SERIES_COLORS[i % SERIES_COLORS.length];
-        const sr = byKey.get(sourceToken(src));
-        const label = sr?.display_name || src.display_name;
-        const rows = sr?.points || [];
-        const points: HistorianPoint[] = rows.map((r, pIdx) => {
-          const rawVal = r.value;
-          const numVal = typeof rawVal === 'number' ? rawVal : typeof rawVal === 'boolean' ? (rawVal ? 1 : 0) : null;
-          const tMs = new Date(r.ts).getTime();
-          const parsedValue: string | number | boolean | null =
-            typeof rawVal === 'number' || typeof rawVal === 'string' || typeof rawVal === 'boolean' ? rawVal : rawVal != null ? JSON.stringify(rawVal) : null;
-          // Quality is shown only when the storage has it; never defaulted to GOOD (P2).
-          const q = String(r.quality || '').toUpperCase();
-          return {
-            id: `${src.id}-${tMs}-${pIdx}`,
-            eventUid: r.event_uid || r.id,
-            signalId: src.id,
-            signalName: label,
-            timestampMs: tMs,
-            eventTime: r.ts,
-            acquiredAt: r.ts,
-            sourceTime: r.source_time || r.ts,
-            valueType: sr?.value_type || src.data_type || 'FLOAT64',
-            value: parsedValue,
-            numericValue: numVal,
-            unit: sr?.unit || src.unit || '',
-            quality: q || 'UNKNOWN',
-            reasonCode: r.reason_code || null,
-            recordKind: r.record_kind,
-            virtual: !!r.virtual,
-            dataEpoch: Number(r.data_epoch ?? 1),
-          };
-        });
-
-        const qualitySegments: QualitySegment[] = [];
-        const known = points.filter((p) => ['GOOD', 'BAD', 'UNCERTAIN', 'STALE'].includes(String(p.quality)));
-        if (known.length > 0) {
-          let segStart = known[0].timestampMs;
-          let currentQual = known[0].quality as QualitySegment['quality'];
-          for (let pIdx = 1; pIdx < known.length; pIdx++) {
-            const nextQual = known[pIdx].quality as QualitySegment['quality'];
-            if (nextQual !== currentQual) {
-              qualitySegments.push({ startMs: segStart, endMs: known[pIdx].timestampMs, quality: currentQual });
-              segStart = known[pIdx].timestampMs;
-              currentQual = nextQual;
-            }
-          }
-          qualitySegments.push({ startMs: segStart, endMs: known[known.length - 1].timestampMs, quality: currentQual });
-        }
-
-        const st = sr?.stats;
-        const stats: SeriesStats = {
-          signalId: src.id,
-          signalName: label,
-          unit: sr?.unit || src.unit || '',
-          color,
-          isDiscrete: false,
-          last: points.length > 0 ? points[points.length - 1].value : null,
-          min: st?.min ?? null,
-          max: st?.max ?? null,
-          avg: st?.avg != null ? Number(st.avg.toFixed(3)) : null,
-          samples: st?.count ?? points.length,
-          goodPct: st?.good_pct ?? (null as unknown as number),
-          fidelityMode: mode,
-        };
-
-        const signalShim: SignalItem = {
-          id: src.id,
-          name: label,
-          tag: src.path,
-          display_name: label,
-          displayName: label,
-          sourceConnectionId: src.connection_id || '',
-          sourceConnectionName: src.connection_name || '',
-          resourceId: src.resource_id || src.id,
-          resourcePath: src.path,
-          dataType: ((sr?.value_type || src.data_type) as any) || 'FLOAT64',
-          data_type: sr?.value_type || src.data_type || 'FLOAT64',
-          unit: sr?.unit || src.unit || undefined,
-          quality: (points.length > 0 ? points[points.length - 1].quality : 'UNKNOWN') as any,
-          lastUpdated: points.length > 0 ? points[points.length - 1].eventTime : '',
-          sampleIntervalMs: sr?.bucket_ms || 1000,
-        };
-
-        const notes = [...(sr?.coverage_notes || [])];
-        if (sr?.downsampled) notes.unshift(`Downsampled: ${sr.total.toLocaleString()} rows shown as ${points.length} buckets of ${Math.round((sr.bucket_ms || 0) / 1000)} s (avg; min/max per bucket).`);
-        if (sr?.truncated) notes.unshift(`Showing the most recent ${points.length} of ${sr.total.toLocaleString()} rows; narrow the range for all rows.`);
-        if (sr && sr.status !== 'OK') notes.push(sr.status === 'NO_DATA' ? 'No data in this window.' : `Status: ${sr.status}`);
-
-        newSeriesList.push({ signal: signalShim, color, isDiscrete: false, points, qualitySegments, stats, fidelity: mode, coverageNotes: notes });
-
-        allRows.push(...rows.map((r) => ({ ...r, series_name: label } as unknown as HistorianRow)));
-
-        for (let pIdx = 1; pIdx < known.length; pIdx++) {
-          if (known[pIdx].quality !== known[pIdx - 1].quality) {
-            extractedEvents.push({
-              id: `evt-${src.id}-${known[pIdx].timestampMs}`,
-              timestampMs: known[pIdx].timestampMs,
-              timestamp: known[pIdx].eventTime,
-              kind: 'QUALITY_TRANSITION',
-              signalId: src.id,
-              signalName: label,
-              fromQuality: String(known[pIdx - 1].quality),
-              toQuality: String(known[pIdx].quality),
-              summary: `Quality changed from ${known[pIdx - 1].quality} to ${known[pIdx].quality}`,
-            });
-          }
-        }
-      }
-
-      setSeriesData(newSeriesList);
-      allRows.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
-      setRecordsRows(allRows);
-      setRecordsTotal(res.series_list.reduce((acc, sr) => acc + (sr.total || 0), 0));
-      setEventsData(extractedEvents);
-    } catch (err: unknown) {
-      console.error('Historian query failed:', err);
-      setQueryError(err);
-      setSeriesData([]);
-      setRecordsRows([]);
-      setRecordsTotal(0);
-      setEventsData([]);
-    } finally {
-      setQueryLoading(false);
+    if (state.sources.length >= MAX_SERIES) {
+      showToast({ message: `At most ${MAX_SERIES} series can be shown at once. Remove one first.`, tone: 'error' });
+      return;
     }
-  }, [selectionKey, timeRange, mode]); // eslint-disable-line react-hooks/exhaustive-deps
+    catalog.current.set(it.token, it);
+    patch({ sources: [...state.sources, it.token] });
+  };
+  const removeSource = (token: string) => patch({ sources: state.sources.filter((t) => t !== token), hidden: state.hidden.filter((h) => h !== token) });
+  const toggleHidden = (token: string) => patch({ hidden: state.hidden.includes(token) ? state.hidden.filter((h) => h !== token) : [...state.hidden, token] });
 
+  const [zoomStack, setZoomStack] = useState<RangeState[]>([]);
+  const setRange = (range: RangeState, pushZoom = false) => {
+    if (pushZoom) setZoomStack((z) => [...z.slice(-19), state.range]);
+    else setZoomStack([]);
+    patch({ range, live: range.kind === 'preset' ? state.live : false });
+  };
+  const onBrush = (a: number, b: number) => setRange({ kind: 'abs', startMs: a, endMs: b }, true);
+  const zoomBack = () => {
+    const prev = zoomStack[zoomStack.length - 1];
+    if (!prev) return;
+    setZoomStack((z) => z.slice(0, -1));
+    patch({ range: prev });
+  };
+  const pan = (dir: -1 | 1) => {
+    const span = win.endMs - win.startMs;
+    const shift = Math.round(span / 2) * dir;
+    const end = Math.min(Date.now(), win.endMs + shift);
+    setRange({ kind: 'abs', startMs: end - span, endMs: end }, true);
+  };
+  const zoomOut = () => {
+    const span = Math.min(MAX_RANGE_MS, (win.endMs - win.startMs) * 2);
+    const mid = (win.startMs + win.endMs) / 2;
+    const end = Math.min(Date.now(), mid + span / 2);
+    setRange({ kind: 'abs', startMs: Math.round(end - span), endMs: Math.round(end) }, true);
+  };
+  const zoomAround = (t: number) => {
+    const span = Math.max(60e3, (win.endMs - win.startMs) / 10);
+    setRange({ kind: 'abs', startMs: Math.round(t - span / 2), endMs: Math.round(Math.min(Date.now(), t + span / 2)) }, true);
+    patch({ tab: 'trend' });
+  };
+  const atNow = Date.now() - win.endMs < 5000;
+
+  // custom range inputs
+  const [customOpen, setCustomOpen] = useState(state.range.kind === 'abs');
+  const [customFrom, setCustomFrom] = useState(toLocalInput(win.startMs));
+  const [customTo, setCustomTo] = useState(toLocalInput(win.endMs));
   useEffect(() => {
-    void fetchData();
-  }, [fetchData]);
-
-  // Load Saved Views & Exports when switching to exports tab
-  useEffect(() => {
-    if (activeTab === 'exports') {
-      listSavedViews().then(setSavedViews).catch(console.warn);
-      listExportJobs().then(setExportJobs).catch(console.warn);
+    if (state.range.kind === 'abs') {
+      setCustomFrom(toLocalInput(state.range.startMs));
+      setCustomTo(toLocalInput(state.range.endMs));
     }
-  }, [activeTab]);
+  }, [state.range]);
+  const customA = fromLocalInput(customFrom);
+  const customB = fromLocalInput(customTo);
+  const customError =
+    customA == null || customB == null ? 'Enter a start and an end.' : customB <= customA ? 'The end must be after the start.' : customB - customA > MAX_RANGE_MS ? 'At most 366 days.' : null;
 
-  // Trigger export job
-  const handleCreateExport = async (format: 'csv' | 'json') => {
-    if (selectedSeries.length === 0) return;
-    setExportSubmitting(true);
-    setExportError(null);
+  // copy link
+  const copyLink = async () => {
     try {
-      const job = await createExportJob({
-        sources: selectedSeries.map(sourceToken),
-        from_ts: new Date(timeRange.startMs).toISOString(),
-        to_ts: new Date(timeRange.endMs).toISOString(),
-        start: new Date(timeRange.startMs).toISOString(),
-        end: new Date(timeRange.endMs).toISOString(),
-        mode,
-        format,
-      });
-      setExportJobs((prev) => [job, ...prev]);
-    } catch (err: any) {
-      setExportError(err?.message || 'Failed to schedule export job');
+      await navigator.clipboard.writeText(window.location.href);
+      showToast({ message: 'Link copied. It opens this exact view (series, range, mode and chart settings).', tone: 'success' });
+    } catch {
+      showToast({ message: 'The browser blocked the clipboard. Copy the address bar instead.', tone: 'error' });
+    }
+  };
+
+  // ------------------------------------------------------------------ saved views
+  const [views, setViews] = useState<SavedView[] | null>(null);
+  const [viewsLoading, setViewsLoading] = useState(false);
+  const [viewsError, setViewsError] = useState<string | null>(null);
+  const [viewsOpen, setViewsOpen] = useState(false);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [openView, setOpenView] = useState<SavedView | null>(null);
+  const loadViews = useCallback(async () => {
+    setViewsLoading(true);
+    setViewsError(null);
+    try {
+      setViews(await listSavedViews());
+    } catch (e) {
+      setViewsError(errorText(e));
     } finally {
-      setExportSubmitting(false);
+      setViewsLoading(false);
     }
-  };
-
-  // Toggle source in selection
-  const handleToggleSource = (src: SourceRef) => {
-    const exists = selectedSeries.some((s) => s.id === src.id);
-    if (exists) {
-      setSelectedSeries(selectedSeries.filter((s) => s.id !== src.id));
-    } else {
-      if (selectedSeries.length >= MAX_SELECTED_SERIES) {
-        setSelectionNotice(`At most ${MAX_SELECTED_SERIES} series can be shown at once. Remove one first.`);
-        return;
-      }
-      setSelectionNotice(null);
-      setSelectedSeries([...selectedSeries, src]);
-    }
-  };
-
-  const handleToggleTable = (table: TDSubtable) => {
-    const exists = selectedSeries.some((s) => s.id === `subtable:${table.id}`);
-    if (exists) {
-      setSelectedSeries(selectedSeries.filter((s) => s.id !== `subtable:${table.id}`));
-    } else {
-      if (selectedSeries.length >= MAX_SELECTED_SERIES) {
-        setSelectionNotice(`At most ${MAX_SELECTED_SERIES} series can be shown at once. Remove one first.`);
-        return;
-      }
-      const srcRef: SourceRef = {
-        id: `subtable:${table.id}`,
-        kind: 'subtable',
-        display_name: table.display_name || table.physical_name,
-        path: `TDengine / ${table.database_name} / ${table.physical_name}`,
-        status: table.status === 'ACTIVE' ? 'ACTIVE' : 'INACTIVE',
-      };
-      setSelectedSeries([...selectedSeries, srcRef]);
-    }
-  };
-
-  const handleToggleVisibility = (signalId: string) => {
-    setHiddenSeriesIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(signalId)) next.delete(signalId);
-      else next.add(signalId);
-      return next;
+  }, []);
+  useEffect(() => {
+    void loadViews();
+  }, [loadViews]);
+  const labelsMap = () => Object.fromEntries(state.sources.map((t) => [t, labelOf(t)]));
+  const applyView = (v: SavedView) => {
+    const next = stateFromSpec(v.query_spec || { sources: [] });
+    Object.entries(v.query_spec?.labels || {}).forEach(([tok, label]) => {
+      if (!catalog.current.has(tok)) catalog.current.set(tok, { token: tok, kind: kindOfToken(tok), label: String(label), name: String(label), sub: '', unit: '', valueType: '', resourceId: null });
     });
+    setZoomStack([]);
+    setState(next);
+    setOpenView(v);
+    setViewsOpen(false);
+    showToast({ message: `Opened view “${v.name}”.` });
+  };
+  const viewDirty = openView ? !sameState(stateFromSpec(openView.query_spec || { sources: [] }), { ...state, tab: stateFromSpec(openView.query_spec || { sources: [] }).tab }) : false;
+  const doSave = async (name: string, description: string, asNew: boolean) => {
+    setSaveBusy(true);
+    setSaveError(null);
+    const spec = specFromState(state, labelsMap());
+    try {
+      let v: SavedView;
+      if (openView && !asNew) {
+        try {
+          v = await updateView(openView.id, openView.version, { name, description, query_spec: spec });
+        } catch (e) {
+          const status = (e as { status?: number }).status;
+          if (status === 409) throw new Error('Someone else changed this view after you opened it. Reopen it, or save yours as a new view.');
+          if (status === 404 || status === 405) throw new Error('This server cannot update views yet. Use “Save as new view”.');
+          throw e;
+        }
+      } else v = await saveView({ name, description, query_spec: spec, chart_options: { layout: state.layout } });
+      setOpenView(v);
+      setSaveOpen(false);
+      void loadViews();
+      showToast({ message: `Saved view “${v.name}”.`, tone: 'success' });
+    } catch (e) {
+      setSaveError(errorText(e));
+    } finally {
+      setSaveBusy(false);
+    }
+  };
+  const doDeleteView = async (v: SavedView) => {
+    try {
+      await deleteView(v.id);
+      if (openView?.id === v.id) setOpenView(null);
+      showToast({ message: `Deleted view “${v.name}”.` });
+      void loadViews();
+    } catch (e) {
+      setViewsError(errorText(e));
+    }
   };
 
-  return (
-    <div className="space-y-4">
-      {/* Header bar */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-[20px] font-bold text-[#111B37]">Historian</h1>
-          <p className="text-[13px] text-[#657794]">Explore time-series values, state changes and stored records.</p>
-        </div>
+  // ------------------------------------------------------------------ exports
+  const [jobs, setJobs] = useState<ExportJob[] | null>(null);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const [jobsError, setJobsError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState<{ fmt: 'csv' | 'json'; startedAt: number; ctrl: AbortController } | null>(null);
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (!exporting) return;
+    const t = window.setInterval(() => forceTick((x) => x + 1), 1000);
+    return () => window.clearInterval(t);
+  }, [exporting]);
+  const loadJobs = useCallback(async () => {
+    setJobsLoading(true);
+    setJobsError(null);
+    try {
+      setJobs(await listExportJobs());
+    } catch (e) {
+      setJobsError(errorText(e));
+    } finally {
+      setJobsLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    if (state.tab === 'exports' && jobs === null) void loadJobs();
+  }, [state.tab, jobs, loadJobs]);
+  const triggerDownload = (j: ExportJob) => {
+    if (!j.download_url) return;
+    const a = document.createElement('a');
+    a.href = j.download_url;
+    if (j.file_name) a.download = j.file_name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+  const doExport = async (fmt: 'csv' | 'json') => {
+    if (!state.sources.length || exporting) return;
+    const ctrl = new AbortController();
+    setExporting({ fmt, startedAt: Date.now(), ctrl });
+    const { startMs, endMs } = resolveRange(state.range);
+    const first = labelOf(state.sources[0]);
+    const stamp = formatDateTime(startMs).replace(/[: ]/g, '').replace(/-/g, '').slice(0, 13);
+    const fileName = `historian_${safeFilePart(first)}${state.sources.length > 1 ? `_and_${state.sources.length - 1}_more` : ''}_${stamp}.${fmt}`;
+    try {
+      const job = await createExportJob(
+        {
+          sources: state.sources,
+          start: new Date(startMs).toISOString(),
+          end: new Date(endMs).toISOString(),
+          from_ts: new Date(startMs).toISOString(),
+          to_ts: new Date(endMs).toISOString(),
+          mode: state.mode,
+          format: fmt,
+          file_name: fileName,
+          title: `${state.sources.map(labelOf).slice(0, 3).join(', ')}${state.sources.length > 3 ? ` +${state.sources.length - 3}` : ''} · ${rangeLabel(state.range)}`,
+          labels: labelsMap(),
+        },
+        ctrl.signal,
+      );
+      setJobs((prev) => [job, ...(prev || []).filter((j) => j.id !== job.id)]);
+      const ready = ['COMPLETED', 'READY'].includes(String(job.status).toUpperCase());
+      if (ready) triggerDownload(job);
+      showToast({
+        tone: job.truncated_series?.length ? 'error' : 'success',
+        message: ready
+          ? `${fmt.toUpperCase()} export ready: ${(job.row_count ?? 0).toLocaleString()} rows · ${formatBytes(job.byte_size)}.${job.truncated_series?.length ? ` Row limit reached for ${job.truncated_series.join(', ')}.` : ''}`
+          : `Export ${String(job.status).toLowerCase()}. Follow it in the Exports tab.`,
+        action: ready ? { label: 'Download again', run: () => triggerDownload(job) } : { label: 'Open exports', run: () => patch({ tab: 'exports' }) },
+      });
+    } catch (e) {
+      if (!ctrl.signal.aborted) showToast({ tone: 'error', message: `Export failed: ${errorText(e)}` });
+    } finally {
+      setExporting(null);
+    }
+  };
+  const doRetry = async (j: ExportJob) => {
+    try {
+      const nj = await retryExportJob(j.id);
+      setJobs((prev) => [nj, ...(prev || [])]);
+      showToast({ message: 'Export created again.', tone: 'success' });
+    } catch (e) {
+      showToast({ tone: 'error', message: `Could not run the export again: ${errorText(e)}` });
+    }
+  };
 
-        {/* Header Right: Mode switcher & Time Range presets */}
-        <div className="flex flex-wrap items-center gap-3">
-          {/* Mode Switcher: recorded vs reconstructed */}
-          <div className="flex items-center bg-[#F1F5FA] p-1 rounded-lg border border-[#E3EAF3]">
-            {HISTORIAN_MODES.map((m) => (
-              <button
-                key={m.id}
-                type="button"
-                onClick={() => setMode(m.id)}
-                className={`px-3 py-1 rounded-md text-[12px] font-semibold transition-all ${
-                  mode === m.id
-                    ? 'bg-white text-[#111B37] shadow-xs'
-                    : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-                title={m.tooltip}
-              >
-                {m.label}
-              </button>
-            ))}
-          </div>
+  // ------------------------------------------------------------------ inspector & mobile picker
+  const [inspect, setInspect] = useState<{ s: Series; p: Pt } | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(state.sources.length === 0);
+  const lastSelection = useMemo(() => (state.sources.length ? [] : readLastSelection()), [state.sources.length]);
 
-          {/* Time presets */}
-          <div className="flex items-center bg-[#F1F5FA] p-1 rounded-lg border border-[#E3EAF3]">
-            {(['5m', '15m', '1h', '6h', '24h', '7d'] as TimeRangePreset[]).map((p) => (
-              <button
-                key={p}
-                type="button"
-                onClick={() => setTimePreset(p)}
-                className={`px-2.5 py-1 rounded-md text-[12px] font-semibold transition-all ${
-                  timePreset === p
-                    ? 'bg-[#EF1B24] text-white shadow-xs'
-                    : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-              >
-                {p}
-              </button>
-            ))}
-          </div>
+  const modeDef = MODES.find((m) => m.id === state.mode)!;
+  const [explainOpen, setExplainOpen] = useState(false);
 
-          {/* Refresh button */}
-          <button
-            type="button"
-            onClick={fetchData}
-            disabled={queryLoading}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC] shadow-xs transition-colors"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${queryLoading ? 'animate-spin text-[#EF1B24]' : 'text-[#657794]'}`} />
-            <span>Query</span>
-          </button>
+  const exportSummary = state.sources.length
+    ? `${state.sources.length} series · ${rangeLabel(state.range)} · ${modeDef.label}${totalRows ? ` · about ${totalRows.toLocaleString()} rows` : ''}. Every stored row is exported (not the chart buckets); times are UTC ISO-8601.`
+    : 'Pick at least one series first.';
+
+  // ------------------------------------------------------------------ render
+  const header = (
+    <PageHeader
+      title="Historian"
+      subtitle={
+        <>
+          Explore time-series values, state changes and stored records.
+          {openView && (
+            <span className="ml-1 text-[#334568]">
+              View: <span className="font-semibold">{openView.name}</span>
+              {viewDirty && <span className="ml-1 text-amber-700 font-semibold">· unsaved changes</span>}
+            </span>
+          )}
+        </>
+      }
+      actions={
+        <>
+          <MenuButton
+            label="Views"
+            icon={<FolderOpen className="w-4 h-4" />}
+            ariaLabel="Saved views"
+            items={[
+              { key: 'manage', label: views && views.length ? `Open a saved view… (${views.length})` : 'Saved views…', icon: <FolderOpen className="w-3.5 h-3.5" />, onSelect: () => { setViewsOpen(true); void loadViews(); } },
+              ...(views || []).slice(0, 6).map((v) => ({ key: v.id, label: v.name, icon: <History className="w-3.5 h-3.5" />, onSelect: () => applyView(v) })),
+              ...(openView ? [{ key: 'close', label: `Close view “${openView.name}”`, icon: <X className="w-3.5 h-3.5" />, onSelect: () => setOpenView(null) }] : []),
+            ]}
+          />
+          <Button variant="outline" size="md" icon={<Save className="w-4 h-4" />} disabled={!state.sources.length} onClick={() => { setSaveError(null); setSaveOpen(true); }}>
+            {openView ? 'Save view' : 'Save view…'}
+          </Button>
+          <Button variant="outline" size="md" icon={<Link2 className="w-4 h-4" />} onClick={() => void copyLink()} title="Copy a link to this exact view">
+            Copy link
+          </Button>
+          <MenuButton
+            label={exporting ? 'Exporting…' : 'Export'}
+            icon={<Download className="w-4 h-4" />}
+            items={[
+              { key: 'csv', label: 'Export CSV', icon: <FileSpreadsheet className="w-3.5 h-3.5" />, disabled: !state.sources.length || !!exporting, hint: state.sources.length ? undefined : 'Pick a series first', onSelect: () => void doExport('csv') },
+              { key: 'json', label: 'Export JSON', icon: <FileJson className="w-3.5 h-3.5" />, disabled: !state.sources.length || !!exporting, hint: state.sources.length ? undefined : 'Pick a series first', onSelect: () => void doExport('json') },
+              { key: 'hist', label: 'Export history', icon: <History className="w-3.5 h-3.5" />, onSelect: () => patch({ tab: 'exports' }) },
+            ]}
+          />
+        </>
+      }
+    />
+  );
+
+  const toolbar = (
+    <div className="bg-white border border-[#CBD5E1] rounded-xl p-2.5 space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <Segmented
+          ariaLabel="History mode"
+          value={state.mode}
+          onChange={(m) => patch({ mode: m })}
+          options={MODES.map((m) => ({ id: m.id, label: m.label, title: m.explain }))}
+        />
+        <button
+          type="button"
+          onClick={() => setExplainOpen((v) => !v)}
+          aria-expanded={explainOpen}
+          className="inline-flex items-center gap-1 h-8 px-2 rounded-lg text-[12px] font-semibold text-[#657794] hover:bg-[#F1F5FA] hover:text-[#111B37]"
+        >
+          <Info className="w-3.5 h-3.5" /> What is the difference?
+        </button>
+        <span className="hidden xl:block w-px h-6 bg-[#E3EAF3]" aria-hidden="true" />
+        <Segmented
+          ariaLabel="Time range"
+          value={state.range.kind === 'preset' && !customOpen ? state.range.preset : 'custom'}
+          onChange={(id) => {
+            if (id === 'custom') {
+              setCustomOpen(true);
+              return;
+            }
+            setCustomOpen(false);
+            setRange({ kind: 'preset', preset: id });
+          }}
+          options={[...RANGE_PRESETS.map((p) => ({ id: p.id, label: p.label, title: `Last ${p.label}` })), { id: 'custom', label: 'Custom' }]}
+        />
+        <Button
+          size="sm"
+          variant={liveOn ? 'primary' : 'outline'}
+          icon={<Radio className={`w-3.5 h-3.5 ${liveOn ? 'animate-pulse' : ''}`} />}
+          aria-pressed={liveOn}
+          disabled={state.range.kind !== 'preset' || !state.sources.length}
+          title={state.range.kind !== 'preset' ? 'Live follow works with “last …” ranges' : `Refresh every ${liveIntervalMs(win.endMs - win.startMs) / 1000} s and keep the window ending now`}
+          onClick={() => patch({ live: !state.live })}
+        >
+          {liveOn ? 'Live' : 'Follow live'}
+        </Button>
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-[11px] text-[#657794] tabular-nums" aria-live="polite">
+            {loading ? (slow ? 'Still loading… long windows take longer on a busy appliance' : 'Loading…') : result ? `Updated ${formatClock(result.fetchedAt)}` : ''}
+          </span>
+          {loading && slow ? (
+            <Button size="sm" variant="outline" onClick={cancel}>
+              Cancel
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" icon={<RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />} disabled={!state.sources.length || loading} onClick={() => void run()}>
+              Refresh
+            </Button>
+          )}
         </div>
       </div>
-
-      {(selectionNotice || !coverage.available || coverage.downsampled || coverage.notes.length > 0) && (
-        <div className="space-y-1.5">
-          {selectionNotice && (
-            <div role="status" className="px-3 py-2 rounded-lg border border-[#FFE2B3] bg-[#FFF6E5] text-[12px] text-[#334568] flex items-center justify-between gap-2">
-              <span>{selectionNotice}</span>
-              <button type="button" onClick={() => setSelectionNotice(null)} aria-label="Dismiss" className="text-[#657794]"><X className="w-3.5 h-3.5" /></button>
-            </div>
-          )}
-          {!coverage.available && (
-            <div className="px-3 py-2 rounded-lg border border-[#FAC6C9] bg-[#FFF0F1] text-[12px] text-[#334568]">
-              Time-series storage is not configured; only PostgreSQL observations can be shown.
-            </div>
-          )}
-          {(coverage.downsampled || coverage.notes.length > 0) && (
-            <div className="px-3 py-2 rounded-lg border border-[#E3EAF3] bg-white text-[12px] text-[#334568] space-y-0.5">
-              {coverage.downsampled && <div>Long range: values are aggregated per time bucket on the server (average, with min/max per bucket).</div>}
-              {[...new Set(coverage.notes)].slice(0, 6).map((n) => <div key={n} className="text-[#657794]">{n}</div>)}
-            </div>
-          )}
-        </div>
+      {customOpen && (
+        <form
+          className="flex flex-wrap items-end gap-2 pt-1"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!customError && customA != null && customB != null) setRange({ kind: 'abs', startMs: customA, endMs: customB });
+          }}
+        >
+          <label className="text-[11px] font-semibold text-[#334568]">
+            From
+            <input type="datetime-local" step={1} value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} className={`${selectCls} block mt-0.5 h-8`} />
+          </label>
+          <label className="text-[11px] font-semibold text-[#334568]">
+            To
+            <input type="datetime-local" step={1} value={customTo} onChange={(e) => setCustomTo(e.target.value)} className={`${selectCls} block mt-0.5 h-8`} />
+          </label>
+          <Button type="submit" size="sm" variant="primary" disabled={!!customError}>
+            Apply
+          </Button>
+          <Button type="button" size="sm" variant="ghost" onClick={() => { setCustomOpen(false); if (state.range.kind === 'abs') setRange({ kind: 'preset', preset: '1h' }); }}>
+            Back to presets
+          </Button>
+          <span className="text-[11px] text-[#657794]">{customError || `Times in ${TZ_LABEL}`}</span>
+        </form>
       )}
-
-      {/* Main split layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-        {/* Left Source Picker (col-span-3) */}
-        <div className="lg:col-span-3 bg-white border border-[#E3EAF3] rounded-xl shadow-xs p-3 flex flex-col space-y-3 max-h-[360px] lg:max-h-none lg:min-h-[680px]">
-          <div>
-            <div className="text-[11px] font-bold text-[#657794] uppercase tracking-wider mb-2">
-              Select Series
-            </div>
-
-            {/* Picker tabs: Hierarchy | Collector | Models | Tables */}
-            <div className="grid grid-cols-4 gap-1 bg-[#F1F5FA] p-1 rounded-lg text-[11px] font-semibold">
-              <button
-                type="button"
-                onClick={() => setPickerView('hierarchy')}
-                className={`py-1 px-1 rounded text-center truncate whitespace-nowrap transition-all ${
-                  pickerView === 'hierarchy' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-                title="Hierarchy Tree"
-              >
-                Tree
-              </button>
-              <button
-                type="button"
-                onClick={() => setPickerView('collector')}
-                className={`py-1 px-1 rounded text-center truncate whitespace-nowrap transition-all ${
-                  pickerView === 'collector' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-                title="Collector Connections"
-              >
-                Conn
-              </button>
-              <button
-                type="button"
-                onClick={() => setPickerView('models')}
-                className={`py-1 px-1 rounded text-center truncate whitespace-nowrap transition-all ${
-                  pickerView === 'models' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-                title="Data Models"
-              >
-                Models
-              </button>
-              <button
-                type="button"
-                onClick={() => setPickerView('tables')}
-                className={`py-1 px-1 rounded text-center truncate whitespace-nowrap transition-all ${
-                  pickerView === 'tables' ? 'bg-white text-[#111B37] shadow-xs' : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-                title="Physical Subtables"
-              >
-                Tables
-              </button>
-            </div>
-          </div>
-
-          {/* Search input */}
-          <div className="relative">
-            <Search className="w-3.5 h-3.5 text-[#94A3B8] absolute left-2.5 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              placeholder="Filter sources..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-8 pr-2.5 py-1.5 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg text-[12px] text-[#111B37] focus:outline-none focus:border-[#EF1B24]"
-            />
-          </div>
-
-          {/* Source items scroll area */}
-          <div className="flex-1 overflow-y-auto space-y-1.5 pr-1">
-            {loadingSources ? (
-              <div className="py-12 text-center text-[#657794] text-[12px]">
-                <RefreshCw className="w-4 h-4 animate-spin text-[#EF1B24] mx-auto mb-1.5" />
-                Loading sources...
-              </div>
-            ) : sourcesError ? (
-              <div className="p-3 bg-[#FEF2F2] border border-[#FAC6C9] rounded-lg text-center">
-                <p className="text-[12px] text-[#EF1B24] font-medium mb-1.5">Failed to load sources</p>
-                <button
-                  type="button"
-                  onClick={fetchSources}
-                  className="px-2.5 py-1 bg-white border border-[#FAC6C9] text-[#EF1B24] rounded text-[11px] font-semibold hover:bg-[#FEF2F2]"
-                >
-                  Retry
-                </button>
-              </div>
-            ) : pickerView === 'tables' ? (
-              tablesList.length === 0 ? (
-                <div className="py-8 text-center text-[#8C9BAE] text-[12px] italic">
-                  No subtables found.
-                </div>
-              ) : (
-                tablesList.map((tbl) => {
-                  const isSelected = selectedSeries.some((s) => s.id === `subtable:${tbl.id}`);
-                  return (
-                    <div
-                      key={tbl.id}
-                      onClick={() => handleToggleTable(tbl)}
-                      className={`p-2.5 rounded-lg border text-[12px] cursor-pointer transition-all ${
-                        isSelected
-                          ? 'border-[#7C3AED] bg-[#F5F3FF] font-semibold text-[#7C3AED]'
-                          : 'border-[#E3EAF3] bg-white hover:border-[#CBD5E1] text-[#334155]'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="truncate">{tbl.physical_name}</span>
-                        <TableIcon className="w-3.5 h-3.5 shrink-0 text-[#7C3AED]" />
-                      </div>
-                      <div className="text-[10px] text-[#94A3B8] truncate mt-0.5">{tbl.database_name}</div>
-                    </div>
-                  );
-                })
-              )
-            ) : groupsList.length > 0 ? (
-              groupsList.map((grp) => {
-                const isExpanded = expandedGroupIds.has(grp.id);
-                return (
-                  <div key={grp.id} className="border border-[#E3EAF3] rounded-lg overflow-hidden bg-white mb-1.5 shadow-2xs">
-                    <button
-                      type="button"
-                      onClick={() => toggleGroupExpand(grp.id)}
-                      className="w-full px-2.5 py-1.5 flex items-center justify-between bg-[#F8FAFC] hover:bg-[#F1F5FA] text-left transition-colors"
-                    >
-                      <div className="flex items-center gap-1.5 min-w-0 pr-1">
-                        {isExpanded ? (
-                          <ChevronDown className="w-3.5 h-3.5 text-[#657794] shrink-0" />
-                        ) : (
-                          <ChevronRight className="w-3.5 h-3.5 text-[#657794] shrink-0" />
-                        )}
-                        <span className="text-[12px] font-semibold text-[#111B37] truncate" title={grp.name}>
-                          {grp.name}
-                        </span>
-                        {grp.protocol && (
-                          <span className="text-[9px] uppercase px-1 py-0.2 bg-[#E2E8F0] text-[#475569] rounded font-mono">
-                            {grp.protocol}
-                          </span>
-                        )}
-                      </div>
-                      <span className="text-[10px] font-semibold text-[#657794] bg-white px-1.5 py-0.5 rounded border border-[#E3EAF3] shrink-0">
-                        {grp.signals_count}
-                      </span>
-                    </button>
-                    {isExpanded && (
-                      <div className="p-1 space-y-1 divide-y divide-[#F8FAFC]">
-                        {grp.signals.length === 0 ? (
-                          <div className="py-2 text-center text-[#94A3B8] text-[11px] italic">
-                            No signals in this group
-                          </div>
-                        ) : (
-                          grp.signals.map((sig: SourceRef) => {
-                            const isSelected = selectedSeries.some((s) => s.id === sig.id);
-                            return (
-                              <div
-                                key={sig.id}
-                                onClick={() => handleToggleSource(sig)}
-                                className={`p-1.5 rounded-md text-[11px] cursor-pointer transition-all flex items-center justify-between gap-1.5 ${
-                                  isSelected
-                                    ? 'border border-[#EF1B24] bg-[#FEF2F2] font-semibold text-[#EF1B24]'
-                                    : 'hover:bg-[#F8FAFC] text-[#334155]'
-                                }`}
-                              >
-                                <div className="min-w-0 flex-1">
-                                  <div className="truncate font-medium" title={sig.display_name || sig.path}>
-                                    {(sig as any).key || (sig as any).name || sig.display_name?.split('/').pop()?.trim() || sig.display_name}
-                                  </div>
-                                  <div className="text-[9px] text-[#94A3B8] font-mono truncate">
-                                    {sig.data_type || 'float64'}{sig.unit ? ` · ${sig.unit}` : ''}
-                                  </div>
-                                </div>
-                                <div className="flex items-center gap-1 shrink-0">
-                                  <span
-                                    className={`w-1.5 h-1.5 rounded-full ${
-                                      typeof navigator !== 'undefined' && !navigator.onLine
-                                        ? 'bg-[#CBD5E1]'
-                                        : (sig.quality || '').includes('BAD')
-                                        ? 'bg-[#F2343B]'
-                                        : (sig.quality || '').includes('GOOD') && sig.freshness === 'FRESH'
-                                        ? 'bg-[#0DBA67]'
-                                        : sig.freshness === 'STALE'
-                                        ? 'bg-[#FFAA23]'
-                                        : 'bg-[#CBD5E1]'
-                                    }`}
-                                    title={`${sig.quality || 'UNKNOWN'}${sig.freshness ? ` · ${sig.freshness}` : ''}`}
-                                  />
-                                  {isSelected && <Check className="w-3.5 h-3.5 text-[#EF1B24]" />}
-                                </div>
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })
-            ) : sourcesList.length === 0 ? (
-              <div className="py-8 text-center text-[#8C9BAE] text-[12px] italic">
-                No sources found.
-              </div>
-            ) : (
-              sourcesList.map((src) => {
-                const isSelected = selectedSeries.some((s) => s.id === src.id);
-                return (
-                  <div
-                    key={src.id}
-                    onClick={() => handleToggleSource(src)}
-                    className={`p-2 rounded-lg border text-[12px] cursor-pointer transition-all ${
-                      isSelected
-                        ? 'border-[#EF1B24] bg-[#FEF2F2] font-semibold text-[#EF1B24]'
-                        : 'border-[#E3EAF3] bg-white hover:border-[#CBD5E1] text-[#334155]'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="truncate">{src.display_name || (src as any).name}</span>
-                      {isSelected && <Check className="w-3.5 h-3.5 text-[#EF1B24] shrink-0" />}
-                    </div>
-                    <div className="text-[10px] text-[#94A3B8] truncate mt-0.5">{src.path || src.display_name}</div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          {/* Active selection count */}
-          <div className="pt-2 border-t border-[#E3EAF3] flex items-center justify-between text-[11px] text-[#657794]">
-            <span>Active: {selectedSeries.length}/{MAX_SELECTED_SERIES}</span>
-            {selectedSeries.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setSelectedSeries([])}
-                className="text-[#EF1B24] hover:underline font-semibold"
-              >
-                Clear all
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Right Workspace (col-span-9) */}
-        <div className="lg:col-span-9 space-y-4 min-w-0">
-          {/* Main workspace tabs */}
-          <div className="bg-white border border-[#E3EAF3] rounded-xl shadow-xs p-1 flex items-center justify-between">
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => setActiveTab('trend')}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-[13px] font-semibold transition-all ${
-                  activeTab === 'trend'
-                    ? 'bg-[#FEF2F2] text-[#EF1B24]'
-                    : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-              >
-                <LineChartIcon className="w-4 h-4" />
-                <span>Trend Chart</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setActiveTab('records')}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-[13px] font-semibold transition-all ${
-                  activeTab === 'records'
-                    ? 'bg-[#FEF2F2] text-[#EF1B24]'
-                    : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-              >
-                <TableIcon className="w-4 h-4" />
-                <span>Records ({recordsTotal})</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setActiveTab('events')}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-[13px] font-semibold transition-all ${
-                  activeTab === 'events'
-                    ? 'bg-[#FEF2F2] text-[#EF1B24]'
-                    : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-              >
-                <Activity className="w-4 h-4" />
-                <span>Events ({eventsData.length})</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setActiveTab('exports')}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-[13px] font-semibold transition-all ${
-                  activeTab === 'exports'
-                    ? 'bg-[#FEF2F2] text-[#EF1B24]'
-                    : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-              >
-                <Download className="w-4 h-4" />
-                <span>Saved Views & Exports</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Active Tab Body */}
-          <div className="bg-white border border-[#E3EAF3] rounded-xl shadow-xs p-4 min-h-[620px]">
-            {activeTab === 'trend' && (
-              <div>
-                {selectedSeries.length === 0 ? (
-                  <div className="py-32 text-center text-[#657794]">
-                    <LineChartIcon className="w-12 h-12 text-[#CBD5E1] mx-auto mb-3" />
-                    <h3 className="text-[15px] font-bold text-[#111B37] mb-1">No Sources Selected</h3>
-                    <p className="text-[13px]">
-                      Select telemetry sources from the left picker panel to visualize time-series trends.
-                    </p>
-                  </div>
-                ) : queryError ? (
-                  <RemoteErrorState
-                    error={queryError}
-                    subject="historian trend query"
-                    onRetry={fetchData}
-                  />
-                ) : !queryLoading && recordsTotal === 0 ? (
-                  <RemoteEmptyState
-                    title="No Telemetry Data Recorded"
-                    description={`No observations found for the selected ${selectedSeries.length} source(s) in this ${timePreset} window.`}
-                    icon={LineChartIcon}
-                  />
-                ) : (
-                  <HistorianTrendChart
-                    seriesList={seriesData}
-                    events={eventsData}
-                    mode={mode}
-                    startMs={timeRange.startMs}
-                    endMs={timeRange.endMs}
-                    loading={queryLoading}
-                    hiddenSignalIds={hiddenSeriesIds}
-                    onToggleSeriesVisibility={handleToggleVisibility}
-                    onSelectPoint={setInspectedPoint}
-                  />
-                )}
-              </div>
-            )}
-
-            {activeTab === 'records' && (
-              <div className="space-y-3">
-                <div className="flex items-center justify-between text-[12px] text-[#657794]">
-                  <span>{coverage.downsampled ? 'Long ranges are aggregated server-side; narrow the range to see every stored row.' : 'Stored rows, newest first.'}</span>
-                  <span>Rows in window: {recordsTotal.toLocaleString()}</span>
-                </div>
-
-                {queryError ? (
-                  <RemoteErrorState
-                    error={queryError}
-                    subject="historian records"
-                    onRetry={fetchData}
-                  />
-                ) : queryLoading ? (
-                  <RemoteLoadingState subject="historian records" />
-                ) : (
-                  <div className="border border-[#E3EAF3] rounded-lg overflow-x-auto max-h-[540px]">
-                    <table className="w-full text-left text-[12px] font-mono">
-                      <thead className="bg-[#F8FAFC] border-b border-[#E3EAF3] text-[#657794] sticky top-0">
-                        <tr>
-                          <th className="py-2.5 px-3">Time ({Intl.DateTimeFormat().resolvedOptions().timeZone})</th>
-                          <th className="py-2.5 px-3">Series</th>
-                          <th className="py-2.5 px-3">Value</th>
-                          <th className="py-2.5 px-3">Quality</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-[#F1F5FA]">
-                        {recordsRows.length === 0 ? (
-                          <tr>
-                            <td colSpan={4} className="py-12 text-center text-[#657794]">
-                              No records found for the selected time range.
-                            </td>
-                          </tr>
-                        ) : (
-                          recordsRows.map((row, idx) => {
-                            const rawQual = row.quality ? String(row.quality).toUpperCase() : '—';
-                            const isGood = rawQual.includes('GOOD');
-                            const isBad = rawQual.includes('BAD');
-
-                            return (
-                              <tr key={idx} className="hover:bg-[#F8FAFC]">
-                                <td className="py-2 px-3 text-[#111B37] whitespace-nowrap" title={String(row.ts)}>{new Date(String(row.ts)).toLocaleString()}</td>
-                                <td className="py-2 px-3 text-[#334568] whitespace-nowrap">{String((row as Record<string, unknown>).series_name || '')}</td>
-                                <td className="py-2 px-3 text-[#111B37] font-semibold whitespace-nowrap">
-                                  {(row as Record<string, unknown>).value === null || (row as Record<string, unknown>).value === undefined
-                                    ? 'null'
-                                    : typeof (row as Record<string, unknown>).value === 'object'
-                                    ? JSON.stringify((row as Record<string, unknown>).value)
-                                    : String((row as Record<string, unknown>).value)}
-                                  {String(row.record_kind || '') === 'AGGREGATE' && <span className="ml-1 text-[10px] text-[#657794]">avg</span>}
-                                </td>
-                                <td className="py-2 px-3">
-                                  <span
-                                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                                      isGood
-                                        ? 'bg-[#E8FAF0] text-[#0DBA67]'
-                                        : isBad
-                                        ? 'bg-[#FEF2F2] text-[#EF1B24]'
-                                        : 'bg-[#FFFBEB] text-[#D97706]'
-                                    }`}
-                                  >
-                                    {rawQual}
-                                  </span>
-                                </td>
-                              </tr>
-                            );
-                          })
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {activeTab === 'events' && (
-              <div className="space-y-3">
-                <div className="text-[12px] text-[#657794]">
-                  Quality transitions, recording policy triggers, and alarms recorded across the time window.
-                </div>
-                {eventsData.length === 0 ? (
-                  <div className="py-16 text-center text-[#657794] text-[13px] border border-[#E3EAF3] rounded-lg">
-                    No transition events recorded in this time range.
-                  </div>
-                ) : (
-                  <div className="border border-[#E3EAF3] rounded-lg overflow-hidden divide-y divide-[#F1F5FA] text-[12px]">
-                    {eventsData.map((evt) => {
-                      const isBad = evt.toQuality?.includes('BAD');
-                      const isWarn = evt.toQuality?.includes('UNCERTAIN');
-                      return (
-                        <div key={evt.id} className="p-3 flex items-center justify-between hover:bg-[#F8FAFC]">
-                          <div className="flex items-center gap-2.5">
-                            <Activity
-                              className={`w-4 h-4 ${
-                                isBad
-                                  ? 'text-[#EF1B24]'
-                                  : isWarn
-                                  ? 'text-[#D97706]'
-                                  : 'text-[#0DBA67]'
-                              }`}
-                            />
-                            <div>
-                              <span className="font-semibold text-[#111B37]">{evt.summary}</span>
-                              <div className="text-[11px] text-[#657794]">
-                                {evt.signalName ? `${evt.signalName} (${evt.kind})` : evt.kind}
-                              </div>
-                            </div>
-                          </div>
-                          <span className="font-mono text-[11px] text-[#94A3B8]">
-                            {new Date(evt.timestamp).toLocaleTimeString()}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {activeTab === 'exports' && (
-              <div className="space-y-6">
-                {/* Export Action Card */}
-                <div className="p-4 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl flex items-center justify-between">
-                  <div>
-                    <h3 className="text-[14px] font-bold text-[#111B37]">Export Active Selection</h3>
-                    <p className="text-[12px] text-[#657794] mt-0.5">
-                      Download historical records ({recordsTotal} rows) in CSV or JSON format.
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      disabled={selectedSeries.length === 0 || exportSubmitting}
-                      onClick={() => handleCreateExport('csv')}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-[#EF1B24] hover:bg-[#D9141D] text-white rounded-lg text-[12px] font-semibold shadow-xs disabled:opacity-50 transition-colors"
-                    >
-                      <FileSpreadsheet className="w-3.5 h-3.5" />
-                      <span>Export CSV</span>
-                    </button>
-                    <button
-                      type="button"
-                      disabled={selectedSeries.length === 0 || exportSubmitting}
-                      onClick={() => handleCreateExport('json')}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-white border border-[#E3EAF3] hover:bg-[#F1F5FA] text-[#111B37] rounded-lg text-[12px] font-semibold shadow-xs disabled:opacity-50 transition-colors"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>Export JSON</span>
-                    </button>
-                  </div>
-                </div>
-
-                {exportError && (
-                  <div className="p-3 bg-[#FEF2F2] border border-[#FAC6C9] rounded-lg text-[12px] text-[#EF1B24]">
-                    {exportError}
-                  </div>
-                )}
-
-                <div>
-                  <h3 className="text-[14px] font-bold text-[#111B37] mb-2">Saved Trend Views</h3>
-                  {savedViews.length === 0 ? (
-                    <p className="text-[12px] text-[#657794] italic">No saved views created yet.</p>
-                  ) : (
-                    <div className="grid grid-cols-2 gap-3">
-                      {savedViews.map((v) => (
-                        <div key={v.id} className="p-3 border border-[#E3EAF3] rounded-lg bg-[#F8FAFC]">
-                          <div className="font-semibold text-[#111B37] text-[13px]">{v.name}</div>
-                          <div className="text-[11px] text-[#657794] mt-1">{v.description || 'No description'}</div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div className="pt-4 border-t border-[#E3EAF3]">
-                  <h3 className="text-[14px] font-bold text-[#111B37] mb-2">Export Jobs</h3>
-                  {exportJobs.length === 0 ? (
-                    <p className="text-[12px] text-[#657794] italic">No export jobs recorded.</p>
-                  ) : (
-                    <div className="space-y-2">
-                      {exportJobs.map((j) => (
-                        <div key={j.id} className="p-3 border border-[#E3EAF3] rounded-lg flex items-center justify-between bg-white">
-                          <div className="flex items-center gap-3">
-                            <Download className="w-4 h-4 text-[#657794]" />
-                            <div>
-                              <div className="font-semibold text-[13px] text-[#111B37]">{j.id}</div>
-                              <div className="text-[11px] text-[#657794]">
-                                Format: <span className="font-mono uppercase">{j.format}</span> · {j.row_count ?? 0} rows
-                              </div>
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <span
-                              className={`px-2 py-0.5 rounded text-[11px] font-bold ${
-                                j.status === 'DONE'
-                                  ? 'bg-[#E8FAF0] text-[#0DBA67]'
-                                  : j.status === 'ERROR'
-                                  ? 'bg-[#FEF2F2] text-[#EF1B24]'
-                                  : 'bg-[#FFFBEB] text-[#D97706]'
-                              }`}
-                            >
-                              {j.status}
-                            </span>
-                            {j.download_url && (
-                              <a
-                                href={j.download_url}
-                                download
-                                className="px-2.5 py-1 bg-[#1976D2] text-white rounded text-[11px] font-semibold hover:bg-[#1565C0]"
-                              >
-                                Download
-                              </a>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Value Inspector Drawer with Real Observation Provenance */}
-      {inspectedPoint && (
-        <div className="fixed inset-y-0 right-0 z-40 w-[380px] bg-white border-l border-[#E3EAF3] shadow-xl p-4 flex flex-col animate-in slide-in-from-right duration-200">
-          <div className="flex items-center justify-between pb-3 border-b border-[#E3EAF3] mb-4">
-            <h3 className="text-[14px] font-bold text-[#111B37] flex items-center gap-1.5">
-              <Info className="w-4 h-4 text-[#EF1B24]" />
-              <span>Observation Inspector</span>
-            </h3>
-            <button
-              type="button"
-              onClick={() => setInspectedPoint(null)}
-              className="p-1 rounded text-[#657794] hover:text-[#111B37]"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-
-          <div className="space-y-3 flex-1 overflow-y-auto text-[12px]">
-            <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
-              <div className="text-[10px] font-semibold text-[#657794] uppercase">Sampled Value</div>
-              <div className="text-[18px] font-mono font-bold text-[#111B37] mt-0.5">
-                {typeof inspectedPoint.value === 'number' ? inspectedPoint.value.toFixed(3) : String(inspectedPoint.value)}
-              </div>
-            </div>
-
-            <div className="p-3 bg-white border border-[#E3EAF3] rounded-lg space-y-2.5">
-              <div>
-                <div className="text-[#657794] text-[11px]">Signal / Source</div>
-                <div className="font-semibold text-[#111B37] truncate">{inspectedPoint.signalName}</div>
-                <div className="font-mono text-[10px] text-[#94A3B8] truncate">{inspectedPoint.signalId}</div>
-              </div>
-
-              <div>
-                <div className="text-[#657794] text-[11px]">Primary Event Time</div>
-                <div className="font-mono text-[#111B37] font-semibold">{inspectedPoint.eventTime}</div>
-              </div>
-
-              <div>
-                <div className="text-[#657794] text-[11px]">Acquired At</div>
-                <div className="font-mono text-[#334155]">{inspectedPoint.acquiredAt}</div>
-              </div>
-
-              <div>
-                <div className="text-[#657794] text-[11px]">Source Time (Device Clock)</div>
-                <div className="font-mono text-[#334155]">{inspectedPoint.sourceTime || inspectedPoint.eventTime}</div>
-              </div>
-
-              <div>
-                <div className="text-[#657794] text-[11px]">Quality State</div>
-                <span
-                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                    inspectedPoint.quality === 'GOOD'
-                      ? 'bg-[#E8FAF0] text-[#0DBA67]'
-                      : inspectedPoint.quality === 'BAD'
-                      ? 'bg-[#FEF2F2] text-[#EF1B24]'
-                      : 'bg-[#FFFBEB] text-[#D97706]'
-                  }`}
-                >
-                  <CheckCircle2 className="w-3 h-3" />
-                  <span>{inspectedPoint.quality}</span>
-                </span>
-              </div>
-
-              <div>
-                <div className="text-[#657794] text-[11px]">Reason Code</div>
-                <div className="font-mono text-[#334155]">{inspectedPoint.reasonCode || 'NORMAL'}</div>
-              </div>
-
-              <div>
-                <div className="text-[#657794] text-[11px]">Record Origin</div>
-                <span className="font-mono text-[11px] px-1.5 py-0.5 bg-[#F1F5FA] rounded text-[#334568]">
-                  {inspectedPoint.recordKind}
-                </span>
-              </div>
-
-              <div>
-                <div className="text-[#657794] text-[11px]">Fidelity Semantics</div>
-                <div className="text-[#334568]">
-                  {inspectedPoint.virtual ? 'Virtual Step (Reconstructed Timeline)' : 'Exact Ingested Observation'}
-                </div>
-              </div>
-
-              <div>
-                <div className="text-[#657794] text-[11px]">Data Epoch</div>
-                <div className="font-mono text-[#334568]">{inspectedPoint.dataEpoch}</div>
-              </div>
-            </div>
-          </div>
-        </div>
+      <p className="text-[12px] text-[#657794] px-0.5">
+        <span className="font-semibold text-[#334568]">{modeDef.label}:</span> {modeDef.explain}
+      </p>
+      {explainOpen && (
+        <Banner tone="info" onClose={() => setExplainOpen(false)}>
+          <ul className="space-y-1">
+            {MODES.map((m) => (
+              <li key={m.id}>
+                <span className="font-semibold">{m.label}</span> — {m.explain}
+              </li>
+            ))}
+            <li>
+              Example: a machine status read every second that changes twice in an hour shows ~3,600 raw readings, 2–3 recorded rows, and a reconstructed line that
+              looks like the raw one but is drawn from those few rows.
+            </li>
+          </ul>
+        </Banner>
       )}
     </div>
   );
+
+  const legend = (
+    <div className="flex flex-wrap items-center gap-1.5" role="list" aria-label="Selected series">
+      {allSeries.map((s) => {
+        const hidden = state.hidden.includes(s.token);
+        const st = statusText(s.status);
+        return (
+          <span
+            key={s.token}
+            role="listitem"
+            className={`inline-flex items-center gap-1.5 h-7 pl-2 pr-1 rounded-full border text-[12px] max-w-full ${hidden ? 'bg-white border-dashed border-[#CBD5E1] text-[#94A3B8]' : 'bg-white border-[#D4DFEC] text-[#334568]'}`}
+            title={`${s.label}${s.unit ? ` (${s.unit})` : ''}${st ? ` — ${st}` : ''}`}
+          >
+            <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: hidden ? '#CBD5E1' : s.color }} aria-hidden="true" />
+            <span className="truncate max-w-[220px] font-semibold">{s.label}</span>
+            {s.unit && <span className="text-[11px] text-[#94A3B8]">{s.unit}</span>}
+            {s.status === 'LOADING' && <RefreshCw className="w-3 h-3 animate-spin text-[#94A3B8]" aria-label="loading" />}
+            {st && <span className="text-[10px] font-semibold text-amber-700">{st}</span>}
+            <button type="button" onClick={() => toggleHidden(s.token)} aria-label={hidden ? `Show ${s.label}` : `Hide ${s.label}`} className="p-0.5 rounded-full hover:bg-slate-100">
+              {hidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+            </button>
+            <button type="button" onClick={() => removeSource(s.token)} aria-label={`Remove ${s.label}`} className="p-0.5 rounded-full hover:bg-slate-100">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </span>
+        );
+      })}
+    </div>
+  );
+
+  const chartControls = (
+    <div className="flex flex-wrap items-center gap-2">
+      <Segmented
+        ariaLabel="Chart layout"
+        size="sm"
+        value={state.layout}
+        onChange={(l) => patch({ layout: l })}
+        options={[
+          { id: 'overlay', label: 'One chart', icon: <Columns3 className="w-3.5 h-3.5" />, title: 'All series in one chart, one axis per unit' },
+          { id: 'lanes', label: 'Split by unit', icon: <Rows3 className="w-3.5 h-3.5" />, title: 'One chart per unit, shared time axis' },
+        ]}
+      />
+      <select className={selectCls} value={state.compare} onChange={(e) => patch({ compare: e.target.value as CompareOffset })} aria-label="Compare with">
+        {COMPARE_OPTIONS.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.id ? `Compare: ${c.label}` : c.label}
+          </option>
+        ))}
+      </select>
+      <span className="inline-flex items-center gap-1">
+        <Button size="sm" variant="outline" aria-label="Earlier" title="Move half a window earlier" onClick={() => pan(-1)}>
+          <ChevronLeft className="w-3.5 h-3.5" />
+        </Button>
+        <Button size="sm" variant="outline" icon={<ZoomOut className="w-3.5 h-3.5" />} onClick={zoomOut} title="Show twice the time span">
+          Zoom out
+        </Button>
+        <Button size="sm" variant="outline" aria-label="Later" title="Move half a window later" disabled={atNow} onClick={() => pan(1)}>
+          <ChevronRight className="w-3.5 h-3.5" />
+        </Button>
+        {zoomStack.length > 0 && (
+          <Button size="sm" variant="ghost" onClick={zoomBack} title="Back to the previous range">
+            Undo zoom
+          </Button>
+        )}
+      </span>
+    </div>
+  );
+
+  const trendBody = (() => {
+    if (error) return <ErrorBanner error={error} subject="the history" onRetry={() => void run()} />;
+    if (!result && loading)
+      return (
+        <div className="space-y-3" aria-busy="true" aria-label="Loading history">
+          <Skeleton className="h-[300px] w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      );
+    if (!result) return null;
+    return (
+      <div className="space-y-3">
+        {allNoData && (
+          <Banner
+            tone="info"
+            action={
+              state.range.kind !== 'preset' || state.range.preset !== '24h' ? (
+                <Button size="sm" variant="outline" onClick={() => setRange({ kind: 'preset', preset: '24h' })}>
+                  Try the last 24 h
+                </Button>
+              ) : undefined
+            }
+          >
+            No stored rows for the selected series in this window.
+            {state.mode !== 'operational' && ' Recorded and reconstructed views only show what your recording rules stored — try Raw readings to see every reading.'}
+          </Banner>
+        )}
+        <HistorianTrendChart
+          series={visible}
+          compareSeries={compareSeries}
+          compareLabel={compareLabel}
+          mode={state.mode}
+          layout={state.layout}
+          startMs={win.startMs}
+          endMs={win.endMs}
+          markers={markers}
+          gapsBySeries={gapsBySeries}
+          loading={loading}
+          onBrush={onBrush}
+          onPick={(s, p) => setInspect({ s, p })}
+        />
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-[#657794]">
+          <span>
+            {formatDateTime(win.startMs)} → {formatDateTime(win.endMs)} · times in {TZ_LABEL}
+          </span>
+          <span>Drag on the chart to zoom · click a point to inspect it</span>
+          <span className="inline-flex items-center gap-2">
+            {(['GOOD', 'UNCERTAIN', 'STALE', 'BAD', 'GAP'] as const).map((q) => (
+              <span key={q} className="inline-flex items-center gap-1">
+                <span className="w-2.5 h-2 rounded-sm" style={{ background: { GOOD: '#0DBA67', UNCERTAIN: '#F59E0B', STALE: '#94A3B8', BAD: '#EF4444', GAP: '#E2E8F0' }[q] }} aria-hidden="true" />
+                {{ GOOD: 'Good', UNCERTAIN: 'Uncertain', STALE: 'Stale', BAD: 'Bad', GAP: 'No data' }[q]}
+              </span>
+            ))}
+          </span>
+          {compareSeries.length > 0 && <span>Dashed = {compareLabel}</span>}
+          {downsampled && <span className="font-semibold text-[#334568]">Long range: values are averaged per time bucket on the server (band = min/max).</span>}
+        </div>
+        {notes.length > 0 && (
+          <ul className="text-[11px] text-[#657794] space-y-0.5">
+            {notes.map((n) => (
+              <li key={n}>· {n}</li>
+            ))}
+          </ul>
+        )}
+        <div>
+          <h3 className="text-[13px] font-bold text-[#111B37] mb-1.5">Statistics of this window</h3>
+          <StatsTable series={allSeries.filter((s) => s.status !== 'LOADING')} compare={compareSeries} compareLabel={compareLabel} mode={state.mode} startMs={win.startMs} endMs={win.endMs} hidden={state.hidden} />
+          <p className="mt-1 text-[11px] text-[#94A3B8]">Per series only — values with different units are never combined.</p>
+        </div>
+      </div>
+    );
+  })();
+
+  return (
+    <div className="space-y-4 min-w-0">
+      {header}
+      {toolbar}
+      {result && !result.res.history_available && (
+        <Banner tone="warning">
+          The time-series store (TDengine) is not configured on this appliance. Values come from PostgreSQL observations, which keep only a short history.
+        </Banner>
+      )}
+      {exporting && (
+        <div role="status" className="flex flex-wrap items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-[12px] text-blue-900">
+          <RefreshCw className="w-4 h-4 animate-spin" aria-hidden="true" />
+          <span className="flex-1 min-w-0">
+            Preparing {exporting.fmt.toUpperCase()} export of {state.sources.length} series{totalRows ? ` (about ${totalRows.toLocaleString()} rows)` : ''}… {Math.round((Date.now() - exporting.startedAt) / 1000)} s
+          </span>
+          <div className="w-40 h-1.5 rounded-full bg-blue-100 overflow-hidden" aria-hidden="true">
+            <div className="h-full w-1/3 bg-blue-500 animate-pulse" />
+          </div>
+          <Button size="sm" variant="outline" onClick={() => exporting.ctrl.abort()}>
+            Cancel
+          </Button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)] gap-4 items-start">
+        {/* Source picker: a panel on the left; collapsible above the chart on small screens */}
+        <aside className="bg-white border border-[#CBD5E1] rounded-xl overflow-hidden lg:sticky lg:top-[calc(var(--fx-topbar-height)+var(--fx-banner-height,0px)+16px)]">
+          <button
+            type="button"
+            className="lg:hidden w-full flex items-center justify-between px-3 py-2.5 text-[13px] font-bold text-[#111B37]"
+            aria-expanded={pickerOpen}
+            onClick={() => setPickerOpen((v) => !v)}
+          >
+            <span>
+              Series · {state.sources.length}/{MAX_SERIES}
+            </span>
+            <ChevronDown className={`w-4 h-4 transition-transform ${pickerOpen ? 'rotate-180' : ''}`} />
+          </button>
+          <div className={`${pickerOpen ? 'block' : 'hidden'} lg:block border-t border-[#E3EAF3] lg:border-t-0`}>
+            <SeriesPicker
+              className="h-[60vh] lg:h-[calc(100vh-var(--fx-topbar-height)-var(--fx-banner-height,0px)-150px)] lg:min-h-[480px]"
+              selected={state.sources}
+              colorOf={colorOf}
+              onToggle={toggleSource}
+              onClear={() => patch({ sources: [], hidden: [] })}
+              onCatalog={onCatalog}
+            />
+          </div>
+        </aside>
+
+        <section className="min-w-0 space-y-3" aria-label="Trend workspace">
+          {state.sources.length === 0 ? (
+            <EmptyState
+              icon={<LineChartIcon className="w-6 h-6" />}
+              title="Choose what to look at"
+              action={
+                <>
+                  {lastSelection.length > 0 && (
+                    <Button variant="primary" size="sm" icon={<History className="w-3.5 h-3.5" />} onClick={() => patch({ sources: lastSelection })}>
+                      Restore last selection ({lastSelection.length})
+                    </Button>
+                  )}
+                  {(views || []).slice(0, 3).map((v) => (
+                    <Button key={v.id} variant="outline" size="sm" icon={<FolderOpen className="w-3.5 h-3.5" />} onClick={() => applyView(v)}>
+                      {v.name}
+                    </Button>
+                  ))}
+                </>
+              }
+            >
+              <p>
+                Tick signals, Data Model fields or recorded tables in the Factory Model on the left (up to {MAX_SERIES}). Series with different units get their own axis;
+                text and on/off values are drawn as state bands.
+              </p>
+              <p className="mt-1">Tip: “Open in Historian” on a signal or a recorded table opens it here directly.</p>
+            </EmptyState>
+          ) : (
+            <div className="bg-white border border-[#CBD5E1] rounded-xl p-3 sm:p-4 space-y-3 min-w-0">
+              <div className="flex flex-col xl:flex-row xl:items-start justify-between gap-3">
+                {legend}
+                {state.tab === 'trend' && chartControls}
+              </div>
+              <Tabs
+                activeTab={state.tab}
+                onChange={(id) => patch({ tab: id as HistorianTab })}
+                tabs={[
+                  { id: 'trend', label: 'Trend' },
+                  { id: 'records', label: downsampled ? 'Records (buckets)' : 'Records', count: totalRows ? totalRows.toLocaleString() : undefined },
+                  { id: 'events', label: 'Events', count: eventRows.filter((e) => e.kind !== 'storage').length },
+                  { id: 'exports', label: 'Exports', count: jobs ? jobs.length : undefined },
+                ]}
+                className="overflow-x-auto"
+              />
+              {state.tab === 'trend' && trendBody}
+              {state.tab === 'records' &&
+                (error ? (
+                  <ErrorBanner error={error} subject="the records" onRetry={() => void run()} />
+                ) : !result ? (
+                  <Skeleton className="h-64 w-full" />
+                ) : (
+                  <RecordsTable series={allSeries.filter((s) => s.status !== 'LOADING')} onInspect={(s, p) => setInspect({ s, p })} onZoomRaw={() => setRange({ kind: 'preset', preset: '15m' })} />
+                ))}
+              {state.tab === 'events' && <EventsList events={eventRows} onJump={(e) => zoomAround(e.t)} />}
+              {state.tab === 'exports' && (
+                <ExportsPanel
+                  jobs={jobs}
+                  loading={jobsLoading}
+                  error={jobsError}
+                  onReload={() => void loadJobs()}
+                  onRetry={(j) => void doRetry(j)}
+                  labelOf={labelOf}
+                  canExport={state.sources.length > 0}
+                  exporting={!!exporting}
+                  onExport={(f) => void doExport(f)}
+                  summary={exportSummary}
+                />
+              )}
+            </div>
+          )}
+          {state.sources.length === 0 && state.tab === 'exports' && (
+            <div className="bg-white border border-[#CBD5E1] rounded-xl p-4">
+              <ExportsPanel
+                jobs={jobs}
+                loading={jobsLoading}
+                error={jobsError}
+                onReload={() => void loadJobs()}
+                onRetry={(j) => void doRetry(j)}
+                labelOf={labelOf}
+                canExport={false}
+                exporting={false}
+                onExport={() => undefined}
+                summary={exportSummary}
+              />
+            </div>
+          )}
+        </section>
+      </div>
+
+      <PointInspector target={inspect} onClose={() => setInspect(null)} onZoom={(t) => { setInspect(null); zoomAround(t); }} />
+      <SaveViewDialog open={saveOpen} initialName={state.sources.length ? `${labelOf(state.sources[0])}${state.sources.length > 1 ? ` +${state.sources.length - 1}` : ''} · ${rangeLabel(state.range)}` : ''} current={openView} busy={saveBusy} error={saveError} onClose={() => setSaveOpen(false)} onSave={(n, d, asNew) => void doSave(n, d, asNew)} />
+      <ViewsDialog open={viewsOpen} views={views} loading={viewsLoading} error={viewsError} onClose={() => setViewsOpen(false)} onOpen={applyView} onDelete={(v) => void doDeleteView(v)} onReload={() => void loadViews()} currentId={openView?.id} />
+      <ActionToast toast={toast} onDismiss={dismiss} />
+    </div>
+  );
 };
+
+export default HistorianExplorerPage;

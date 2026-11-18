@@ -480,10 +480,10 @@ async def capture_model_results(
         INSERT INTO storage_field_state (binding_key, tenant_id, physical_db, physical_subtable, data_epoch,
                                          last_value_canon, last_quality, last_is_null, last_identity, sequence, updated_at)
         SELECT t.k, :tenant_id, split_part(t.k, '.', 1), split_part(split_part(t.k, ':', 1), '.', 2), t.epoch,
-               t.val, t.q, t.isnull, t.ident, t.seq, now()
+               t.val, t.q, t.is_null_v, t.ident, t.seq, now()
         FROM unnest(CAST(:keys AS text[]), CAST(:epochs AS bigint[]), CAST(:vals AS text[]), CAST(:qs AS text[]),
                     CAST(:nulls AS boolean[]), CAST(:idents AS text[]), CAST(:seqs AS bigint[]))
-             AS t(k, epoch, val, q, isnull, ident, seq)
+             AS t(k, epoch, val, q, is_null_v, ident, seq)
         ON CONFLICT (tenant_id, binding_key) DO UPDATE SET
             data_epoch = EXCLUDED.data_epoch, last_value_canon = EXCLUDED.last_value_canon,
             last_quality = EXCLUDED.last_quality, last_is_null = EXCLUDED.last_is_null,

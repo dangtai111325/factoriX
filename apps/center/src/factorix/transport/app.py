@@ -2161,14 +2161,23 @@ def _bearer(request: Request) -> str | None:
     return None
 
 
-@app.post("/api/v1/edge-sync/enroll")
+def _legacy_edge_sync_enabled() -> None:
+    """A4(b) safety guard: the legacy Edge M2M API (it serves decrypted secrets) is gone in acquisition mode.
+
+    Only the ``factorix_edge`` daemon calls these routes; acquisition reads PostgreSQL directly.
+    """
+    if _settings().collector_mode == "acquisition":
+        raise AppError(410, "EDGE_SYNC_DISABLED", "The legacy Edge sync API is disabled: this installation uses the built-in acquisition collector.")
+
+
+@app.post("/api/v1/edge-sync/enroll", dependencies=[Depends(_legacy_edge_sync_enabled)])
 async def edge_enroll(body: EdgeEnrollIn, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     result = await edge_sync.enroll(session, body.enrollment_token)
     await _commit_now(session)
     return result
 
 
-@app.post("/api/v1/edge-sync/heartbeat")
+@app.post("/api/v1/edge-sync/heartbeat", dependencies=[Depends(_legacy_edge_sync_enabled)])
 async def edge_heartbeat(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     body = await request.json()
@@ -2179,13 +2188,13 @@ async def edge_heartbeat(request: Request, session: AsyncSession = Depends(db_se
     return result
 
 
-@app.get("/api/v1/edge-sync/config")
+@app.get("/api/v1/edge-sync/config", dependencies=[Depends(_legacy_edge_sync_enabled)])
 async def edge_config(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     return await edge_sync.desired_config(session, edge)
 
 
-@app.post("/api/v1/edge-sync/ack")
+@app.post("/api/v1/edge-sync/ack", dependencies=[Depends(_legacy_edge_sync_enabled)])
 async def edge_ack(body: EdgeAckIn, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     result = await edge_sync.acknowledge(session, edge, body.revision, body.state, body.diagnostic)
@@ -2193,13 +2202,13 @@ async def edge_ack(body: EdgeAckIn, request: Request, session: AsyncSession = De
     return result
 
 
-@app.get("/api/v1/edge-sync/secrets/{secret_id}")
+@app.get("/api/v1/edge-sync/secrets/{secret_id}", dependencies=[Depends(_legacy_edge_sync_enabled)])
 async def edge_secret(secret_id: str, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, str]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     return await edge_sync.read_secret(session, edge, parse_uuid(secret_id), _settings().data_key)
 
 
-@app.post("/api/v1/edge-sync/observations")
+@app.post("/api/v1/edge-sync/observations", dependencies=[Depends(_legacy_edge_sync_enabled)])
 async def edge_observations(body: EdgeBatchIn, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     result = await edge_sync.accept_observations(session, edge, body.observations)
@@ -2208,7 +2217,7 @@ async def edge_observations(body: EdgeBatchIn, request: Request, session: AsyncS
     return result
 
 
-@app.get("/api/v1/edge-sync/commands")
+@app.get("/api/v1/edge-sync/commands", dependencies=[Depends(_legacy_edge_sync_enabled)])
 async def edge_commands(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     result = await edge_sync.pull_commands(session, edge)
@@ -2216,7 +2225,7 @@ async def edge_commands(request: Request, session: AsyncSession = Depends(db_ses
     return result
 
 
-@app.post("/api/v1/edge-sync/commands/{job_id}")
+@app.post("/api/v1/edge-sync/commands/{job_id}", dependencies=[Depends(_legacy_edge_sync_enabled)])
 async def edge_command_result(job_id: str, request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     edge = await edge_sync.edge_principal(session, _bearer(request))
     body = await request.json()

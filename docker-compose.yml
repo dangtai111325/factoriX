@@ -96,7 +96,7 @@ services:
     env_file:
       - .env
     environment:
-      - FACTORIX_COLLECTOR_MODE=acquisition
+      - FACTORIX_COLLECTOR_MODE=${FACTORIX_COLLECTOR_MODE:-acquisition}
       - FACTORIX_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-factorix}:${POSTGRES_PASSWORD}@factorix-postgres:5432/${POSTGRES_DB:-factorix}
       - FACTORIX_RABBITMQ_URL=${FACTORIX_RABBITMQ_URL:-amqp://${FACTORIX_RABBITMQ_USER:-factorix_mq}:${FACTORIX_RABBITMQ_PASSWORD}@factorix-rabbitmq:5672/}
       - FACTORIX_RABBITMQ_MGMT_URL=${FACTORIX_RABBITMQ_MGMT_URL:-http://factorix-rabbitmq:15672}

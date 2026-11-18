@@ -111,9 +111,16 @@ async def test_partial_failure_spills_unconfirmed_items_and_keeps_unattempted_ra
 
     broker.down = False
     broker.fail_after = None
-    sent2, failed2 = await pub.flush_once(budget_s=5.0)
-    assert failed2 is False
-    assert sent2 == 2598
+    # The live failure paused replay (cooldown); the live RAM goes out first regardless.
+    assert pub.replay.controller.paused_until > time.monotonic()
+    sent2, failed2 = await pub.flush_once(budget_s=0.2)
+    assert (sent2, failed2) == (600, False)
+    pub.replay.controller.paused_until = 0.0
+    for _ in range(20):
+        pub.replay.controller.tokens = 1000.0
+        await pub.flush_once(budget_s=0.2)
+        if spool.pending_count() == 0:
+            break
     assert spool.pending_count() == 0
     seqs = [o.source_sequence for o in broker.published]
     # Live RAM data leaves before any spooled replay.
@@ -401,18 +408,20 @@ async def test_live_ram_drains_before_replay_and_replay_is_rate_limited(tmp_path
         spec, _, _ = _spec()
         await publisher.emit(spec, [Sample(spec.fields[0]["id"], float(i + 10), "GOOD") for i in range(9)])
 
-        # Replay tokens exhausted: live RAM still flows completely, replay waits without failing.
-        publisher._replay_tokens = 0.0
-        publisher._replay_refill_at = time.monotonic() + 3600.0
+        controller = publisher.replay.controller
+        # Replay paused by the controller: live RAM still flows completely, replay waits without failing.
+        controller.paused_until = time.monotonic() + 3600.0
         assert await publisher.flush_once(budget_s=0) == (9, False)
         assert publisher.fast_buffered == 0 and spool.pending_count() == 3
         assert [o.value for o in broker.published] == [float(i + 10) for i in range(9)]
 
-        # Tokens refill: replay resumes, newest-per-signal first.
-        publisher._replay_tokens = 2.0
+        # Pause over, two tokens: replay resumes, newest-per-signal first.
+        controller.paused_until = 0.0
+        controller.tokens = 2.0
+        controller.last_tick = time.monotonic()
         assert await publisher.flush_once(budget_s=0) == (2, False)
         assert spool.pending_count() == 1
-        publisher._replay_refill_at = 0.0  # long elapsed: bucket refills to capacity
+        controller.tokens = 1000.0
         assert await publisher.flush_once(budget_s=0) == (1, False)
         assert spool.pending_count() == 0
     finally:

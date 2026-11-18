@@ -53,10 +53,13 @@ from factorix.modules.storage_objects import (
     build_create_database_plan,
     build_create_stable_plan,
     build_create_subtable_plan,
+    generate_alter_stable_add_column_ddl,
+    generate_alter_stable_add_tag_ddl,
     generate_drop_stable_ddl,
     generate_drop_table_ddl,
     is_system_stable,
     validate_database_spec,
+    validate_identifier,
     validate_stable_spec,
     validate_subtable_spec,
 )
@@ -195,8 +198,8 @@ def _split_parent(data: dict[str, Any]) -> tuple[str, str]:
     if stable.startswith("stable:"):
         stable = stable[len("stable:"):]
     if "." in stable:
-        db_part, stable = stable.split(".", 1)
-        db = db or db_part
+        # "<db>.<stable>" names the database explicitly; it wins over a defaulted "database" key.
+        db, stable = stable.split(".", 1)
     return db, stable
 
 
@@ -350,6 +353,19 @@ class StorageRevisionService:
             "tags": _json_list(row.get("tags_json")),
         })
         return reg.columns, reg.tags
+
+    async def parent_schema(
+        self, session: AsyncSession, tenant_id: UUID, sub: SubtableSpec, spec_data: dict[str, Any]
+    ) -> tuple[list[ColumnSpec], list[TagSpec]]:
+        """Schema of the parent STABLE. For planning a whole profile before anything exists, a plan
+        request may carry ``parent_stable_spec`` (the STABLE spec it will be created from); it is used
+        only when the parent does not exist yet and never by the publish saga."""
+        cols, tags = await self.stable_schema(session, tenant_id, sub.database, sub.stable)
+        hypo = spec_data.get("parent_stable_spec")
+        if not cols and isinstance(hypo, dict) and not spec_data.get("_publishing"):
+            parent = stable_spec_from({**hypo, "database": sub.database, "name": sub.stable})
+            return parent.columns, parent.tags
+        return cols, tags
 
     async def _resolve_stable_tags(
         self, session: AsyncSession, tenant_id: UUID, database: str, stable_name: str
@@ -523,7 +539,7 @@ class StorageRevisionService:
                     res.valid = False
         elif kind == "subtable":
             sub = subtable_spec_from(spec_data)
-            cols, tags = await self.stable_schema(session, tenant_id, sub.database, sub.stable)
+            cols, tags = await self.parent_schema(session, tenant_id, sub, spec_data)
             res = validate_subtable_spec(sub, tags)
             extra["stable_columns"] = cols
             extra["stable_tags"] = tags
@@ -714,7 +730,7 @@ class StorageRevisionService:
             steps = build_create_stable_plan(stable_spec_from(spec_data))
         elif kind == "subtable":
             sub = subtable_spec_from(spec_data)
-            cols, tags = await self.stable_schema(session, tenant_id, sub.database, sub.stable)
+            cols, tags = await self.parent_schema(session, tenant_id, sub, spec_data)
             steps = build_create_subtable_plan(sub, tags)
             try:
                 bindings = await self.resolve_bindings(session, tenant_id, sub, cols, spec_data)
@@ -768,7 +784,8 @@ class StorageRevisionService:
         if self.td is None:
             raise storage_error("STORAGE_ENGINE_UNAVAILABLE", "TDengine is not configured or not reachable.")
 
-        # 1. Validate everything before touching TDengine.
+        # 1. Validate everything before touching TDengine (against the REAL parent only).
+        spec_data.pop("parent_stable_spec", None)
         v_res, extra = await self._validate(session, tenant_id, kind, spec_data)
         if not v_res.valid:
             first = v_res.errors[0]["message"] if v_res.errors else "Validation failed"
@@ -1132,6 +1149,122 @@ class StorageRevisionService:
         return obj_id
 
     # ------------------------------------------------------------------
+    # Additive schema change of a user supertable (ALTER STABLE ADD COLUMN / ADD TAG)
+    # ------------------------------------------------------------------
+
+    def plan_alter_stable(
+        self, database: str, name: str, existing: tuple[list[ColumnSpec], list[TagSpec]], change: dict[str, Any]
+    ) -> tuple[list[str], list[dict[str, Any]], list[ColumnSpec], list[TagSpec]]:
+        """Validate an additive change; returns ``(ddl, errors, new_columns, new_tags)``.
+
+        Only additions are supported: dropping/retyping a column of a table with history is not an
+        in-place operation (the UI offers Duplicate instead). New columns are appended (TDengine
+        cannot reorder), never become the composite key and need a length when variable-length.
+        """
+        cols_now, tags_now = existing
+        taken = {c.name for c in cols_now} | {t.name for t in tags_now}
+        spec = stable_spec_from({"database": database, "name": name,
+                                 "columns": [{"name": "ts", "td_type": "TIMESTAMP"}, *(change.get("add_columns") or [])],
+                                 "tags": change.get("add_tags") or []})
+        new_cols, new_tags = spec.columns[1:], spec.tags
+        errors: list[dict[str, Any]] = []
+        if is_system_stable(name):
+            errors.append({"field": "name", "code": "SYSTEM_OBJECT", "message": f"'{name}' is a FactoriX system supertable."})
+        if not new_cols and not new_tags:
+            errors.append({"field": "add_columns", "code": "NO_CHANGE", "message": "Nothing to add."})
+        for kind, items in (("add_columns", new_cols), ("add_tags", new_tags)):
+            for i, item in enumerate(items):
+                try:
+                    validate_identifier(item.name, f"{kind}[{i}].name")
+                except StorageObjectError as exc:
+                    errors.append({"field": f"{kind}[{i}].name", "code": exc.code, "message": str(exc)})
+                    continue
+                if item.name in taken:
+                    errors.append({"field": f"{kind}[{i}].name", "code": "DUPLICATE_NAME", "message": f"'{item.name}' already exists."})
+                taken.add(item.name)
+                base = _base_type(item.td_type)
+                if base in ("VARCHAR", "NCHAR", "BINARY", "VARBINARY", "GEOMETRY") and not item.length:
+                    errors.append({"field": f"{kind}[{i}].length", "code": "LENGTH_REQUIRED", "message": f"'{item.name}' needs a length."})
+                if kind == "add_columns" and base == "JSON":
+                    errors.append({"field": f"{kind}[{i}].td_type", "code": "TAG_ONLY_TYPE", "message": "JSON is a tag-only type."})
+                if kind == "add_columns" and getattr(item, "primary_key", False):
+                    errors.append({"field": f"{kind}[{i}].primary_key", "code": "COMPOSITE_KEY_POSITION",
+                                   "message": "The composite key can only be defined when the supertable is created."})
+        ddl = [generate_alter_stable_add_column_ddl(database, name, c) for c in new_cols] + [
+            generate_alter_stable_add_tag_ddl(database, name, t) for t in new_tags]
+        return ddl, errors, new_cols, new_tags
+
+    async def alter_stable(
+        self, session: AsyncSession, tenant_id: UUID, actor_id: UUID | None, database: str, name: str,
+        change: dict[str, Any], *, dry_run: bool = False,
+    ) -> dict[str, Any]:
+        existing = await self.describe(database, name)
+        if not existing[0]:
+            raise storage_error("VALIDATION_FAILED", f"Supertable '{database}.{name}' was not found.")
+        ddl, errors, new_cols, new_tags = self.plan_alter_stable(database, name, existing, change)
+        if errors:
+            raise storage_error("VALIDATION_FAILED", errors[0]["message"], errors)
+        if dry_run:
+            return {"valid": True, "ddl": ddl}
+        op_id = uuid4()
+        now = utcnow()
+        key = f"{database}.{name}:alter:{_compute_spec_hash(change)}"
+        await execute(
+            session,
+            """
+            INSERT INTO storage_operations (id, tenant_id, operation_type, target_type, actor_id, idempotency_key,
+                status, requested_at, started_at, step_state_json, object_key)
+            VALUES (:id, :tenant_id, 'ALTER_STABLE', 'stable', :actor, :key, 'APPLYING', :now, :now, :state, :obj)
+            ON CONFLICT (tenant_id, operation_type, idempotency_key) WHERE idempotency_key IS NOT NULL
+            DO UPDATE SET status = 'APPLYING', started_at = EXCLUDED.started_at, error_code = NULL, error_message = NULL
+            """,
+            {"id": op_id, "tenant_id": tenant_id, "actor": actor_id, "key": key, "now": now,
+             "state": jsonb({"phase": "APPLYING", "ddl": ddl}), "obj": f"{database}.{name}"},
+        )
+        await session.commit()
+        executed: list[str] = []
+        failure: str | None = None
+        for sql in ddl:
+            try:
+                await self._td_exec(sql)
+                executed.append(sql)
+            except Exception as exc:  # noqa: BLE001 - reported, earlier additions stay (additive, harmless)
+                failure = str(exc)
+                break
+        cols_after, tags_after = await self.describe(database, name)
+        missing = [c.name for c in new_cols if c.name not in {x.name for x in cols_after}] + [
+            t.name for t in new_tags if t.name not in {x.name for x in tags_after}]
+        status = "APPLIED" if not failure and not missing else "FAILED"
+        await execute(
+            session,
+            """
+            UPDATE storage_operations SET status = :st, completed_at = :now, error_code = :code, error_message = :msg,
+                   step_state_json = :state
+            WHERE tenant_id = :tenant_id AND operation_type = 'ALTER_STABLE' AND idempotency_key = :key
+            """,
+            {"st": status, "now": utcnow(), "code": None if status == "APPLIED" else "ALTER_FAILED",
+             "msg": failure or (f"missing after ALTER: {missing}" if missing else None), "tenant_id": tenant_id, "key": key,
+             "state": jsonb({"phase": status, "executed_sqls": executed, "missing": missing})},
+        )
+        await execute(
+            session,
+            """
+            UPDATE storage_objects SET schema_json = :schema, tags_json = :tags, revision = revision + 1, updated_at = :now
+            WHERE tenant_id = :tenant_id AND object_type = 'stable' AND physical_db = :db AND physical_name = :name
+              AND status <> 'PURGED'
+            """,
+            {"tenant_id": tenant_id, "db": database, "name": name, "now": utcnow(),
+             "schema": jsonb([{"name": c.name, "td_type": c.td_type, "length": c.length, "role": c.role,
+                               "primary_key": c.primary_key} for c in cols_after]),
+             "tags": jsonb([{"name": t.name, "td_type": t.td_type, "length": t.length} for t in tags_after])},
+        )
+        await session.commit()
+        if status != "APPLIED":
+            raise storage_error("PUBLISH_FAILED", f"ALTER failed after {len(executed)} of {len(ddl)} statement(s): "
+                                f"{failure or missing}. Statements already applied are kept (additive).")
+        return {"status": "APPLIED", "ddl": executed, "columns": [c.name for c in cols_after], "tags": [t.name for t in tags_after]}
+
+    # ------------------------------------------------------------------
     # Operation status
     # ------------------------------------------------------------------
 
@@ -1183,3 +1316,17 @@ def _json_list(raw: Any) -> list[Any]:
 
 def is_user_stable(name: str) -> bool:
     return not is_system_stable(name)
+
+
+async def discard_draft(session: AsyncSession, tenant_id: UUID, draft_id: UUID) -> int:
+    """Discard a wizard draft (state CANCELLED; the row stays for audit)."""
+    from factorix.modules.common import execute_rowcount
+
+    n = await execute_rowcount(
+        session,
+        "UPDATE storage_object_drafts SET state = 'CANCELLED', updated_at = :now "
+        "WHERE tenant_id = :tenant_id AND id = :id AND state = 'DRAFT'",
+        {"tenant_id": tenant_id, "id": draft_id, "now": utcnow()},
+    )
+    _IN_MEMORY_DRAFTS.pop((tenant_id, draft_id), None)
+    return n

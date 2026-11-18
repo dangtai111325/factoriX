@@ -24,9 +24,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
-    smtp_user: str = "tai.dang@avenue-net.com"
+    # No personal mailbox as default: mail stays MAIL_UNAVAILABLE until the installation configures it.
+    smtp_user: str = ""
     smtp_password: str = ""
-    smtp_from: str = "tai.dang@avenue-net.com"
+    smtp_from: str = ""
     appliance: bool = False
     data_dir: str = ""
     web_dist: str = ""

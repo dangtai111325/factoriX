@@ -168,13 +168,13 @@ export function buildSubtableSpec(data: SubtableWizardData): Record<string, unkn
 }
 
 const inputCls =
-  'w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] focus:outline-none focus:border-[#EF1B24] focus:ring-2 focus:ring-[#EF1B24]/10 bg-white';
+  'w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 bg-white';
 
 const Field: React.FC<{ label: string; required?: boolean; error?: string; hint?: string; children: React.ReactNode }> = ({
   label, required, error, hint, children,
 }) => (
   <div>
-    <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
+    <label className="block text-[12px] font-semibold text-[#334568] mb-1">
       {label} {required && <span className="text-[#EF1B24]">*</span>}
     </label>
     {children}
@@ -188,7 +188,7 @@ const Field: React.FC<{ label: string; required?: boolean; error?: string; hint?
 
 const StepHeader: React.FC<{ title: string; subtitle: string }> = ({ title, subtitle }) => (
   <div>
-    <h2 className="text-[16px] font-bold text-[#111B37]">{title}</h2>
+    <h2 className="text-[15px] font-bold text-[#111B37]">{title}</h2>
     <p className="text-[13px] text-[#657794] mt-1">{subtitle}</p>
   </div>
 );
@@ -248,7 +248,7 @@ export const SubtableIdentityStep: React.FC<SubtableStepProps> = ({ data, onChan
         </Field>
         <Field label="Description" hint={`${(data.description || '').length}/1000`}>
           <textarea maxLength={1000} rows={3} value={data.description} onChange={(e) => onChange({ description: e.target.value })}
-            className="w-full px-3 py-2 rounded-lg border border-[#D4DFEC] text-[13px] focus:outline-none focus:border-[#EF1B24]" />
+            className="w-full px-3 py-2 rounded-lg border border-[#D4DFEC] text-[13px] focus:outline-none focus:border-blue-500" />
         </Field>
       </div>
     </div>
@@ -402,7 +402,7 @@ export const SubtableBindSourcesStep: React.FC<SubtableStepProps> = ({ data, onC
             <div className="relative">
               <Search className="w-3.5 h-3.5 text-[#94A3B8] absolute left-2.5 top-1/2 -translate-y-1/2" />
               <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search model, machine or field"
-                className="w-full pl-8 pr-2 h-8 rounded-lg border border-[#D4DFEC] text-[12px] focus:outline-none focus:border-[#EF1B24]" />
+                className="w-full pl-8 pr-2 h-8 rounded-lg border border-[#D4DFEC] text-[12px] focus:outline-none focus:border-blue-500" />
             </div>
           </div>
           <div className="flex-1 overflow-y-auto p-2 space-y-1">

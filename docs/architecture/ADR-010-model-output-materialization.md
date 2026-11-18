@@ -1,6 +1,7 @@
 # ADR-010: Model Output Materialization to TDengine
 
-**Status:** Accepted  
+**Status:** Accepted — partly superseded by ADR-016 (2026-11-18): Data Model fields recorded into user
+subtables go through a PostgreSQL transactional outbox, not a RabbitMQ envelope.  
 **Date:** 2026-11-12  
 **Branch:** TDengine-RabbitMQ-Stoorage-Historian  
 **Source baseline:** 400dba192eb13be30806dbacb1568ffff23ae26b

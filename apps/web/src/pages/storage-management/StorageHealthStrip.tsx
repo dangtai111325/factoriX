@@ -1,17 +1,25 @@
 import React from 'react';
-import { Database, Layers, Table, Activity, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { KpiTile } from '../historian/hsUi';
 
 interface StorageHealthStripProps {
-  databaseCount: number;
-  stableCount: number;
-  subtableCount: number;
-  recordingActive: number;
-  recordingPaused: number;
-  recordingError: number;
-  lastObservedAt?: string;
-  onFilterStatus?: (status: string | null) => void;
+  databaseCount: number | null;
+  stableCount: number | null;
+  subtableCount: number | null;
+  recordingActive: number | null;
+  recordingPaused: number | null;
+  recordingError: number | null;
+  draftCount?: number | null;
+  activeType?: 'all' | 'database' | 'stable' | 'subtable';
+  onFilterType?: (type: 'database' | 'stable' | 'subtable') => void;
+  onOpenDrafts?: () => void;
 }
 
+const n = (v: number | null | undefined) => (v == null ? '—' : v.toLocaleString());
+
+/**
+ * KPI row in the Connections style (11 px UPPERCASE label, 24 px number). "Recording" is muted at 0 —
+ * never a green tick when nothing is written (R1-14); errors and paused objects are named under it.
+ */
 export const StorageHealthStrip: React.FC<StorageHealthStripProps> = ({
   databaseCount,
   stableCount,
@@ -19,72 +27,31 @@ export const StorageHealthStrip: React.FC<StorageHealthStripProps> = ({
   recordingActive,
   recordingPaused,
   recordingError,
-  lastObservedAt,
-  onFilterStatus,
+  draftCount,
+  activeType,
+  onFilterType,
+  onOpenDrafts,
 }) => {
+  const recordingSub = [
+    recordingPaused ? `${recordingPaused} paused` : '',
+    recordingError ? `${recordingError} with write errors` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
   return (
-    <div className="flex flex-wrap items-center gap-3 py-2 px-1">
-      {/* Databases */}
-      <div className="flex items-center gap-2 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg shadow-xs">
-        <Database className="w-4 h-4 text-[#EF1B24]" />
-        <span className="text-[12px] font-medium text-[#657794]">Databases</span>
-        <span className="text-[13px] font-bold text-[#111B37]">{databaseCount}</span>
-      </div>
-
-      {/* Supertables */}
-      <div className="flex items-center gap-2 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg shadow-xs">
-        <Layers className="w-4 h-4 text-[#2A82E7]" />
-        <span className="text-[12px] font-medium text-[#657794]">Supertables</span>
-        <span className="text-[13px] font-bold text-[#111B37]">{stableCount}</span>
-      </div>
-
-      {/* Subtables */}
-      <div className="flex items-center gap-2 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg shadow-xs">
-        <Table className="w-4 h-4 text-[#8858EA]" />
-        <span className="text-[12px] font-medium text-[#657794]">Subtables</span>
-        <span className="text-[13px] font-bold text-[#111B37]">{subtableCount}</span>
-      </div>
-
-      {/* Recording Status */}
-      <div className="flex items-center gap-2.5 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg shadow-xs">
-        <Activity className="w-4 h-4 text-[#657794]" />
-        <span className="text-[12px] font-medium text-[#657794]">Recording:</span>
-        <button
-          type="button"
-          onClick={() => onFilterStatus?.('ACTIVE')}
-          className={`flex items-center gap-1 text-[12px] font-semibold hover:underline ${recordingActive > 0 ? 'text-[#0DBA67]' : 'text-[#657794]'}`}
-          title="Subtables that are recording (active, with at least one binding)"
-        >
-          {recordingActive > 0 && <CheckCircle2 className="w-3.5 h-3.5" />}
-          <span>{recordingActive} recording</span>
-        </button>
-        {recordingPaused > 0 && (
-          <button
-            type="button"
-            onClick={() => onFilterStatus?.('PAUSED')}
-            className="flex items-center gap-1 text-[12px] font-medium text-[#D97706] hover:underline"
-            title="Paused recording"
-          >
-            <span>• {recordingPaused} paused</span>
-          </button>
-        )}
-        {recordingError > 0 && (
-          <button
-            type="button"
-            onClick={() => onFilterStatus?.('ERROR')}
-            className="flex items-center gap-1 text-[12px] font-medium text-[#DC2626] hover:underline"
-            title="Subtables with errors"
-          >
-            <AlertCircle className="w-3.5 h-3.5" />
-            <span>{recordingError} errors</span>
-          </button>
-        )}
-      </div>
-
-      {lastObservedAt && (
-        <span className="ml-auto text-[11px] text-[#94A3B8]">
-          Observed {new Date(lastObservedAt).toLocaleTimeString()}
-        </span>
+    <div className={`grid grid-cols-2 ${draftCount != null ? 'sm:grid-cols-5' : 'sm:grid-cols-4'} gap-3`}>
+      <KpiTile label="Databases" value={n(databaseCount)} active={activeType === 'database'} onClick={onFilterType ? () => onFilterType('database') : undefined} hint="Show databases in the Objects table" />
+      <KpiTile label="Supertables" value={n(stableCount)} active={activeType === 'stable'} onClick={onFilterType ? () => onFilterType('stable') : undefined} hint="Show supertables in the Objects table" />
+      <KpiTile label="Subtables" value={n(subtableCount)} active={activeType === 'subtable'} onClick={onFilterType ? () => onFilterType('subtable') : undefined} hint="Show subtables in the Objects table" />
+      <KpiTile
+        label="Recording"
+        value={n(recordingActive)}
+        tone={recordingError ? 'error' : recordingActive ? 'success' : 'muted'}
+        sub={recordingSub || (recordingActive ? 'subtables with an active binding' : 'nothing is recorded yet')}
+        hint="User subtables that are active and have at least one active binding"
+      />
+      {draftCount != null && (
+        <KpiTile label="Drafts" value={n(draftCount)} tone={draftCount ? 'ink' : 'muted'} onClick={onOpenDrafts} hint="Unfinished wizard drafts" />
       )}
     </div>
   );

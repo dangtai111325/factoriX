@@ -1,17 +1,10 @@
 import React from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import {
-  ArrowLeft,
-  ArrowRight,
-  Check,
-  Save,
-  Loader2,
-  AlertCircle,
-  HelpCircle,
-} from 'lucide-react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { ArrowLeft, ArrowRight, Save } from 'lucide-react';
 import { Button } from '../../../components/common/Button';
 import { ConfirmDialog } from '../../../components/common/ConfirmDialog';
 import { useLeaveGuard } from '../../06_AddDataWizard/useLeaveGuard';
+import { Banner, DraftChip, WizardHeader, WizardStepper as PillStepper } from '../../historian/hsUi';
 
 // ============================================================================
 // Types
@@ -74,6 +67,8 @@ export interface StorageWizardLayoutProps {
   error?: string | null;
   submitLabel?: string;
   onDiscard?: () => void;
+  /** Wider card for table-heavy steps (columns, bindings, bulk matrix). */
+  wide?: boolean;
 }
 
 // ============================================================================
@@ -171,10 +166,10 @@ export const DirtyLeaveGuard: React.FC<{
   return (
     <ConfirmDialog
       isOpen={!!pending}
-      title="Unsaved Changes"
+      title="Leave without saving?"
       message="You have unsaved changes in this wizard. Are you sure you want to leave? Your changes may be lost unless saved as a draft."
-      confirmLabel="Discard & Leave"
-      cancelLabel="Stay on Page"
+      confirmLabel="Discard & leave"
+      cancelLabel="Stay"
       variant="danger"
       onConfirm={() => {
         onDiscard?.();
@@ -186,7 +181,7 @@ export const DirtyLeaveGuard: React.FC<{
 };
 
 // ============================================================================
-// Component: WizardStepper
+// Component: WizardStepper (Data model wizard pill stepper, shared with hsUi)
 // ============================================================================
 
 export const WizardStepper: React.FC<WizardStepperProps> = ({
@@ -194,74 +189,17 @@ export const WizardStepper: React.FC<WizardStepperProps> = ({
   currentStep,
   onStepClick,
   maxVisitedStep,
-}) => {
-  const effectiveMaxVisited = maxVisitedStep !== undefined ? maxVisitedStep : currentStep;
-
-  return (
-    <div className="w-full py-3">
-      <div className="flex items-center justify-between relative">
-        {/* Background track */}
-        <div className="absolute top-4 left-6 right-6 h-0.5 bg-[#E3EAF3] -z-0" />
-
-        {steps.map((step, idx) => {
-          const label = typeof step === 'string' ? step : step.label;
-          const description = typeof step === 'string' ? undefined : step.description;
-          const isCompleted = idx < currentStep;
-          const isCurrent = idx === currentStep;
-          const isClickable = onStepClick && idx <= effectiveMaxVisited && idx !== currentStep;
-
-          return (
-            <div
-              key={idx}
-              className={`flex-1 flex flex-col items-center relative z-10 ${
-                isClickable ? 'cursor-pointer group' : 'cursor-default'
-              }`}
-              onClick={() => {
-                if (isClickable) onStepClick(idx);
-              }}
-            >
-              {/* Step indicator circle */}
-              <div
-                className={`w-8 h-8 rounded-full flex items-center justify-center text-[13px] font-semibold transition-all duration-200 ${
-                  isCompleted
-                    ? 'bg-[#0DBA67] text-white shadow-xs'
-                    : isCurrent
-                    ? 'bg-[#EF1B24] text-white shadow-sm ring-4 ring-[#FEE2E2]'
-                    : 'bg-white text-[#657794] border border-[#D4DFEC]'
-                } ${isClickable ? 'group-hover:scale-105' : ''}`}
-              >
-                {isCompleted ? <Check className="w-4 h-4 stroke-[2.5]" /> : <span>{idx + 1}</span>}
-              </div>
-
-              {/* Step Label */}
-              <div className="mt-2 text-center">
-                <div
-                  className={`text-[12px] font-semibold transition-colors ${
-                    isCurrent
-                      ? 'text-[#EF1B24]'
-                      : isCompleted
-                      ? 'text-[#111B37]'
-                      : 'text-[#657794]'
-                  } ${isClickable ? 'group-hover:text-[#111B37]' : ''}`}
-                >
-                  {label}
-                </div>
-                {description && (
-                  <div className="text-[11px] text-[#8C9BAE] hidden sm:block max-w-[120px] truncate">
-                    {description}
-                  </div>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-};
+}) => (
+  <PillStepper
+    steps={steps.map((s, i) => (typeof s === 'string' ? { id: `s${i}`, label: s } : { id: s.id || `s${i}`, label: s.label }))}
+    current={currentStep}
+    onGo={onStepClick}
+    maxReachable={maxVisitedStep !== undefined ? Math.max(maxVisitedStep, currentStep) : currentStep}
+  />
+);
 
 // ============================================================================
-// Component: WizardFooter
+// Component: WizardFooter (inside the wizard card, Data model wizard style)
 // ============================================================================
 
 export const WizardFooter: React.FC<WizardFooterProps> = ({
@@ -278,81 +216,39 @@ export const WizardFooter: React.FC<WizardFooterProps> = ({
   lastSavedAt,
   backLabel = 'Back',
   nextLabel = 'Next',
-  submitLabel = 'Publish',
-  draftLabel = 'Save Draft',
+  submitLabel = 'Create',
+  draftLabel = 'Save draft',
   error,
 }) => {
   const isFirst = currentStep === 0;
   const isLast = currentStep === totalSteps - 1;
 
   return (
-    <div className="space-y-2">
-      {error && (
-        <div className="flex items-center gap-2 p-3 bg-[#FEF2F2] border border-[#FAC6C9] rounded-lg text-[13px] text-[#EF1B24]">
-          <AlertCircle className="w-4 h-4 flex-shrink-0" />
-          <span className="flex-1">{error}</span>
-        </div>
-      )}
-
-      <div className="flex items-center justify-between gap-4">
-        {/* Left: Back + Save Draft */}
-        <div className="flex items-center gap-2.5">
+    <div className="space-y-3">
+      {error && <Banner tone="error">{error}</Banner>}
+      <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-100">
+        <div className="flex flex-wrap items-center gap-2">
           {!isFirst && (
-            <Button
-              type="button"
-              variant="outline"
-              size="md"
-              icon={<ArrowLeft className="w-4 h-4" />}
-              onClick={onBack}
-              disabled={loading}
-            >
+            <Button type="button" variant="outline" size="sm" icon={<ArrowLeft className="w-3.5 h-3.5" />} onClick={onBack} disabled={loading}>
               {backLabel}
             </Button>
           )}
-
           {onSaveDraft && (
-            <div className="flex items-center gap-2">
-              <Button
-                type="button"
-                variant="ghost"
-                size="md"
-                icon={<Save className="w-4 h-4" />}
-                onClick={onSaveDraft}
-                disabled={loading || !isDirty}
-              >
+            <>
+              <Button type="button" variant="ghost" size="sm" icon={<Save className="w-3.5 h-3.5" />} onClick={onSaveDraft} disabled={loading || !isDirty}>
                 {draftLabel}
               </Button>
-              {lastSavedAt && (
-                <span className="text-[11px] text-[#8C9BAE] hidden sm:inline">
-                  Draft saved {lastSavedAt}
-                </span>
-              )}
-            </div>
+              {lastSavedAt && <span className="text-[11px] text-[#657794]">Draft saved {lastSavedAt} (this browser tab)</span>}
+            </>
           )}
         </div>
-
-        {/* Right: Next or Submit */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 ml-auto">
           {!isLast ? (
-            <Button
-              type="button"
-              variant="primary"
-              size="md"
-              onClick={onNext}
-              disabled={nextDisabled || loading}
-            >
-              <span>{nextLabel}</span>
-              <ArrowRight className="w-4 h-4 ml-1" />
+            <Button type="button" variant="primary" size="sm" onClick={onNext} disabled={nextDisabled || loading}>
+              {nextLabel} <ArrowRight className="w-3.5 h-3.5" />
             </Button>
           ) : (
-            <Button
-              type="button"
-              variant="primary"
-              size="md"
-              onClick={onSubmit}
-              disabled={submitDisabled || loading}
-              loading={loading}
-            >
+            <Button type="button" variant="primary" size="sm" onClick={onSubmit} disabled={submitDisabled || loading} loading={loading} aria-busy={loading}>
               {submitLabel}
             </Button>
           )}
@@ -362,14 +258,23 @@ export const WizardFooter: React.FC<WizardFooterProps> = ({
   );
 };
 
+/** Where "Storage Management" back returns: the page the user came from (router state `from`), else `fallback`. */
+export function useStorageBackTarget(fallback = '/historian/storage'): string {
+  const location = useLocation();
+  const from = (location.state as { from?: unknown } | null)?.from;
+  return typeof from === 'string' && from.startsWith('/historian/') ? from : fallback;
+}
+
 // ============================================================================
-// Component: StorageWizardLayout
+// Component: StorageWizardLayout - Data model wizard layout:
+//   back link + title + chip on the left, pill stepper on the right,
+//   the step in a card (max-w-3xl, wider for table-heavy steps) with Back / Save draft / Next inside it.
 // ============================================================================
 
 export const StorageWizardLayout: React.FC<StorageWizardLayoutProps> = ({
   title,
   subtitle,
-  backTo = '/historian/storage?tab=objects',
+  backTo = '/historian/storage',
   onBackClick,
   badge,
   currentStep,
@@ -390,95 +295,71 @@ export const StorageWizardLayout: React.FC<StorageWizardLayoutProps> = ({
   error,
   submitLabel,
   onDiscard,
+  wide = false,
 }) => {
   const navigate = useNavigate();
+  const target = useStorageBackTarget(backTo);
+  const headingRef = React.useRef<HTMLHeadingElement>(null);
+  const firstRender = React.useRef(true);
 
-  const handleHeaderBack = () => {
-    if (onBackClick) {
-      onBackClick();
-    } else {
-      navigate(backTo);
+  // Move focus to the heading when the step changes (screen readers announce the new step).
+  React.useEffect(() => {
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
     }
+    headingRef.current?.focus();
+  }, [currentStep]);
+
+  const stepLabel = (i: number) => {
+    const s = steps[i];
+    return typeof s === 'string' ? s : s?.label || '';
   };
 
   return (
-    <div className="min-h-screen bg-[#F6F8FC] flex flex-col justify-between">
-      {/* Dirty leave blocker */}
+    <div className="space-y-4">
       <DirtyLeaveGuard isDirty={isDirty} onDiscard={onDiscard} />
+      <WizardHeader
+        backLabel="Storage Management"
+        onBack={() => (onBackClick ? onBackClick() : navigate(target))}
+        title={title}
+        headingRef={headingRef}
+        srStep={`step ${currentStep + 1} of ${steps.length}: ${stepLabel(currentStep)}`}
+        chip={badge ?? <DraftChip state={lastSavedAt ? 'draft' : 'new'} />}
+        note={
+          <>
+            {subtitle && <span>{subtitle}</span>}
+            {isDirty && <span className="text-amber-700 font-semibold">Unsaved changes</span>}
+          </>
+        }
+        stepper={<WizardStepper steps={steps} currentStep={currentStep} onStepClick={onStepClick} maxVisitedStep={maxVisitedStep} />}
+      />
 
-      {/* Sticky Header */}
-      <header className="sticky top-0 z-20 bg-white border-b border-[#E3EAF3] shadow-xs">
-        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-3.5">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <button
-                type="button"
-                onClick={handleHeaderBack}
-                className="p-1.5 rounded-lg border border-[#D4DFEC] hover:bg-[#F9FAFD] text-[#334568] transition-colors"
-                title="Back to Storage Management"
-                aria-label="Back"
-              >
-                <ArrowLeft className="w-4 h-4" />
-              </button>
-
-              <div>
-                <div className="flex items-center gap-2">
-                  <h1 className="text-[17px] font-bold text-[#111B37] tracking-tight">{title}</h1>
-                  {badge}
-                </div>
-                {subtitle && <p className="text-[12px] text-[#657794] mt-0.5">{subtitle}</p>}
-              </div>
-            </div>
-
-            <div className="text-[12px] font-medium text-[#657794] hidden sm:block">
-              Step <span className="font-bold text-[#111B37]">{currentStep + 1}</span> of{' '}
-              <span className="font-bold text-[#111B37]">{steps.length}</span>
-            </div>
-          </div>
-
-          {/* Stepper bar */}
-          <div className="mt-2 pt-2 border-t border-[#F1F5FA]">
-            <WizardStepper
-              steps={steps}
-              currentStep={currentStep}
-              onStepClick={onStepClick}
-              maxVisitedStep={maxVisitedStep}
-            />
-          </div>
-        </div>
-      </header>
-
-      {/* Main Body */}
-      <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 py-6">
-        <div className="bg-white rounded-xl border border-[#E3EAF3] shadow-xs p-6 sm:p-8">
-          {children}
-        </div>
-      </main>
-
-      {/* Sticky Footer */}
-      <footer className="sticky bottom-0 z-20 bg-white/95 backdrop-blur-sm border-t border-[#E3EAF3] shadow-lg">
-        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-3.5">
-          {footer ? (
-            footer
-          ) : (
-            <WizardFooter
-              currentStep={currentStep}
-              totalSteps={steps.length}
-              onBack={onBack || (() => {})}
-              onNext={onNext || (() => {})}
-              onSubmit={onSubmit || (() => {})}
-              onSaveDraft={onSaveDraft}
-              nextDisabled={nextDisabled}
-              submitDisabled={submitDisabled}
-              loading={loading}
-              isDirty={isDirty}
-              lastSavedAt={lastSavedAt}
-              error={error}
-              submitLabel={submitLabel}
-            />
-          )}
-        </div>
-      </footer>
+      <section
+        aria-label={stepLabel(currentStep)}
+        className={`${wide ? 'max-w-6xl' : 'max-w-4xl'} bg-white border border-[#CBD5E1] rounded-xl p-4 sm:p-5 space-y-5 min-w-0`}
+      >
+        <div className="min-w-0">{children}</div>
+        {footer ?? (
+          <WizardFooter
+            currentStep={currentStep}
+            totalSteps={steps.length}
+            onBack={onBack || (() => {})}
+            onNext={onNext || (() => {})}
+            onSubmit={onSubmit || (() => {})}
+            onSaveDraft={onSaveDraft}
+            nextDisabled={nextDisabled}
+            submitDisabled={submitDisabled}
+            loading={loading}
+            isDirty={isDirty}
+            lastSavedAt={lastSavedAt}
+            error={error}
+            nextLabel={currentStep + 1 < steps.length ? `Next: ${stepLabel(currentStep + 1)}` : 'Next'}
+            backLabel={currentStep > 0 ? stepLabel(currentStep - 1) : 'Back'}
+            submitLabel={submitLabel}
+          />
+        )}
+      </section>
     </div>
   );
 };

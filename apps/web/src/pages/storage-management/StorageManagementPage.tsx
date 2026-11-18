@@ -1,77 +1,257 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useSearchParams, useNavigate } from 'react-router-dom';
-import {
-  Plus,
-  RefreshCw,
-  HardDrive,
-  Database,
-  Layers,
-  Table,
-  LayoutGrid,
-  List,
-  ChevronDown,
-  Activity,
-  AlertTriangle,
-} from 'lucide-react';
+import React, { useState, useEffect, useCallback, useRef, useId } from 'react';
+import { useSearchParams, useNavigate, useLocation } from 'react-router-dom';
+import { ChevronDown, Database, Layers, LayoutGrid, List, Plus, RefreshCw, Table, Rows3 } from 'lucide-react';
+import { Button } from '../../components/common/Button';
+import { ActionToast, useActionToast } from '../../components/common/ActionToast';
 import { StorageEngineSwitcher, StorageEngine } from './StorageEngineSwitcher';
 import { StorageHealthStrip } from './StorageHealthStrip';
 import { StorageObjectGraph } from './StorageObjectGraph';
-import { StorageObjectsTable } from './StorageObjectsTable';
+import { ObjectTypeFilter, StorageObjectsTable } from './StorageObjectsTable';
 import { StorageObjectDrawer } from './StorageObjectDrawer';
 import { PostgresExplorerView } from './PostgresExplorerView';
-import {
-  RemoteErrorState,
-  RemoteLoadingState,
-  RemoteEmptyState,
-} from '../../components/common/RemoteResourceState';
+import { Dialog, EmptyState, ErrorBanner, LoadingBlock, PageHeader, Segmented, TimeCell } from '../historian/hsUi';
+import { StorageObjectData, kindOfId, KIND_LABEL } from './objectViews';
 import {
   TopologyNode,
   TopologyEdge,
   getTDTopology,
   getStorageStats,
   getStorageObject,
-  TDDatabase,
-  TDStable,
-  TDSubtable,
+  listStorageDrafts,
+  discardStorageDraft,
+  StorageDraftItem,
 } from '../../lib/storagePhysicalApi';
+
+// ------------------------------------------------------------------ "New" primary menu
+
+interface NewItem {
+  key: string;
+  label: string;
+  hint: string;
+  icon: React.ReactNode;
+  to: string;
+}
+
+/** Primary red "New ▾" with the MenuButton behaviour (Esc / outside click close, arrow keys). */
+const NewMenu: React.FC<{ items: NewItem[]; onPick: (to: string) => void }> = ({ items, onPick }) => {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuId = useId();
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        setOpen(false);
+        rootRef.current?.querySelector<HTMLButtonElement>('button[aria-haspopup]')?.focus();
+      }
+    };
+    document.addEventListener('mousedown', onPointer);
+    document.addEventListener('keydown', onKey);
+    rootRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+    return () => {
+      document.removeEventListener('mousedown', onPointer);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  const move = (e: React.KeyboardEvent) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    const nodes = Array.from(rootRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') || []);
+    const i = nodes.indexOf(document.activeElement as HTMLButtonElement);
+    nodes[e.key === 'ArrowDown' ? (i + 1) % nodes.length : (i - 1 + nodes.length) % nodes.length]?.focus();
+  };
+  return (
+    <div className="relative" ref={rootRef}>
+      <Button
+        variant="primary"
+        size="lg"
+        icon={<Plus className="w-4 h-4" />}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
+        onClick={() => setOpen((v) => !v)}
+      >
+        New <ChevronDown className={`w-3.5 h-3.5 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </Button>
+      {open && (
+        <div id={menuId} role="menu" aria-label="Create" onKeyDown={move} className="absolute right-0 top-full mt-1.5 w-64 max-w-[calc(100vw-24px)] rounded-xl bg-white border border-[#D4DFEC] shadow-xl py-1.5 z-40">
+          {items.map((it, i) => (
+            <button
+              key={it.key}
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onPick(it.to);
+              }}
+              className={`w-full text-left px-3 py-2 flex items-start gap-2.5 outline-none hover:bg-[#F8FAFC] focus-visible:bg-[#F1F5FA] ${i === items.length - 1 ? 'border-t border-[#F1F5FA] mt-1 pt-2.5' : ''}`}
+            >
+              <span className="w-4 h-4 mt-0.5 flex items-center justify-center shrink-0" aria-hidden="true">
+                {it.icon}
+              </span>
+              <span>
+                <span className="block text-[13px] font-semibold text-[#111B37]">{it.label}</span>
+                <span className="block text-[11px] text-[#657794]">{it.hint}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ------------------------------------------------------------------ drafts
+
+const LOCAL_DRAFT_KEYS: { key: string; kind: 'database' | 'stable' | 'subtable' }[] = [
+  { key: 'fx_wizard_draft_database', kind: 'database' },
+  { key: 'fx_wizard_draft_stable', kind: 'stable' },
+  { key: 'fx_wizard_draft_subtable', kind: 'subtable' },
+];
+
+interface LocalDraft {
+  key: string;
+  kind: 'database' | 'stable' | 'subtable';
+  name: string;
+}
+
+function readLocalDrafts(): LocalDraft[] {
+  const out: LocalDraft[] = [];
+  for (const d of LOCAL_DRAFT_KEYS) {
+    try {
+      const raw = sessionStorage.getItem(d.key);
+      if (!raw) continue;
+      const data = JSON.parse(raw) as { physical_name?: string; display_name?: string };
+      out.push({ ...d, name: data.physical_name || data.display_name || '(no name yet)' });
+    } catch {
+      // ignore unreadable drafts
+    }
+  }
+  return out;
+}
+
+const DraftsDialog: React.FC<{
+  open: boolean;
+  onClose: () => void;
+  local: LocalDraft[];
+  server: StorageDraftItem[];
+  onResume: (kind: string) => void;
+  onDiscard: (key: string) => void;
+  onDiscardServer: (d: StorageDraftItem) => void;
+}> = ({ open, onClose, local, server, onResume, onDiscard, onDiscardServer }) => (
+  <Dialog open={open} onClose={onClose} title="Drafts" subtitle="Unfinished storage objects" width="md" footer={<Button size="sm" variant="outline" onClick={onClose}>Close</Button>}>
+    <div className="space-y-4">
+      <section className="space-y-2">
+        <h3 className="text-[12px] font-bold text-[#111B37]">In this browser tab</h3>
+        {local.length === 0 ? (
+          <p className="text-[12px] text-[#657794]">No wizard draft saved in this tab. “Save draft” in a wizard keeps its input here until the tab is closed.</p>
+        ) : (
+          <ul className="divide-y divide-[#E3EAF3] border border-[#E3EAF3] rounded-lg">
+            {local.map((d) => (
+              <li key={d.key} className="flex flex-wrap items-center gap-2 px-3 py-2">
+                <span className="text-[11px] font-bold uppercase text-[#657794] w-20">{KIND_LABEL[d.kind]}</span>
+                <span className="font-mono text-[13px] text-[#111B37] truncate flex-1 min-w-[120px]">{d.name}</span>
+                <Button size="sm" variant="outline" onClick={() => onResume(d.kind)}>
+                  Resume
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => onDiscard(d.key)}>
+                  Discard
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+      {server.length > 0 && (
+        <section className="space-y-2">
+          <h3 className="text-[12px] font-bold text-[#111B37]">Saved on the server</h3>
+          <div className="border border-[#E3EAF3] rounded-lg overflow-x-auto">
+            <table className="fx-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>State</th>
+                  <th>Updated</th>
+                  <th className="w-24"><span className="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {server.map((d) => (
+                  <tr key={d.id}>
+                    <td className="font-mono text-[#111B37]">{d.name}</td>
+                    <td>{KIND_LABEL[d.object_kind] || d.object_kind}</td>
+                    <td>{d.state}</td>
+                    <td>
+                      <TimeCell iso={d.updated_at} />
+                    </td>
+                    <td className="text-right">
+                      <Button size="sm" variant="ghost" onClick={() => onDiscardServer(d)}>
+                        Discard
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-[11px] text-[#657794]">Server drafts are listed for reference; the wizards do not open them yet.</p>
+        </section>
+      )}
+    </div>
+  </Dialog>
+);
+
+// ------------------------------------------------------------------ page
 
 export const StorageManagementPage: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const from = `${location.pathname}${location.search}`;
+  const { toast, show: showToast, dismiss: dismissToast } = useActionToast();
 
-  // Engine selection: 'tdengine' | 'postgresql'
-  const [engine, setEngine] = useState<StorageEngine>('tdengine');
-
-  // TDengine view mode: 'topology' | 'objects'
+  const engine: StorageEngine = searchParams.get('engine') === 'postgresql' ? 'postgresql' : 'tdengine';
   const activeTab = searchParams.get('tab') === 'objects' ? 'objects' : 'topology';
-  const setActiveTab = (tab: 'topology' | 'objects') => {
-    const next = new URLSearchParams(searchParams);
-    if (tab === 'objects') next.set('tab', 'objects');
-    else next.delete('tab');
-    setSearchParams(next, { replace: true });
-  };
+  const typeFilter = (['database', 'stable', 'subtable'].includes(searchParams.get('type') || '') ? searchParams.get('type') : 'all') as ObjectTypeFilter;
+  const [statusFilter, setStatusFilter] = useState('all');
 
-  // State
+  const patchParams = useCallback(
+    (patch: Record<string, string | null>) => {
+      const next = new URLSearchParams(searchParams);
+      Object.entries(patch).forEach(([k, v]) => (v ? next.set(k, v) : next.delete(k)));
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
+  const setEngine = (e: StorageEngine) => patchParams({ engine: e === 'postgresql' ? 'postgresql' : null });
+  const setActiveTab = (tab: 'topology' | 'objects') => patchParams({ tab: tab === 'objects' ? 'objects' : null });
+  const setTypeFilter = (t: ObjectTypeFilter) => patchParams({ type: t === 'all' ? null : t, tab: 'objects' });
+
   const [loading, setLoading] = useState(false);
-  const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [nodes, setNodes] = useState<TopologyNode[]>([]);
   const [edges, setEdges] = useState<TopologyEdge[]>([]);
+  const [topoLoaded, setTopoLoaded] = useState(false);
   const [stats, setStats] = useState<Awaited<ReturnType<typeof getStorageStats>> | null>(null);
   const [statsError, setStatsError] = useState<unknown>(null);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const loadController = useRef<AbortController>();
 
-  // Selected object for drawer
+  const [localDrafts, setLocalDrafts] = useState<LocalDraft[]>(() => readLocalDrafts());
+  const [serverDrafts, setServerDrafts] = useState<StorageDraftItem[]>([]);
+  const [draftsOpen, setDraftsOpen] = useState(false);
+
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
-  const [selectedObjectData, setSelectedObjectData] = useState<
-    ((TDDatabase | TDStable | TDSubtable) & { object_type: 'database' | 'stable' | 'subtable' }) | null
-  >(null);
+  const [selectedObjectData, setSelectedObjectData] = useState<StorageObjectData | null>(null);
+  const [drawerError, setDrawerError] = useState<unknown>(null);
+  const [drawerReload, setDrawerReload] = useState(0);
+  const [topoError, setTopoError] = useState<unknown>(null);
 
-  const [topoError, setTopoError] = useState<unknown | null>(null);
-  const [drawerError, setDrawerError] = useState<unknown | null>(null);
-
-  // Load TDengine data - strictly real data, no synthetic fallbacks
   const loadTDengineData = useCallback(async () => {
     loadController.current?.abort();
     const controller = new AbortController();
@@ -85,22 +265,18 @@ export const StorageManagementPage: React.FC = () => {
     ]);
     if (controller.signal.aborted) return;
     if (statsResult.status === 'fulfilled') setStats(statsResult.value);
-    else {
-      setStats(null);
-      setStatsError(statsResult.reason);
-    }
+    else setStatsError(statsResult.reason);
     try {
       if (topologyResult.status === 'rejected') throw topologyResult.reason;
       const topo = topologyResult.value;
       if (!topo) return;
-
       const safeNodes: TopologyNode[] = Array.isArray(topo?.nodes)
         ? topo.nodes.map((n: any) => {
             const rawType = (n.object_type || n.kind || 'database') as string;
             const objType: 'database' | 'stable' | 'subtable' =
               rawType === 'engine' || rawType === 'database' ? 'database' : rawType === 'stable' ? 'stable' : 'subtable';
             const physName = n.physical_name || n.label || n.name || '';
-            // Standardize canonical object IDs: db:<name>, stable:<db>.<name>, subtable:<db>.<name>
+            // Canonical object ids: db:<name>, stable:<db>.<name>, subtable:<db>.<name>
             let canonicalId = n.node_id || '';
             if (!canonicalId || canonicalId.includes('/')) {
               if (objType === 'database') canonicalId = `db:${physName}`;
@@ -112,230 +288,131 @@ export const StorageManagementPage: React.FC = () => {
                 canonicalId = `subtable:${parent}.${physName}`;
               }
             }
-            return {
-              ...n,
-              node_id: canonicalId,
-              object_type: objType,
-              physical_name: physName,
-              display_name: n.display_name || n.label || physName,
-              status: n.status || 'ACTIVE',
-            };
+            return { ...n, node_id: canonicalId, object_type: objType, physical_name: physName, display_name: n.display_name || n.label || physName, status: n.status || 'ACTIVE' };
           })
         : [];
-      const safeEdges: TopologyEdge[] = Array.isArray(topo?.edges) ? topo.edges : [];
-
       setNodes(safeNodes);
-      setEdges(safeEdges);
+      setEdges(Array.isArray(topo?.edges) ? topo.edges : []);
+      setTopoLoaded(true);
     } catch (err: unknown) {
-      console.error('Failed to load TDengine topology:', err);
       setTopoError(err);
-      setNodes([]);
-      setEdges([]);
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, [activeTab]);
 
+  const loadDrafts = useCallback(() => {
+    setLocalDrafts(readLocalDrafts());
+    listStorageDrafts()
+      .then((r) => setServerDrafts(Array.isArray(r?.items) ? r.items : []))
+      .catch(() => setServerDrafts([]));
+  }, []);
+
   const refreshTDengine = () => {
-    setRefreshVersion((previous) => previous + 1);
+    setRefreshVersion((v) => v + 1);
+    loadDrafts();
     void loadTDengineData();
   };
 
   useEffect(() => {
-    if (engine === 'tdengine') {
-      void loadTDengineData();
-    }
+    if (engine === 'tdengine') void loadTDengineData();
     return () => loadController.current?.abort();
   }, [engine, loadTDengineData]);
+  useEffect(() => loadDrafts(), [loadDrafts]);
 
-  // Load detailed object for drawer when selected - strictly real data
   useEffect(() => {
     if (!selectedObjectId) {
       setSelectedObjectData(null);
       setDrawerError(null);
       return;
     }
-
     let active = true;
     setSelectedObjectData(null);
     setDrawerError(null);
     getStorageObject(selectedObjectId)
       .then((obj) => {
-        if (!active) return;
-        const isDb = selectedObjectId.startsWith('db:') || selectedObjectId.startsWith('db/');
-        const isStable = selectedObjectId.startsWith('stable:') || selectedObjectId.startsWith('stable/');
-        const type: 'database' | 'stable' | 'subtable' = isDb ? 'database' : isStable ? 'stable' : 'subtable';
-        setSelectedObjectData({ ...obj, object_type: type });
-        setDrawerError(null);
+        if (active) setSelectedObjectData({ ...obj, object_type: kindOfId(selectedObjectId) } as StorageObjectData);
       })
       .catch((err) => {
-        if (!active) return;
-        console.error('Failed to load storage object detail:', err);
-        setSelectedObjectData(null);
-        setDrawerError(err);
+        if (active) setDrawerError(err);
       });
-    return () => { active = false; };
-  }, [selectedObjectId]);
+    return () => {
+      active = false;
+    };
+  }, [selectedObjectId, drawerReload]);
+
+  const notice = useCallback((message: string, tone: 'info' | 'success' | 'error' = 'info') => showToast({ message, tone }), [showToast]);
+
+  const newItems: NewItem[] = [
+    { key: 'db', label: 'Database', hint: 'Precision and retention', icon: <Database className="w-4 h-4 text-[#111B37]" />, to: '/historian/storage/create?kind=database' },
+    { key: 'st', label: 'Supertable', hint: 'Columns and tags for a family of tables', icon: <Layers className="w-4 h-4 text-[#2A82E7]" />, to: '/historian/storage/create?kind=stable' },
+    { key: 'sub', label: 'Subtable', hint: 'One table bound to a Data Model field', icon: <Table className="w-4 h-4 text-[#8858EA]" />, to: '/historian/storage/create?kind=subtable' },
+    { key: 'bulk', label: 'Subtables from Data Models', hint: 'Machines × fields in one go', icon: <Rows3 className="w-4 h-4 text-[#657794]" />, to: '/historian/storage/bulk' },
+  ];
+  const draftCount = localDrafts.length + serverDrafts.length;
 
   return (
     <div className="space-y-4">
-      {/* Top Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div className="min-w-0">
-          <h1 className="text-[20px] font-bold text-[#111B37]">Storage Management</h1>
-          <p className="text-[13px] text-[#657794]">
-            Databases, supertables and subtables in TDengine, and the Data Model fields recorded into them.
-          </p>
-        </div>
+      <ActionToast toast={toast} onDismiss={dismissToast} />
+      <PageHeader
+        title="Storage Management"
+        subtitle="TDengine databases, supertables and subtables, and the Data Model fields recorded into them."
+        actions={
+          <>
+            <StorageEngineSwitcher activeEngine={engine} onChange={setEngine} />
+            {engine === 'tdengine' && (
+              <>
+                <Button variant="outline" size="md" icon={<RefreshCw className={`w-3.5 h-3.5 ${loading || catalogLoading ? 'animate-spin' : ''}`} />} onClick={refreshTDengine} disabled={loading || catalogLoading}>
+                  Refresh
+                </Button>
+                <NewMenu items={newItems} onPick={(to) => navigate(to, { state: { from } })} />
+              </>
+            )}
+          </>
+        }
+      />
 
-        {/* Header Right Actions */}
-        <div className="flex flex-wrap items-center gap-2.5">
-          {/* Engine Switcher */}
-          <StorageEngineSwitcher activeEngine={engine} onChange={setEngine} />
-
-          {engine === 'tdengine' && (
-            <>
-              {/* Refresh button */}
-              <button
-                type="button"
-                onClick={refreshTDengine}
-                disabled={loading || catalogLoading}
-                className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD] transition-colors"
-                title="Refresh physical metadata"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-                <span>Refresh</span>
-              </button>
-
-              {/* + New Dropdown */}
-              <div
-                className="relative"
-                onKeyDown={(e) => { if (e.key === 'Escape') setNewMenuOpen(false); }}
-                onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setNewMenuOpen(false); }}
-              >
-                <button
-                  type="button"
-                  aria-haspopup="menu"
-                  aria-expanded={newMenuOpen}
-                  onClick={() => setNewMenuOpen(!newMenuOpen)}
-                  className="flex items-center gap-1.5 h-10 px-5 bg-[#EF1B24] hover:bg-[#D9141D] text-white rounded-lg text-[14px] font-semibold shadow-sm transition-colors"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>New</span>
-                  <ChevronDown className="w-3.5 h-3.5 ml-0.5" />
-                </button>
-
-                {newMenuOpen && (
-                  <div
-                    className="absolute right-0 top-11 z-30 w-52 bg-white border border-[#E3EAF3] rounded-xl shadow-xl py-1.5 animate-in fade-in zoom-in-95 duration-100"
-                    onClick={() => setNewMenuOpen(false)}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => navigate('/historian/storage/create?kind=database')}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC]"
-                    >
-                      <Database className="w-4 h-4 text-[#EF1B24]" />
-                      <div>
-                        <div>Database</div>
-                        <div className="text-[11px] font-normal text-[#657794]">Create TDengine database</div>
-                      </div>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => navigate('/historian/storage/create?kind=stable')}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC]"
-                    >
-                      <Layers className="w-4 h-4 text-[#2A82E7]" />
-                      <div>
-                        <div>Supertable (STable)</div>
-                        <div className="text-[11px] font-normal text-[#657794]">Define time-series schema</div>
-                      </div>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => navigate('/historian/storage/create?kind=subtable')}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC]"
-                    >
-                      <Table className="w-4 h-4 text-[#8858EA]" />
-                      <div>
-                        <div>Subtable</div>
-                        <div className="text-[11px] font-normal text-[#657794]">One table bound to a Data Model field</div>
-                      </div>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => navigate('/historian/storage/bulk')}
-                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC] border-t border-[#E3EAF3]"
-                    >
-                      <Layers className="w-4 h-4 text-[#2A82E7]" />
-                      <div>
-                        <div>Subtables from Data Models</div>
-                        <div className="text-[11px] font-normal text-[#657794]">Machines x fields, in one go</div>
-                      </div>
-                    </button>
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* Main body based on engine */}
       {engine === 'postgresql' ? (
         <PostgresExplorerView />
       ) : (
-        <div className="space-y-3">
-          {/* KPI Strip & View Mode Switcher */}
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            {stats && (
-              <StorageHealthStrip
-                databaseCount={stats.database_count}
-                stableCount={stats.stable_count}
-                subtableCount={stats.subtable_count}
-                recordingActive={stats.recording_active}
-                recordingPaused={stats.recording_paused}
-                recordingError={stats.recording_error}
-                lastObservedAt={stats.observed_at}
-              />
+        <div className="space-y-4">
+          {statsError != null ? (
+            <ErrorBanner error={statsError} subject="storage totals" onRetry={refreshTDengine} />
+          ) : (
+            <StorageHealthStrip
+              databaseCount={stats?.database_count ?? null}
+              stableCount={stats?.stable_count ?? null}
+              subtableCount={stats?.subtable_count ?? null}
+              recordingActive={stats?.recording_active ?? null}
+              recordingPaused={stats?.recording_paused ?? null}
+              recordingError={stats?.recording_error ?? null}
+              draftCount={draftCount}
+              activeType={activeTab === 'objects' ? typeFilter : undefined}
+              onFilterType={setTypeFilter}
+              onOpenDrafts={() => {
+                loadDrafts();
+                setDraftsOpen(true);
+              }}
+            />
+          )}
+
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Segmented<'topology' | 'objects'>
+              ariaLabel="View"
+              value={activeTab}
+              onChange={setActiveTab}
+              options={[
+                { id: 'topology', label: 'Topology', icon: <LayoutGrid className="w-3.5 h-3.5" /> },
+                { id: 'objects', label: 'Objects table', icon: <List className="w-3.5 h-3.5" /> },
+              ]}
+            />
+            {stats?.observed_at && (
+              <span className="text-[11px] text-[#94A3B8]">
+                Observed <TimeCell iso={stats.observed_at} />
+              </span>
             )}
-
-            {/* View Mode Switcher: Topology / Objects */}
-            <div className="flex items-center gap-1 bg-[#EEF2F6] p-1 rounded-lg">
-              <button
-                type="button"
-                onClick={() => setActiveTab('topology')}
-                className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-[12px] font-semibold transition-all ${
-                  activeTab === 'topology'
-                    ? 'bg-white text-[#111B37] shadow-xs'
-                    : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-              >
-                <LayoutGrid className="w-3.5 h-3.5" />
-                <span>Topology</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setActiveTab('objects')}
-                className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-[12px] font-semibold transition-all ${
-                  activeTab === 'objects'
-                    ? 'bg-white text-[#111B37] shadow-xs'
-                    : 'text-[#657794] hover:text-[#111B37]'
-                }`}
-              >
-                <List className="w-3.5 h-3.5" />
-                <span>Objects Table</span>
-              </button>
-            </div>
           </div>
 
-          {/* Active view */}
-          {statsError != null && <RemoteErrorState error={statsError} subject="Storage totals" onRetry={refreshTDengine} />}
           {activeTab === 'objects' ? (
             <StorageObjectsTable
               selectedObjectId={selectedObjectId}
@@ -343,71 +420,87 @@ export const StorageManagementPage: React.FC = () => {
               onRefresh={refreshTDengine}
               refreshVersion={refreshVersion}
               onLoadingChange={setCatalogLoading}
+              typeFilter={typeFilter}
+              onTypeFilter={(t) => patchParams({ type: t === 'all' ? null : t })}
+              statusFilter={statusFilter}
+              onStatusFilter={setStatusFilter}
+              onNotice={notice}
             />
           ) : topoError != null ? (
-            <RemoteErrorState
-              error={topoError}
-              subject="TDengine Storage Topology"
-              onRetry={loadTDengineData}
-            />
-          ) : loading && nodes.length === 0 ? (
-            <RemoteLoadingState subject="TDengine storage topology" />
-          ) : nodes.length === 0 ? (
-            <RemoteEmptyState
-              title="No Storage Objects Found"
-              description="There are no physical TDengine databases or supertables configured yet. Start by creating your first database."
-              actionLabel="Create Database"
-              onAction={() => navigate('/historian/storage/create?kind=database')}
-              icon={Database}
-            />
+            <ErrorBanner error={topoError} subject="the TDengine topology" onRetry={() => void loadTDengineData()} />
+          ) : !topoLoaded && loading ? (
+            <div className="bg-white border border-[#CBD5E1] rounded-xl">
+              <LoadingBlock label="Loading TDengine topology…" />
+            </div>
+          ) : topoLoaded && nodes.length === 0 ? (
+            <EmptyState
+              icon={<Database className="w-6 h-6" />}
+              title="No storage objects yet"
+              action={
+                <Button variant="primary" size="md" icon={<Plus className="w-4 h-4" />} onClick={() => navigate('/historian/storage/create?kind=database', { state: { from } })}>
+                  Create database
+                </Button>
+              }
+            >
+              Start with a TDengine database, then a supertable (columns + tags) and its subtables.
+            </EmptyState>
           ) : (
             <StorageObjectGraph
               nodes={nodes}
               edges={edges}
               selectedObjectId={selectedObjectId}
               onSelectObject={setSelectedObjectId}
-              onRefresh={loadTDengineData}
+              onRefresh={() => void loadTDengineData()}
               loading={loading}
+              onShowObjects={() => setActiveTab('objects')}
             />
           )}
 
-          {/* Details Drawer for selected object */}
-          {selectedObjectData && (
+          {selectedObjectId && (
             <StorageObjectDrawer
+              objectId={selectedObjectId}
               object={selectedObjectData}
+              error={drawerError}
+              onRetry={() => setDrawerReload((v) => v + 1)}
               onClose={() => setSelectedObjectId(null)}
               onRefresh={refreshTDengine}
+              onNotice={(m) => notice(m, 'success')}
             />
-          )}
-
-          {/* Drawer Error State */}
-          {drawerError != null && selectedObjectId && !selectedObjectData && (
-            <div className="fixed inset-y-0 right-0 z-40 w-[420px] bg-white border-l border-[#FAC6C9] shadow-xl p-6 flex flex-col justify-center animate-in slide-in-from-right duration-200">
-              <RemoteErrorState
-                error={drawerError}
-                subject={`Storage Object "${selectedObjectId}"`}
-                onRetry={() => {
-                  if (selectedObjectId) {
-                    const id = selectedObjectId;
-                    setSelectedObjectId(null);
-                    setTimeout(() => setSelectedObjectId(id), 50);
-                  }
-                }}
-              />
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedObjectId(null);
-                  setDrawerError(null);
-                }}
-                className="mt-4 px-4 py-2 bg-[#F1F5FA] hover:bg-[#E3EAF3] text-[#111B37] rounded-lg text-[13px] font-semibold"
-              >
-                Close Drawer
-              </button>
-            </div>
           )}
         </div>
       )}
+
+      <DraftsDialog
+        open={draftsOpen}
+        onClose={() => setDraftsOpen(false)}
+        local={localDrafts}
+        server={serverDrafts}
+        onResume={(kind) => navigate(`/historian/storage/create?kind=${kind}`, { state: { from } })}
+        onDiscard={(key) => {
+          try {
+            sessionStorage.removeItem(key);
+          } catch {
+            // ignore
+          }
+          setLocalDrafts(readLocalDrafts());
+        }}
+        onDiscardServer={(d) => {
+          discardStorageDraft(d.id)
+            .then(() => {
+              notice(`Discarded draft ${d.name}.`, 'success');
+              loadDrafts();
+            })
+            .catch((e: unknown) => {
+              const status = (e as { status?: number }).status;
+              notice(
+                status === 404 || status === 405
+                  ? 'This server cannot discard drafts yet (needs the newer Center).'
+                  : `Could not discard the draft: ${(e as Error)?.message || 'error'}`,
+                'error',
+              );
+            });
+        }}
+      />
     </div>
   );
 };

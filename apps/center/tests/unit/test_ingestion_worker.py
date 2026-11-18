@@ -1151,3 +1151,30 @@ async def test_v2_latest_ids_notify_is_bounded_and_parsed_by_the_api_bridge() ->
     parsed = [_parse_latest_ids(p) for p in payloads]
     assert all(t == str(tid) for t, _ in parsed)
     assert [sid for _, chunk in parsed for sid in chunk] == ids
+
+
+@pytest.mark.asyncio
+async def test_replay_lane_has_its_own_sli_and_smaller_batches() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    worker = IngestionWorker(pg_store=pg, tdengine=_FakeTDEngine(), batch_size=500, flush_ms=10, replay_batch_size=2)  # type: ignore[arg-type]
+    now = datetime.now(timezone.utc)
+
+    def obs(age_s: float, seq: int) -> CanonicalObservation:
+        return _make_obs(
+            tenant_id=ids["tenant_id"], signal_id=ids["signal_id"], resource_id=ids["resource_id"],
+            connection_id=ids["connection_id"], source_field_id=ids["field_id"], site_id=ids["site_id"],
+            acquired_at=now - timedelta(seconds=age_s), seq=seq,
+        )
+
+    live = _batch_message([obs(0.5, 1)], message_id="fxb-live")
+    replay = _batch_message([obs(21 * 3600, 10 + i) for i in range(5)], message_id="fxb-replay")
+    outcomes = await _run_lanes(
+        worker, asyncio.gather(worker.handle_live_message(live), worker.handle_legacy_message(replay))
+    )
+    assert outcomes == [ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+    snap = worker.hist.snapshot()
+    # 21-hour-old replay rows no longer pollute the live SLI.
+    assert snap["sli_acq_to_commit_p50_ms"] < 60_000
+    assert snap["sli_replay_acq_to_commit_p50_ms"] > 20 * 3600 * 1000
+    assert worker.lane_metrics()["legacy"]["batches"] == 3  # 5 items in replay batches of 2

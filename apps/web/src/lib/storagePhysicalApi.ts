@@ -623,6 +623,11 @@ export async function listStorageDrafts(kind?: TDObjectType): Promise<{ items: S
   return api(`/api/v1/storage/td/drafts${kind ? `?kind=${kind}` : ''}`);
 }
 
+/** DELETE /api/v1/storage/td/drafts/{id} → state CANCELLED (contract H9; 404/405 on older servers). */
+export async function discardStorageDraft(id: string): Promise<{ id: string; state: string }> {
+  return api(`/api/v1/storage/td/drafts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
 export interface RecordingStatus {
   pending: number;
   failed: number;
@@ -756,12 +761,14 @@ export async function getPgTablePreview(
 }
 
 // --- Historian queries ---
+// Contract: v6_contracts.md H5/H6/H8. Fields marked "newer servers" are optional: the UI degrades
+// gracefully when an older Center does not send them.
 
 export interface HistorianQueryParams {
   source_kind: 'subtable' | 'signal' | 'model_field';
   source_id: string;
-  from_ts: string;   // ISO
-  to_ts: string;     // ISO
+  from_ts: string; // ISO
+  to_ts: string; // ISO
   resolution?: string | null;
   mode?: 'recorded' | 'reconstructed' | 'operational';
   limit?: number;
@@ -800,18 +807,40 @@ export interface HistorianSeriesPoint {
   max?: number | null;
   count?: number;
   source_time?: string | null;
+  acquired_at?: string | null;
   reason_code?: string | null;
   event_uid?: string | null;
   data_epoch?: number | null;
   virtual?: boolean;
   series_key: string;
   signal_key?: string | null;
+  /** Compare period: real timestamp of a point shifted onto the main axis (newer servers). */
+  original_ts?: string | null;
+}
+
+export interface HistorianSeriesStats {
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+  last: unknown;
+  last_ts: string | null;
+  count: number;
+  total: number;
+  good_pct: number | null;
+  // newer servers
+  first?: unknown;
+  first_ts?: string | null;
+  gap_count?: number | null;
+  longest_gap_ms?: number | null;
+  coverage_pct?: number | null;
+  gap_threshold_ms?: number | null;
 }
 
 export interface HistorianSeriesResult {
   series_key: string;
   source_kind: 'signal' | 'model_field' | 'subtable';
   display_name: string;
+  resource_id?: string | null;
   resource_name?: string | null;
   value_type?: string | null;
   unit?: string | null;
@@ -825,10 +854,7 @@ export interface HistorianSeriesResult {
   next_cursor?: string | null;
   column?: string | null;
   coverage_notes: string[];
-  stats: {
-    min: number | null; max: number | null; avg: number | null; last: unknown; last_ts: string | null;
-    count: number; total: number; good_pct: number | null;
-  };
+  stats: HistorianSeriesStats;
 }
 
 export interface HistorianMultiQuery {
@@ -840,19 +866,28 @@ export interface HistorianMultiQuery {
   max_points?: number;
   bucket_ms?: number;
   cursor?: string;
+  /** "1h" | "1d" | "7d" or milliseconds (newer servers; older ones ignore it). */
+  compare_offset?: string | number;
 }
 
-/** POST /api/v1/historian/query — every series in one call; values are in `point.value`. */
-export async function queryHistorianSeries(params: HistorianMultiQuery): Promise<{
+export interface HistorianQueryResponse {
   series_list: HistorianSeriesResult[];
   downsampled: boolean;
   history_available: boolean;
   coverage_notes: string[];
   next_cursor: string | null;
-}> {
-  return api('/api/v1/historian/query', { method: 'POST', body: JSON.stringify(params) });
+  start?: string;
+  end?: string;
+  /** Newer servers: the same series over the earlier window, points shifted onto the main axis. */
+  compare?: { offset_ms: number; start: string; end: string; series_list: HistorianSeriesResult[] } | null;
 }
 
+/** POST /api/v1/historian/query — every series in one call; values are in `point.value`. */
+export async function queryHistorianSeries(params: HistorianMultiQuery, signal?: AbortSignal): Promise<HistorianQueryResponse> {
+  return api('/api/v1/historian/query', { method: 'POST', body: JSON.stringify(params), signal });
+}
+
+/** Legacy single-source query (kept for older callers). */
 export async function queryHistorian(params: HistorianQueryParams): Promise<{
   rows: HistorianRow[];
   total: number;
@@ -868,58 +903,129 @@ export async function queryHistorian(params: HistorianQueryParams): Promise<{
   });
 }
 
+export interface HistorianEvent {
+  id: string;
+  ts: string;
+  kind: 'QUALITY_TRANSITION' | 'STORAGE_OPERATION' | 'EPOCH_RESET' | string;
+  summary: string;
+  message?: string;
+  signal_id?: string;
+  data_epoch?: number;
+}
+
+/** GET /api/v1/historian/events — storage operations and telemetry resets (tenant-wide). */
+export async function listHistorianEvents(
+  params: { start: string; end: string; types?: string[]; limit?: number },
+  signal?: AbortSignal,
+): Promise<{ items: HistorianEvent[] }> {
+  const qs = new URLSearchParams({ start: params.start, end: params.end, limit: String(params.limit ?? 200) });
+  if (params.types?.length) qs.set('types', params.types.join(','));
+  return api(`/api/v1/historian/events?${qs}`, { signal });
+}
+
+/** What a saved view stores (free-form JSON on the server; this is the Historian UI's own shape). */
+export interface HistorianViewSpec {
+  v?: number;
+  sources: string[];
+  labels?: Record<string, string>;
+  mode?: 'operational' | 'recorded' | 'reconstructed';
+  range?: string | null;
+  start?: string | null;
+  end?: string | null;
+  compare_offset?: string | null;
+  layout?: string;
+  hidden?: string[];
+  tab?: string;
+  [key: string]: unknown;
+}
+
 export interface SavedView {
   id: string;
   name: string;
   description?: string | null;
-  query_params: HistorianQueryParams;
+  query_spec: HistorianViewSpec;
+  chart_options?: Record<string, unknown>;
+  is_default?: boolean;
+  visibility?: 'PRIVATE' | 'TEAM' | string;
+  version?: number;
   created_at: string;
   updated_at: string;
   created_by?: string | null;
 }
 
-export async function listSavedViews(): Promise<SavedView[]> {
-  return api('/api/v1/historian/views');
+export async function listSavedViews(q?: string): Promise<SavedView[]> {
+  const res = await api<SavedView[] | { items: SavedView[] }>(`/api/v1/historian/views${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+  return Array.isArray(res) ? res : res?.items || [];
 }
 
-export async function saveView(view: Omit<SavedView, 'id' | 'created_at' | 'updated_at'>): Promise<SavedView> {
-  return api('/api/v1/historian/views', {
-    method: 'POST',
-    body: JSON.stringify(view),
+export async function saveView(view: {
+  name: string;
+  description?: string;
+  query_spec: HistorianViewSpec;
+  chart_options?: Record<string, unknown>;
+  visibility?: 'PRIVATE' | 'TEAM';
+  is_default?: boolean;
+}): Promise<SavedView> {
+  return api('/api/v1/historian/views', { method: 'POST', body: JSON.stringify(view) });
+}
+
+/** PATCH with optimistic concurrency (newer servers; 409 VERSION_CONFLICT when someone else saved first). */
+export async function updateView(
+  id: string,
+  version: number | undefined,
+  patch: Partial<{ name: string; description: string; query_spec: HistorianViewSpec; chart_options: Record<string, unknown> }>,
+): Promise<SavedView> {
+  return api(`/api/v1/historian/views/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: version != null ? { 'If-Match': String(version) } : undefined,
+    body: JSON.stringify(version != null ? { ...patch, version } : patch),
   });
+}
+
+export async function deleteView(id: string): Promise<{ ok: boolean }> {
+  return api(`/api/v1/historian/views/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 export interface ExportJob {
   id: string;
-  status: 'PENDING' | 'RUNNING' | 'DONE' | 'ERROR' | 'CANCELLED';
-  format: 'csv' | 'json';
-  source_id: string;
-  from_ts: string;
-  to_ts: string;
+  status: 'PENDING' | 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'READY' | 'FAILED' | 'ERROR' | 'CANCELLED' | 'EXPIRED' | string;
+  format: 'csv' | 'json' | string;
+  file_name?: string | null;
   row_count?: number | null;
+  byte_size?: number | null;
   download_url?: string | null;
+  error_code?: string | null;
   error_message?: string | null;
+  truncated_series?: string[];
+  query_spec?: Record<string, unknown>;
   created_at: string;
   completed_at?: string | null;
   expires_at?: string | null;
+  // newer servers
+  title?: string | null;
+  series?: string[];
+  start?: string | null;
+  end?: string | null;
+  mode?: string | null;
+  progress_pct?: number | null;
 }
 
-export async function createExportJob(params: {
-  source_kind?: string;
-  source_id?: string;
-  sources?: string[];
-  from_ts: string;
-  to_ts: string;
-  start?: string;
-  end?: string;
-  mode?: string;
-  format: 'csv' | 'json';
-  file_name?: string;
-}): Promise<ExportJob> {
-  return api('/api/v1/historian/exports', {
-    method: 'POST',
-    body: JSON.stringify(params),
-  });
+export async function createExportJob(
+  params: {
+    sources: string[];
+    start: string;
+    end: string;
+    from_ts?: string;
+    to_ts?: string;
+    mode?: string;
+    format: 'csv' | 'json';
+    file_name?: string;
+    title?: string;
+    labels?: Record<string, string>;
+  },
+  signal?: AbortSignal,
+): Promise<ExportJob> {
+  return api('/api/v1/historian/exports', { method: 'POST', body: JSON.stringify(params), signal });
 }
 
 export async function getExportJob(id: string): Promise<ExportJob> {
@@ -927,7 +1033,16 @@ export async function getExportJob(id: string): Promise<ExportJob> {
 }
 
 export async function listExportJobs(): Promise<ExportJob[]> {
-  return api('/api/v1/historian/exports');
+  const res = await api<ExportJob[] | { items: ExportJob[] }>('/api/v1/historian/exports');
+  return Array.isArray(res) ? res : res?.items || [];
+}
+
+export async function retryExportJob(id: string): Promise<ExportJob> {
+  return api(`/api/v1/historian/exports/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+}
+
+export async function cancelExportJob(id: string): Promise<ExportJob> {
+  return api(`/api/v1/historian/exports/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
 }
 
 // --- KPI stats ---
