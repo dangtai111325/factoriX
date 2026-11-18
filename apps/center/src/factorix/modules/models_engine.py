@@ -2,8 +2,9 @@
 
 Every RUNNING model is sampled every ``sample_ms`` (independent of the collectors). A sample:
 
-1. reads the latest **valid** value (GOOD/UNCERTAIN) of every referenced signal with one query
-   per tenant and tick; unavailable current values are emitted as null;
+1. reads the latest value of every referenced signal with one query per tenant and tick; a STALE /
+   PAUSED signal keeps its last value and a BAD one its last good value (the field quality shows the
+   condition, R1-02); only signals without any value (NO_DATA / DISABLED) are emitted as null;
 2. evaluates the body (:func:`factorix.domain.body.evaluate_detailed`); ``value_at`` lookups use
    the ``observations (tenant_id, signal_id, source_time DESC)`` index and are cached;
 3. stores the ordered JSON text in ``model_state`` and appends it to the ``model_snapshots`` ring
@@ -35,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from factorix.domain import rules as R
 from factorix.domain.body import BodyContext, CompiledSpec, EvalResult, compile_spec, evaluate_detailed
 from factorix.domain.signal_state import evaluate_signal_state
+from factorix.modules import storage_model_recorder
 from factorix.modules.common import execute, fetch_all, queue_stream_event, utcnow
 from factorix.platform import after_commit
 
@@ -181,6 +183,31 @@ async def load_catalog(session: AsyncSession, tenant_id: UUID, signal_ids: Itera
     )
 
 
+#: Effective statuses whose last value is still published in the body (flagged by the field quality,
+#: never blanked to null — R1-02 / v6 contract Q3). BAD publishes the last GOOD value.
+HOLD_LAST_QUALITIES = ("STALE", "PAUSED", "DELAYED")
+
+
+def live_sample(rec: Any, status: str, last_good_source_time: datetime | None = None) -> R.Sample | None:
+    """Sample handed to the body for a live-state record with effective ``status``.
+
+    GOOD/UNCERTAIN → current value; STALE/PAUSED/DELAYED → last value with that quality;
+    BAD → the last good value (and its source time) with quality BAD; DISABLED → no sample.
+    """
+    status = str(status or "").upper()
+    if status in VALID_QUALITIES or status in HOLD_LAST_QUALITIES:
+        value = rec.value
+        if value is None and getattr(rec, "last_good_value", None) is not None and status in HOLD_LAST_QUALITIES:
+            value = rec.last_good_value
+        return R.Sample(value, status, rec.source_time, rec.last_acquired_at)
+    if status == "BAD":
+        good = getattr(rec, "last_good_value", None)
+        if good is None:
+            return None
+        return R.Sample(good, "BAD", last_good_source_time, getattr(rec, "last_good_at", None) or rec.last_acquired_at)
+    return None
+
+
 def sample_from_latest(row: Mapping[str, Any], *, now: datetime | None = None) -> tuple[R.Sample | None, str]:
     """Apply canonical freshness before making a PostgreSQL sample available to the model."""
     value_json = _json(row.get("value_json"))
@@ -200,7 +227,14 @@ def sample_from_latest(row: Mapping[str, Any], *, now: datetime | None = None) -
         now=now,
     )
     quality = evaluation.effective_status
-    if quality not in VALID_QUALITIES:
+    if quality == "BAD":
+        good_json = _json(row.get("last_good_value_json"))
+        good = good_json.get("v") if isinstance(good_json, dict) else None
+        if good is None:
+            return None, quality
+        good_at = R.as_utc(row.get("last_good_event_time"))
+        return R.Sample(good, quality, good_at, good_at), quality
+    if quality not in VALID_QUALITIES and quality not in HOLD_LAST_QUALITIES:
         return None, quality
     return R.Sample(value, quality, R.as_utc(row.get("source_time")), received_at), quality
 
@@ -357,10 +391,7 @@ async def load_samples(
             if rec is None or ev.effective_status == "NO_DATA":
                 continue
             qualities_p[sid_key] = ev.effective_status
-            if ev.effective_status in VALID_QUALITIES:
-                samples_p[sid_key] = R.Sample(rec.value, ev.effective_status, rec.source_time, rec.last_acquired_at)
-            else:
-                samples_p[sid_key] = None
+            samples_p[sid_key] = live_sample(rec, ev.effective_status, evaluated.last_good_source_time)
         return samples_p, qualities_p
 
     rows = await fetch_all(
@@ -840,12 +871,14 @@ class ModelEngine:
             by_tenant.setdefault(model.tenant_id, []).append(model)
         rows: list[dict[str, Any]] = []
         prune: list[str] = []
+        recorded: dict[UUID, list[Any]] = {}
         for tenant_id, group in by_tenant.items():
             tenant = UUID(tenant_id)
             signal_ids: set[str] = set()
             for model in group:
                 signal_ids |= model.compiled.signal_ids
             catalog = await self._catalog(session, tenant_id, signal_ids)
+            await storage_model_recorder.ensure_targets(session, tenant)
             samples, qualities = (
                 await load_samples(session, tenant, signal_ids, live_provider=self.live_provider)
                 if self.live_provider is not None
@@ -869,12 +902,25 @@ class ModelEngine:
                     }
                 )
                 queue_stream_event(session, "model_body", tenant_id, body_message(model.id, result.text, now, errors), group_id=model.id)
+                if storage_model_recorder.has_targets(tenant_id, model.id):
+                    recorded.setdefault(tenant, []).append(
+                        storage_model_recorder.ModelResult(
+                            model_id=model.id,
+                            model_revision=model.version,
+                            sampled_at=now,
+                            body=result.body,
+                            field_quality=storage_model_recorder.field_quality_map(model.compiled, result, qualities),
+                        )
+                    )
                 model.samples_since_prune += 1
                 if model.samples_since_prune >= PRUNE_EVERY:
                     model.samples_since_prune = 0
                     prune.append(model.id)
                 await asyncio.sleep(0)  # yield between models
         await write_samples(session, rows)
+        # Bound Data Model fields -> durable outbox, in the same transaction as model_state (G-05).
+        for tenant, results in recorded.items():
+            await storage_model_recorder.capture_safely(session, tenant, results)
         if prune:
             await prune_snapshots(session, prune)
         return len(rows)

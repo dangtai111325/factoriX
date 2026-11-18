@@ -180,3 +180,85 @@ async def test_execute_sql_timeout_raises_retryable_tdengine_error() -> None:
     finally:
         gate.set()
         await client.close()
+
+
+def test_errors_are_classified_by_type_and_native_code_before_message_text() -> None:
+    from factorix.platform.tdengine import _is_retryable_error, parse_native_code, td_error_is_schema_missing
+
+    class QueryError(Exception):
+        pass
+
+    assert parse_native_code("[0x2603] Table does not exist") == 0x2603
+    assert td_error_is_schema_missing("[0x2603] Table does not exist")
+    assert td_error_is_schema_missing("[0x0388] Database not exist")
+    # A deterministic parser error is permanent even if its text mentions "connection" / "closed".
+    assert not td_error_is_schema_missing("[0x2600] syntax error near 'not exist'")
+    assert _is_retryable_error(QueryError("[0x2600] syntax error near 'connection closed'")) is False
+    # Transport / transient server states are retryable.
+    assert _is_retryable_error(QueryError("[0xE001] Internal error: WebSocket IO error")) is True
+    assert _is_retryable_error(QueryError("[0x0396] Database in creating status")) is True
+    assert _is_retryable_error(ConnectionResetError()) is True
+    # Code-less errors keep the legacy heuristics.
+    assert _is_retryable_error(QueryError("websocket closed")) is True
+    err = TDEngineError("TDENGINE_QUERY_FAILED", "[0x2603] Table does not exist")
+    assert err.native_code == 0x2603 and err.schema_missing
+
+
+@pytest.mark.asyncio
+async def test_permanent_chunk_failure_is_isolated_by_bisection_not_row_by_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = TDEngineClient(TDEngineConfig(dsn="ws://localhost:6041", batch_chunk_rows=1000))
+    statements: list[str] = []
+
+    async def execute(sql: str, **_kw: Any) -> int:
+        statements.append(sql)
+        if "'bad'" in sql:
+            raise TDEngineError("TDENGINE_QUERY_FAILED", "[0x2600] syntax error", retryable=False)
+        return 0
+
+    monkeypatch.setattr(client, "execute_sql", execute)
+    try:
+        items = [
+            SubtableWriteItem(str(i), "sensors", f"motor{i % 4}", ("north",), ("ts", "val"), (i, "bad" if i == 37 else "ok"))
+            for i in range(64)
+        ]
+        result = await client.write_batch("plant", items)
+        assert [failure.item_id for failure in result.failures] == ["37"]
+        assert not result.failures[0].retryable
+        assert sorted(result.succeeded_ids, key=int) == [str(i) for i in range(64) if i != 37]
+        assert len(statements) <= 2 * 6 + 2  # 1 + 2*log2(64) + 1 statements instead of 64 single-row INSERTs
+        assert statements[0].count("USING") == 4  # one header per subtable, rows grouped
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_operational_fast_values_render_identically_to_generic_literals(monkeypatch: pytest.MonkeyPatch) -> None:
+    import dataclasses
+
+    client = TDEngineClient(TDEngineConfig(dsn="ws://localhost:6041"))
+    captured: list[Any] = []
+
+    async def write_batch(database: str, items: Any) -> Any:
+        captured.extend(items)
+        return None
+
+    monkeypatch.setattr(client, "write_batch", write_batch)
+    now = datetime(2026, 11, 18, 1, 2, 3, 456789, tzinfo=timezone.utc)
+    base = {"signal_id": uuid4(), "resource_id": uuid4(), "connection_id": uuid4(), "event_time": now, "acquired_at": now}
+    records = [
+        {**base, "event_uid": "a", "value_type": "float64", "value": -0.0, "source_time": now, "raw_quality": "GOOD", "unit": "°C", "source_seq": 7},
+        {**base, "event_uid": "b", "value_type": "int64", "value": 2**62, "reason_code": "X'Y", "origin": "LIVE", "config_revision": 3, "data_epoch": 2},
+        {**base, "event_uid": "c", "value_type": "bool", "value": True, "raw_quality": "UNCERTAIN"},
+        {**base, "event_uid": "d", "value_type": "string", "value": "it's \ fine", "source_seq": None},
+        {**base, "event_uid": "e", "value_type": "json", "value": {"k": [1, "ü"]}, "raw_quality": "BAD"},
+        {**base, "event_uid": "f", "value_type": "float64", "value": None, "raw_quality": "BAD"},
+    ]
+    try:
+        await client.write_operational_observations(uuid4(), records)
+        assert len(captured) == len(records)
+        for item in captured:
+            assert item.values_sql is not None
+            generic = client._format_values_tuple(dataclasses.replace(item, values_sql=None))
+            assert item.values_sql == generic
+    finally:
+        await client.close()

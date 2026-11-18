@@ -192,14 +192,20 @@ export const Sidebar: React.FC = () => {
   }, [drawerOpen, isMobile]);
 
   // Group open state persistence
+  // Released groups are open by default. A remembered choice applies only to the groups it names:
+  // a group added later (Historian & Storage) opens like the others instead of starting collapsed.
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() => {
+    const defaults: Record<string, boolean> = { factory: true, collector: true, models: true, historian: true };
     try {
       const saved = localStorage.getItem('fx.sidebar.groups');
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed: unknown = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') return { ...defaults, ...(parsed as Record<string, boolean>) };
+      }
     } catch {
       // fallback
     }
-    return { factory: true, collector: true, models: true, historian: true };
+    return defaults;
   });
 
   // "Coming soon" section: collapsed by default so the released modules stay in view. The choice is

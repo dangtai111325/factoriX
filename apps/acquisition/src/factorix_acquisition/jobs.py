@@ -37,7 +37,10 @@ PUSH_PROTOCOLS = frozenset({"mqtt", "websocket"})
 MIN_INTERVAL_MS = {"http": 1000}
 DEFAULT_MIN_INTERVAL_MS = 200
 DEFAULT_MODBUS_MERGE_GAP = 16
-MAX_BACKOFF_S = 30.0
+# Retry backoff after failed reads. Capped at 10 s (was 30 s): a recovered device is noticed within
+# the connection-health window instead of staying "down" for up to 30 s after it came back.
+MAX_BACKOFF_S = 10.0
+MIN_BACKOFF_S = 0.2
 # Failures caused by the control plane (e.g. a temporary PG outage fetching a newly needed
 # secret) say nothing about the OT device itself. Reported failed only after this many tries
 # in a row, so transient hiccups do not mark a healthy source DOWN.
@@ -81,11 +84,24 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
 
+# MQTT keys that only shape the subscription. The connector changes its subscriptions live
+# (set_topics), so editing a topic must not tear the session down (a reconnect loses messages and
+# shows up at the broker as a disconnect).
+MQTT_SUBSCRIPTION_KEYS = frozenset({"topics", "qos", "delivery_policy"})
+
+
+def _transport_config(connection: dict[str, Any]) -> Any:
+    config = connection.get("config_json")
+    if str(connection.get("protocol") or "") == "mqtt" and isinstance(config, dict):
+        return {k: v for k, v in config.items() if k not in MQTT_SUBSCRIPTION_KEYS}
+    return config
+
+
 def connection_fingerprint(connection: dict[str, Any]) -> str:
     return _digest(
         {
             "protocol": connection.get("protocol"),
-            "config": connection.get("config_json"),
+            "config": _transport_config(connection),
             "secret_ref": connection.get("secret_ref"),
             "secret_hash": connection.get("secret_hash"),
             "status": connection.get("status"),
@@ -152,6 +168,11 @@ def build_specs(snapshot: dict[str, Any]) -> dict[str, JobSpec]:
             {
                 "job": {k: job.get(k) for k in ("id", "mode", "interval_ms", "timeout_ms", "enabled", "schedule_json")},
                 "connection": conn_fp,
+                "subscription": (
+                    {k: (connection.get("config_json") or {}).get(k) for k in sorted(MQTT_SUBSCRIPTION_KEYS)}
+                    if protocol == "mqtt"
+                    else None
+                ),
                 "fields": mapped,
                 "bindings": job_bindings,
             }
@@ -170,9 +191,9 @@ class Host(Protocol):
 
     async def emit(self, spec: JobSpec, samples: list[Sample]) -> int: ...
 
-    def record_ok(self, connection_id: str, read_ms: int | None, samples: int, at: str | None = None) -> None: ...
+    def record_ok(self, connection_id: str, read_ms: int | None, samples: int, at: str | None = None, *, job_id: str | None = None) -> None: ...
 
-    def record_failure(self, connection_id: str, error: ConnectorError) -> None: ...
+    def record_failure(self, connection_id: str, error: ConnectorError, *, job_id: str | None = None) -> None: ...
 
 
 def as_connector_error(exc: BaseException) -> ConnectorError:
@@ -191,7 +212,7 @@ def as_connector_error(exc: BaseException) -> ConnectorError:
 
 
 def backoff_delay(failures: int, interval_s: float, retry_after: float | None = None) -> float:
-    delay = min(MAX_BACKOFF_S, max(1.0, interval_s) * (2 ** max(0, failures - 1)))
+    delay = min(MAX_BACKOFF_S, max(MIN_BACKOFF_S, interval_s) * (2 ** max(0, failures - 1)))
     if retry_after:
         delay = max(delay, float(retry_after))
     return delay
@@ -211,6 +232,18 @@ def read_budget_s(spec: JobSpec) -> float:
 
 
 MODBUS_MAX_CYCLE_S = 120.0
+
+
+def poll_watchdog_s(spec: JobSpec) -> float:
+    """Outer deadline of one poll cycle.
+
+    Modbus enforces its timeout per request, starting when the endpoint scheduler hands the request
+    the endpoint (queue wait excluded), so the cycle only needs a hang watchdog. Other protocols use
+    their read budget.
+    """
+    if spec.protocol == "modbus_tcp":
+        return max(MODBUS_MAX_CYCLE_S, read_budget_s(spec))
+    return read_budget_s(spec)
 
 
 def modbus_cycle_budget_s(fields: list[dict[str, Any]], config: dict[str, Any], timeout_s: float) -> float:
@@ -321,13 +354,23 @@ async def read_modbus(
         key = (block.unit_id, block.area, block.start, block.count)
         pending.extend(split_contiguous(block) if key in cache else [block])
     queue = list(pending)
+    # A unit that timed out is not asked again in this cycle: one dead unit behind a gateway costs one
+    # timeout per cycle instead of one per block, and healthy units on the endpoint keep their slot.
+    timed_out_units: dict[int, ConnectorError] = {}
     while queue:
         block = queue.pop(0)
+        skipped = timed_out_units.get(block.unit_id)
+        if skipped is not None:
+            block_errors.append(skipped)
+            decoded.extend({"field_id": f.field_id, "value": None, "error_code": skipped.code, "error": str(skipped)} for f in block.fields)
+            continue
         try:
             data = await connector.read_raw(block)
         except ConnectorError as exc:
             if exc.code == "NETWORK":
                 raise
+            if exc.code == "TIMEOUT":
+                timed_out_units[block.unit_id] = exc
             parts = split_contiguous(block)
             if exc.code == "MODBUS_EXCEPTION" and len(parts) > 1:
                 cache.add((block.unit_id, block.area, block.start, block.count))
@@ -497,6 +540,9 @@ class JobRunner:
         self.stats = JobStats()
         self.partial_error: ConnectorError | None = None
         self._unreported = False
+        self._started_mono = time.monotonic()
+        self._last_ok_mono: float | None = None
+        self._bad_emitted = False
 
     @property
     def interval_s(self) -> float:
@@ -571,7 +617,7 @@ class JobRunner:
         http_url = str(spec.config.get("base_url") or spec.config.get("url") or "").strip().lower()
         if spec.protocol == "http" and http_url.startswith("https://"):
             await prewarm_http_ssl()
-        budget = read_budget_s(spec)
+        budget = poll_watchdog_s(spec)
         next_due = time.monotonic()
         while True:
             started = time.monotonic()
@@ -589,15 +635,26 @@ class JobRunner:
             self.stats.failures = 0
             self.stats.reads += 1
             emitted = await self.host.emit(spec, samples)
-            self.host.record_ok(spec.connection_id, elapsed_ms, emitted)
+            self._mark_ok()
+            self.host.record_ok(spec.connection_id, elapsed_ms, emitted, job_id=spec.job_id)
             if self.partial_error is not None:
-                self.host.record_failure(spec.connection_id, self.partial_error)
+                self.host.record_failure(spec.connection_id, self.partial_error, job_id=spec.job_id)
                 self.partial_error = None
             next_due += self.interval_s
             now = time.monotonic()
             if next_due < now:
                 next_due = now
             await asyncio.sleep(next_due - now)
+
+    def _mark_ok(self) -> None:
+        self._last_ok_mono = time.monotonic()
+        self._bad_emitted = False
+
+    def _degrade_window_s(self) -> float:
+        min_s = float(getattr(self.host, "min_degrade_s", 10.0))
+        if min_s <= 0:
+            return 0.0
+        return max(3 * self.interval_s, min_s)
 
     async def _failed(self, error: ConnectorError) -> None:
         self.stats.failures += 1
@@ -607,12 +664,20 @@ class JobRunner:
             return
         transition = self.stats.failures == 1 or self._unreported
         self._unreported = False
-        self.host.record_failure(self.spec.connection_id, error)
+        self.host.record_failure(self.spec.connection_id, error, job_id=self.spec.job_id)
         if transition:
             logger.warning("Job %s (%s) failed: %s %s", self.spec.job_id, self.spec.protocol, error.code, error)
-        if transition and error.code != "RATE_LIMITED":
-            received = now_iso()
-            await self.host.emit(self.spec, [Sample(str(f["id"]), None, "BAD", None, error.code, received) for f in self.spec.fields])
+        if error.code == "RATE_LIMITED" or self._bad_emitted:
+            return
+        # BAD samples only once the failure is sustained (same hysteresis as connection health):
+        # one transient timeout must not blank every value of the job for a cycle. Until then the
+        # last good values stay current and freshness judges them.
+        reference = self._last_ok_mono if self._last_ok_mono is not None else self._started_mono
+        if time.monotonic() - reference < self._degrade_window_s():
+            return
+        self._bad_emitted = True
+        received = now_iso()
+        await self.host.emit(self.spec, [Sample(str(f["id"]), None, "BAD", None, error.code, received) for f in self.spec.fields])
 
     # ---- push
 
@@ -630,7 +695,11 @@ class JobRunner:
 
     def _push_state(self, connector: Any) -> None:
         if connector.state != "UP" and connector.last_error_code:
-            self.host.record_failure(self.spec.connection_id, ConnectorError(connector.last_error_code, connector.last_error or "Disconnected."))
+            self.host.record_failure(
+                self.spec.connection_id,
+                ConnectorError(connector.last_error_code, connector.last_error or "Disconnected."),
+                job_id=self.spec.job_id,
+            )
 
     async def _consume_mqtt(self, connector: MqttConnector) -> None:
         spec = self.spec
@@ -669,8 +738,9 @@ class JobRunner:
 
     async def _emit_push(self, samples: list[Sample]) -> None:
         self.stats.failures = 0
+        self._mark_ok()
         emitted = await self.host.emit(self.spec, samples)
-        self.host.record_ok(self.spec.connection_id, None, emitted, samples[-1].received_time if samples else None)
+        self.host.record_ok(self.spec.connection_id, None, emitted, samples[-1].received_time if samples else None, job_id=self.spec.job_id)
 
     async def _consume_ws(self, connector: WebSocketConnector) -> None:
         spec = self.spec

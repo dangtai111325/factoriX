@@ -172,8 +172,14 @@ export const EditResourceModal: React.FC<EditResourceModalProps> = ({ isOpen, on
       nextProperties[key] = unchanged ? original : item.value.trim();
     }
 
+    // R1-20: save to the record this dialog loaded, never to another resource the caller might pass
+    // after a selection change.
+    if (detail.id && detail.id !== resource.id) {
+      setError('The selected resource changed while this dialog was open. Close it and open Edit again.');
+      return;
+    }
     try {
-      await save.run(resource.id, {
+      await save.run(detail.id || resource.id, {
         version: Number(detail.version || resource.attributes?.version || 1),
         name: trimmedName,
         code: trimmedCode,

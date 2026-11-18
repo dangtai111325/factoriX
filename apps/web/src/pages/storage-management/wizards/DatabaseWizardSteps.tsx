@@ -230,7 +230,7 @@ export const DatabaseSettingsStep: React.FC<StepProps> = ({ data, onChange, erro
             </p>
           ) : (
             <p className="text-[11px] text-[#8C9BAE] mt-1">
-              Corresponds to TDengine <code className="font-mono text-[#334568]">KEEP</code> option. Minimum 30 days (KEEP &gt;= 3 × DURATION). Data older than this threshold will be pruned automatically.
+              Corresponds to TDengine <code className="font-mono text-[#334568]">KEEP</code> option. Minimum 30 days (KEEP &gt;= 3 x DURATION). Data older than this threshold will be pruned automatically.
             </p>
           )}
         </div>

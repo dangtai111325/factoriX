@@ -17,7 +17,9 @@ import {
 import { SignalItem } from '../../types';
 import { Button } from '../../components/common/Button';
 import { StatusBadge } from '../../components/common/StatusBadge';
-import { QUALITY_HINT, QUALITY_LABEL, formatCurrentSignalValue, formatTimestamp, normalizeQuality, timeAgo } from '../../lib/format';
+import { DELAYED_HINT, QUALITY_HINT, QUALITY_LABEL, delayLabel, formatCurrentSignalValue, formatTimestamp, isDimmedValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { historianLinkForSignal } from './historianLink';
+import { collectorSiteLabel } from '../05_Connections/collectorName';
 
 interface SignalInspectorProps {
   signal: SignalItem | null;
@@ -56,6 +58,8 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
   const staleSec = Math.round((signal.staleAfterMs ?? Math.max(2 * (signal.expectedIntervalMs || 1000), 12000)) / 1000);
   const lastRead = signal.lastAcquiredAt || signal.receivedTime || signal.lastUpdated;
   const lastChange = signal.lastValueChangedAt || signal.sourceTime;
+  const delayed = delayLabel(signal.freshness, lastRead, signal.deliveryLagMs);
+  const openHistorian = () => (onOpenHistorian ? onOpenHistorian(signal) : window.location.assign(historianLinkForSignal(signal.id)));
 
   return (
     <aside
@@ -87,9 +91,14 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
         <div className="p-4 bg-slate-50 border-b border-slate-100 space-y-3">
           <div className="flex items-start justify-between">
             <div>
-              <div className="text-[28px] font-extrabold text-[#111B37] tabular-nums">
+              <div className={`text-[28px] font-extrabold tabular-nums ${isDimmedValue(quality, signal.freshness) ? 'text-slate-400' : 'text-[#111B37]'}`}>
                 {formattedVal}
               </div>
+              {delayed && (
+                <div className="text-[11px] font-semibold text-amber-700" title={DELAYED_HINT}>
+                  {delayed}
+                </div>
+              )}
               <div className="text-[11px] text-[#657794] mt-0.5" title={formatTimestamp(lastRead)}>
                 Last read {timeAgo(lastRead)}
               </div>
@@ -101,11 +110,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
               <StatusBadge status={quality} />
               <button
                 type="button"
-                onClick={() =>
-                  onOpenHistorian
-                    ? onOpenHistorian(signal)
-                    : window.location.assign(`/historian/historian?signalId=${signal.id}`)
-                }
+                onClick={openHistorian}
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold text-[#EF1B24] bg-white border border-[#FAC6C9] hover:bg-[#FEF2F2] transition-colors shadow-2xs cursor-pointer"
                 title="Open this signal in Historian & Storage trend workspace"
               >
@@ -121,10 +126,12 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
             <span className="font-semibold text-slate-700">{QUALITY_LABEL[quality]}</span>
             {signal.reasonCode ? <span className="font-mono"> · {signal.reasonCode}</span> : null}
             {' — '}
-            {quality === 'GOOD'
+            {quality === 'GOOD' && delayed
+              ? DELAYED_HINT
+              : quality === 'GOOD'
               ? 'Value read successfully within the expected interval.'
               : quality === 'STALE'
-              ? `No new read within ${staleSec} s.`
+              ? `No new read from the source within ${staleSec} s; the last value is shown.`
               : quality === 'UNCERTAIN' && signal.reasonCode === 'UNVERIFIED_AFTER_RESTART'
               ? 'Restored from historian after restart; waiting for the first fresh acquisition.'
               : quality === 'UNCERTAIN'
@@ -168,8 +175,10 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
               </span>
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-[#657794]">Edge collector:</span>
-              <span className="font-medium text-[#111B37]">{edgeName || '—'}</span>
+              <span className="text-[#657794]">Collected by:</span>
+              <span className="font-medium text-[#111B37]">
+                {edgeName ? `Built-in collector · ${collectorSiteLabel(edgeName)}` : '—'}
+              </span>
             </div>
           </div>
 
@@ -208,20 +217,6 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
           <Button variant="outline" size="sm" onClick={() => onEdit(signal)}>
             <Edit2 className="w-3.5 h-3.5 mr-1.5" />
             Edit
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() =>
-              onOpenHistorian
-                ? onOpenHistorian(signal)
-                : window.location.assign(`/historian/historian?signalId=${signal.id}`)
-            }
-            className="text-[#EF1B24] border-[#FAC6C9] hover:bg-[#FEF2F2]"
-            title="Open in Historian"
-          >
-            <LineChart className="w-3.5 h-3.5 mr-1.5 text-[#EF1B24]" />
-            Historian
           </Button>
         </div>
 

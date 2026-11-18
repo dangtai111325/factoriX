@@ -19,6 +19,7 @@ import { ChangePasswordModal } from '../modals/ChangePasswordModal';
 import { AboutFactorixModal } from '../modals/AboutFactorixModal';
 import { ConnectivityBanner } from './ConnectivityBanner';
 import { toggleSidebar, useSidebarOpen } from './sidebarState';
+import { useModelSync } from './modelSync';
 
 const ROUTE_BREADCRUMBS: Record<string, { group?: string; title: string }> = {
   '/overview': { title: 'Overview' },
@@ -29,7 +30,9 @@ const ROUTE_BREADCRUMBS: Record<string, { group?: string; title: string }> = {
   '/collector/add-data': { group: 'Data Collector', title: 'Add Data' },
   '/models': { group: 'Data Models', title: 'Model Catalog' },
   '/dashboards': { group: 'Coming soon', title: 'Dashboards' },
-  '/historian': { group: 'Coming soon', title: 'Historian & Storage' },
+  '/historian': { group: 'Historian & Storage', title: 'Storage Management' },
+  '/historian/storage': { group: 'Historian & Storage', title: 'Storage Management' },
+  '/historian/historian': { group: 'Historian & Storage', title: 'Historian' },
   '/alarms': { group: 'Coming soon', title: 'Alarms & Events' },
   '/analytics': { group: 'Coming soon', title: 'Analytics' },
   '/reports': { group: 'Coming soon', title: 'Reports' },
@@ -39,7 +42,9 @@ const ROUTE_BREADCRUMBS: Record<string, { group?: string; title: string }> = {
 export const Topbar: React.FC = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { setSearchOpen, resources } = useApp();
+  const { setSearchOpen, resources, refresh } = useApp();
+  // R1-42: a change made in another tab (or while this tab was hidden) reloads the lists here.
+  useModelSync(refresh);
   const collector = useCollectorHealth();
   const { state, signOut } = useAuth();
   const navOpen = useSidebarOpen();
@@ -91,6 +96,12 @@ export const Topbar: React.FC = () => {
     }
     if (location.pathname.startsWith('/models')) {
       return { group: 'Data Models', title: 'Model Catalog' };
+    }
+    if (location.pathname.startsWith('/historian/storage')) {
+      return { group: 'Historian & Storage', title: 'Storage Management' };
+    }
+    if (location.pathname.startsWith('/historian')) {
+      return { group: 'Historian & Storage', title: 'Historian' };
     }
     return { title: 'FactoriX' };
   }, [location.pathname]);

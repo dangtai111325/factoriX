@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 # MQTT 3.1.1 CONNACK 4/5 and MQTT 5 reason codes for rejected credentials.
 _AUTH_CODES = {4, 5, 134, 135}
+# Persistent session (clean_session=False / MQTT 5 clean_start=False): the broker keeps the
+# subscriptions and queues QoS>=1 messages while the client is away, so a reconnect does not lose
+# them. MQTT 5 sessions expire after this many seconds without the client.
+SESSION_EXPIRY_S = 3600
+RECONNECT_MIN_S = 1
+RECONNECT_MAX_S = 10
 
 Message = tuple[str, Any, str, str]  # (topic, decoded JSON payload, arrival time ISO, payload text as received)
 
@@ -97,9 +103,13 @@ class MqttConnector:
         self.client = self._build_client(client_id)
 
         self.state = "DOWN"
+        self.down_since: float | None = time.monotonic()
         self.last_error_code: str | None = None
         self.last_error: str | None = None
         self.last_message_at: str | None = None
+        self.connects = 0
+        self.disconnects = 0
+        self.session_present: bool | None = None
         self.messages = 0
         self.decode_errors = 0
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -122,7 +132,7 @@ class MqttConnector:
             client.tls_set(ca_certs=self._ca_path) if self._ca_path else client.tls_set()
             if self.tls_insecure:
                 client.tls_insecure_set(True)
-        client.reconnect_delay_set(min_delay=1, max_delay=30)
+        client.reconnect_delay_set(min_delay=RECONNECT_MIN_S, max_delay=RECONNECT_MAX_S)
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_connect_fail = self._on_connect_fail
@@ -178,7 +188,15 @@ class MqttConnector:
         self._loop = asyncio.get_running_loop()
         self._connected_event = asyncio.Event()
         try:
-            self.client.connect_async(self.host, self.port, keepalive=self.keepalive)
+            if self.protocol_version == mqtt.MQTTv5:
+                from paho.mqtt.packettypes import PacketTypes
+                from paho.mqtt.properties import Properties
+
+                props = Properties(PacketTypes.CONNECT)
+                props.SessionExpiryInterval = 0 if self.clean_session else SESSION_EXPIRY_S
+                self.client.connect_async(self.host, self.port, keepalive=self.keepalive, clean_start=self.clean_session, properties=props)
+            else:
+                self.client.connect_async(self.host, self.port, keepalive=self.keepalive)
         except (OSError, ValueError) as exc:
             raise ConnectorError("NETWORK", f"Cannot connect to MQTT broker {self.host}:{self.port}.") from exc
         self.client.loop_start()
@@ -227,9 +245,10 @@ class MqttConnector:
             logger.debug("MQTT message after event loop closed")
 
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any, reason_code: Any, properties: Any = None) -> None:
-        del client, userdata, flags, properties
+        del client, userdata, properties
         code = int(getattr(reason_code, "value", reason_code) or 0)
-        self._call(self._connected, code, str(reason_code))
+        present = getattr(flags, "session_present", None)
+        self._call(self._connected, code, str(reason_code), present)
 
     def _on_connect_fail(self, client: mqtt.Client, userdata: Any) -> None:
         del client, userdata
@@ -252,7 +271,7 @@ class MqttConnector:
             return
         self._call(self._dispatch, (message.topic, payload, arrival, raw))
 
-    def _connected(self, code: int, text: str) -> None:
+    def _connected(self, code: int, text: str, session_present: bool | None = None) -> None:
         if code != 0:
             if code in _AUTH_CODES:
                 self.state = "AUTH_FAILED"
@@ -264,7 +283,17 @@ class MqttConnector:
                 self._connected_event.set()
             return
         if self.last_error_code is not None:
-            logger.info("MQTT %s:%s connected again after: %s", self.host, self.port, self.last_error)
+            logger.info(
+                "MQTT %s:%s (client %s) connected again after: %s (session resumed: %s)",
+                self.host,
+                self.port,
+                self.client_id,
+                self.last_error,
+                session_present,
+            )
+        self.connects += 1
+        self.session_present = session_present
+        self.down_since = None
         self.state = "UP"
         self.last_error_code = None
         self.last_error = None
@@ -275,7 +304,11 @@ class MqttConnector:
 
     def _set_down(self, code: str, text: str) -> None:
         if self.state == "UP":
+            self.disconnects += 1
+            self.down_since = time.monotonic()
             logger.warning("MQTT %s:%s (client %s) went down: %s %s", self.host, self.port, self.client_id, code, text)
+        elif self.down_since is None:
+            self.down_since = time.monotonic()
         if self.state != "AUTH_FAILED" or code != "NETWORK":
             self.state = "DOWN"
         self.last_error_code = code

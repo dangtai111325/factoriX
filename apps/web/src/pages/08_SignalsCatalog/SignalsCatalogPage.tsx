@@ -39,7 +39,8 @@ import { sortBySourceOrder } from './signalOrder';
 import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { api } from '../../api/client';
 import { PROTOCOL_LABEL } from '../../lib/protocols';
-import { formatCurrentSignalValue, formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { DELAYED_HINT, delayLabel, formatCurrentSignalValue, formatTimestamp, formatValue, isDimmedValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { historianLinkForSignal } from './historianLink';
 import { fetchSignalUsage, fetchSignalsUsage } from '../../lib/impactApi';
 import { indeterminateRef, useRangeSelection } from './useRangeSelection';
 import { useSubmit } from '../../lib/useSubmit';
@@ -256,6 +257,9 @@ export const SignalsCatalogPage: React.FC = () => {
   // Bulk selection with Shift+click ranges over the visible (filtered) order; see below.
   const allSignalIds = useMemo(() => signals.map((s) => s.id), [signals]);
   const [trendSignals, setTrendSignals] = useState<SignalItem[]>([]);
+  // R1-39: sortable table columns (null = source order, the default).
+  const [sortKey, setSortKey] = useState<SortKey | null>(null);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
   const [timeframe, setTimeframe] = useState<'15m' | '1h' | '6h'>('15m');
 
   // Toast / Feedback (shared toast: pauses on hover / focus, keyboard reachable).
@@ -400,9 +404,51 @@ export const SignalsCatalogPage: React.FC = () => {
     getResourceSubtree,
   ]);
 
+  const sortedSignals = useMemo(() => {
+    if (!sortKey) return filteredSignals;
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+    const resName = new Map(resources.map((r) => [r.id, r.name || r.code || '']));
+    const keyOf = (sig: SignalItem): string | number => {
+      switch (sortKey) {
+        case 'signal':
+          return sig.key || sig.tag || sig.name || '';
+        case 'resource':
+          return resName.get(sig.resourceId) || sig.resourcePath || '';
+        case 'value':
+          return typeof sig.value === 'number' ? sig.value : String(sig.value ?? '');
+        case 'quality':
+          return QUALITY_ORDER.indexOf(normalizeQuality(sig.quality));
+        case 'read':
+          return Date.parse(sig.lastAcquiredAt || sig.receivedTime || sig.lastUpdated || '') || 0;
+        case 'change':
+          return Date.parse(sig.lastValueChangedAt || sig.sourceTime || '') || 0;
+        default:
+          return '';
+      }
+    };
+    const factor = sortDir === 'asc' ? 1 : -1;
+    return [...filteredSignals].sort((a, b) => {
+      const ka = keyOf(a);
+      const kb = keyOf(b);
+      const cmp = typeof ka === 'number' && typeof kb === 'number' ? ka - kb : collator.compare(String(ka), String(kb));
+      return cmp * factor;
+    });
+  }, [filteredSignals, sortKey, sortDir, resources]);
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey !== key) {
+      setSortKey(key);
+      setSortDir('asc');
+    } else if (sortDir === 'asc') {
+      setSortDir('desc');
+    } else {
+      setSortKey(null); // third click: back to source order
+    }
+  };
+
   // Bulk Selection: Shift+click selects a range in the visible order; the header checkbox selects or
   // clears every visible (filtered) signal and leaves hidden selections alone.
-  const visibleIds = useMemo(() => filteredSignals.map((s) => s.id), [filteredSignals]);
+  const visibleIds = useMemo(() => sortedSignals.map((s) => s.id), [sortedSignals]);
   const selection = useRangeSelection(visibleIds, allSignalIds);
   const selectedIds = useMemo(() => Array.from(selection.selected), [selection.selected]);
   const visibleSelectionState = selection.stateOf(visibleIds);
@@ -572,7 +618,9 @@ export const SignalsCatalogPage: React.FC = () => {
           <p className="text-[13px] text-[#657794]">
             {loadState !== 'ready' && signals.length === 0
               ? 'Signal catalog with live values (loading…)'
-              : `Signal catalog with live values (${signals.length} signal${signals.length === 1 ? '' : 's'})`}
+              : filteredSignals.length === signals.length
+                ? `Signal catalog with live values (${signals.length} signal${signals.length === 1 ? '' : 's'})`
+                : `Signal catalog with live values (${filteredSignals.length} of ${signals.length} signals)`}
           </p>
         </div>
 
@@ -946,9 +994,12 @@ export const SignalsCatalogPage: React.FC = () => {
                       </div>
 
                       <div className="mt-2.5">
-                        <div className="text-[22px] font-black font-mono text-[#0B2545] tabular-nums truncate">
+                        <div
+                          className={`text-[22px] font-black font-mono tabular-nums truncate ${isDimmedValue(sig.quality, sig.freshness) ? 'text-slate-400' : 'text-[#0B2545]'}`}
+                        >
                           {formattedVal}
                         </div>
+                        <DelayNote sig={sig} />
                       </div>
 
                       <div className="mt-2.5 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px]">
@@ -997,17 +1048,17 @@ export const SignalsCatalogPage: React.FC = () => {
                             className="rounded border-slate-300 text-blue-600 focus:ring-0"
                           />
                         </th>
-                        <th className="py-2.5 px-3">Signal Variable</th>
-                        <th className="py-2.5 px-3">Resource</th>
-                        <th className="py-2.5 px-3">Value</th>
+                        <SortHeader label="Signal Variable" column="signal" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                        <SortHeader label="Resource" column="resource" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                        <SortHeader label="Value" column="value" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                         <th className="py-2.5 px-3">Trend 15 min</th>
-                        <th className="py-2.5 px-3">Quality</th>
-                        <th className="py-2.5 px-3 text-right">Last read</th>
-                        <th className="py-2.5 px-3 text-right">Last change</th>
+                        <SortHeader label="Quality" column="quality" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                        <SortHeader label="Last read" column="read" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} align="right" />
+                        <SortHeader label="Last change" column="change" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} align="right" />
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {filteredSignals.map((sig) => {
+                      {sortedSignals.map((sig) => {
                         const res = resources.find((r) => r.id === sig.resourceId);
                         const isChecked = selection.isSelected(sig.id);
                         const formattedVal = formatCurrentSignalValue(sig.value, sig.quality, sig.enabled !== false);
@@ -1062,8 +1113,11 @@ export const SignalsCatalogPage: React.FC = () => {
                             <td className="py-2.5 px-3 text-[#657794] font-mono text-[11px] max-w-[220px] truncate" title={res?.name || sig.resourcePath}>
                               {res?.name || sig.resourcePath || '—'}
                             </td>
-                            <td className="py-2.5 px-3 font-mono font-black text-xs text-[#0B2545] tabular-nums">
+                            <td
+                              className={`py-2.5 px-3 font-mono font-black text-xs tabular-nums ${isDimmedValue(sig.quality, sig.freshness) ? 'text-slate-400' : 'text-[#0B2545]'}`}
+                            >
                               {formattedVal}
+                              <DelayNote sig={sig} />
                             </td>
                             <td className="py-2.5 px-3">
                               {classifyType(sig.data_type || sig.dataType) === 'text' || classifyType(sig.data_type || sig.dataType) === 'boolean' ? (
@@ -1107,7 +1161,7 @@ export const SignalsCatalogPage: React.FC = () => {
         connectionName={selectedSignal?.sourceConnectionName || connections.find((c) => c.id === selectedSignal?.sourceConnectionId)?.name}
         edgeName={selectedSignal?.edgeName}
         onClose={() => setSelectedSignal(null)}
-        onOpenHistorian={(sig) => navigate(`/historian/historian?signalId=${sig.id}`)}
+        onOpenHistorian={(sig) => navigate(historianLinkForSignal(sig.id))}
         onEdit={(sig) => setEditTarget(sig)}
         onToggleEnabled={handleToggleEnabled}
         togglePending={setEnabled.pending}
@@ -1240,6 +1294,49 @@ export const SignalsCatalogPage: React.FC = () => {
       </ConfirmDialog>
 
       <ActionToast toast={toast} onDismiss={dismissToast} />
+    </div>
+  );
+};
+
+type SortKey = 'signal' | 'resource' | 'value' | 'quality' | 'read' | 'change';
+
+/** Sort order of the Quality column: problems first when descending. */
+const QUALITY_ORDER = ['GOOD', 'UNCERTAIN', 'PAUSED', 'DISABLED', 'NO_DATA', 'STALE', 'BAD', 'NO_CONNECTION'];
+
+const SortHeader: React.FC<{
+  label: string;
+  column: SortKey;
+  sortKey: SortKey | null;
+  sortDir: 'asc' | 'desc';
+  onSort: (key: SortKey) => void;
+  align?: 'right';
+}> = ({ label, column, sortKey, sortDir, onSort, align }) => {
+  const active = sortKey === column;
+  return (
+    <th
+      className={`py-2.5 px-3 ${align === 'right' ? 'text-right' : ''}`}
+      aria-sort={active ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
+    >
+      <button
+        type="button"
+        onClick={() => onSort(column)}
+        className={`inline-flex items-center gap-1 uppercase tracking-wider font-semibold hover:text-[#0B2545] ${active ? 'text-[#0B2545]' : ''}`}
+        title={active ? `Sorted ${sortDir === 'asc' ? 'ascending' : 'descending'}; click to change` : `Sort by ${label}`}
+      >
+        {label}
+        <span aria-hidden className="text-[9px]">{active ? (sortDir === 'asc' ? '▲' : '▼') : '↕'}</span>
+      </button>
+    </th>
+  );
+};
+
+/** "Delayed 34 s": the value is current at the source but late in the pipeline (kept visible). */
+const DelayNote: React.FC<{ sig: SignalItem }> = ({ sig }) => {
+  const label = delayLabel(sig.freshness, sig.lastAcquiredAt || sig.receivedTime, sig.deliveryLagMs);
+  if (!label) return null;
+  return (
+    <div className="text-[10px] font-semibold text-amber-700 font-sans" title={DELAYED_HINT}>
+      {label}
     </div>
   );
 };

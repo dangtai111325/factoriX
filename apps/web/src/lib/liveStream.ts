@@ -6,7 +6,10 @@
  *   {type:"health", entity:"edge"|"connection", id, health, effective_health, last_error, last_success_at}
  *   {type:"model_body", group_id, body}     body = exact ordered JSON text
  *   {type:"model_event", group_id, event_id, body}
- *   {type:"subscribed", count}              ack for a signal subscription
+ *   {type:"subscribed", count, rejected?, heartbeat_s?}  ack for a signal subscription
+ *   {type:"heartbeat", seq, server_time, pipeline?:{[connection_id]:{source_ok_at, delivered_at, delivery_lag_ms}}}
+ *                                           every 5 s on every socket (liveness + server clock)
+ *   {type:"resync"}                         the server missed events (e.g. its NOTIFY bridge reconnected)
  * Client -> server:
  *   {op:"subscribe", signal_ids:[...]}      replaces the signal subscription of this socket
  *   {op:"subscribe_models", group_ids:[...]}
@@ -15,6 +18,11 @@
  *
  * The socket is opened lazily when the first subscriber registers and closed when the last one leaves.
  * It reconnects with exponential backoff and re-sends every subscription after a reconnect.
+ *
+ * Liveness: an "open" socket is not trusted blindly. If no frame (heartbeat, pong or data) arrives
+ * for 3 heartbeat periods the socket is dropped, push coverage becomes empty (callers poll REST)
+ * and a reconnect starts. Freshness (FRESH / DELAYED / STALE) is decided by the server; the client
+ * only renders it and computes the displayed age with the server clock offset.
  */
 import { useSyncExternalStore } from 'react'
 
@@ -38,6 +46,18 @@ export interface LatestMsg {
   connection_health?: string | null
   broker_health?: string | null
   storage_health?: string | null
+  /** FRESH | DELAYED | STALE | UNKNOWN | NO_DATA (server evaluated). */
+  freshness?: string | null
+  /** Set when DELAYED: the value is current at the source but late in the pipeline. */
+  delivery_lag_ms?: number | null
+  age_ms?: number | null
+  connection_id?: string | null
+}
+
+export interface PipelineEntry {
+  source_ok_at?: string | null
+  delivered_at?: string | null
+  delivery_lag_ms?: number | null
 }
 
 export interface HealthMsg {
@@ -88,10 +108,23 @@ let backoffMs = 1000
 let lastRequestedSignalIds: string[] = []
 /** How many of `lastRequestedSignalIds` the server acknowledged (it may cap the list). */
 let acknowledgedCount = 0
+/** Ids the server refused (unknown / other tenant); everything else requested is pushed. */
+let rejectedIds = new Set<string>()
 const coverageListeners = new Set<() => void>()
+const resyncListeners = new Set<() => void>()
+const pipelineListeners = new Set<() => void>()
+let lastFrameAt = 0
+let heartbeatSeen = false
+let heartbeatMs = 5000
+let livenessTimer: number | null = null
+/** server_time - Date.now(), from heartbeats and pongs. */
+let serverOffsetMs = 0
+let pipeline: Record<string, PipelineEntry> = {}
 
 const MAX_BACKOFF_MS = 30000
-const PING_INTERVAL_MS = 25000
+const PING_INTERVAL_MS = 10000
+/** Without heartbeats (older server) the 10 s ping/pong is the liveness probe. */
+const PONG_TIMEOUT_MS = 25000
 
 function setStatus(next: StreamStatus): void {
   if (status === next) return
@@ -119,6 +152,7 @@ function sendSubscriptions(): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) return
   lastRequestedSignalIds = Array.from(signalSubs.keys())
   acknowledgedCount = 0
+  rejectedIds = new Set()
   send({ op: 'subscribe', signal_ids: lastRequestedSignalIds })
   if (modelSubs.size > 0) send({ op: 'subscribe_models', group_ids: Array.from(modelSubs.keys()) })
   if (healthSubs.size > 0) send({ op: 'subscribe_health' })
@@ -152,6 +186,41 @@ function clearTimers(): void {
     window.clearInterval(pingTimer)
     pingTimer = null
   }
+  if (livenessTimer !== null) {
+    window.clearInterval(livenessTimer)
+    livenessTimer = null
+  }
+}
+
+function noteServerTime(value: unknown): void {
+  if (typeof value !== 'string') return
+  const ms = Date.parse(value)
+  if (Number.isFinite(ms)) serverOffsetMs = ms - Date.now()
+}
+
+/** Drop a socket that looks open but delivers nothing (half-open TCP, stuck server sender). */
+function checkLiveness(): void {
+  if (!socket || status !== 'open') return
+  const limit = heartbeatSeen ? heartbeatMs * 3 : PONG_TIMEOUT_MS
+  if (Date.now() - lastFrameAt <= limit) return
+  console.warn(`liveStream: no frame for ${Math.round((Date.now() - lastFrameAt) / 1000)} s; reconnecting`)
+  const dead = socket
+  socket = null
+  dead.onopen = null
+  dead.onclose = null
+  dead.onerror = null
+  dead.onmessage = null
+  try {
+    dead.close()
+  } catch {
+    // already broken
+  }
+  clearTimers()
+  lastRequestedSignalIds = []
+  acknowledgedCount = 0
+  setStatus('closed')
+  backoffMs = 1000
+  scheduleReconnect()
 }
 
 function disconnect(): void {
@@ -194,6 +263,21 @@ function dispatch(raw: unknown): void {
   if (!raw || typeof raw !== 'object') return
   const msg = raw as { type?: string } & Record<string, unknown>
   switch (msg.type) {
+    case 'heartbeat': {
+      heartbeatSeen = true
+      noteServerTime(msg.server_time)
+      if (msg.pipeline && typeof msg.pipeline === 'object') {
+        pipeline = { ...pipeline, ...(msg.pipeline as Record<string, PipelineEntry>) }
+        pipelineListeners.forEach((listener) => listener())
+      }
+      break
+    }
+    case 'pong':
+      noteServerTime(msg.server_time)
+      break
+    case 'resync':
+      resyncListeners.forEach((listener) => listener())
+      break
     case 'latest': {
       const id = String(msg.signal_id ?? '')
       const subs = signalSubs.get(id)
@@ -213,6 +297,9 @@ function dispatch(raw: unknown): void {
     case 'subscribed': {
       const count = Number(msg.count)
       acknowledgedCount = Number.isFinite(count) ? count : 0
+      rejectedIds = new Set(Array.isArray(msg.rejected) ? (msg.rejected as unknown[]).map(String) : [])
+      const hb = Number(msg.heartbeat_s)
+      if (Number.isFinite(hb) && hb > 0) heartbeatMs = hb * 1000
       coverageListeners.forEach((listener) => listener())
       break
     }
@@ -237,11 +324,15 @@ function connect(): void {
   socket = ws
   ws.onopen = () => {
     backoffMs = 1000
+    lastFrameAt = Date.now()
+    heartbeatSeen = false
     setStatus('open')
     sendSubscriptions()
     pingTimer = window.setInterval(() => send({ op: 'ping' }), PING_INTERVAL_MS)
+    livenessTimer = window.setInterval(checkLiveness, 2000)
   }
   ws.onmessage = (event) => {
+    lastFrameAt = Date.now()
     try {
       dispatch(JSON.parse(String(event.data)))
     } catch (error) {
@@ -352,7 +443,45 @@ export function useStreamStatus(): StreamStatus {
  */
 export function getPushedSignalIds(): Set<string> {
   if (status !== 'open') return new Set()
-  return new Set(lastRequestedSignalIds.slice(0, acknowledgedCount))
+  // The server reports what it refused (unknown ids): coverage is the accepted ids, capped at its count.
+  const accepted = rejectedIds.size > 0 ? lastRequestedSignalIds.filter((id) => !rejectedIds.has(id)) : lastRequestedSignalIds
+  return new Set(accepted.slice(0, acknowledgedCount))
+}
+
+/** Server clock minus browser clock (ms), learned from heartbeats/pongs. 0 until known. */
+export function getServerOffsetMs(): number {
+  return serverOffsetMs
+}
+
+/** Server "now" in epoch ms (browser clock corrected by the heartbeat offset). */
+export function serverNowMs(): number {
+  return Date.now() + serverOffsetMs
+}
+
+/** Per-connection delivery evidence from the latest heartbeat (source read time, newest delivered data). */
+export function getPipeline(): Record<string, PipelineEntry> {
+  return pipeline
+}
+
+export function onPipelineChange(listener: () => void): () => void {
+  pipelineListeners.add(listener)
+  return () => {
+    pipelineListeners.delete(listener)
+  }
+}
+
+/** React hook: delivery evidence of one connection from the stream heartbeat (undefined if unknown). */
+export function usePipelineEntry(connectionId: string | undefined): PipelineEntry | undefined {
+  const snapshot = useSyncExternalStore(onPipelineChange, getPipeline, getPipeline)
+  return connectionId ? snapshot[connectionId.toLowerCase()] : undefined
+}
+
+/** Called when the server asks clients to refetch (it may have missed pushes). */
+export function onStreamResync(listener: () => void): () => void {
+  resyncListeners.add(listener)
+  return () => {
+    resyncListeners.delete(listener)
+  }
 }
 
 /** Listen for changes of `getPushedSignalIds()` (socket state or subscription acknowledgement). */

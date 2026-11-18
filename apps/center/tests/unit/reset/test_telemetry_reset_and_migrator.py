@@ -343,6 +343,10 @@ def _fake_tdengine() -> Any:
         ]
     )
     client.execute_sql = AsyncMock(return_value=0)
+    client.query_rows = AsyncMock(
+        return_value=[{"stable_name": "op_float64"}, {"stable_name": "op_int64"},
+                      {"stable_name": "model_snapshots"}, {"stable_name": "st_line1"}]
+    )
     client.ensure_operational_schema = AsyncMock(return_value=f"fx_t_{TENANT_ID.hex}")
     client.write_operational_observations = AsyncMock(
         side_effect=lambda _tid, recs, **_: BatchWriteResult(
@@ -356,7 +360,6 @@ def _fake_tdengine() -> Any:
             failures=(),
         )
     )
-    client.query_rows = AsyncMock(return_value=[])
     return client
 
 
@@ -502,10 +505,13 @@ async def test_execute_runs_r0_through_r5_fences_epoch_and_strictly_preserves_co
     assert result["cleared"]["broker_messages_purged"] == 27
     assert result["cleared"]["tdengine_subtables_total"] == 4
 
-    # Verify TDengine subtables were dropped and operational STable schema was re-ensured
-    dropped_sqls = [call.args[0] for call in td.execute_sql.call_args_list]
-    assert len(dropped_sqls) == 4
-    assert all(s.startswith("DROP TABLE IF EXISTS `fx_t_") for s in dropped_sqls)
+    # Plan §10: rows are deleted per STABLE; no table (operational or user-created) is dropped,
+    # so schema, subtables and their TAG values survive the reset.
+    td_sqls = [call.args[0] for call in td.execute_sql.call_args_list]
+    assert len(td_sqls) == 4
+    assert all(s.startswith("DELETE FROM `fx_t_") for s in td_sqls)
+    assert not any("DROP" in s.upper() for s in td_sqls)
+    assert "`st_line1`" in td_sqls[-1]
     td.ensure_operational_schema.assert_awaited_once_with(TENANT_ID)
 
     # Verify LiveStateProvider cache for TENANT_ID was invalidated and fenced to epoch 2

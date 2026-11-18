@@ -7,7 +7,10 @@ Provides:
 - Real foreign key relationships (from pg_constraint) vs inferred relationships.
 - Sanitized data preview with secret/password/token masking.
 
-Zero write operations. All table/schema names validated against pg catalog.
+Zero write operations: the explorer never accepts SQL text. Every statement is a SELECT generated
+here from identifiers validated against the catalog, runs under ``SET LOCAL statement_timeout`` and
+is refused for credential/session/audit tables (P1-14). It runs with the application's database
+role (no separate read-only role is provisioned), which the UI states truthfully.
 """
 
 from __future__ import annotations
@@ -37,7 +40,11 @@ SENSITIVE_TABLES = frozenset({
     "secret_store",
     "sessions",
     "password_reset_codes",
+    "edge_enrollment_tokens",
+    "login_throttle",
+    "audit_events",
 })
+PREVIEW_TIMEOUT_MS = 5000
 
 # Columns whose values MUST be masked in data preview
 SENSITIVE_COLUMN_PATTERNS = re.compile(
@@ -86,12 +93,22 @@ class PostgresExplorerService:
             """,
             {},
         )
+        counts = await fetch_all(
+            session,
+            """
+            SELECT table_schema, COUNT(*) FILTER (WHERE table_type = 'BASE TABLE') AS tables,
+                   COUNT(*) FILTER (WHERE table_type = 'VIEW') AS views
+            FROM information_schema.tables GROUP BY table_schema
+            """,
+            {},
+        )
+        by_schema = {str(c["table_schema"]): c for c in counts}
         return [
             {
                 "name": str(r["schema_name"]),
                 "schema_name": str(r["schema_name"]),
-                "table_count": 0,
-                "view_count": 0,
+                "table_count": int((by_schema.get(str(r["schema_name"])) or {}).get("tables") or 0),
+                "view_count": int((by_schema.get(str(r["schema_name"])) or {}).get("views") or 0),
             }
             for r in rows
         ]
@@ -109,7 +126,7 @@ class PostgresExplorerService:
             SELECT
                 t.table_name,
                 t.table_type,
-                COALESCE(c.reltuples::bigint, 0) AS estimated_rows,
+                c.reltuples::bigint AS estimated_rows,
                 (
                     SELECT count(*)
                     FROM information_schema.columns col
@@ -117,8 +134,8 @@ class PostgresExplorerService:
                       AND col.table_name = t.table_name
                 ) AS column_count
             FROM information_schema.tables t
-            LEFT JOIN pg_class c ON c.relname = t.table_name
-            LEFT JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.table_schema
+            LEFT JOIN pg_namespace n ON n.nspname = t.table_schema
+            LEFT JOIN pg_class c ON c.relname = t.table_name AND c.relnamespace = n.oid
             WHERE t.table_schema = :schema
             ORDER BY t.table_name
             """,
@@ -132,8 +149,9 @@ class PostgresExplorerService:
                 "table_name": str(r["table_name"]),
                 "type": "VIEW" if "VIEW" in str(r["table_type"]).upper() else "BASE TABLE",
                 "table_type": "VIEW" if "VIEW" in str(r["table_type"]).upper() else "TABLE",
-                "estimated_rows": max(0, int(r["estimated_rows"] or 0)),
-                "row_count_estimate": max(0, int(r["estimated_rows"] or 0)),
+                # reltuples is -1 until the table is analyzed: report "unknown", not 0 (R1-35)
+                "estimated_rows": int(r["estimated_rows"]) if r["estimated_rows"] is not None and int(r["estimated_rows"]) >= 0 else None,
+                "row_count_estimate": int(r["estimated_rows"]) if r["estimated_rows"] is not None and int(r["estimated_rows"]) >= 0 else None,
                 "column_count": int(r["column_count"] or 0),
             }
             for r in rows
@@ -390,7 +408,11 @@ class PostgresExplorerService:
         quoted_cols = ", ".join(f'"{c}"' for c in column_names)
         sql = f'SELECT {quoted_cols} FROM "{schema}"."{table}"{where_clause} LIMIT {safe_limit} OFFSET {safe_offset}'
 
+        from factorix.modules.common import execute
+
+        await execute(session, f"SET LOCAL statement_timeout = {int(PREVIEW_TIMEOUT_MS)}", {})
         rows = await fetch_all(session, sql, params)
+        json_cols = {str(r["column_name"]) for r in col_rows if str(r.get("data_type") or "").lower() in ("json", "jsonb")}
 
         # Mask sensitive columns and nested secrets in JSON
         masked_rows = []
@@ -398,6 +420,13 @@ class PostgresExplorerService:
             row_dict: dict[str, Any] = {}
             for col in column_names:
                 val = r.get(col)
+                if col in json_cols and isinstance(val, str):
+                    import json as _json
+
+                    try:
+                        val = _json.loads(val)
+                    except ValueError:
+                        pass
                 if SENSITIVE_COLUMN_PATTERNS.search(col):
                     row_dict[col] = "********" if val is not None else None
                 elif isinstance(val, (dict, list)):

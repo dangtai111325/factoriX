@@ -54,7 +54,7 @@ async def test_ingestion_flushes_a_full_delivery_window_without_waiting_for_time
 
 
 @pytest.mark.asyncio
-async def test_dual_lane_delivery_windows_do_not_flush_at_legacy_limit():
+async def test_each_lane_wakes_on_its_own_delivery_window():
     worker = IngestionWorker(
         pg_store=MagicMock(), tdengine=MagicMock(), batch_size=8, flush_ms=5_000,
         broker_cfg=BrokerConfig(
@@ -65,13 +65,15 @@ async def test_dual_lane_delivery_windows_do_not_flush_at_legacy_limit():
     message = MagicMock(body=b"{}", message_id="message", headers={}, redelivered=False)
     handlers = [worker.handle_live_message, worker.handle_legacy_message,
                 worker.handle_live_message, worker.handle_live_message, worker.handle_legacy_message]
+    expected = [(False, False), (False, False), (False, False), (True, False), (True, True)]
     tasks = []
     try:
         for index, handle in enumerate(handlers):
             tasks.append(asyncio.create_task(handle(message)))
             await asyncio.sleep(0)
-            assert worker._wake_batcher.is_set() == (index == len(handlers) - 1)
-        assert len(worker._take_pending_batch()) == 5
+            assert (worker._wake_live.is_set(), worker._wake_legacy.is_set()) == expected[index]
+        assert len(worker._take_lane_batch("live")) == 3
+        assert len(worker._take_lane_batch("legacy")) == 2
     finally:
         for task in tasks:
             task.cancel()
@@ -656,7 +658,7 @@ async def test_emit_chunked_notify_respects_count_and_8kb_limit() -> None:
     _, channel, payloads = conn.execute.await_args.args
     assert channel == "factorix_stream_events"
     batches = [json.loads(payload)["events"] for payload in payloads]
-    assert [len(batch) for batch in batches] == [20, 20, 5]
+    assert [len(batch) for batch in batches] == [45]  # one NOTIFY while the payload fits
     assert [event for batch in batches for event in batch] == events
     assert all(len(payload.encode("utf-8")) < 8000 for payload in payloads)
 
@@ -861,45 +863,51 @@ async def test_formula_seed_requires_causal_active_epoch_sample(alias_epoch: int
 
 
 @pytest.mark.asyncio
-async def test_two_lane_fair_batching_ratio() -> None:
+async def test_replay_lane_never_blocks_live_lane_and_batches_stay_single_lane() -> None:
     worker = IngestionWorker(
         pg_store=MagicMock(), tdengine=MagicMock(), batch_size=8, flush_ms=5_000,
     )
-    # Populate 10 live and 10 legacy pending envelopes
     loop = asyncio.get_running_loop()
     from factorix.modules.ingestion_worker import _PendingEnvelope
 
     for i in range(10):
-        worker._pending_live.append(_PendingEnvelope(
-            raw_body=b"{}", message_id=f"live-{i}", headers={}, redelivered=False,
-            ingested_at=_now(), future=loop.create_future(),
-        ))
         worker._pending_legacy.append(_PendingEnvelope(
             raw_body=b"{}", message_id=f"legacy-{i}", headers={}, redelivered=False,
             ingested_at=_now(), future=loop.create_future(),
         ))
+    release_replay = asyncio.Event()
+    batches: list[list[str]] = []
 
-    batches: list[list[_PendingEnvelope]] = []
     async def capture_batch(batch):
-        batches.append(list(batch))
+        ids = [str(e.message_id) for e in batch]
+        batches.append(ids)
+        if ids[0].startswith("legacy-"):
+            await release_replay.wait()  # e.g. TDengine retry loop on the replay lane
         for env in batch:
             env.future.set_result(ConsumeOutcome.ACK)
 
     worker._process_batch = capture_batch
     batcher = asyncio.create_task(worker._batcher_loop())
-    worker._wake_batcher.set()
-
+    worker._wake_legacy.set()
     try:
-        await asyncio.sleep(0.1)
-        # Total batch size 8: 75% Live (6) : 25% Legacy (2)
-        assert len(batches) >= 1
-        first_batch = batches[0]
-        assert len(first_batch) == 8
-        live_count = sum(1 for e in first_batch if str(e.message_id).startswith("live-"))
-        legacy_count = sum(1 for e in first_batch if str(e.message_id).startswith("legacy-"))
-        assert live_count == 6
-        assert legacy_count == 2
+        await asyncio.sleep(0.05)
+        assert batches == [[f"legacy-{i}" for i in range(8)]]  # replay batch stuck in flight
+        for i in range(3):
+            worker._pending_live.append(_PendingEnvelope(
+                raw_body=b"{}", message_id=f"live-{i}", headers={}, redelivered=False,
+                ingested_at=_now(), future=loop.create_future(),
+            ))
+        worker._wake_live.set()
+        await asyncio.sleep(0.05)
+        # The live lane committed while the replay batch is still blocked.
+        assert batches[1] == ["live-0", "live-1", "live-2"]
+        release_replay.set()
+        await asyncio.sleep(0.4)
+        assert batches[2] == ["legacy-8", "legacy-9"]
+        assert all(len({name.split("-")[0] for name in batch}) == 1 for batch in batches)
+        assert worker.lane_metrics()["live"]["batches"] == 1
     finally:
+        release_replay.set()
         worker._stop_event.set()
         worker._wake_batcher.set()
         await batcher
@@ -929,31 +937,137 @@ async def test_dual_consumers_start_and_stop(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("batch_size", "live_count", "legacy_count", "expected"),
-    [
-        (8, 10, 1, [("live", 7), ("legacy", 1)]),
-        (8, 1, 10, [("live", 1), ("legacy", 7)]),
-        (1, 3, 3, [("live", 1), ("legacy", 1)]),
-    ],
-)
-async def test_batch_capacity_and_single_slot_fairness(batch_size, live_count, legacy_count, expected) -> None:
+@pytest.mark.parametrize(("batch_size", "queued", "expected"), [(8, 10, [8, 2]), (1, 3, [1, 1, 1]), (4096, 4500, [4096, 404])])
+async def test_lane_batch_capacity(batch_size, queued, expected) -> None:
     from factorix.modules.ingestion_worker import _PendingEnvelope
 
     worker = IngestionWorker(pg_store=MagicMock(), tdengine=MagicMock(), batch_size=batch_size)
     loop = asyncio.get_running_loop()
-    for name, queue, count in (
-        ("live", worker._pending_live, live_count), ("legacy", worker._pending_legacy, legacy_count),
-    ):
-        for _ in range(count):
-            queue.append(_PendingEnvelope(b"{}", name, {}, False, _now(), loop.create_future()))
+    for i in range(queued):
+        worker._pending_live.append(_PendingEnvelope(b"{}", f"live-{i}", {}, False, _now(), loop.create_future()))
+    worker._pending_legacy.append(_PendingEnvelope(b"{}", "legacy", {}, False, _now(), loop.create_future()))
+    sizes = []
+    while worker._pending_live:
+        sizes.append(len(worker._take_lane_batch("live")))
+    assert sizes == expected
+    assert [e.message_id for e in worker._take_lane_batch("legacy")] == ["legacy"]
 
-    if batch_size == 1:
-        ids = [worker._take_pending_batch()[0].message_id for _ in range(6)]
-        assert ids == [name for name, _ in expected] * 3
-    else:
-        ids = [envelope.message_id for envelope in worker._take_pending_batch()]
-        assert ids == [name for name, count in expected for _ in range(count)]
+
+def _batch_message(observations, *, message_id="fxb-test", delivery_count=0, body=None):
+    from factorix.domain.canonical import OBS_BATCH_HEADER, OBS_BATCH_HEADER_VALUE, encode_observation_batch
+
+    headers = {OBS_BATCH_HEADER: OBS_BATCH_HEADER_VALUE}
+    if delivery_count:
+        headers["x-delivery-count"] = delivery_count
+    raw = body if body is not None else encode_observation_batch(observations, batch_id=message_id)
+    return MagicMock(body=raw, message_id=message_id, headers=headers, redelivered=bool(delivery_count))
+
+
+async def _run_lanes(worker, coro):
+    batcher = asyncio.create_task(worker._batcher_loop())
+    try:
+        return await asyncio.wait_for(coro, 5)
+    finally:
+        worker._stop_event.set()
+        worker._wake_batcher.set()
+        await batcher
+
+
+@pytest.mark.asyncio
+async def test_batch_envelope_is_ingested_with_one_td_write_one_pg_commit_and_ingested_at() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    worker = IngestionWorker(pg_store=pg, tdengine=td, batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    base = datetime.now(timezone.utc) - timedelta(seconds=1)
+    observations = [
+        _make_obs(
+            tenant_id=ids["tenant_id"], signal_id=ids["signal_id"], resource_id=ids["resource_id"],
+            connection_id=ids["connection_id"], source_field_id=ids["field_id"], site_id=ids["site_id"],
+            value=float(i), seq=i + 1, acquired_at=base + timedelta(milliseconds=i),
+        )
+        for i in range(50)
+    ]
+    outcome = await _run_lanes(worker, worker.handle_live_message(_batch_message(observations)))
+    assert outcome == ConsumeOutcome.ACK
+    assert len(td.writes) == 1 and len(td.writes[0]) == 50  # one multi-row TDengine write
+    assert len(pg.commits) == 1  # one batched latest-state upsert (+ its NOTIFY) for the envelope
+    latest = pg.commits[0]["latest_rows"]
+    assert len(latest) == 1 and latest[0]["value"] == 49.0
+    assert latest[0]["ingested_at"] is not None
+    assert worker.metrics.received_total == 50 and worker.envelopes_received == 1
+    assert worker.metrics.acked_total == 50
+
+
+@pytest.mark.asyncio
+async def test_batch_envelope_isolates_bad_items_and_keeps_old_single_format_working() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    worker = IngestionWorker(pg_store=pg, tdengine=td, batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    good = _make_obs(
+        tenant_id=ids["tenant_id"], signal_id=ids["signal_id"], resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"], source_field_id=ids["field_id"], site_id=ids["site_id"],
+        acquired_at=datetime.now(timezone.utc),
+    )
+    unbound = _make_obs(
+        tenant_id=ids["tenant_id"], signal_id=uuid4(), resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"], source_field_id=ids["field_id"], acquired_at=datetime.now(timezone.utc),
+    )
+    # One unbound item: quarantined with durable evidence, the good neighbour still commits, message ACKed.
+    outcome = await _run_lanes(worker, worker.handle_live_message(_batch_message([good, unbound])))
+    assert outcome == ConsumeOutcome.ACK
+    assert [q["event_uid"] for q in pg.quarantined] == [unbound.event_uid]
+    assert len(td.writes) == 1 and td.writes[0][0]["event_uid"] == good.event_uid
+
+    # Quarantine evidence could not be written -> the envelope is retried (never silently dropped).
+    async def failing_quarantine(**_kw):
+        raise TimeoutError("pg down")
+
+    worker2 = IngestionWorker(pg_store=pg, tdengine=td, batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    pg.write_quarantine = failing_quarantine  # type: ignore[method-assign]
+    unbound2 = _make_obs(
+        tenant_id=ids["tenant_id"], signal_id=uuid4(), resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"], source_field_id=ids["field_id"], acquired_at=datetime.now(timezone.utc),
+    )
+    outcome2 = await _run_lanes(worker2, worker2.handle_live_message(_batch_message([good, unbound2])))
+    assert outcome2 == ConsumeOutcome.RETRY
+
+    # Malformed envelope: DEAD_LETTER (whole message to the DLQ as evidence).
+    worker3 = IngestionWorker(pg_store=_FakePgStore(cat), tdengine=td, batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    bad = _batch_message([], body=b'{"schema":"factorix.obs-batch","envelope_version":2,"observations":[]}')
+    assert await _run_lanes(worker3, worker3.handle_live_message(bad)) == ConsumeOutcome.DEAD_LETTER
+
+    # Transition: legacy single-observation messages (backlog in queues/spool) still ingest.
+    worker4 = IngestionWorker(pg_store=_FakePgStore(cat), tdengine=_FakeTDEngine(), batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    single = MagicMock(body=good.to_json_bytes(), message_id=good.event_uid, headers={}, redelivered=False)
+    assert await _run_lanes(worker4, worker4.handle_legacy_message(single)) == ConsumeOutcome.ACK
+
+
+@pytest.mark.asyncio
+async def test_unexpected_exception_is_isolated_to_the_poison_item() -> None:
+    from factorix.modules.ingestion_worker import _PendingEnvelope
+
+    pg = _FakePgStore(_catalog_with_signal()[0])
+    worker = IngestionWorker(pg_store=pg, tdengine=MagicMock(), batch_size=8, broker_cfg=BrokerConfig(amqp_url="amqp://x/", delivery_limit=3))  # type: ignore[arg-type]
+    loop = asyncio.get_running_loop()
+    envs = [
+        _PendingEnvelope(b"{}", f"m{i}", {}, False, _now(), loop.create_future(), delivery_count=dc)
+        for i, dc in enumerate([0, 0, 2])
+    ]
+
+    async def process(batch):
+        # m0 and m2 are poison; any batch containing them raises.
+        if len(batch) > 1 or batch[0].message_id in {"m0", "m2"}:
+            raise RuntimeError("poison")
+        batch[0].future.set_result(ConsumeOutcome.ACK)
+
+    worker._process_batch = process
+    await worker._process_batch_isolated(envs)
+    # m0 fails on its first delivery -> RETRY; m1 succeeds alone; m2 fails on its last delivery -> quarantined.
+    assert [e.future.result() for e in envs] == [ConsumeOutcome.RETRY, ConsumeOutcome.ACK, ConsumeOutcome.DEAD_LETTER]
+    assert [q["event_uid"] for q in pg.quarantined] == ["m2"]
+    assert "INGEST_EXCEPTION" in pg.quarantined[0]["reason"]
 
 
 @pytest.mark.asyncio
@@ -1022,3 +1136,18 @@ async def test_mixed_batch_anti_rewind_ensures_live_sample_wins_in_newest_map() 
     assert w._live_cache[tid][sig_id].value == 99.0
     assert w._live_cache[tid][sig_id].event_uid == live_obs.event_uid
 
+
+
+@pytest.mark.asyncio
+async def test_v2_latest_ids_notify_is_bounded_and_parsed_by_the_api_bridge() -> None:
+    from factorix.modules.ingestion_worker import NOTIFY_CHUNK_MAX_BYTES, _latest_ids_payloads
+    from factorix.transport.app import _parse_latest_ids
+
+    tid = uuid4()
+    ids = [str(uuid4()) for _ in range(500)]
+    payloads = _latest_ids_payloads(tid, ids, [str(uuid4())], datetime.now(timezone.utc))
+    assert 1 < len(payloads) <= 4
+    assert all(len(p.encode()) <= NOTIFY_CHUNK_MAX_BYTES for p in payloads)
+    parsed = [_parse_latest_ids(p) for p in payloads]
+    assert all(t == str(tid) for t, _ in parsed)
+    assert [sid for _, chunk in parsed for sid in chunk] == ids

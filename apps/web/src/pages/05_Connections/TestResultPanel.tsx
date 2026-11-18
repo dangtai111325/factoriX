@@ -10,7 +10,7 @@ const STAGE_LABEL: Record<string, string> = {
   SAMPLE: 'Receive sample',
   MAP: 'Map fields',
   CAPTURE: 'Capture',
-  EDGE_ENROLLMENT: 'Edge collector enrollment',
+  EDGE_ENROLLMENT: 'Collector ready',
   REQUEST: 'Send request',
   STATUS: 'Read test status',
 };
@@ -40,14 +40,14 @@ interface TestResultPanelProps {
   successLabel?: string;
 }
 
-/** Renders the real stage results returned by the Edge collector (no invented timings). */
+/** Renders the real stage results returned by the collector (no invented timings). */
 export const TestResultPanel: React.FC<TestResultPanelProps> = ({ running, runningLabel, result, successLabel }) => {
   const collectorStarting = useCollectorStarting();
   if (running) {
     return (
       <div className="p-3 rounded-xl border border-[#CBD5E1] bg-[#F8FAFC] text-xs text-[#334568] flex items-center gap-2" role="status" aria-live="polite">
         <Loader2 className="w-4 h-4 animate-spin text-[#134074]" />
-        <span>{collectorStarting ? COLLECTOR_STARTING_MESSAGE : runningLabel || 'The Edge collector is running the test…'}</span>
+        <span>{collectorStarting ? COLLECTOR_STARTING_MESSAGE : runningLabel || 'The collector is running the test…'}</span>
       </div>
     );
   }

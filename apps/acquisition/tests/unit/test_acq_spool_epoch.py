@@ -36,17 +36,21 @@ def test_purge_old_epochs_isolates_tenants_and_rebuilds_counters(tmp_path: Path)
     spool.close()
 
 
-def test_enforce_byte_cap_prunes_terminal_then_oldest_pending(tmp_path: Path) -> None:
+def test_enforce_byte_cap_prunes_terminal_and_never_evicts_pending(tmp_path: Path) -> None:
     spool = AcquisitionSpool(tmp_path / "cap.sqlite")
     # Write ~150 KB of spooled messages
     spool.add_many([_row(f"u-{i}", "t1", 1, f"s-{i % 5}", payload_size=1500) for i in range(100)])
     assert spool.db_bytes() > 50_000
     # Mark first 20 ACKED so terminal rows are purged first
     spool.mark_sent([f"u-{i}" for i in range(20)])
-    dropped = spool.enforce_byte_cap(40_000)
-    assert dropped >= 20
-    assert spool.pending_count() < 80
-    assert spool.pending_count() == spool.count_by_state().get("PENDING", 0)
+    removed = spool.enforce_byte_cap(40_000)
+    assert removed == 20  # only terminal rows are reclaimed
+    # Pending (unconfirmed) source data is never evicted to honour the cap ...
+    assert spool.pending_count() == 80 == spool.count_by_state().get("PENDING", 0)
+    assert spool.overflow_dropped_count == 0
+    # ... instead the spool reports itself full so the publisher rejects new spills explicitly.
+    assert spool.is_full(1_000_000, 40_000) is True
+    assert spool.is_full(1_000_000, 0) is False
     spool.close()
 
 

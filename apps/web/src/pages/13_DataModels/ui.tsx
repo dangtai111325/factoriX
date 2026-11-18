@@ -65,7 +65,13 @@ export function qualityHeadline(q: QualitySummary | null | undefined): { tone: F
   if (q.status === 'good') return { tone: 'good', text: 'All sources live' };
   const n = q.affectedFields;
   const fields = `${n} field${n === 1 ? '' : 's'}`;
-  if (q.pausedSources.length) return { tone: 'paused', text: `${q.pausedSources.length} source${q.pausedSources.length === 1 ? '' : 's'} paused · ${fields} affected` };
+  if (q.pausedSources.length) {
+    // R1-19: count only the fields fed by the paused source(s); other problems are named apart.
+    const paused = q.counts.paused ?? n;
+    const other = Math.max(0, n - paused);
+    const pausedText = `${q.pausedSources.length} source${q.pausedSources.length === 1 ? '' : 's'} paused · ${paused} field${paused === 1 ? '' : 's'} paused`;
+    return { tone: 'paused', text: other ? `${pausedText} · ${other} other field${other === 1 ? '' : 's'} affected` : pausedText };
+  }
   if (q.status === 'missing') return { tone: 'missing', text: `${q.counts.missing || n} field(s) with missing data points` };
   if (q.staleSources.length || q.status === 'stale') return { tone: 'stale', text: `${fields} stale (no fresh value)` };
   return { tone: q.status, text: `${fields}: ${QUALITY_TEXT[q.status].toLowerCase()}` };

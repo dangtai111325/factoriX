@@ -44,6 +44,8 @@ const FIT_VIEW_OPTIONS = { padding: 0.08, minZoom: 0.75, maxZoom: 1.25, duration
 const FIT_ALL_OPTIONS = { padding: 0.06, minZoom: 0.1, maxZoom: 1.25, duration: 300 };
 /** Space kept between revealed nodes and the canvas edge, in screen pixels. */
 const REVEAL_MARGIN = 32;
+/** R1-46: the default frame shows the whole graph when it fits at this zoom or more. */
+const FULL_FIT_MIN_ZOOM = 0.6;
 
 const nodeTypes = {
   resource: ResourceNodeComponent,
@@ -231,6 +233,18 @@ export const KnowledgeGraphPage: React.FC = () => {
     const instance = flowRef.current;
     const canvas = canvasRef.current;
     if (!instance || !canvas) return;
+    // R1-46: fit only once React Flow has measured every node. On a busy browser a fixed delay was
+    // not enough: the fit used unmeasured (zero-size) nodes and the right part of the graph was cut.
+    for (let i = 0; i < 40; i += 1) {
+      const pending = instance.getNodes().some((node) => !node.measured?.width || !node.measured?.height);
+      if (!pending) break;
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+      if (flowRef.current !== instance) return;
+    }
+    // When the whole graph fits at a slightly smaller (still legible) zoom, show all of it: a frame
+    // that cuts the right-most nodes (the data) by a few pixels is worse than a 15 % smaller one.
+    await instance.fitView({ ...FIT_VIEW_OPTIONS, minZoom: FULL_FIT_MIN_ZOOM, duration: 0 });
+    if (instance.getViewport().zoom > FULL_FIT_MIN_ZOOM + 0.001) return;
     await instance.fitView(FIT_VIEW_OPTIONS);
     const current = instance.getNodes();
     if (!current.length) return;
@@ -238,12 +252,25 @@ export const KnowledgeGraphPage: React.FC = () => {
     if (zoom > FIT_VIEW_OPTIONS.minZoom + 0.001) return;
     const bounds = instance.getNodesBounds(current);
     const margin = 24;
-    const overflowX = bounds.width * zoom + 2 * margin > canvas.clientWidth;
+    const width = canvas.clientWidth;
+    const overflowX = bounds.width * zoom + 2 * margin > width;
     const overflowY = bounds.height * zoom + 2 * margin > canvas.clientHeight;
     if (!overflowX && !overflowY) return;
+    // Too large for a readable zoom. A focused view keeps the focused resource and what is under it
+    // (its data) in the frame; the whole model starts from the root (top-left).
+    const focusId = focusIdRef.current;
+    let nextX = overflowX ? margin - bounds.x * zoom : x;
+    if (overflowX && focusId) {
+      const focusNodes = current.filter((node) => node.id === focusId || node.id === `telemetry-${focusId}`);
+      if (focusNodes.length) {
+        const fb = instance.getNodesBounds(focusNodes);
+        const right = Math.min(bounds.x + bounds.width, fb.x + fb.width + 240);
+        nextX = Math.min(margin - bounds.x * zoom, width - margin - right * zoom);
+      }
+    }
     await instance.setViewport(
       {
-        x: overflowX ? margin - bounds.x * zoom : x,
+        x: nextX,
         y: overflowY ? margin - bounds.y * zoom : y,
         zoom,
       },
@@ -289,6 +316,8 @@ export const KnowledgeGraphPage: React.FC = () => {
 
   const resourceById = useMemo(() => new Map(resources.map((item) => [item.id, item])), [resources]);
   const focus = focusParam ? resourceById.get(focusParam) : undefined;
+  const focusIdRef = useRef('');
+  focusIdRef.current = focus?.id || '';
 
   // Resources in view: the whole model, or the focused resource with its ancestors and descendants.
   // Sorted naturally by name: the layout keeps this order, so siblings read 01, 02, 03…
@@ -956,6 +985,9 @@ export const KnowledgeGraphPage: React.FC = () => {
                             <div className="text-right shrink-0">
                               <div className="font-mono font-bold text-xs text-[#0B2545]">
                                 {formatCurrentSignalValue(sig.value, sig.quality)}
+                                {sig.unit && formatCurrentSignalValue(sig.value, sig.quality) !== '—' ? (
+                                  <span className="font-sans font-normal text-[10px] text-slate-500 ml-1">{sig.unit}</span>
+                                ) : null}
                               </div>
                               <div
                                 title={QUALITY_HINT[quality]}

@@ -304,7 +304,14 @@ def test_interval_buckets_intra_bucket_quality_and_gap_markers_across_missing_po
     assert hold_rows[0].raw_quality == "UNCERTAIN" and hold_rows[0].value == 50.0
     assert len(null_rows) == 4 and all(w.raw_quality == "BAD" and w.reason_code == "INTERVAL_MISSING" for w in null_rows)
 
-    # Sweep quiet stream after another 15s without new arrival (now = sec=45, lateTolerance=5s -> closed up to bucket 7)
+    # Wall clock alone never closes buckets while the pipeline may be behind (event-time watermark,
+    # R1-A P2-3): no other data has arrived since sec=26, so nothing is closed at sec=46.
+    assert ev.sweep_interval_gaps(tid, targets=[tgt_gap], active_epoch=1, now=_utc(46)) == []
+
+    # Another stream of the same tenant delivers sec=46 -> the watermark proves this stream is quiet:
+    # closed up to bucket 7 (46 - 5 s tolerance) -> buckets 6 and 7 become gap markers.
+    other = uuid4()
+    ev.evaluate_for_targets(_obs(tenant_id=tid, signal_id=other, resource_id=rid, value=1.0, sec=46), targets=[])
     swept = ev.sweep_interval_gaps(tid, targets=[tgt_gap], active_epoch=1, now=_utc(46))
     assert len(swept) == 2  # buckets 6 and 7 closed!
 

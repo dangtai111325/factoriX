@@ -1,5 +1,5 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { X, RadioTower, Network, Cable, Cloud, AlertCircle, Eye, EyeOff, Activity, Plus, Trash2, Waypoints } from 'lucide-react';
+import { X, RadioTower, Network, Cable, Cloud, AlertCircle, Eye, EyeOff, Activity, Plus, Trash2, Waypoints, Loader2 } from 'lucide-react';
 import { ProtocolType, ConnectionItem, EdgeItem } from '../../types';
 import { api, ApiError } from '../../api/client';
 import { CommissionResult, runConnectionTest } from '../../lib/commissioning';
@@ -119,9 +119,13 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
   const [secretConfigured, setSecretConfigured] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [dirty, setDirty] = useState(false);
-  const isEdit = Boolean(savedId);
+  // R1-22: an Edit dialog is an edit from the first frame (title, protocol locked), not "New
+  // Connection" until the saved configuration has loaded.
+  const isEdit = Boolean(savedId) || Boolean(connectionToEdit);
 
   const [siteOptions, setSiteOptions] = useState<Array<{ id: string; name: string }>>([]);
+  // The "create a site first" hint is shown only once the site list answered empty.
+  const [sitesLoaded, setSitesLoaded] = useState(false);
 
   // Common
   const [protocol, setProtocol] = useState<ProtocolType>('mqtt');
@@ -289,22 +293,38 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
     setHttpTestPath('');
     setShowSecret(false);
     setDirty(false);
+    setSitesLoaded(false);
     let cancelled = false;
     api<{ items: Array<{ id: string; name: string; code?: string }> }>('/api/v1/sites')
       .then((res) => {
         if (cancelled) return;
         const items = (res.items || []).map((row) => ({ id: String(row.id), name: String(row.name || row.code || row.id) }));
         setSiteOptions(items);
+        setSitesLoaded(true);
         setSiteId((current) => current || defaultSiteId || items[0]?.id || '');
       })
       .catch((error) => {
         if (!cancelled) setGeneralError(error instanceof Error ? `Could not load sites: ${error.message}` : 'Could not load sites.');
       });
     if (connectionToEdit) {
+      // R1-22: start from what the list knows and lock the fields until the saved configuration is
+      // loaded, so nothing typed meanwhile is silently overwritten.
+      setSavedId(null);
+      setVersion(Number(connectionToEdit.version || 1));
+      setBaseConfig({});
+      setJob(null);
+      setSecretConfigured(Boolean(connectionToEdit.secretConfigured));
+      setName(connectionToEdit.name);
+      setSiteId(connectionToEdit.siteId || '');
+      setProtocol(connectionToEdit.protocol);
+      resetProtocolFields();
       setLoadingDetail(true);
       api<ConnectionDetail>(`/api/v1/connections/${encodeURIComponent(connectionToEdit.id)}`)
         .then((detail) => {
-          if (!cancelled) applyDetail(detail);
+          if (cancelled) return;
+          applyDetail(detail);
+          setDirty(false);
+          window.setTimeout(() => firstFieldRef.current?.focus(), 0);
         })
         .catch((error) => {
           if (!cancelled) setGeneralError(error instanceof Error ? `Could not load the connection: ${error.message}` : 'Could not load the connection.');
@@ -556,7 +576,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
 
   const handleSave = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (actionRunningRef.current) return;
+    if (actionRunningRef.current || loadingDetail) return;
     actionRunningRef.current = true;
     try {
       const id = await save();
@@ -567,7 +587,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
   };
 
   const handleTest = async () => {
-    if (actionRunningRef.current) return;
+    if (actionRunningRef.current || loadingDetail) return;
     actionRunningRef.current = true;
     try {
       // Unsaved edits of an existing connection are tested as a draft (nothing is stored);
@@ -720,7 +740,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
             <h2 id={titleId} className="text-base font-bold text-[#0B2545]">
               {isEdit ? 'Edit Connection' : 'New Connection'}
             </h2>
-            <p className="text-xs text-[#64748B]">Endpoint, security and polling parameters used by the Edge collector.</p>
+            <p className="text-xs text-[#64748B]">Endpoint, security and polling parameters used by the collector.</p>
           </div>
           <button
             type="button"
@@ -739,7 +759,14 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
               <span>{generalError}</span>
             </div>
           )}
-          {loadingDetail && <div className="text-xs text-[#64748B]">Loading saved configuration…</div>}
+          {loadingDetail && (
+            <div role="status" className="p-2.5 rounded-lg bg-[#F8FAFC] border border-[#E2E8F0] text-xs text-[#475569] flex items-center gap-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-[#134074]" aria-hidden="true" />
+              <span>Loading the saved configuration… The fields can be edited once it is loaded.</span>
+            </div>
+          )}
+
+          <fieldset disabled={loadingDetail} aria-busy={loadingDetail} className="m-0 p-0 border-0 min-w-0 space-y-4 disabled:opacity-60">
 
           {!isEdit && (
             <fieldset>
@@ -806,7 +833,7 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
                   </option>
                 ))}
               </select>
-              {siteOptions.length === 0 && <p className="text-[11px] text-amber-700 mt-0.5">Create a site in the Factory Model first.</p>}
+              {siteOptions.length === 0 && sitesLoaded && <p className="text-[11px] text-amber-700 mt-0.5">Create a site in the Factory Model first.</p>}
               {err('site')}
             </div>
           </div>
@@ -1138,11 +1165,13 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
             </div>
           )}
 
+          </fieldset>
+
           <TestResultPanel
             running={isTesting}
-            runningLabel="The Edge collector is testing reachability and authentication…"
+            runningLabel="The collector is testing reachability and authentication…"
             result={testResult}
-            successLabel="The Edge collector reached the endpoint"
+            successLabel="The collector reached the endpoint"
           />
 
           <div className="pt-3 border-t border-[#E2E8F0] flex flex-wrap items-center justify-between gap-2">

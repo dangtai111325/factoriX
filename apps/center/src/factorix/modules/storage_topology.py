@@ -44,6 +44,7 @@ class ColumnInfo:
     length: int | None
     role: str  # "time_key" | "value" | "tag"
     nullable: bool
+    primary_key: bool = False
 
 
 @dataclass
@@ -114,6 +115,11 @@ class TopologySnapshot:
 # ---------------------------------------------------------------------------
 # Main topology inspector
 # ---------------------------------------------------------------------------
+
+#: Subtables drawn per supertable in the topology canvas; ``subtable_count`` always carries the true
+#: total so the UI shows "+N more" and links to the paginated Objects table (G-08 / P1-17).
+TOPOLOGY_CHILD_LIMIT = 50
+
 
 class StorageTopologyInspector:
     """Inspects live TDengine metadata and reconciles against desired registry."""
@@ -200,12 +206,16 @@ class StorageTopologyInspector:
             },
         }
 
-    async def list_databases(self, tenant_id: UUID | None = None) -> list[DatabaseInfo]:
+    async def list_databases(
+        self, tenant_id: UUID | None = None, extra_names: Any = ()
+    ) -> list[DatabaseInfo]:
         """Return actual TDengine databases (excluding system DBs).
 
-        If *tenant_id* is given only the matching ``fx_t_<hex>`` database is
-        returned.
+        If *tenant_id* is given only the tenant's canonical ``fx_t_<hex>`` database and the databases
+        in *extra_names* (user databases registered to that tenant in ``storage_objects``) are
+        returned, so a database created through the wizard is visible to its owner only (G-08).
         """
+        allowed_extra = {str(n) for n in (extra_names or ())}
         rows = await self._td_query("SELECT * FROM information_schema.ins_databases")
 
         dbs: list[DatabaseInfo] = []
@@ -216,7 +226,7 @@ class StorageTopologyInspector:
             is_tenant = bool(_TENANT_DB_RE.fullmatch(name))
             if tenant_id is not None:
                 expected = f"fx_t_{UUID(str(tenant_id)).hex}"
-                if name != expected:
+                if name != expected and name not in allowed_extra:
                     continue
             _safe_ident(name)
             stable_counts = await self._td_query(
@@ -298,6 +308,26 @@ class StorageTopologyInspector:
             for row in rows
         }
 
+    @staticmethod
+    def _subtable_filter(database: str, stable_name: str | None, search: str | None) -> str:
+        _safe_ident(database)
+        where = f"WHERE db_name = '{database}' AND type = 'CHILD_TABLE'"
+        if stable_name:
+            _safe_ident(stable_name)
+            where += f" AND stable_name = '{stable_name}'"
+        if search:
+            # Identifier characters only (P1-12: nothing user-typed reaches SQL unvalidated).
+            needle = re.sub(r"[^A-Za-z0-9_]", "", str(search))[:64]
+            if needle:
+                where += f" AND table_name LIKE '%{needle}%'"
+        return where
+
+    async def count_subtables(self, database: str, stable_name: str | None = None, search: str | None = None) -> int:
+        rows = await self._td_query(
+            "SELECT COUNT(*) AS n FROM information_schema.ins_tables " + self._subtable_filter(database, stable_name, search)
+        )
+        return (_safe_int(rows[0], ("n", "count(*)"), 0, 0) or 0) if rows else 0
+
     async def list_subtables(
         self,
         database: str,
@@ -306,40 +336,36 @@ class StorageTopologyInspector:
         limit: int = 200,
         *,
         include_tags: bool = True,
+        search: str | None = None,
     ) -> tuple[list[SubtableInfo], str | None]:
-        """Return subtables with tag values, optionally filtered by stable.
+        """Return subtables with tag values, optionally filtered by stable and name search.
 
+        Keyset pagination on ``table_name``; the cursor must be an identifier (P1-12). The search
+        is applied in SQL *before* paging, so totals and pages are exact. Tags of the page are read
+        with one ``information_schema.ins_tags`` query (no N+1, no invalid ``SELECT ... TAGS``).
         Returns (items, next_cursor).
         """
-        _safe_ident(database)
-        base = (
-            "SELECT table_name, stable_name, create_time "
-            f"FROM information_schema.ins_tables "
-            f"WHERE db_name = '{database}' AND type = 'CHILD_TABLE'"
+        base = "SELECT table_name, stable_name, create_time FROM information_schema.ins_tables " + self._subtable_filter(
+            database, stable_name, search
         )
-        if stable_name:
-            _safe_ident(stable_name)
-            base += f" AND stable_name = '{stable_name}'"
         if cursor:
-            # cursor is last table_name seen; use it for keyset pagination
+            _safe_ident(cursor)
             base += f" AND table_name > '{cursor}'"
-        base += f" ORDER BY table_name LIMIT {int(limit) + 1}"
+        base += f" ORDER BY table_name LIMIT {max(1, int(limit)) + 1}"
 
-        try:
-            rows = await self._td_query(base)
-        except Exception as exc:
-            logger.warning("list_subtables failed: %s", exc)
-            return [], None
+        rows = await self._td_query(base)
 
         has_more = len(rows) > limit
         rows = rows[:limit]
         next_cur = _safe_str(rows[-1], ("table_name", "name"), 0) if has_more and rows else None
+        names = [_safe_str(r, ("table_name", "name"), 0) for r in rows]
+        tag_map = await self._get_tags_bulk(database, names) if include_tags and names else {}
 
         items: list[SubtableInfo] = []
         for r in rows:
             tname = _safe_str(r, ("table_name", "name"), 0)
             sname = _safe_str(r, "stable_name", 1, "")
-            tags = await self._get_subtable_tags(database, tname) if include_tags else {}
+            tags = tag_map.get(tname, {})
             items.append(SubtableInfo(
                 name=tname,
                 stable_name=sname,
@@ -397,7 +423,8 @@ class StorageTopologyInspector:
             for entry in registry
         }
         rows: list[dict[str, Any]] = []
-        for db in await self.list_databases(tenant_id):
+        registered_dbs = [e["physical_name"] for e in registry if e["object_type"] == "database"]
+        for db in await self.list_databases(tenant_id, registered_dbs):
             db_label = labels.get(db.name, db.name)
             if object_type in (None, "database"):
                 rows.append({
@@ -457,7 +484,8 @@ class StorageTopologyInspector:
     ) -> TopologySnapshot:
         """Return full or filtered topology snapshot for the UI canvas."""
         observed_at = datetime.now(timezone.utc)
-        dbs = await self.list_databases(tenant_id if not database else None)
+        # Always tenant-scoped (P1-13): ?database= can only narrow to a database the tenant owns.
+        dbs = await self.list_databases(tenant_id, await registered_databases(session, tenant_id))
         if database:
             dbs = [d for d in dbs if d.name == database]
 
@@ -500,7 +528,8 @@ class StorageTopologyInspector:
                     ))
                     if depth >= 2:
                         subs, _nc = await self.list_subtables(
-                            db.name, st.name, cursor=cursor, limit=50, include_tags=include_subtable_tags,
+                            db.name, st.name, cursor=cursor, limit=TOPOLOGY_CHILD_LIMIT,
+                            include_tags=include_subtable_tags,
                         )
                         all_subtables.extend(subs)
                         for sub in subs:
@@ -556,12 +585,15 @@ class StorageTopologyInspector:
             try:
                 s_rows = await fetch_all(
                     session,
-                    "SELECT id, key FROM signal_definitions WHERE tenant_id = :tenant_id",
+                    "SELECT s.id, s.key, r.name AS resource_name FROM signal_definitions s "
+                    "LEFT JOIN resources r ON r.id = s.resource_id WHERE s.tenant_id = :tenant_id",
                     {"tenant_id": tenant_id},
                 )
                 for r in s_rows:
                     s_id_hex = UUID(str(r["id"])).hex
                     s_label = str(r.get("key") or "")
+                    if r.get("resource_name"):
+                        s_label = f"{r['resource_name']} \u00b7 {s_label}"
                     if s_label:
                         for pfx in ("op_float64_", "op_int64_", "op_bool_", "op_binary_", "op_string_", "op_json_"):
                             label_map[f"{pfx}{s_id_hex}"] = f"{s_label} (Telemetry)"
@@ -621,7 +653,7 @@ class StorageTopologyInspector:
             clength = _safe_int(r, ("Length", "length"), 2, None)
             note = _safe_str(r, ("Note", "note"), 3, "").upper()
             is_tag = "TAG" in note
-            is_ts = ctype.upper() == "TIMESTAMP" and not is_tag
+            is_ts = ctype.upper() == "TIMESTAMP" and not is_tag and not cols
             role = "time_key" if is_ts else ("tag" if is_tag else "value")
             ci = ColumnInfo(
                 name=cname,
@@ -629,6 +661,7 @@ class StorageTopologyInspector:
                 length=clength,
                 role=role,
                 nullable=not is_ts,
+                primary_key=("COMPOSITE" in note or "PRIMARY" in note) and not is_tag,
             )
             if is_tag:
                 tags.append(ci)
@@ -636,28 +669,35 @@ class StorageTopologyInspector:
                 cols.append(ci)
         return cols, tags
 
+    async def _get_tags_bulk(self, database: str, names: list[str]) -> dict[str, dict[str, Any]]:
+        """Tag values of many subtables with one query (TDengine 3.4: ``information_schema.ins_tags``)."""
+        if self._td is None or not names:
+            return {}
+        _safe_ident(database)
+        out: dict[str, dict[str, Any]] = {}
+        for i in range(0, len(names), 200):
+            chunk = [n for n in names[i:i + 200] if n]
+            for n in chunk:
+                _safe_ident(n)
+            in_list = ", ".join(f"'{n}'" for n in chunk)
+            try:
+                rows = await self._td_query(
+                    "SELECT table_name, tag_name, tag_value FROM information_schema.ins_tags "
+                    f"WHERE db_name = '{database}' AND table_name IN ({in_list})"
+                )
+            except Exception as exc:  # noqa: BLE001 - tags are optional decoration of the list
+                logger.warning("Reading tags of %s failed: %s", database, exc)
+                return out
+            for r in rows or []:
+                t = _safe_str(r, "table_name", 0)
+                out.setdefault(t, {})[_safe_str(r, "tag_name", 1)] = _row_val(r, "tag_value", 2, None)
+        return out
+
     async def _get_subtable_tags(
         self, database: str, table_name: str
     ) -> dict[str, Any]:
         """Return tag values for a subtable as {tag_name: value}."""
-        if self._td is None:
-            return {}
-        try:
-            if hasattr(self._td, "query_rows"):
-                rows = await self._td.query_rows(
-                    f"SELECT * FROM {_safe_ident(database)}.{_safe_ident(table_name)} TAGS"
-                )
-            else:
-                rows = await self._td.run_read(
-                    f"SELECT * FROM {_safe_ident(database)}.{_safe_ident(table_name)} TAGS"
-                )
-            if not rows:
-                return {}
-            if isinstance(rows[0], dict):
-                return {k: v for k, v in rows[0].items()}
-            return {}
-        except Exception:
-            return {}
+        return (await self._get_tags_bulk(database, [table_name])).get(table_name, {})
 
     async def _compute_drift(
         self,
@@ -780,6 +820,21 @@ class StorageTopologyInspector:
 # Helper serialization
 # ---------------------------------------------------------------------------
 
+async def registered_databases(session: Any | None, tenant_id: UUID) -> list[str]:
+    """User databases registered to *tenant_id* (created through the Storage wizard)."""
+    if session is None:
+        return []
+    from factorix.modules.common import fetch_all
+
+    rows = await fetch_all(
+        session,
+        "SELECT physical_name FROM storage_objects WHERE tenant_id = :tenant_id "
+        "AND object_type = 'database' AND status <> 'PURGED'",
+        {"tenant_id": tenant_id},
+    )
+    return [str(r["physical_name"]) for r in rows]
+
+
 def topology_snapshot_to_dict(snap: TopologySnapshot) -> dict[str, Any]:
     edges = []
     for n in snap.nodes:
@@ -867,6 +922,7 @@ def _col_to_dict(c: ColumnInfo) -> dict[str, Any]:
         "length": c.length,
         "role": c.role,
         "nullable": c.nullable,
+        "primary_key": c.primary_key,
     }
 
 

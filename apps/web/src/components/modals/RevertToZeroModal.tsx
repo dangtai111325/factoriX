@@ -20,33 +20,36 @@ export interface RevertToZeroModalProps {
   onClose: () => void;
 }
 
+/** A count from the server, or null when it is not known (never an invented number, R1-18c). */
+type Count = number | null;
+
 export interface TelemetryResetPreview {
-  activeEpoch: number;
-  nextEpoch: number;
+  activeEpoch: Count;
+  nextEpoch: Count;
   lifecycleState: string;
   previewToken?: string;
   cleared: {
-    observations: number;
-    latestSignalState: number;
-    modelSnapshots: number;
-    modelState: number;
-    quarantine: number;
-    ingestDedup: number;
-    exportJobs: number;
-    commissioningJobs: number;
-    tdengineSubtables: number;
+    observations: Count;
+    latestSignalState: Count;
+    modelSnapshots: Count;
+    modelState: Count;
+    quarantine: Count;
+    ingestDedup: Count;
+    exportJobs: Count;
+    commissioningJobs: Count;
+    tdengineSubtables: Count;
   };
   preserved: {
-    connections: number;
-    signalsActive: number;
-    signalsArchived: number;
-    dataModels: number;
-    storageDesigns: number;
-    resources: number;
-    adminAccounts: number;
-    sessions: number;
-    secretStore: number;
-    formulas: number;
+    connections: Count;
+    signalsActive: Count;
+    signalsArchived: Count;
+    dataModels: Count;
+    storageDesigns: Count;
+    resources: Count;
+    adminAccounts: Count;
+    sessions: Count;
+    secretStore: Count;
+    formulas: Count;
   };
   raw: Record<string, unknown>;
 }
@@ -70,9 +73,23 @@ function num(val: unknown, fallback: number): number {
   return fallback;
 }
 
+function count(val: unknown): Count {
+  const n = num(val, Number.NaN);
+  return Number.isFinite(n) ? n : null;
+}
+
+function sum(a: Count, b: Count): Count {
+  if (a === null && b === null) return null;
+  return (a ?? 0) + (b ?? 0);
+}
+
+/**
+ * Preview counts as answered by the server. A count the server did not send stays unknown (null);
+ * only when the preview itself failed are the configuration counts taken from the loaded lists.
+ */
 function normalizePreview(
   raw: Record<string, unknown> | null | undefined,
-  fallbacks: { connections: number; signals: number; models: number; resources: number },
+  fallbacks: { connections: Count; signals: Count; models: Count; resources: Count },
 ): TelemetryResetPreview {
   const data = raw && typeof raw === 'object' ? raw : {};
   const clearedObj =
@@ -86,8 +103,9 @@ function normalizePreview(
     (data.configuration as Record<string, unknown>) ||
     data;
 
-  const activeEpoch = Math.max(1, num(data.active_epoch ?? data.activeEpoch ?? data.current_epoch, 1));
-  const nextEpoch = num(data.next_epoch ?? data.nextEpoch, activeEpoch + 1);
+  const epoch = count(data.active_epoch ?? data.activeEpoch ?? data.current_epoch);
+  const activeEpoch = epoch === null ? null : Math.max(1, epoch);
+  const nextEpoch = count(data.next_epoch ?? data.nextEpoch) ?? (activeEpoch === null ? null : activeEpoch + 1);
 
   return {
     activeEpoch,
@@ -95,42 +113,29 @@ function normalizePreview(
     lifecycleState: String(data.lifecycle_state ?? data.lifecycleState ?? 'ACTIVE'),
     previewToken: typeof data.preview_token === 'string' ? data.preview_token : undefined,
     cleared: {
-      observations: num(clearedObj.observations ?? clearedObj.pg_observations, 0),
-      latestSignalState: num(clearedObj.latest_signal_state ?? clearedObj.latestSignalState, 0),
-      modelSnapshots: num(clearedObj.model_snapshots ?? clearedObj.modelSnapshots, 0),
-      modelState: num(clearedObj.model_state ?? clearedObj.modelState, 0),
-      quarantine: num(clearedObj.observation_quarantine ?? clearedObj.quarantine, 0),
-      ingestDedup: num(clearedObj.ingest_dedup ?? clearedObj.ingestDedup, 0),
-      exportJobs: num(clearedObj.export_jobs ?? clearedObj.exportJobs, 0),
-      commissioningJobs: num(clearedObj.commissioning_jobs ?? clearedObj.commissioningJobs, 0),
-      tdengineSubtables: num(
-        clearedObj.tdengine_subtables ??
-          clearedObj.tdengine_series ??
-          clearedObj.tdengine_tables ??
-          clearedObj.tdengine,
-        0,
+      observations: count(clearedObj.observations ?? clearedObj.pg_observations),
+      latestSignalState: count(clearedObj.latest_signal_state ?? clearedObj.latestSignalState),
+      modelSnapshots: count(clearedObj.model_snapshots ?? clearedObj.modelSnapshots),
+      modelState: count(clearedObj.model_state ?? clearedObj.modelState),
+      quarantine: count(clearedObj.observation_quarantine ?? clearedObj.quarantine),
+      ingestDedup: count(clearedObj.ingest_dedup ?? clearedObj.ingestDedup),
+      exportJobs: count(clearedObj.export_jobs ?? clearedObj.exportJobs),
+      commissioningJobs: count(clearedObj.commissioning_jobs ?? clearedObj.commissioningJobs),
+      tdengineSubtables: count(
+        clearedObj.tdengine_subtables ?? clearedObj.tdengine_series ?? clearedObj.tdengine_tables ?? clearedObj.tdengine,
       ),
     },
     preserved: {
-      connections: num(preservedObj.connections, fallbacks.connections || 5),
-      signalsActive: num(
-        preservedObj.signals_active ?? preservedObj.signalsActive ?? preservedObj.active_signals,
-        fallbacks.signals || 336,
-      ),
-      signalsArchived: num(
-        preservedObj.signals_archived ?? preservedObj.signalsArchived ?? preservedObj.archived_signals,
-        8,
-      ),
-      dataModels: num(
-        preservedObj.data_models ?? preservedObj.dataModels ?? preservedObj.output_groups,
-        fallbacks.models || 36,
-      ),
-      storageDesigns: num(preservedObj.storage_designs ?? preservedObj.storageDesigns, 0),
-      resources: num(preservedObj.resources, fallbacks.resources || 0),
-      adminAccounts: num(preservedObj.admin_accounts ?? preservedObj.adminAccounts, 1),
-      sessions: num(preservedObj.sessions ?? preservedObj.active_sessions, 1),
-      secretStore: num(preservedObj.secret_store ?? preservedObj.secretStore, 5),
-      formulas: num(preservedObj.formulas ?? preservedObj.formula_definitions, 0),
+      connections: count(preservedObj.connections) ?? fallbacks.connections,
+      signalsActive: count(preservedObj.signals_active ?? preservedObj.signalsActive ?? preservedObj.active_signals) ?? fallbacks.signals,
+      signalsArchived: count(preservedObj.signals_archived ?? preservedObj.signalsArchived ?? preservedObj.archived_signals),
+      dataModels: count(preservedObj.data_models ?? preservedObj.dataModels ?? preservedObj.output_groups) ?? fallbacks.models,
+      storageDesigns: count(preservedObj.storage_designs ?? preservedObj.storageDesigns),
+      resources: count(preservedObj.resources) ?? fallbacks.resources,
+      adminAccounts: count(preservedObj.admin_accounts ?? preservedObj.adminAccounts),
+      sessions: count(preservedObj.sessions ?? preservedObj.active_sessions),
+      secretStore: count(preservedObj.secret_store ?? preservedObj.secretStore),
+      formulas: count(preservedObj.formulas ?? preservedObj.formula_definitions),
     },
     raw: data,
   };
@@ -140,7 +145,8 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
   const app = useApp() as ReturnType<typeof useApp> & {
     refreshSystemState?: () => Promise<void> | void;
   };
-  const { connections, signals, dataModels, resources, refresh } = app;
+  const { connections, signals, dataModels, resources, refresh, loadState } = app;
+  const listsReady = loadState === 'ready';
 
   const [confirmPhrase, setConfirmPhrase] = useState('');
   const [password, setPassword] = useState('');
@@ -161,29 +167,22 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
     setPreviewError(null);
     try {
       const res = await api<Record<string, unknown>>('/api/v1/admin/telemetry-reset/preview');
-      setPreview(
-        normalizePreview(res, {
-          connections: connections.length || 5,
-          signals: signals.length || 336,
-          models: dataModels.length || 36,
-          resources: resources.length,
-        }),
-      );
+      setPreview(normalizePreview(res, { connections: null, signals: null, models: null, resources: null }));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Unable to load live reset impact preview.';
       setPreviewError(msg);
       setPreview(
         normalizePreview(null, {
-          connections: connections.length || 5,
-          signals: signals.length || 336,
-          models: dataModels.length || 36,
-          resources: resources.length,
+          connections: listsReady ? connections.length : null,
+          signals: listsReady ? signals.length : null,
+          models: listsReady ? dataModels.length : null,
+          resources: listsReady ? resources.length : null,
         }),
       );
     } finally {
       setLoadingPreview(false);
     }
-  }, [connections.length, signals.length, dataModels.length, resources.length]);
+  }, [listsReady, connections.length, signals.length, dataModels.length, resources.length]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -192,8 +191,13 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
     setError(null);
     setIsSubmitting(false);
     setResetResult(null);
+    // R1-18c: no counts from an earlier opening while the new preview loads.
+    setPreview(null);
+    setPreviewError(null);
     void loadPreview();
-  }, [isOpen, loadPreview]);
+    // loadPreview changes with the list sizes; the preview is loaded once per opening.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -207,7 +211,7 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `factorix-telemetry-reset-preview-epoch-${preview.activeEpoch}.json`;
+    a.download = `factorix-telemetry-reset-preview-epoch-${preview.activeEpoch ?? 'unknown'}.json`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -263,14 +267,16 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
     }
   };
 
-  const effPreview =
-    preview ??
-    normalizePreview(null, {
-      connections: connections.length || 5,
-      signals: signals.length || 336,
-      models: dataModels.length || 36,
-      resources: resources.length,
-    });
+  // Until the preview answered, every count reads "Loading…" (R1-18c: the dialog showed made-up
+  // numbers such as "0 rows / 336 active / 8 archived" first, then the real ones).
+  const effPreview = preview ?? normalizePreview(null, { connections: null, signals: null, models: null, resources: null });
+  const loadingCounts = !preview;
+  const show = (value: Count, unit = ''): string => {
+    if (loadingCounts) return 'Loading…';
+    if (value === null) return '—';
+    return unit ? `${value.toLocaleString()} ${unit}` : value.toLocaleString();
+  };
+  const epochText = (value: Count): string => (loadingCounts ? '…' : value === null ? '—' : `#${value}`);
 
   return (
     <ModalPortal>
@@ -355,10 +361,10 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
                       Preserved Entities
                     </div>
                     <div className="mt-1 text-[13px] font-bold text-[#111B37]">
-                      {effPreview.preserved.connections} Connections · {effPreview.preserved.signalsActive} Signals
+                      {show(effPreview.preserved.connections)} Connections · {show(effPreview.preserved.signalsActive)} Signals
                     </div>
                     <div className="text-[11px] text-[#657794] mt-0.5">
-                      {effPreview.preserved.dataModels} Data Models · {effPreview.preserved.signalsArchived} Archived
+                      {show(effPreview.preserved.dataModels)} Data Models · {show(effPreview.preserved.signalsArchived)} Archived
                     </div>
                   </div>
 
@@ -383,11 +389,11 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
                     <Database className="w-4 h-4 text-[#657794]" />
                     <span>
                       Current Generation:{' '}
-                      <strong className="font-mono text-[#111B37]">Epoch #{effPreview.activeEpoch}</strong>
+                      <strong className="font-mono text-[#111B37]">Epoch {epochText(effPreview.activeEpoch)}</strong>
                     </span>
                     <span className="text-[#94A3B8]">→</span>
                     <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-mono font-bold bg-[#FEF2F2] text-[#EF1B24] border border-[#FECACA]">
-                      Advances to Epoch #{effPreview.nextEpoch}
+                      Advances to Epoch {epochText(effPreview.nextEpoch)}
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
@@ -415,7 +421,7 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
 
                 {previewError && (
                   <div className="px-3.5 py-2 rounded-lg bg-amber-50 border border-amber-200 text-[12px] text-amber-800">
-                    Live preview notice: {previewError} Showing current baseline configuration counts.
+                    Live preview notice: {previewError} Telemetry counts are unknown; configuration counts come from the loaded lists.
                   </div>
                 )}
 
@@ -431,37 +437,37 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
                       <li className="flex items-center justify-between gap-2">
                         <span>Observations (PG legacy buffer)</span>
                         <span className="font-mono font-bold text-[#9B1C1C]">
-                          {effPreview.cleared.observations.toLocaleString()} rows
+                          {show(effPreview.cleared.observations, 'rows')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Live Signal State Cache</span>
                         <span className="font-mono font-bold text-[#9B1C1C]">
-                          {effPreview.cleared.latestSignalState.toLocaleString()} states
+                          {show(effPreview.cleared.latestSignalState, 'states')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Model Snapshots &amp; Runtime</span>
                         <span className="font-mono font-bold text-[#9B1C1C]">
-                          {(effPreview.cleared.modelSnapshots + effPreview.cleared.modelState).toLocaleString()} rows
+                          {show(sum(effPreview.cleared.modelSnapshots, effPreview.cleared.modelState), 'rows')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Quarantine &amp; Ingest Dedup</span>
                         <span className="font-mono font-bold text-[#9B1C1C]">
-                          {(effPreview.cleared.quarantine + effPreview.cleared.ingestDedup).toLocaleString()} keys
+                          {show(sum(effPreview.cleared.quarantine, effPreview.cleared.ingestDedup), 'keys')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Export Jobs &amp; Artifacts</span>
                         <span className="font-mono font-bold text-[#9B1C1C]">
-                          {effPreview.cleared.exportJobs.toLocaleString()} jobs
+                          {show(effPreview.cleared.exportJobs, 'jobs')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2 pt-1 border-t border-[#FED7D7]/70">
                         <span>TDengine Operational &amp; Managed Time-Series</span>
                         <span className="font-mono font-bold text-[#EF1B24]">
-                          epoch #{effPreview.activeEpoch} → #{effPreview.nextEpoch}
+                          epoch {epochText(effPreview.activeEpoch)} → {epochText(effPreview.nextEpoch)}
                         </span>
                       </li>
                     </ul>
@@ -477,31 +483,33 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
                       <li className="flex items-center justify-between gap-2">
                         <span>Connections</span>
                         <span className="font-mono font-bold text-emerald-800">
-                          {effPreview.preserved.connections} preserved
+                          {show(effPreview.preserved.connections, 'preserved')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Signals (Active / Archived)</span>
                         <span className="font-mono font-bold text-emerald-800">
-                          {effPreview.preserved.signalsActive} active / {effPreview.preserved.signalsArchived} archived
+                          {loadingCounts
+                            ? 'Loading…'
+                            : `${show(effPreview.preserved.signalsActive, 'active')} / ${show(effPreview.preserved.signalsArchived, 'archived')}`}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Data Models</span>
                         <span className="font-mono font-bold text-emerald-800">
-                          {effPreview.preserved.dataModels} preserved
+                          {show(effPreview.preserved.dataModels, 'preserved')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Storage Designs &amp; Policies</span>
                         <span className="font-mono font-bold text-emerald-800">
-                          {effPreview.preserved.storageDesigns} designs + STables
+                          {show(effPreview.preserved.storageDesigns, 'designs + STables')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Factory Structure Resources</span>
                         <span className="font-mono font-bold text-emerald-800">
-                          {effPreview.preserved.resources} resources
+                          {show(effPreview.preserved.resources, 'resources')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">

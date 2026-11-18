@@ -156,6 +156,10 @@ export interface SignalItem {
   connectionHealth?: string;
   brokerHealth?: string;
   storageHealth?: string;
+  /** Server freshness verdict: FRESH | DELAYED | STALE. DELAYED keeps quality GOOD (value late in transit). */
+  freshness?: string;
+  /** Age of the value when DELAYED (ms). */
+  deliveryLagMs?: number;
   version?: number;
   addressKind?: string;
   addressJson?: Record<string, unknown>;

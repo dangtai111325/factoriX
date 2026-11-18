@@ -143,6 +143,9 @@ class PgControlPlane:
         updated = 0
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                # Never queue behind a long row lock (an operator editing the connection): the next
+                # heartbeat brings fresher evidence anyway.
+                await conn.execute("SET LOCAL lock_timeout = '2s'")
                 rows = await conn.fetch(
                     """
                     SELECT id, tenant_id, status, health, last_error, last_success_at
@@ -203,7 +206,7 @@ class PgControlPlane:
                                 INSERT INTO audit_events (
                                     id, tenant_id, event_type, actor_id, entity_type, entity_id,
                                     before_json, after_json, correlation_id, occurred_at, severity
-                                ) VALUES ($1, $2, 'CONNECTION_DEGRADED', NULL, 'connection', $3, $4::jsonb, $5::jsonb, 'acquisition', $6, 'WARNING')
+                                ) VALUES ($1, $2, 'CONNECTION_DEGRADED', NULL, 'connection', $3, $4::jsonb, $5::jsonb, 'acquisition', $6, 'WARN')
                                 """,
                                 uuid4(),
                                 tenant_id,
@@ -227,10 +230,14 @@ class PgControlPlane:
                                 json.dumps({"health": update.health}),
                                 current_now,
                             )
-                    await conn.execute(
-                        "SELECT pg_notify('factorix_health_changed', $1)",
-                        json.dumps({"tenant_id": str(tenant_id), "event": payload}),
-                    )
+                    # Push only real changes. last_success_at advances every heartbeat; the API reads
+                    # it from PostgreSQL itself (source evidence for DELAYED vs STALE), so notifying
+                    # every connection every 5 s was pure NOTIFY/WebSocket noise.
+                    if update.health != row["health"] or (update.last_error or None) != (row["last_error"] or None):
+                        await conn.execute(
+                            "SELECT pg_notify('factorix_health_changed', $1)",
+                            json.dumps({"tenant_id": str(tenant_id), "event": payload}),
+                        )
         return updated
 
     async def record_heartbeat(

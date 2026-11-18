@@ -110,7 +110,7 @@ export const PostgresExplorerView: React.FC = () => {
               schema_name: t.schema_name || t.schema || schema,
               table_name: t.table_name || t.name || '',
               table_type: t.table_type || t.type || 'TABLE',
-              row_count_estimate: t.row_count_estimate ?? t.estimated_rows ?? 0,
+              row_count_estimate: t.row_count_estimate ?? t.estimated_rows ?? null,
               column_count: t.column_count || 0,
             }))
           : [];
@@ -236,19 +236,13 @@ export const PostgresExplorerView: React.FC = () => {
 
   return (
     <div className="space-y-4">
-      {/* Strict Read-Only Security Banner */}
-      <div className="flex items-center justify-between p-3 bg-[#F0FDF4] border border-[#BBF7D0] rounded-xl text-[12px] text-[#166534]">
-        <div className="flex items-center gap-2">
-          <ShieldCheck className="w-4 h-4 text-[#16A34A] shrink-0" />
-          <span className="font-semibold">PostgreSQL Explorer (Strict Read-Only)</span>
-          <span className="text-[#4ADE80]">•</span>
-          <span>
-            Connected under bounded query role <code className="bg-[#DCFCE7] px-1.5 py-0.5 rounded font-mono text-[11px]">factorix_explorer_ro</code>.
-            DDL, DML, and sensitive admin secret tables are blocked.
-          </span>
-        </div>
-        <span className="px-2 py-0.5 bg-[#DCFCE7] text-[#15803D] font-bold rounded text-[10px] shrink-0">
-          SET TRANSACTION READ ONLY
+      {/* Read-only banner: states exactly what is enforced (P1-14) */}
+      <div className="flex items-start gap-2 p-3 bg-[#EEF5FF] border border-[#D4DFEC] rounded-xl text-[12px] text-[#334568]">
+        <ShieldCheck className="w-4 h-4 text-[#2A82E7] shrink-0 mt-0.5" />
+        <span>
+          <span className="font-semibold text-[#111B37]">Read-only explorer.</span> Only generated SELECT statements on catalog-validated
+          tables run here (5 s timeout, rows of your tenant only). Credential, session and audit tables are hidden and secret
+          values are masked. It uses the application database role, not a separate read-only role.
         </span>
       </div>
 
@@ -265,7 +259,7 @@ export const PostgresExplorerView: React.FC = () => {
               <button
                 type="button"
                 onClick={fetchSchemas}
-                className="text-[11px] text-[#1976D2] hover:underline flex items-center gap-1"
+                className="text-[11px] text-[#EF1B24] hover:underline flex items-center gap-1"
                 title="Refresh schemas"
               >
                 <RefreshCw className="w-3 h-3" />
@@ -306,7 +300,7 @@ export const PostgresExplorerView: React.FC = () => {
           <div className="space-y-1 max-h-[500px] overflow-y-auto">
             {tablesLoading ? (
               <div className="py-8 text-center text-[#657794] text-[12px]">
-                <RefreshCw className="w-4 h-4 animate-spin text-[#1976D2] mx-auto mb-1.5" />
+                <RefreshCw className="w-4 h-4 animate-spin text-[#EF1B24] mx-auto mb-1.5" />
                 Loading tables...
               </div>
             ) : tablesError ? (
@@ -332,7 +326,7 @@ export const PostgresExplorerView: React.FC = () => {
                   onClick={() => setSelectedTable(t.table_name)}
                   className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-left text-[12px] transition-colors ${
                     selectedTable === t.table_name
-                      ? 'bg-[#E8EEF8] text-[#1976D2] font-semibold'
+                      ? 'bg-[#E8EEF8] text-[#EF1B24] font-semibold'
                       : 'text-[#334155] hover:bg-[#F8FAFC]'
                   }`}
                 >
@@ -367,7 +361,7 @@ export const PostgresExplorerView: React.FC = () => {
                 onClick={() => setActiveTab('erd')}
                 className={`px-3 py-1 rounded-md text-[12px] font-semibold transition-colors ${
                   activeTab === 'erd'
-                    ? 'bg-white text-[#1976D2] shadow-xs'
+                    ? 'bg-white text-[#EF1B24] shadow-xs'
                     : 'text-[#657794] hover:text-[#111B37]'
                 }`}
               >
@@ -379,7 +373,7 @@ export const PostgresExplorerView: React.FC = () => {
                 onClick={() => setActiveTab('columns')}
                 className={`px-3 py-1 rounded-md text-[12px] font-semibold transition-colors disabled:opacity-40 ${
                   activeTab === 'columns'
-                    ? 'bg-white text-[#1976D2] shadow-xs'
+                    ? 'bg-white text-[#EF1B24] shadow-xs'
                     : 'text-[#657794] hover:text-[#111B37]'
                 }`}
               >
@@ -391,7 +385,7 @@ export const PostgresExplorerView: React.FC = () => {
                 onClick={() => setActiveTab('preview')}
                 className={`px-3 py-1 rounded-md text-[12px] font-semibold transition-colors disabled:opacity-40 ${
                   activeTab === 'preview'
-                    ? 'bg-white text-[#1976D2] shadow-xs'
+                    ? 'bg-white text-[#EF1B24] shadow-xs'
                     : 'text-[#657794] hover:text-[#111B37]'
                 }`}
               >
@@ -442,12 +436,12 @@ export const PostgresExplorerView: React.FC = () => {
                           onClick={() => setSelectedTable(tableName)}
                           className={`p-3.5 bg-white border-2 rounded-xl cursor-pointer transition-all hover:shadow-sm ${
                             isSelected
-                              ? 'border-[#1976D2] ring-2 ring-[#1976D2]/20'
+                              ? 'border-[#EF1B24] ring-2 ring-[#EF1B24]/20'
                               : 'border-[#E3EAF3] hover:border-[#CBD5E1]'
                           }`}
                         >
                           <div className="flex items-center gap-2 mb-2">
-                            <Table className="w-4 h-4 text-[#1976D2]" />
+                            <Table className="w-4 h-4 text-[#EF1B24]" />
                             <span className="font-mono text-[12px] font-bold text-[#111B37] truncate">
                               {tableName}
                             </span>
@@ -457,7 +451,7 @@ export const PostgresExplorerView: React.FC = () => {
                             <div className="text-[11px] text-[#657794] space-y-1 border-t border-[#E3EAF3] pt-2">
                               {outgoing.map((rel) => (
                                 <div key={rel.constraint_name} className="flex items-center gap-1.5 truncate">
-                                  <Link2 className="w-3 h-3 text-[#1976D2] shrink-0" />
+                                  <Link2 className="w-3 h-3 text-[#EF1B24] shrink-0" />
                                   <span className="truncate">
                                     {rel.source_column} &rarr; {rel.target_table}
                                   </span>

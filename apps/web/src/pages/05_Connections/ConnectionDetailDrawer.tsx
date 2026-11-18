@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { X, Play, Pause, PlusCircle, Activity, Edit2 } from 'lucide-react';
+import { collectorSiteLabel } from './collectorName';
 import { ConnectionItem, SignalItem, ResourceNode } from '../../types';
 import { StatusBadge } from '../../components/common/StatusBadge';
 import { CommissionResult } from '../../lib/commissioning';
@@ -121,7 +122,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {(testing || testResult) && (
-          <TestResultPanel running={testing} result={testResult || null} successLabel="The Edge collector reached the endpoint" />
+          <TestResultPanel running={testing} result={testResult || null} successLabel="The collector reached the endpoint" />
         )}
 
         {activeTab === 'overview' && (
@@ -139,7 +140,7 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
             <dl className="p-3 rounded-xl border border-[#E2E8F0] bg-white text-xs divide-y divide-[#F1F5F9]">
               {[
                 ['Endpoint', <span className="font-mono break-all">{connection.endpoint}</span>],
-                ['Edge collector', edgeName || '—'],
+                ['Collected by', `Built-in collector · ${collectorSiteLabel(edgeName)}`],
                 ['Lifecycle', connection.lifecycleStatus || '—'],
                 ['Health (server)', connection.effectiveHealth || connection.health || '—'],
                 ['Last data received', connection.lastSuccessAt ? `${formatTimestamp(connection.lastSuccessAt)} (${timeAgo(connection.lastSuccessAt)})` : '—'],
@@ -182,6 +183,9 @@ export const ConnectionDetailDrawer: React.FC<ConnectionDetailDrawerProps> = ({
                           <div className="text-right shrink-0">
                             <div className="font-mono font-black text-[#0B2545]">
                               {formatCurrentSignalValue(s.value, s.quality)}
+                              {s.unit && formatCurrentSignalValue(s.value, s.quality) !== '—' ? (
+                                <span className="font-normal text-[10px] text-[#64748B] ml-1">{s.unit}</span>
+                              ) : null}
                             </div>
                             <StatusBadge status={s.quality || 'NO_DATA'} />
                           </div>

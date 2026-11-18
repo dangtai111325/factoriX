@@ -14,7 +14,9 @@ The existing Storage Designer (`StorageDesignerPage.tsx`, 2639 lines) exposes a 
 Key findings from source review at SHA `400dba1`:
 - `StorageDesignerPage.tsx:302` sets `step=2` by default, bypassing A1 basics
 - `StorageCatalogDetailPage.tsx:383–445` builds a fallback `CompiledDatasetPlan` from client-side heuristics, inventing physical names and hash values
-- `apps/web/src/components/shell/Sidebar.tsx:71–79` has 3 navigation children instead of the required 2
+- `apps/web/src/components/shell/Sidebar.tsx:71–79` had 3 navigation children (Designer / Catalog / Historian).
+  Note (2026-11-18 correction): plan.md §2 *requires* those 3 children; the earlier wording "instead of the
+  required 2" misquoted the plan. The 2-child layout below is a deliberate deviation, see "Deviation from plan §2".
 - Backend `storage_dsl.py` (1620 lines) uses `DatasetAst` which does not map 1:1 to physical TDengine objects
 
 ## Decision
@@ -50,6 +52,25 @@ Legacy routes (`/historian/designer`, `/historian/catalog`) redirect with query 
 - TDengine metadata read from actual engine via `INFORMATION_SCHEMA`; never inferred client-side
 - Physical topology API: `GET /api/v1/storage/td/topology` returns `actual_state`, `desired_state`, `drift_type`, `last_verified_at`
 - Operation saga: `DRAFT → PLANNED → APPLYING → VERIFYING → APPLIED/FAILED/OUT_OF_SYNC`; `publish_state=APPLIED` only after DDL verification
+
+## Deviation from plan §2 (recorded 2026-11-18, v6 WS-H)
+
+plan.md §2 specifies three children under *Historian & Storage*: `Designer`, `Catalog`, `Historian`.
+This product keeps **two** children, by decision of this ADR:
+
+| plan §2 child | Where it lives now |
+|---|---|
+| Designer (`/historian/designer`) | Storage Management → New ▸ Database / Supertable / Subtable wizards, and New ▸ *Subtables from Data Models* (bulk). Each wizard's Review step shows the DDL produced by the backend compiler (`POST /api/v1/storage/td/plan`). |
+| Catalog (`/historian/catalog`) | Storage Management → Objects table / Topology, object detail page (`/historian/storage/object/:id`) with bindings, recording state and lifecycle (pause / resume / retire / delete). |
+| Historian (`/historian/historian`) | unchanged. |
+
+Why: the owner's target workflow (tdengine_guide.md: 1 DB, 7 supertables, 324 subtables bound to Data Model
+fields) is a physical Database → Supertable → Subtable workflow; a separate logical Designer adds a second
+vocabulary without adding capability. Nothing was removed: `/historian/designer`, `/historian/designer/:id`,
+`/historian/catalog`, `/historian/catalog/:id`, `/historian/explorer`, `/historian/policies`,
+`/historian/retention` redirect (query preserved) to the corresponding page, and the logical
+`/api/v1/storage/designs/*` API remains available (it can be surfaced as a tab of Storage Management if the
+owner wants the logical layer back). This is a contract deviation of plan §2, not a silent change.
 
 ## References
 

@@ -40,7 +40,8 @@ import { SignalItem } from '../../types';
 import {
   getSources,
   listSubtables,
-  queryHistorian,
+  queryHistorianSeries,
+  HistorianSeriesResult,
   listSavedViews,
   listExportJobs,
   createExportJob,
@@ -58,17 +59,49 @@ import {
   RemoteEmptyState,
 } from '../../components/common/RemoteResourceState';
 
+/** Stable token the backend understands for a picked source (signal | model field | subtable). */
+function sourceToken(src: SourceRef): string {
+  if (src.kind === 'model_field' && src.model_id && src.field_path) return `mod:${src.model_id}:${src.field_path}`;
+  if (src.kind === 'subtable' || src.kind === 'resource_context') return src.id.startsWith('subtable:') ? src.id : `subtable:${src.id}`;
+  return src.id.startsWith('sig:') ? src.id.slice(4) : src.id;
+}
+
+function tokenToSource(token: string, kind?: string | null): SourceRef {
+  const t = token.trim();
+  if (t.startsWith('mod:')) {
+    const [, mid, ...rest] = t.split(':');
+    return { id: t, kind: 'model_field', model_id: mid, field_path: rest.join(':'), display_name: rest.join(':'), path: t, status: 'ACTIVE' };
+  }
+  if (t.startsWith('subtable:') || kind === 'subtable') {
+    const id = t.startsWith('subtable:') ? t : `subtable:${t}`;
+    return { id, kind: 'subtable', display_name: id.split('.').pop() || id, path: id, status: 'ACTIVE' };
+  }
+  const id = t.startsWith('sig:') ? t.slice(4) : t;
+  return { id, kind: 'signal', display_name: id, path: id, status: 'ACTIVE' };
+}
+
+const PRESETS: Record<string, number> = { '5m': 5 * 60e3, '15m': 15 * 60e3, '1h': 3600e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3, '7d': 7 * 24 * 3600e3 };
+
 export const HistorianExplorerPage: React.FC = () => {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   // Active view tab: 'trend' | 'records' | 'events' | 'exports'
   const [activeTab, setActiveTab] = useState<'trend' | 'records' | 'events' | 'exports'>('trend');
 
   // Mode: recorded (strict raw events) vs reconstructed (interpolated timeline) vs operational
-  const [mode, setMode] = useState<HistorianMode>('recorded');
+  const [mode, setMode] = useState<HistorianMode>(() => {
+    const m = searchParams.get('mode');
+    return m === 'recorded' || m === 'reconstructed' ? m : 'operational';
+  });
 
-  // Time range preset
-  const [timePreset, setTimePreset] = useState<TimeRangePreset>('1h');
+  // Time range preset (a deep link without range starts at 15 minutes, plan §8.3)
+  const [timePreset, setTimePreset] = useState<TimeRangePreset>(() => {
+    const r = searchParams.get('range');
+    if (r && r in PRESETS) return r as TimeRangePreset;
+    return searchParams.get('source_id') || searchParams.get('signalId') || searchParams.get('signal_id') || searchParams.get('sources') ? '15m' : '1h';
+  });
+  const [selectionNotice, setSelectionNotice] = useState<string | null>(null);
+  const [coverage, setCoverage] = useState<{ downsampled: boolean; notes: string[]; available: boolean }>({ downsampled: false, notes: [], available: true });
 
   // Computed start/end in ms
   const [timeRange, setTimeRange] = useState(() => {
@@ -196,23 +229,33 @@ export const HistorianExplorerPage: React.FC = () => {
     fetchSources();
   }, [fetchSources]);
 
-  // Handle URL query param: ?source_id=...
+  // Deep links: ?source_id=<id>&kind=signal|model_field|subtable, legacy ?signalId= / ?signal_id=,
+  // and ?sources=<token>,<token> (the selection is kept in the URL so Back/refresh restore it).
   useEffect(() => {
-    const srcId = searchParams.get('source_id');
-    if (srcId && selectedSeries.length === 0) {
-      const initial: SourceRef = {
-        id: srcId,
-        kind: 'signal',
-        display_name: srcId.split('/').pop() || srcId,
-        path: srcId,
-        status: 'ACTIVE',
-      };
-      setSelectedSeries([initial]);
-    }
-  }, [searchParams]);
+    if (selectedSeries.length > 0) return;
+    const many = searchParams.get('sources');
+    const one = searchParams.get('source_id') || searchParams.get('signalId') || searchParams.get('signal_id');
+    const tokens = many ? many.split(',').filter(Boolean) : one ? [one] : [];
+    if (tokens.length) setSelectedSeries(tokens.slice(0, MAX_SELECTED_SERIES).map((t) => tokenToSource(t, searchParams.get('kind'))));
+  }, [searchParams]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams);
+    ['source_id', 'signalId', 'signal_id', 'kind'].forEach((k) => next.delete(k));
+    if (selectedSeries.length) next.set('sources', selectedSeries.map(sourceToken).join(','));
+    else next.delete('sources');
+    next.set('range', timePreset);
+    next.set('mode', mode);
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true });
+  }, [selectedSeries, timePreset, mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load trend/record data for selected series - strictly real queries, NO Math.sin fallback!
+  // Re-query only when the SET of series changes (label updates from the backend must not refetch).
+  const selectionKey = selectedSeries.map(sourceToken).join(',');
+  const selectedRef = React.useRef(selectedSeries);
+  selectedRef.current = selectedSeries;
   const fetchData = useCallback(async () => {
+    const selectedSeries = selectedRef.current;
     if (selectedSeries.length === 0) {
       setSeriesData([]);
       setRecordsRows([]);
@@ -232,181 +275,142 @@ export const HistorianExplorerPage: React.FC = () => {
       const allRows: HistorianRow[] = [];
       const extractedEvents: HistorianEventItem[] = [];
 
+      const res = await queryHistorianSeries({
+        sources: selectedSeries.map(sourceToken),
+        start: fromTs,
+        end: toTs,
+        mode,
+        resolution: 'auto',
+        max_points: 1500,
+      });
+      const byKey = new Map<string, HistorianSeriesResult>(res.series_list.map((sr) => [sr.series_key, sr]));
+      setCoverage({ downsampled: res.downsampled, notes: res.coverage_notes || [], available: res.history_available });
+      // Show the backend's real display names (a deep link only knows the id).
+      setSelectedSeries((prev) => {
+        let changed = false;
+        const next = prev.map((p) => {
+          const sr = byKey.get(sourceToken(p));
+          if (sr && sr.display_name && sr.display_name !== p.display_name) { changed = true; return { ...p, display_name: sr.display_name, unit: sr.unit ?? p.unit, data_type: sr.value_type ?? p.data_type }; }
+          return p;
+        });
+        return changed ? next : prev;
+      });
+
       for (let i = 0; i < selectedSeries.length; i++) {
         const src = selectedSeries[i];
         const color = SERIES_COLORS[i % SERIES_COLORS.length];
-
-        const queryRes = await queryHistorian({
-          source_kind: src.kind === 'signal' ? 'signal' : src.kind === 'model_field' ? 'model_field' : 'subtable',
-          source_id: src.id,
-          from_ts: fromTs,
-          to_ts: toTs,
-          mode,
-        });
-
-        const rows = Array.isArray(queryRes?.rows) ? queryRes.rows : [];
-
+        const sr = byKey.get(sourceToken(src));
+        const label = sr?.display_name || src.display_name;
+        const rows = sr?.points || [];
         const points: HistorianPoint[] = rows.map((r, pIdx) => {
-          const rawVal = typeof r.values?.value === 'number' ? r.values.value : Object.values(r.values || {})[0];
-          const numVal = typeof rawVal === 'number' ? rawVal : typeof rawVal === 'string' && !isNaN(Number(rawVal)) ? Number(rawVal) : null;
+          const rawVal = r.value;
+          const numVal = typeof rawVal === 'number' ? rawVal : typeof rawVal === 'boolean' ? (rawVal ? 1 : 0) : null;
           const tMs = new Date(r.ts).getTime();
-
           const parsedValue: string | number | boolean | null =
-            typeof rawVal === 'number' || typeof rawVal === 'string' || typeof rawVal === 'boolean'
-              ? rawVal
-              : rawVal != null
-              ? String(rawVal)
-              : null;
-
-          // Parse actual quality from record
-          const rawQualStr = r.quality
-            ? String(typeof r.quality === 'object' && r.quality !== null ? ((r.quality as Record<string, string>).value || Object.values(r.quality)[0] || 'GOOD') : r.quality).toUpperCase()
-            : 'GOOD';
-          const pointQuality: 'GOOD' | 'BAD' | 'UNCERTAIN' | 'STALE' =
-            rawQualStr.includes('BAD')
-              ? 'BAD'
-              : rawQualStr.includes('UNCERTAIN')
-              ? 'UNCERTAIN'
-              : rawQualStr.includes('STALE')
-              ? 'STALE'
-              : 'GOOD';
-
-          const eventUid = r.event_uid || r.eventUid || `uid-${src.id}-${tMs}`;
-          const dataEpoch = Number(r.data_epoch ?? r.dataEpoch ?? 1);
-          const reasonCode = r.reason_code ?? r.reasonCode ?? null;
-          const recordKind = String(r.record_kind || r.recordKind || (mode === 'reconstructed' ? 'RECONSTRUCTED_STEP' : 'POLICY_RECORDED'));
-          const isVirtual = r.virtual !== undefined ? Boolean(r.virtual) : (mode === 'reconstructed');
-          const acquiredAt = String(r.acquired_at || r.acquiredAt || r.ts);
-
+            typeof rawVal === 'number' || typeof rawVal === 'string' || typeof rawVal === 'boolean' ? rawVal : rawVal != null ? JSON.stringify(rawVal) : null;
+          // Quality is shown only when the storage has it; never defaulted to GOOD (P2).
+          const q = String(r.quality || '').toUpperCase();
           return {
             id: `${src.id}-${tMs}-${pIdx}`,
-            eventUid,
+            eventUid: r.event_uid || r.id,
             signalId: src.id,
-            signalName: src.display_name,
+            signalName: label,
             timestampMs: tMs,
             eventTime: r.ts,
-            acquiredAt,
-            sourceTime: r.source_times ? String(Object.values(r.source_times)[0]) : (r.source_time || r.ts),
-            valueType: src.data_type || 'FLOAT64',
+            acquiredAt: r.ts,
+            sourceTime: r.source_time || r.ts,
+            valueType: sr?.value_type || src.data_type || 'FLOAT64',
             value: parsedValue,
             numericValue: numVal,
-            unit: src.unit || '',
-            quality: pointQuality,
-            reasonCode,
-            recordKind,
-            virtual: isVirtual,
-            dataEpoch,
+            unit: sr?.unit || src.unit || '',
+            quality: q || 'UNKNOWN',
+            reasonCode: r.reason_code || null,
+            recordKind: r.record_kind,
+            virtual: !!r.virtual,
+            dataEpoch: Number(r.data_epoch ?? 1),
           };
         });
 
-        // Helper to normalize quality to valid segment union
-        const toQuality = (q: unknown): 'GOOD' | 'UNCERTAIN' | 'STALE' | 'BAD' => {
-          const s = String(q || '').toUpperCase();
-          if (s.includes('BAD')) return 'BAD';
-          if (s.includes('UNCERTAIN')) return 'UNCERTAIN';
-          if (s.includes('STALE')) return 'STALE';
-          return 'GOOD';
-        };
-
-        // Compute actual quality segments
         const qualitySegments: QualitySegment[] = [];
-        if (points.length > 0) {
-          let segStart = points[0].timestampMs;
-          let currentQual = toQuality(points[0].quality);
-          for (let pIdx = 1; pIdx < points.length; pIdx++) {
-            const nextQual = toQuality(points[pIdx].quality);
+        const known = points.filter((p) => ['GOOD', 'BAD', 'UNCERTAIN', 'STALE'].includes(String(p.quality)));
+        if (known.length > 0) {
+          let segStart = known[0].timestampMs;
+          let currentQual = known[0].quality as QualitySegment['quality'];
+          for (let pIdx = 1; pIdx < known.length; pIdx++) {
+            const nextQual = known[pIdx].quality as QualitySegment['quality'];
             if (nextQual !== currentQual) {
-              qualitySegments.push({
-                startMs: segStart,
-                endMs: points[pIdx].timestampMs,
-                quality: currentQual,
-              });
-              segStart = points[pIdx].timestampMs;
+              qualitySegments.push({ startMs: segStart, endMs: known[pIdx].timestampMs, quality: currentQual });
+              segStart = known[pIdx].timestampMs;
               currentQual = nextQual;
             }
           }
-          qualitySegments.push({
-            startMs: segStart,
-            endMs: points[points.length - 1].timestampMs,
-            quality: currentQual,
-          });
+          qualitySegments.push({ startMs: segStart, endMs: known[known.length - 1].timestampMs, quality: currentQual });
         }
 
-        // Calculate REAL statistical aggregates from actual points
-        const numPoints = points.filter((p) => p.numericValue !== null);
-        const goodCount = points.filter((p) => p.quality === 'GOOD').length;
-        const actualGoodPct = points.length > 0 ? Number(((goodCount / points.length) * 100).toFixed(1)) : 0;
-
+        const st = sr?.stats;
         const stats: SeriesStats = {
           signalId: src.id,
-          signalName: src.display_name,
-          unit: src.unit || '',
+          signalName: label,
+          unit: sr?.unit || src.unit || '',
           color,
           isDiscrete: false,
           last: points.length > 0 ? points[points.length - 1].value : null,
-          min: numPoints.length > 0 ? Math.min(...numPoints.map((p) => p.numericValue!)) : null,
-          max: numPoints.length > 0 ? Math.max(...numPoints.map((p) => p.numericValue!)) : null,
-          avg:
-            numPoints.length > 0
-              ? Number((numPoints.reduce((acc, p) => acc + p.numericValue!, 0) / numPoints.length).toFixed(2))
-              : null,
-          samples: points.length,
-          goodPct: actualGoodPct,
+          min: st?.min ?? null,
+          max: st?.max ?? null,
+          avg: st?.avg != null ? Number(st.avg.toFixed(3)) : null,
+          samples: st?.count ?? points.length,
+          goodPct: st?.good_pct ?? (null as unknown as number),
           fidelityMode: mode,
         };
 
         const signalShim: SignalItem = {
           id: src.id,
-          name: src.display_name,
+          name: label,
           tag: src.path,
-          display_name: src.display_name,
-          displayName: src.display_name,
-          sourceConnectionId: src.connection_id || 'conn-1',
-          sourceConnectionName: src.connection_name || 'Industrial Connection',
+          display_name: label,
+          displayName: label,
+          sourceConnectionId: src.connection_id || '',
+          sourceConnectionName: src.connection_name || '',
           resourceId: src.resource_id || src.id,
           resourcePath: src.path,
-          dataType: (src.data_type as any) || 'FLOAT64',
-          data_type: src.data_type || 'FLOAT64',
-          unit: src.unit || undefined,
-          quality: points.length > 0 ? points[points.length - 1].quality : 'GOOD',
-          lastUpdated: points.length > 0 ? points[points.length - 1].eventTime : new Date().toISOString(),
-          sampleIntervalMs: 1000,
+          dataType: ((sr?.value_type || src.data_type) as any) || 'FLOAT64',
+          data_type: sr?.value_type || src.data_type || 'FLOAT64',
+          unit: sr?.unit || src.unit || undefined,
+          quality: (points.length > 0 ? points[points.length - 1].quality : 'UNKNOWN') as any,
+          lastUpdated: points.length > 0 ? points[points.length - 1].eventTime : '',
+          sampleIntervalMs: sr?.bucket_ms || 1000,
         };
 
-        newSeriesList.push({
-          signal: signalShim,
-          color,
-          isDiscrete: false,
-          points,
-          qualitySegments,
-          stats,
-          fidelity: mode,
-          coverageNotes: [],
-        });
+        const notes = [...(sr?.coverage_notes || [])];
+        if (sr?.downsampled) notes.unshift(`Downsampled: ${sr.total.toLocaleString()} rows shown as ${points.length} buckets of ${Math.round((sr.bucket_ms || 0) / 1000)} s (avg; min/max per bucket).`);
+        if (sr?.truncated) notes.unshift(`Showing the most recent ${points.length} of ${sr.total.toLocaleString()} rows; narrow the range for all rows.`);
+        if (sr && sr.status !== 'OK') notes.push(sr.status === 'NO_DATA' ? 'No data in this window.' : `Status: ${sr.status}`);
 
-        allRows.push(...rows);
+        newSeriesList.push({ signal: signalShim, color, isDiscrete: false, points, qualitySegments, stats, fidelity: mode, coverageNotes: notes });
 
-        // Extract quality transition events
-        for (let pIdx = 1; pIdx < points.length; pIdx++) {
-          if (points[pIdx].quality !== points[pIdx - 1].quality) {
+        allRows.push(...rows.map((r) => ({ ...r, series_name: label } as unknown as HistorianRow)));
+
+        for (let pIdx = 1; pIdx < known.length; pIdx++) {
+          if (known[pIdx].quality !== known[pIdx - 1].quality) {
             extractedEvents.push({
-              id: `evt-${src.id}-${points[pIdx].timestampMs}`,
-              timestampMs: points[pIdx].timestampMs,
-              timestamp: points[pIdx].eventTime,
+              id: `evt-${src.id}-${known[pIdx].timestampMs}`,
+              timestampMs: known[pIdx].timestampMs,
+              timestamp: known[pIdx].eventTime,
               kind: 'QUALITY_TRANSITION',
               signalId: src.id,
-              signalName: src.display_name,
-              fromQuality: String(points[pIdx - 1].quality),
-              toQuality: String(points[pIdx].quality),
-              summary: `Quality changed from ${points[pIdx - 1].quality} to ${points[pIdx].quality}`,
+              signalName: label,
+              fromQuality: String(known[pIdx - 1].quality),
+              toQuality: String(known[pIdx].quality),
+              summary: `Quality changed from ${known[pIdx - 1].quality} to ${known[pIdx].quality}`,
             });
           }
         }
       }
 
       setSeriesData(newSeriesList);
+      allRows.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
       setRecordsRows(allRows);
-      setRecordsTotal(allRows.length);
+      setRecordsTotal(res.series_list.reduce((acc, sr) => acc + (sr.total || 0), 0));
       setEventsData(extractedEvents);
     } catch (err: unknown) {
       console.error('Historian query failed:', err);
@@ -418,7 +422,7 @@ export const HistorianExplorerPage: React.FC = () => {
     } finally {
       setQueryLoading(false);
     }
-  }, [selectedSeries, timeRange, mode]);
+  }, [selectionKey, timeRange, mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     void fetchData();
@@ -438,12 +442,13 @@ export const HistorianExplorerPage: React.FC = () => {
     setExportSubmitting(true);
     setExportError(null);
     try {
-      const src = selectedSeries[0];
       const job = await createExportJob({
-        source_kind: src.kind,
-        source_id: src.id,
+        sources: selectedSeries.map(sourceToken),
         from_ts: new Date(timeRange.startMs).toISOString(),
         to_ts: new Date(timeRange.endMs).toISOString(),
+        start: new Date(timeRange.startMs).toISOString(),
+        end: new Date(timeRange.endMs).toISOString(),
+        mode,
         format,
       });
       setExportJobs((prev) => [job, ...prev]);
@@ -460,21 +465,28 @@ export const HistorianExplorerPage: React.FC = () => {
     if (exists) {
       setSelectedSeries(selectedSeries.filter((s) => s.id !== src.id));
     } else {
-      if (selectedSeries.length >= MAX_SELECTED_SERIES) return;
+      if (selectedSeries.length >= MAX_SELECTED_SERIES) {
+        setSelectionNotice(`At most ${MAX_SELECTED_SERIES} series can be shown at once. Remove one first.`);
+        return;
+      }
+      setSelectionNotice(null);
       setSelectedSeries([...selectedSeries, src]);
     }
   };
 
   const handleToggleTable = (table: TDSubtable) => {
-    const exists = selectedSeries.some((s) => s.id === table.id);
+    const exists = selectedSeries.some((s) => s.id === `subtable:${table.id}`);
     if (exists) {
-      setSelectedSeries(selectedSeries.filter((s) => s.id !== table.id));
+      setSelectedSeries(selectedSeries.filter((s) => s.id !== `subtable:${table.id}`));
     } else {
-      if (selectedSeries.length >= MAX_SELECTED_SERIES) return;
+      if (selectedSeries.length >= MAX_SELECTED_SERIES) {
+        setSelectionNotice(`At most ${MAX_SELECTED_SERIES} series can be shown at once. Remove one first.`);
+        return;
+      }
       const srcRef: SourceRef = {
-        id: table.id,
-        kind: 'resource_context',
-        display_name: table.physical_name,
+        id: `subtable:${table.id}`,
+        kind: 'subtable',
+        display_name: table.display_name || table.physical_name,
         path: `TDengine / ${table.database_name} / ${table.physical_name}`,
         status: table.status === 'ACTIVE' ? 'ACTIVE' : 'INACTIVE',
       };
@@ -494,17 +506,10 @@ export const HistorianExplorerPage: React.FC = () => {
   return (
     <div className="space-y-4">
       {/* Header bar */}
-      <div className="flex flex-wrap items-center justify-between gap-4 pb-2 border-b border-[#E3EAF3]">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 text-[12px] font-medium text-[#657794] mb-0.5">
-            <span>Historian & Storage</span>
-            <span>/</span>
-            <span className="text-[#111B37] font-semibold">Historian</span>
-          </div>
-          <h1 className="text-[20px] font-bold text-[#111B37] leading-tight">Historian Explorer</h1>
-          <p className="text-[13px] text-[#657794] mt-0.5">
-            High-fidelity historical analysis powered by TDengine time-series data plane.
-          </p>
+          <h1 className="text-[20px] font-bold text-[#111B37]">Historian</h1>
+          <p className="text-[13px] text-[#657794]">Explore time-series values, state changes and stored records.</p>
         </div>
 
         {/* Header Right: Mode switcher & Time Range presets */}
@@ -559,10 +564,32 @@ export const HistorianExplorerPage: React.FC = () => {
         </div>
       </div>
 
+      {(selectionNotice || !coverage.available || coverage.downsampled || coverage.notes.length > 0) && (
+        <div className="space-y-1.5">
+          {selectionNotice && (
+            <div role="status" className="px-3 py-2 rounded-lg border border-[#FFE2B3] bg-[#FFF6E5] text-[12px] text-[#334568] flex items-center justify-between gap-2">
+              <span>{selectionNotice}</span>
+              <button type="button" onClick={() => setSelectionNotice(null)} aria-label="Dismiss" className="text-[#657794]"><X className="w-3.5 h-3.5" /></button>
+            </div>
+          )}
+          {!coverage.available && (
+            <div className="px-3 py-2 rounded-lg border border-[#FAC6C9] bg-[#FFF0F1] text-[12px] text-[#334568]">
+              Time-series storage is not configured; only PostgreSQL observations can be shown.
+            </div>
+          )}
+          {(coverage.downsampled || coverage.notes.length > 0) && (
+            <div className="px-3 py-2 rounded-lg border border-[#E3EAF3] bg-white text-[12px] text-[#334568] space-y-0.5">
+              {coverage.downsampled && <div>Long range: values are aggregated per time bucket on the server (average, with min/max per bucket).</div>}
+              {[...new Set(coverage.notes)].slice(0, 6).map((n) => <div key={n} className="text-[#657794]">{n}</div>)}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Main split layout */}
-      <div className="grid grid-cols-12 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         {/* Left Source Picker (col-span-3) */}
-        <div className="col-span-3 bg-white border border-[#E3EAF3] rounded-xl shadow-xs p-3 flex flex-col space-y-3 min-h-[680px]">
+        <div className="lg:col-span-3 bg-white border border-[#E3EAF3] rounded-xl shadow-xs p-3 flex flex-col space-y-3 max-h-[360px] lg:max-h-none lg:min-h-[680px]">
           <div>
             <div className="text-[11px] font-bold text-[#657794] uppercase tracking-wider mb-2">
               Select Series
@@ -650,7 +677,7 @@ export const HistorianExplorerPage: React.FC = () => {
                 </div>
               ) : (
                 tablesList.map((tbl) => {
-                  const isSelected = selectedSeries.some((s) => s.id === tbl.id);
+                  const isSelected = selectedSeries.some((s) => s.id === `subtable:${tbl.id}`);
                   return (
                     <div
                       key={tbl.id}
@@ -729,13 +756,17 @@ export const HistorianExplorerPage: React.FC = () => {
                                 <div className="flex items-center gap-1 shrink-0">
                                   <span
                                     className={`w-1.5 h-1.5 rounded-full ${
-                                      (sig.quality || '').includes('GOOD')
-                                        ? 'bg-[#0DBA67]'
+                                      typeof navigator !== 'undefined' && !navigator.onLine
+                                        ? 'bg-[#CBD5E1]'
                                         : (sig.quality || '').includes('BAD')
-                                        ? 'bg-[#EF1B24]'
-                                        : 'bg-[#F59E0B]'
+                                        ? 'bg-[#F2343B]'
+                                        : (sig.quality || '').includes('GOOD') && sig.freshness === 'FRESH'
+                                        ? 'bg-[#0DBA67]'
+                                        : sig.freshness === 'STALE'
+                                        ? 'bg-[#FFAA23]'
+                                        : 'bg-[#CBD5E1]'
                                     }`}
-                                    title={sig.quality || 'UNKNOWN'}
+                                    title={`${sig.quality || 'UNKNOWN'}${sig.freshness ? ` · ${sig.freshness}` : ''}`}
                                   />
                                   {isSelected && <Check className="w-3.5 h-3.5 text-[#EF1B24]" />}
                                 </div>
@@ -792,7 +823,7 @@ export const HistorianExplorerPage: React.FC = () => {
         </div>
 
         {/* Right Workspace (col-span-9) */}
-        <div className="col-span-9 space-y-4">
+        <div className="lg:col-span-9 space-y-4 min-w-0">
           {/* Main workspace tabs */}
           <div className="bg-white border border-[#E3EAF3] rounded-xl shadow-xs p-1 flex items-center justify-between">
             <div className="flex items-center gap-1">
@@ -893,8 +924,8 @@ export const HistorianExplorerPage: React.FC = () => {
             {activeTab === 'records' && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between text-[12px] text-[#657794]">
-                  <span>Raw ingested rows from TDengine storage engine.</span>
-                  <span>Total matching: {recordsTotal}</span>
+                  <span>{coverage.downsampled ? 'Long ranges are aggregated server-side; narrow the range to see every stored row.' : 'Stored rows, newest first.'}</span>
+                  <span>Rows in window: {recordsTotal.toLocaleString()}</span>
                 </div>
 
                 {queryError ? (
@@ -910,7 +941,8 @@ export const HistorianExplorerPage: React.FC = () => {
                     <table className="w-full text-left text-[12px] font-mono">
                       <thead className="bg-[#F8FAFC] border-b border-[#E3EAF3] text-[#657794] sticky top-0">
                         <tr>
-                          <th className="py-2.5 px-3">Timestamp (UTC)</th>
+                          <th className="py-2.5 px-3">Time ({Intl.DateTimeFormat().resolvedOptions().timeZone})</th>
+                          <th className="py-2.5 px-3">Series</th>
                           <th className="py-2.5 px-3">Value</th>
                           <th className="py-2.5 px-3">Quality</th>
                         </tr>
@@ -918,23 +950,27 @@ export const HistorianExplorerPage: React.FC = () => {
                       <tbody className="divide-y divide-[#F1F5FA]">
                         {recordsRows.length === 0 ? (
                           <tr>
-                            <td colSpan={3} className="py-12 text-center text-[#657794]">
+                            <td colSpan={4} className="py-12 text-center text-[#657794]">
                               No records found for the selected time range.
                             </td>
                           </tr>
                         ) : (
                           recordsRows.map((row, idx) => {
-                            const rawQual = row.quality
-                              ? String(typeof row.quality === 'object' && row.quality !== null ? ((row.quality as Record<string, string>).value || Object.values(row.quality)[0] || 'GOOD') : row.quality).toUpperCase()
-                              : 'GOOD';
+                            const rawQual = row.quality ? String(row.quality).toUpperCase() : '—';
                             const isGood = rawQual.includes('GOOD');
                             const isBad = rawQual.includes('BAD');
 
                             return (
                               <tr key={idx} className="hover:bg-[#F8FAFC]">
-                                <td className="py-2 px-3 text-[#111B37] whitespace-nowrap">{row.ts}</td>
-                                <td className="py-2 px-3 text-[#0284C7] font-bold whitespace-nowrap">
-                                  {JSON.stringify(row.values)}
+                                <td className="py-2 px-3 text-[#111B37] whitespace-nowrap" title={String(row.ts)}>{new Date(String(row.ts)).toLocaleString()}</td>
+                                <td className="py-2 px-3 text-[#334568] whitespace-nowrap">{String((row as Record<string, unknown>).series_name || '')}</td>
+                                <td className="py-2 px-3 text-[#111B37] font-semibold whitespace-nowrap">
+                                  {(row as Record<string, unknown>).value === null || (row as Record<string, unknown>).value === undefined
+                                    ? 'null'
+                                    : typeof (row as Record<string, unknown>).value === 'object'
+                                    ? JSON.stringify((row as Record<string, unknown>).value)
+                                    : String((row as Record<string, unknown>).value)}
+                                  {String(row.record_kind || '') === 'AGGREGATE' && <span className="ml-1 text-[10px] text-[#657794]">avg</span>}
                                 </td>
                                 <td className="py-2 px-3">
                                   <span

@@ -120,6 +120,38 @@ def _fmt_utc_us(dt: datetime | None) -> str | None:
     return moment.isoformat().replace("+00:00", "Z")
 
 
+# Telemetry repeats a small set of ids (tenant/signal/resource/connection/field) millions of
+# times; parsing and formatting UUIDs was the top CPU cost per observation. Bounded interning.
+_UUID_CACHE: dict[str, UUID] = {}
+_UUID_STR_CACHE: dict[UUID, str] = {}
+_UUID_CACHE_MAX = 200_000
+
+
+def intern_uuid(value: Any) -> UUID:
+    """``UUID(str(value))`` with a bounded cache; raises ``ValueError``/``TypeError`` like ``UUID``."""
+    if isinstance(value, UUID):
+        return value
+    text = value if isinstance(value, str) else str(value)
+    cached = _UUID_CACHE.get(text)
+    if cached is None:
+        cached = UUID(text)
+        if len(_UUID_CACHE) >= _UUID_CACHE_MAX:
+            _UUID_CACHE.clear()
+        _UUID_CACHE[text] = cached
+    return cached
+
+
+def uuid_str(value: UUID) -> str:
+    """``str(uuid)`` with a bounded cache."""
+    cached = _UUID_STR_CACHE.get(value)
+    if cached is None:
+        cached = str(value)
+        if len(_UUID_STR_CACHE) >= _UUID_CACHE_MAX:
+            _UUID_STR_CACHE.clear()
+        _UUID_STR_CACHE[value] = cached
+    return cached
+
+
 def _parse_uuid(value: Any, *, field_name: str, allow_none: bool = False) -> UUID | None:
     if value is None or value == "":
         if allow_none:
@@ -128,8 +160,8 @@ def _parse_uuid(value: Any, *, field_name: str, allow_none: bool = False) -> UUI
     if isinstance(value, UUID):
         return value
     try:
-        return UUID(str(value))
-    except (TypeError, ValueError) as exc:
+        return intern_uuid(value)
+    except (TypeError, ValueError, AttributeError) as exc:
         raise ObservationError("INVALID_ID", f"{field_name} must be a valid UUID.") from exc
 
 
@@ -230,9 +262,9 @@ class CanonicalProvenance:
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "protocol": self.protocol,
-            "connection_id": str(self.connection_id) if self.connection_id else None,
-            "job_id": str(self.job_id) if self.job_id else None,
-            "source_field_id": str(self.source_field_id) if self.source_field_id else None,
+            "connection_id": uuid_str(self.connection_id) if self.connection_id else None,
+            "job_id": uuid_str(self.job_id) if self.job_id else None,
+            "source_field_id": uuid_str(self.source_field_id) if self.source_field_id else None,
             "config_revision": int(self.config_revision),
         }
         if self.address_kind is not None:
@@ -247,11 +279,41 @@ class CanonicalProvenance:
     def from_dict(cls, data: Mapping[str, Any] | None) -> "CanonicalProvenance | None":
         if not data:
             return None
-        known = {"protocol", "connection_id", "job_id", "source_field_id", "config_revision", "address_kind", "address_summary", "extra"}
+        known = _PROVENANCE_KEYS
+        cache_key: Any = None
+        if data.keys() <= known:
+            extra_raw = data.get("extra")
+            try:
+                cache_key = (
+                    data.get("protocol"),
+                    data.get("connection_id"),
+                    data.get("job_id"),
+                    data.get("source_field_id"),
+                    data.get("config_revision"),
+                    data.get("address_kind"),
+                    data.get("address_summary"),
+                    tuple(sorted(extra_raw.items())) if isinstance(extra_raw, Mapping) else extra_raw,
+                )
+                hash(cache_key)
+            except TypeError:  # unhashable extra values: build without the cache
+                cache_key = None
+            if cache_key is not None:
+                cached = _PROVENANCE_CACHE.get(cache_key)
+                if cached is not None:
+                    return cached
         merged_extra = dict(data.get("extra") or {}) if isinstance(data.get("extra"), Mapping) else {}
         for k, v in data.items():
             if k not in known:
                 merged_extra[str(k)] = v
+        built = cls._build_from_dict(data, merged_extra)
+        if cache_key is not None:
+            if len(_PROVENANCE_CACHE) >= 50_000:
+                _PROVENANCE_CACHE.clear()
+            _PROVENANCE_CACHE[cache_key] = built
+        return built
+
+    @classmethod
+    def _build_from_dict(cls, data: Mapping[str, Any], merged_extra: dict[str, Any]) -> "CanonicalProvenance":
         return cls(
             protocol=str(data.get("protocol") or "unknown"),
             connection_id=_parse_uuid(data.get("connection_id"), field_name="provenance.connection_id", allow_none=True),
@@ -262,6 +324,13 @@ class CanonicalProvenance:
             address_summary=str(data["address_summary"])[:256] if data.get("address_summary") is not None else None,
             extra=merged_extra,
         )
+
+
+_PROVENANCE_KEYS = frozenset(
+    {"protocol", "connection_id", "job_id", "source_field_id", "config_revision", "address_kind", "address_summary", "extra"}
+)
+# Provenance objects are immutable and identical for every sample of a field: decode each once.
+_PROVENANCE_CACHE: dict[Any, CanonicalProvenance] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,13 +492,13 @@ class CanonicalObservation:
             "data_epoch": self.data_epoch,
             "config_revision": self.config_revision,
             "event_uid": self.event_uid,
-            "tenant_id": str(self.tenant_id),
-            "site_id": str(self.site_id) if self.site_id else None,
-            "connection_id": str(self.connection_id) if self.connection_id else None,
-            "acquisition_job_id": str(self.acquisition_job_id) if self.acquisition_job_id else None,
-            "source_field_id": str(self.source_field_id) if self.source_field_id else None,
-            "signal_id": str(self.signal_id),
-            "resource_id": str(self.resource_id),
+            "tenant_id": uuid_str(self.tenant_id),
+            "site_id": uuid_str(self.site_id) if self.site_id else None,
+            "connection_id": uuid_str(self.connection_id) if self.connection_id else None,
+            "acquisition_job_id": uuid_str(self.acquisition_job_id) if self.acquisition_job_id else None,
+            "source_field_id": uuid_str(self.source_field_id) if self.source_field_id else None,
+            "signal_id": uuid_str(self.signal_id),
+            "resource_id": uuid_str(self.resource_id),
             "source_time": _fmt_utc_us(self.source_time),
             "acquired_at": _fmt_utc_us(self.acquired_at),
             "ingested_at": _fmt_utc_us(self.ingested_at),
@@ -490,3 +559,100 @@ class CanonicalObservation:
         if not isinstance(payload, Mapping):
             raise ObservationError("INVALID_JSON", "Canonical observation payload must be a JSON object.")
         return cls.from_dict(payload)
+
+    def to_compact_dict(self) -> dict[str, Any]:
+        """``to_dict`` without null/default members; ``from_dict`` restores the identical observation."""
+        out = self.to_dict()
+        return {k: v for k, v in out.items() if v is not None and not (k == "keepalive" and v is False)}
+
+
+# ---------------------------------------------------------------------------
+# Batch envelope (wire schema v2): one AMQP message carries many observations.
+# ---------------------------------------------------------------------------
+#
+# Every item inside ``observations`` is a complete schema_version=1 observation
+# (own event_uid, times, quality, epoch), so per-observation idempotency and
+# fencing semantics are unchanged. The envelope only amortises the per-message
+# broker cost (publish, confirm, quorum entry, delivery, ack).
+#
+#   {"schema": "factorix.obs-batch", "envelope_version": 2, "batch_id": "...",
+#    "tenant_id": "<uuid>", "created_at": "...Z", "count": N, "observations": [{v1}, ...]}
+
+OBS_BATCH_SCHEMA = "factorix.obs-batch"
+OBS_BATCH_ENVELOPE_VERSION = 2
+OBS_BATCH_CONTENT_TYPE = "application/vnd.factorix.obs-batch+json"
+OBS_BATCH_HEADER = "x-envelope"
+OBS_BATCH_HEADER_VALUE = "obs-batch.v2"
+MAX_OBS_PER_BATCH = 5000
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationBatch:
+    """Decoded v2 envelope. ``items`` stay raw mappings so one bad item never poisons its neighbours."""
+
+    batch_id: str
+    tenant_id: UUID
+    items: tuple[Mapping[str, Any], ...]
+    created_at: datetime | None = None
+
+
+def encode_observation_batch(
+    observations: "list[CanonicalObservation] | tuple[CanonicalObservation, ...]",
+    *,
+    batch_id: str,
+    created_at: datetime | None = None,
+) -> bytes:
+    """Serialize observations of ONE tenant into a v2 batch envelope (compact JSON, UTF-8)."""
+    if not observations:
+        raise ObservationError("EMPTY_BATCH", "An observation batch needs at least one observation.")
+    if len(observations) > MAX_OBS_PER_BATCH:
+        raise ObservationError("BATCH_TOO_LARGE", f"An observation batch carries at most {MAX_OBS_PER_BATCH} observations.")
+    tenant = observations[0].tenant_id
+    if any(obs.tenant_id != tenant for obs in observations):
+        raise ObservationError("MIXED_TENANT_BATCH", "An observation batch must not mix tenants.")
+    body = {
+        "schema": OBS_BATCH_SCHEMA,
+        "envelope_version": OBS_BATCH_ENVELOPE_VERSION,
+        "batch_id": str(batch_id)[:128],
+        "tenant_id": str(tenant),
+        "created_at": _fmt_utc_us(created_at or datetime.now(timezone.utc)),
+        "count": len(observations),
+        "observations": [obs.to_compact_dict() for obs in observations],
+    }
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def is_observation_batch_payload(payload: Any) -> bool:
+    return isinstance(payload, Mapping) and payload.get("schema") == OBS_BATCH_SCHEMA
+
+
+def decode_observation_batch(raw: bytes | str | Mapping[str, Any]) -> ObservationBatch:
+    """Validate the envelope shell only; items are validated one by one by the consumer."""
+    if isinstance(raw, Mapping):
+        payload: Any = raw
+    else:
+        try:
+            text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+            payload = json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ObservationError("INVALID_JSON", f"Malformed observation batch JSON: {exc}") from exc
+    if not is_observation_batch_payload(payload):
+        raise ObservationError("INVALID_BATCH", "Payload is not a factorix.obs-batch envelope.")
+    version = payload.get("envelope_version")
+    if version != OBS_BATCH_ENVELOPE_VERSION:
+        raise ObservationError("UNSUPPORTED_ENVELOPE_VERSION", f"Unsupported envelope_version={version!r}.")
+    items = payload.get("observations")
+    if not isinstance(items, list) or not items:
+        raise ObservationError("INVALID_BATCH", "observations must be a non-empty list.")
+    if len(items) > MAX_OBS_PER_BATCH:
+        raise ObservationError("BATCH_TOO_LARGE", f"Batch carries {len(items)} > {MAX_OBS_PER_BATCH} observations.")
+    count = payload.get("count")
+    if count is not None and count != len(items):
+        raise ObservationError("INVALID_BATCH", f"Batch count {count!r} does not match {len(items)} observations.")
+    tenant = _parse_uuid(payload.get("tenant_id"), field_name="tenant_id")
+    return ObservationBatch(
+        batch_id=str(payload.get("batch_id") or "")[:128],
+        tenant_id=tenant,  # type: ignore[arg-type]
+        items=tuple(item if isinstance(item, Mapping) else {"_invalid_item": item} for item in items),
+        created_at=_parse_utc(payload.get("created_at"), field_name="created_at", allow_none=True),
+    )

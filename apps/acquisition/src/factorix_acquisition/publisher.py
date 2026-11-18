@@ -1,18 +1,33 @@
-"""ObservationPublisher: RabbitMQ direct fast path + bounded SQLite outage spool.
+"""ObservationPublisher: RabbitMQ fast path with real backpressure + bounded SQLite outage spool.
 
 Builds schema_version=1 CanonicalObservation payloads with monotonic per-field
 source_sequence, deterministic event_uid, redacted CanonicalProvenance, and
-tenant active_epoch fencing. Publishes directly to RabbitMQ with confirms when
-healthy; spills only confirm-failed observations into AcquisitionSpool on broker
-outage or reject-publish backpressure, and replays newest-per-signal before history.
+tenant active_epoch fencing. The broker adapter packs them into v2 batch envelopes
+and confirms them through a sliding window (``factorix.platform.broker``).
+
+Flow-control contract (v6):
+
+* ``emit`` admits observations into a bounded RAM queue. When the queue is full it
+  **awaits** (bounded by ``admission_wait_s``) for the flusher to make room — real
+  backpressure towards the jobs, not a spill to SQLite. If the queue is still full after
+  the bounded wait, the samples are rejected and counted as an explicit acquisition gap
+  (``gap_rejected``) and surfaced through ``storage_error`` (plan §4.1(6)).
+* The SQLite spool is used only when the broker is genuinely unavailable (connect/confirm
+  failure). Queue-full nacks (``reject-publish``) are backpressure: observations stay in
+  RAM, publishing is paced, nothing is marked DEAD.
+* Live data has priority: each flush drains RAM first; spool replay only uses the
+  remaining budget, is rate-limited (``replay_max_obs_s``) and shrinks to a small slice
+  while live data waits.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import Counter, deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import UUID, uuid5, NAMESPACE_URL
@@ -40,12 +55,31 @@ from factorix_acquisition.timeutil import iso_ms, now_iso
 
 logger = logging.getLogger(__name__)
 
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 DEFAULT_FRESHNESS_WINDOW_S = 12.0
+# Observations handed to the broker per call. One call may become several envelopes
+# (per tenant/lane, bounded by the broker's batch_max_obs/bytes) confirmed concurrently.
 BATCH_ROWS = 500
+# While RAM is backlogged a flush hands up to this many BATCH_ROWS to one broker call so
+# several envelopes are in flight at once (sliding window) instead of one confirm RTT each.
+PIPELINE_BATCHES = 4
 CONTENDED_REPLAY_ROWS = BATCH_ROWS // 4
 HISTORY_SLICE_S = 0.25
 FLUSH_BUDGET_S = 1.0
 MAX_MEMORY_QUEUE = 50_000
+ADMISSION_WAIT_S = _env_float("FACTORIX_PUBLISH_ADMISSION_WAIT_S", 2.0)
+REPLAY_MAX_OBS_S = _env_float("FACTORIX_REPLAY_MAX_OBS_S", 2000.0)
+EXPIRE_INTERVAL_S = 60.0
+BACKPRESSURE_PAUSE_MIN_S = 0.05
+BACKPRESSURE_PAUSE_MAX_S = 2.0
+GAP_ALARM_HOLD_S = 60.0
 
 
 class BrokerPublisherProtocol(Protocol):
@@ -106,6 +140,23 @@ def _address_summary(spec: JobSpec, field_id: str) -> str:
     return _redact_url_userinfo(joined)[:256]
 
 
+@dataclass(slots=True)
+class _FieldStatic:
+    """Per (job, config fingerprint, field) constants computed once instead of per sample."""
+
+    spec: JobSpec
+    tenant_uuid: UUID
+    signal_uuid: UUID
+    resource_uuid: UUID
+    field_uuid: UUID | None
+    raw_type: str
+    unit: str | None
+    address_kind: str
+    address_summary: str
+    signal_key: str | None
+    provenance: CanonicalProvenance
+
+
 class ObservationPublisher:
     def __init__(
         self,
@@ -117,35 +168,85 @@ class ObservationPublisher:
         max_spool_bytes: int = 512 * 1024 * 1024,
         max_memory_queue: int = MAX_MEMORY_QUEUE,
         freshness_window_s: float = DEFAULT_FRESHNESS_WINDOW_S,
+        admission_wait_s: float = ADMISSION_WAIT_S,
+        replay_max_obs_s: float = REPLAY_MAX_OBS_S,
         on_wake: Any = None,
         on_broker_restored: Any = None,
     ) -> None:
         self.broker = broker
         self.spool = spool
+        # Kept for API compatibility: replay attempts are counted, but backpressure never DEADs a row.
         self.max_attempts = max(1, int(max_attempts))
         self.max_pending = max(100, int(max_pending))
         self.max_spool_bytes = max(0, int(max_spool_bytes))
         self.max_memory_queue = max(100, int(max_memory_queue))
         self.freshness_window_s = float(freshness_window_s)
+        self.admission_wait_s = max(0.0, float(admission_wait_s))
+        self.replay_max_obs_s = max(1.0, float(replay_max_obs_s))
         self._on_wake = on_wake
         self._on_broker_restored = on_broker_restored
 
         self._fast_queue: deque[CanonicalObservation] = deque()
+        self._space_event = asyncio.Event()
+        self._ram_event = asyncio.Event()
         self._inflight_flushes = 0
         self._seq: dict[tuple[str, str], int] = {}
         self._tenant_epochs: dict[str, int] = {}
+        self._field_cache: dict[tuple[str, str, str], _FieldStatic] = {}
         self._broker_gen = 0
         self._broker_down = broker is None
-        self.storage_error: str | None = None
+        self._spool_error: str | None = None
         self.broker_ok: bool = broker is not None
+        self.ingest_backpressure = False
+        self._backpressure_pause_s = 0.0
+        self._backpressure_until = 0.0
+        self._replay_tokens = max(float(BATCH_ROWS), self.replay_max_obs_s)
+        self._replay_refill_at = time.monotonic()
+        self._next_expire_at = 0.0
         self.published_fast = 0
         self.published_replay = 0
         self.spilled = 0
         self.publish_failed = 0
+        self.backpressure_events = 0
+        self.admission_waits = 0
+        self.admission_wait_seconds = 0.0
+        self.gap_rejected = 0
+        self.last_gap_at: float | None = None
+        self._gap_by_protocol: Counter[str] = Counter()
+        self._last_gap_log = 0.0
         self.last_publish_failure: str | None = None
         self._emitted_by_protocol: Counter[str] = Counter()
         self._stage_calls: Counter[str] = Counter()
         self._stage_seconds: Counter[str] = Counter()
+        if broker is not None and hasattr(broker, "add_reconnect_listener"):
+            broker.add_reconnect_listener(self._broker_reconnected)  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------ health surface
+
+    @property
+    def storage_error(self) -> str | None:
+        """Spool failure, or an active acquisition-gap alarm (kept for ``GAP_ALARM_HOLD_S``)."""
+        if self._spool_error is not None:
+            return self._spool_error
+        if self.last_gap_at is not None and time.monotonic() - self.last_gap_at <= GAP_ALARM_HOLD_S:
+            return (
+                f"Publisher backlog full: {self.gap_rejected} observation(s) rejected "
+                "(acquisition gap); RabbitMQ/Center cannot keep up."
+            )[:240]
+        return None
+
+    @storage_error.setter
+    def storage_error(self, value: str | None) -> None:
+        self._spool_error = value
+
+    def _broker_reconnected(self) -> None:
+        self._broker_gen += 1
+        self._broker_down = False
+        self.broker_ok = True
+        if self._on_broker_restored is not None:
+            self._on_broker_restored()
+        elif self._on_wake is not None:
+            self._on_wake()
 
     def set_broker(self, broker: BrokerPublisherProtocol | None) -> None:
         was_down = self._broker_down or not self.broker_ok
@@ -177,6 +278,7 @@ class ObservationPublisher:
                 if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
                     kept.append(obs)
             self._fast_queue = kept
+            self._space_event.set()
         return await asyncio.to_thread(self.spool.purge_old_epochs, cleaned)
 
     def active_epoch(self, tenant_id: str) -> int:
@@ -190,18 +292,33 @@ class ObservationPublisher:
         queue_age = None
         if self._fast_queue:
             queue_age = round(max(0.0, (datetime.now(timezone.utc) - self._fast_queue[0].acquired_at).total_seconds()), 3)
-        return {
+        metrics: dict[str, Any] = {
             "published_fast": self.published_fast,
             "published_replay": self.published_replay,
             "spilled": self.spilled,
             "overflow_dropped": self.spool.overflow_dropped_count,
+            "spool_expired": getattr(self.spool, "expired_count", 0),
+            "spool_full": self._spool_is_full(),
+            "spool_occupied_bytes": self.spool.occupied_bytes() if hasattr(self.spool, "occupied_bytes") else None,
             "publish_failed": self.publish_failed,
             "last_publish_failure": self.last_publish_failure,
+            "ingest_backpressure": self.ingest_backpressure,
+            "backpressure_events": self.backpressure_events,
+            "admission_waits": self.admission_waits,
+            "admission_wait_s": round(self.admission_wait_seconds, 3),
+            "gap_rejected": self.gap_rejected,
+            "gap_rejected_by_protocol": dict(self._gap_by_protocol),
+            "replay_max_obs_s": self.replay_max_obs_s,
             "fast_head_age_s": queue_age,
             "emitted_by_protocol": dict(self._emitted_by_protocol),
             "stage_calls": dict(self._stage_calls),
             "stage_seconds": {stage: round(seconds, 4) for stage, seconds in self._stage_seconds.items()},
         }
+        broker = self.broker
+        if broker is not None and hasattr(broker, "envelopes_published"):
+            metrics["envelopes_published"] = int(getattr(broker, "envelopes_published", 0))
+            metrics["envelope_observations"] = int(getattr(broker, "observations_published", 0))
+        return metrics
 
     def _record_stage(self, stage: str, started: float) -> None:
         self._stage_calls[stage] += 1
@@ -219,6 +336,47 @@ class ObservationPublisher:
         self._seq[key] = seq
         return seq
 
+    # ------------------------------------------------------------------ canonicalisation
+
+    def _field_static(self, spec: JobSpec, field_id: str, binding: dict[str, Any], eff_rev: int) -> _FieldStatic:
+        key = (spec.job_id, spec.fingerprint, field_id)
+        cached = self._field_cache.get(key)
+        if cached is not None and cached.spec is spec and cached.provenance.config_revision == eff_rev:
+            return cached
+        if len(self._field_cache) > 100_000:
+            self._field_cache.clear()
+        tenant_str = str(spec.tenant_id or binding.get("tenant_id") or "")
+        address_meta = field_address({"address_json": spec.coerce_address.get(field_id) or {}})
+        field_uuid = _optional_uuid(field_id)
+        address_kind = str(address_meta.get("register_area") or spec.protocol)
+        address_summary = _address_summary(spec, field_id)
+        signal_key = str(binding["key"]) if binding.get("key") else None
+        unit = binding.get("unit")
+        static = _FieldStatic(
+            spec=spec,
+            tenant_uuid=_required_uuid(tenant_str),
+            signal_uuid=_required_uuid(binding["signal_id"]),
+            resource_uuid=_required_uuid(binding["resource_id"]),
+            field_uuid=field_uuid,
+            raw_type=normalize_value_type(str(binding.get("data_type") or "float64")),
+            unit=str(unit)[:32] if unit is not None else None,
+            address_kind=address_kind,
+            address_summary=address_summary,
+            signal_key=signal_key,
+            provenance=CanonicalProvenance(
+                protocol=spec.protocol,
+                connection_id=_optional_uuid(spec.connection_id),
+                job_id=_optional_uuid(spec.job_id),
+                source_field_id=field_uuid,
+                config_revision=eff_rev,
+                address_kind=address_kind,
+                address_summary=address_summary,
+                extra={"signal_key": signal_key} if signal_key else {},
+            ),
+        )
+        self._field_cache[key] = static
+        return static
+
     def build_observations(self, spec: JobSpec, samples: list[Sample], *, revision: int = 1) -> list[CanonicalObservation]:
         created_iso = now_iso()
         observations: list[CanonicalObservation] = []
@@ -231,17 +389,12 @@ class ObservationPublisher:
             binding = spec.bindings.get(sample.field_id)
             if not binding:
                 continue
-            tenant_str = str(spec.tenant_id or binding.get("tenant_id") or "")
-            tenant_uuid = _required_uuid(tenant_str)
-            epoch = self.active_epoch(str(tenant_uuid))
-            signal_uuid = _required_uuid(binding["signal_id"])
-            resource_uuid = _required_uuid(binding["resource_id"])
-            field_uuid = _optional_uuid(sample.field_id)
+            static = self._field_static(spec, sample.field_id, binding, eff_rev)
+            epoch = self.active_epoch(str(static.tenant_uuid))
             seq = self._next_sequence(spec.connection_id, sample.field_id)
 
-            raw_type = normalize_value_type(str(binding.get("data_type") or "float64"))
             value, quality_str, coerce_reason = coerce(
-                raw_type, sample.value, sample.quality, spec.coerce_address.get(sample.field_id)
+                static.raw_type, sample.value, sample.quality, spec.coerce_address.get(sample.field_id)
             )
             reason = sample.reason or coerce_reason
             received_iso = sample.received_time or created_iso
@@ -249,80 +402,56 @@ class ObservationPublisher:
             source_dt = _parse_iso_dt(sample.source_time) if sample.source_time else None
 
             event_uid = derive_event_uid(
-                tenant_id=tenant_uuid,
+                tenant_id=static.tenant_uuid,
                 connection_id=conn_uuid,
-                source_field_id=field_uuid,
-                signal_id=signal_uuid,
+                source_field_id=static.field_uuid,
+                signal_id=static.signal_uuid,
                 acquired_at=acquired_dt,
                 sequence_or_key=seq,
                 data_epoch=epoch,
             )
-            extra_prov: dict[str, Any] = {}
+            provenance = static.provenance
             if reason:
-                extra_prov["reason"] = reason
-            if binding.get("key"):
-                extra_prov["signal_key"] = str(binding["key"])
-
-            address_meta = field_address({"address_json": spec.coerce_address.get(sample.field_id) or {}})
-            provenance = CanonicalProvenance(
-                protocol=spec.protocol,
-                connection_id=conn_uuid,
-                job_id=job_uuid,
-                source_field_id=field_uuid,
-                config_revision=eff_rev,
-                address_kind=str(address_meta.get("register_area") or spec.protocol),
-                address_summary=_address_summary(spec, sample.field_id),
-                extra=extra_prov,
-            )
-            unit = binding.get("unit")
+                extra_prov: dict[str, Any] = {"reason": reason}
+                if static.signal_key:
+                    extra_prov["signal_key"] = static.signal_key
+                provenance = CanonicalProvenance(
+                    protocol=spec.protocol,
+                    connection_id=conn_uuid,
+                    job_id=job_uuid,
+                    source_field_id=static.field_uuid,
+                    config_revision=eff_rev,
+                    address_kind=static.address_kind,
+                    address_summary=static.address_summary,
+                    extra=extra_prov,
+                )
+            common = {
+                "event_uid": event_uid,
+                "tenant_id": static.tenant_uuid,
+                "signal_id": static.signal_uuid,
+                "resource_id": static.resource_uuid,
+                "site_id": site_uuid,
+                "connection_id": conn_uuid,
+                "acquisition_job_id": job_uuid,
+                "source_field_id": static.field_uuid,
+                "acquired_at": acquired_dt,
+                "source_time": source_dt,
+                "value_type": static.raw_type,
+                "unit": static.unit,
+                "origin": Origin.LIVE,
+                "data_epoch": epoch,
+                "config_revision": eff_rev,
+                "provenance": provenance,
+                "source_sequence": seq,
+            }
             try:
-                obs = CanonicalObservation(
-                    event_uid=event_uid,
-                    tenant_id=tenant_uuid,
-                    signal_id=signal_uuid,
-                    resource_id=resource_uuid,
-                    site_id=site_uuid,
-                    connection_id=conn_uuid,
-                    acquisition_job_id=job_uuid,
-                    source_field_id=field_uuid,
-                    acquired_at=acquired_dt,
-                    source_time=source_dt,
-                    value_type=raw_type,
-                    value=value,
-                    unit=str(unit)[:32] if unit is not None else None,
-                    quality=Quality(quality_str),
-                    quality_reason=reason,
-                    origin=Origin.LIVE,
-                    data_epoch=epoch,
-                    config_revision=eff_rev,
-                    provenance=provenance,
-                    source_sequence=seq,
-                )
+                obs = CanonicalObservation(value=value, quality=Quality(quality_str), quality_reason=reason, **common)
             except ObservationError as exc:
-                obs = CanonicalObservation(
-                    event_uid=event_uid,
-                    tenant_id=tenant_uuid,
-                    signal_id=signal_uuid,
-                    resource_id=resource_uuid,
-                    site_id=site_uuid,
-                    connection_id=conn_uuid,
-                    acquisition_job_id=job_uuid,
-                    source_field_id=field_uuid,
-                    acquired_at=acquired_dt,
-                    source_time=source_dt,
-                    value_type=raw_type,
-                    value=None,
-                    unit=str(unit)[:32] if unit is not None else None,
-                    quality=Quality.BAD,
-                    quality_reason=exc.code,
-                    origin=Origin.LIVE,
-                    data_epoch=epoch,
-                    config_revision=eff_rev,
-                    provenance=provenance,
-                    source_sequence=seq,
-                )
+                obs = CanonicalObservation(value=None, quality=Quality.BAD, quality_reason=exc.code, **common)
             observations.append(obs)
         return observations
+
+    # ------------------------------------------------------------------ spool
 
     def _to_spool_row(self, obs: CanonicalObservation, created_iso: str) -> SpoolRow:
         return (
@@ -336,7 +465,12 @@ class ObservationPublisher:
             str(obs.signal_id),
         )
 
+    def _spool_is_full(self) -> bool:
+        is_full = getattr(self.spool, "is_full", None)
+        return bool(is_full(self.max_pending, self.max_spool_bytes)) if is_full is not None else False
+
     async def _spill(self, observations: list[CanonicalObservation]) -> int | None:
+        """Write unconfirmed observations to the outage spool. ``None`` = not stored (full or I/O error)."""
         if not observations:
             return 0
         created = now_iso()
@@ -347,15 +481,22 @@ class ObservationPublisher:
         ]
         if not rows:
             return 0
+        if self._spool_is_full():
+            self._spool_error = (
+                f"Outage spool full ({self.spool.pending_count()} pending, budget {self.max_pending} rows / "
+                f"{self.max_spool_bytes // (1024 * 1024)} MiB); new observations are not spooled."
+            )[:240]
+            return None
+
         async def write_rows() -> int | None:
             try:
                 written = await asyncio.to_thread(self.spool.add_many, rows)
             except Exception as exc:  # noqa: BLE001
-                if self.storage_error is None:
+                if self._spool_error is None:
                     logger.error("Cannot spill observations to SQLite spool: %r", exc)
-                self.storage_error = f"Spool write failed: {exc}"[:240]
+                self._spool_error = f"Spool write failed: {exc}"[:240]
                 return None
-            self.storage_error = None
+            self._spool_error = None
             self.spilled += written
             return written
 
@@ -367,6 +508,55 @@ class ObservationPublisher:
             await write
             raise
 
+    def _reject_gap(self, observations: list[CanonicalObservation], protocol: str, why: str) -> None:
+        """Explicitly reject samples that cannot be buffered anywhere (counted acquisition gap)."""
+        if not observations:
+            return
+        self.gap_rejected += len(observations)
+        self._gap_by_protocol[protocol] += len(observations)
+        self.last_gap_at = time.monotonic()
+        if self.last_gap_at - self._last_gap_log >= 10.0:
+            self._last_gap_log = self.last_gap_at
+            logger.error(
+                "ACQUISITION GAP: rejected %d %s observation(s) (%s); total rejected %d",
+                len(observations),
+                protocol,
+                why,
+                self.gap_rejected,
+            )
+
+    def _admit_to_ram(self, observations: list[CanonicalObservation], protocol: str, why: str) -> int:
+        room = self.max_memory_queue - len(self._fast_queue)
+        if room >= len(observations):
+            self._fast_queue.extend(observations)
+            return len(observations)
+        accepted = observations[: max(0, room)]
+        self._fast_queue.extend(accepted)
+        self._reject_gap(observations[len(accepted):], protocol, why)
+        return len(accepted)
+
+    async def _wait_for_ram_space(self) -> None:
+        """Backpressure: block the emitting job (bounded) until the flusher drains the RAM queue."""
+        if self.admission_wait_s <= 0:
+            return
+        started = time.monotonic()
+        deadline = started + self.admission_wait_s
+        self.admission_waits += 1
+        try:
+            while len(self._fast_queue) >= self.max_memory_queue and not self._broker_down:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._space_event.clear()
+                if self._on_wake is not None:
+                    self._on_wake()
+                try:
+                    await asyncio.wait_for(self._space_event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return
+        finally:
+            self.admission_wait_seconds += time.monotonic() - started
+
     async def emit(self, spec: JobSpec, samples: list[Sample], *, revision: int = 1) -> int:
         started = time.monotonic()
         observations = self.build_observations(spec, samples, revision=revision)
@@ -374,11 +564,14 @@ class ObservationPublisher:
         self._emitted_by_protocol[spec.protocol] += len(observations)
         if not observations:
             return 0
-        if self._broker_down or len(self._fast_queue) >= self.max_memory_queue:
-            count = await self._spill(observations) or 0
+        if not self._broker_down and len(self._fast_queue) >= self.max_memory_queue:
+            await self._wait_for_ram_space()
+        if self._broker_down:
+            written = await self._spill(observations)
+            count = written if written is not None else self._admit_to_ram(observations, spec.protocol, "broker down and spool unavailable")
         else:
-            self._fast_queue.extend(observations)
-            count = len(observations)
+            count = self._admit_to_ram(observations, spec.protocol, "publisher RAM queue full after bounded wait")
+        self._ram_event.set()
         if self._on_wake is not None:
             self._on_wake()
         return count
@@ -388,6 +581,7 @@ class ObservationPublisher:
             return
         buffered = list(self._fast_queue)
         self._fast_queue.clear()
+        self._space_event.set()
         await self._spill_or_restore(buffered)
 
     async def _spill_or_restore(self, observations: list[CanonicalObservation]) -> None:
@@ -424,6 +618,8 @@ class ObservationPublisher:
             obs = self._fast_queue.popleft()
             if obs.data_epoch >= self.active_epoch(str(obs.tenant_id)):
                 batch.append(obs)
+        if batch:
+            self._space_event.set()
         return batch
 
     def route_for_observation(self, obs: CanonicalObservation) -> str:
@@ -456,11 +652,53 @@ class ObservationPublisher:
             await self._spill([obs])
             return False, rkey
 
-    async def flush_once(self, budget_s: float = FLUSH_BUDGET_S) -> tuple[int, bool]:
-        """Publish buffered fast-path observations and replay bounded spool slices.
+    # ------------------------------------------------------------------ flushing
 
-        Interleaves RAM publishes with smaller spool slices while both have
-        work. When RAM is empty replay can use the full batch size.
+    def _fast_batch_rows(self) -> int:
+        if len(self._fast_queue) > BATCH_ROWS:
+            return BATCH_ROWS * PIPELINE_BATCHES
+        return BATCH_ROWS
+
+    def _replay_allowance(self, wanted: int) -> int:
+        now = time.monotonic()
+        capacity = max(float(BATCH_ROWS), self.replay_max_obs_s)
+        elapsed = max(0.0, now - self._replay_refill_at)
+        self._replay_tokens = min(capacity, self._replay_tokens + elapsed * self.replay_max_obs_s)
+        self._replay_refill_at = max(now, self._replay_refill_at)
+        return max(0, min(int(wanted), int(self._replay_tokens)))
+
+    async def _wait_for_replay_tokens(self, max_wait_s: float) -> None:
+        needed = max(1.0, float(CONTENDED_REPLAY_ROWS)) - self._replay_tokens
+        wait_s = min(max_wait_s, max(0.0, needed / self.replay_max_obs_s))
+        if wait_s <= 0:
+            return
+        self._ram_event.clear()
+        try:
+            await asyncio.wait_for(self._ram_event.wait(), timeout=wait_s)
+        except asyncio.TimeoutError:
+            pass
+
+    def _note_backpressure(self) -> None:
+        self.ingest_backpressure = True
+        self.backpressure_events += 1
+        self._backpressure_pause_s = min(
+            BACKPRESSURE_PAUSE_MAX_S, max(BACKPRESSURE_PAUSE_MIN_S, self._backpressure_pause_s * 2)
+        )
+        self._backpressure_until = time.monotonic() + self._backpressure_pause_s
+
+    def _clear_backpressure(self) -> None:
+        self.ingest_backpressure = False
+        self._backpressure_pause_s = 0.0
+
+    async def _maybe_expire(self) -> None:
+        now = time.monotonic()
+        if now < self._next_expire_at:
+            return
+        self._next_expire_at = now + EXPIRE_INTERVAL_S
+        await asyncio.to_thread(self.spool.expire_stale)
+
+    async def flush_once(self, budget_s: float = FLUSH_BUDGET_S) -> tuple[int, bool]:
+        """Publish buffered live observations first, then rate-limited spool replay.
 
         Returns ``(published_count, failed_or_broker_unavailable)``.
         """
@@ -468,96 +706,82 @@ class ObservationPublisher:
         self._inflight_flushes += 1
         try:
             published = 0
-            # 1. If recovering from broker outage, move any residual RAM fast-queue items into the
+            # Paced retry while the broker reports queue-full backpressure.
+            pause = self._backpressure_until - time.monotonic()
+            if pause > 0:
+                await asyncio.sleep(min(pause, max(budget_s, BACKPRESSURE_PAUSE_MIN_S)))
+            # If recovering from broker outage, move any residual RAM fast-queue items into the
             # spool first so latest-per-signal ordering stays monotonic across disk + RAM.
             if self._broker_down:
                 await self._spill_buffered()
 
-            has_ram = bool(self._fast_queue)
-            has_spool = self.spool.pending_count() > 0
-
-            if not has_ram and not has_spool:
+            if not self._fast_queue and self.spool.pending_count() <= 0:
                 return 0, False
+            if self.spool.pending_count() > 0:
+                await self._maybe_expire()
 
             deadline = time.monotonic() + max(0.0, budget_s)
-
-            # 2. Fair flushing when both RAM and Spool are pending
-            if has_ram and has_spool:
-                while (self._fast_queue or self.spool.pending_count() > 0) and not self._broker_down:
-                    # Fair quota: up to 2 RAM batches
-                    for _ in range(2):
-                        if not self._fast_queue or self._broker_down:
-                            break
-                        batch = self._pop_fast_batch(BATCH_ROWS)
-                        if batch:
-                            ok_count, failed = await self._publish_or_spill(batch)
-                            published += ok_count
-                            if failed:
-                                if self._broker_down:
-                                    await self._spill_buffered()
-                                return published, True
-
-                    # Followed by 1 Spool batch
-                    if self.spool.pending_count() > 0 and not self._broker_down:
-                        read_started = time.monotonic()
-                        replay_limit = CONTENDED_REPLAY_ROWS if self._fast_queue else BATCH_ROWS
-                        await asyncio.to_thread(self.spool.expire_stale)
-                        await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
-                        rows = await asyncio.to_thread(self.spool.latest_pending, replay_limit)
-                        if not rows:
-                            rows = await asyncio.to_thread(self.spool.pending, replay_limit)
-                        self._record_stage("spool_read", read_started)
-                        if rows:
-                            count, ok = await self._replay_rows(rows)
-                            published += count
-                            if not ok:
-                                return published, True
-
-                    if time.monotonic() >= deadline:
-                        break
-                return published, False
-
-            # 3. Only RAM pending: drain fast-queue directly
-            if has_ram:
-                while self._fast_queue and not self._broker_down:
-                    batch = self._pop_fast_batch(BATCH_ROWS)
+            while True:
+                progressed = False
+                # 1. Live lane: everything buffered in RAM goes first. While the broker is
+                # marked down (RAM could not be spooled) one batch per flush probes recovery.
+                ram_allowed = True
+                while self._fast_queue and ram_allowed:
+                    if self._broker_down:
+                        ram_allowed = False
+                    batch = self._pop_fast_batch(self._fast_batch_rows())
                     if not batch:
                         break
                     ok_count, failed = await self._publish_or_spill(batch)
                     published += ok_count
+                    progressed = True
                     if failed:
                         if self._broker_down:
                             await self._spill_buffered()
                         return published, True
                     if time.monotonic() >= deadline:
                         break
-                return published, False
 
-            # 4. Only Spool pending: latest-per-signal lane first, then history slices
-            read_started = time.monotonic()
-            await asyncio.to_thread(self.spool.expire_stale)
-            await asyncio.to_thread(self.spool.purge_old_epochs, self._tenant_epochs)
-            latest_rows = await asyncio.to_thread(self.spool.latest_pending, BATCH_ROWS)
-            self._record_stage("spool_read", read_started)
-            if latest_rows:
-                count, ok = await self._replay_rows(latest_rows)
-                published += count
-                if not ok:
-                    return published, True
+                # 2. Replay lane: newest-per-signal slice, then one FIFO history slice. While
+                # the broker is down this doubles as the recovery probe.
+                if self.spool.pending_count() > 0:
+                    wanted = CONTENDED_REPLAY_ROWS if self._fast_queue else BATCH_ROWS
+                    lanes: list[list[Any]] = []
+                    limit = self._replay_allowance(wanted)
+                    if limit > 0:
+                        read_started = time.monotonic()
+                        latest = await asyncio.to_thread(self.spool.latest_pending, limit)
+                        self._record_stage("spool_read", read_started)
+                        if latest:
+                            lanes.append(latest)
+                            self._replay_tokens -= len(latest)
+                        history_limit = self._replay_allowance(wanted)
+                        if history_limit > 0:
+                            read_started = time.monotonic()
+                            history = await asyncio.to_thread(
+                                self.spool.pending, history_limit, {int(r["seq"]) for r in latest}
+                            )
+                            self._record_stage("spool_read", read_started)
+                            if history:
+                                lanes.append(history)
+                                self._replay_tokens -= len(history)
+                    for lane_rows in lanes:
+                        count, ok = await self._replay_rows(lane_rows)
+                        published += count
+                        progressed = True
+                        if not ok:
+                            return published, True
 
-            while True:
-                read_started = time.monotonic()
-                rows = await asyncio.to_thread(self.spool.pending, BATCH_ROWS)
-                self._record_stage("spool_read", read_started)
-                if not rows:
+                if not progressed:
+                    if self.spool.pending_count() > 0 and not self._fast_queue and not self._broker_down:
+                        # Replay is rate-limited: wait for tokens, but wake at once for live data,
+                        # so the runtime's flush loop does not spin while the bucket refills.
+                        await self._wait_for_replay_tokens(max(budget_s, 0.01))
                     break
-                count, ok = await self._replay_rows(rows)
-                published += count
-                if not ok:
-                    return published, True
-                if len(rows) < BATCH_ROWS or time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     break
-
+                if not self._fast_queue and self.spool.pending_count() <= 0:
+                    break
             return published, False
         finally:
             self._inflight_flushes = max(0, self._inflight_flushes - 1)
@@ -585,13 +809,22 @@ class ObservationPublisher:
             if same_gen:
                 self._broker_down = False
                 self.broker_ok = True
+                self._clear_backpressure()
             return len(confirmed), (not same_gen and self.broker is None)
-        if same_gen:
-            # Confirmed deliveries show the broker accepted work. Keep the
-            # unattempted RAM queue available for the next live flush.
-            self.broker_ok = bool(confirmed)
-            self._broker_down = not self.broker_ok
-        await self._spill_or_restore([obs for obs, _err in failed])
+
+        backpressured = [obs for obs, err in failed if isinstance(err, BrokerBackpressureError)]
+        unavailable = [obs for obs, err in failed if not isinstance(err, BrokerBackpressureError)]
+        if backpressured:
+            # Queue full = Center is behind, not an outage: keep the data in RAM and pace.
+            self._note_backpressure()
+            self._fast_queue.extendleft(reversed(backpressured))
+        if unavailable:
+            if same_gen:
+                # Confirmed deliveries show the broker accepted work. Keep the
+                # unattempted RAM queue available for the next live flush.
+                self.broker_ok = bool(confirmed)
+                self._broker_down = not self.broker_ok
+            await self._spill_or_restore(unavailable)
         return len(confirmed), True
 
     async def _replay_rows(self, rows: list[Any]) -> tuple[int, bool]:
@@ -642,14 +875,18 @@ class ObservationPublisher:
             if same_gen:
                 self._broker_down = False
                 self.broker_ok = True
+                self._clear_backpressure()
             return len(confirmed), (same_gen or self.broker is not None)
 
-        if same_gen:
+        backpressure_uids = [obs.event_uid for obs, err in failed if isinstance(err, BrokerBackpressureError)]
+        unavailable = len(failed) - len(backpressure_uids)
+        if backpressure_uids:
+            # Count the attempt for diagnostics, but a full queue never turns a pending row DEAD.
+            self._note_backpressure()
+            await asyncio.to_thread(self.spool.note_attempt, backpressure_uids, None)
+        if unavailable and same_gen:
             self.broker_ok = bool(confirmed)
             self._broker_down = not self.broker_ok
-        backpressure_uids = [obs.event_uid for obs, err in failed if isinstance(err, BrokerBackpressureError)]
-        if backpressure_uids:
-            await asyncio.to_thread(self.spool.note_attempt, backpressure_uids, self.max_attempts)
         # BrokerUnavailableError items remain PENDING without counting against max_attempts
         return len(confirmed), False
 
@@ -660,7 +897,7 @@ class ObservationPublisher:
         """Flush buffered observations on shutdown; spill any unconfirmed items cleanly."""
         deadline = time.monotonic() + timeout_s
         while self._fast_queue and time.monotonic() < deadline and not self._broker_down:
-            batch = self._pop_fast_batch(BATCH_ROWS)
+            batch = self._pop_fast_batch(self._fast_batch_rows())
             if not batch:
                 break
             await self._publish_or_spill(batch)

@@ -17,6 +17,13 @@ from factorix.platform.tdengine import TDEngineClient, TDEngineConfig
 logger = logging.getLogger("factorix.ingestion")
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 async def run_forever() -> None:
     logging.basicConfig(
         level=os.environ.get("FACTORIX_LOG_LEVEL", "INFO"),
@@ -41,10 +48,11 @@ async def run_forever() -> None:
             ddl_timeout_s=settings.tdengine_ddl_timeout_s,
         )
     )
+    # Two lane batchers each hold at most one commit at a time, plus catalog/heartbeat/quarantine.
     pg_store = PgIngestionStore(
         settings.database_url,
         min_pool=2,
-        max_pool=max(8, min(32, broker_cfg.consumer_concurrency // 4)),
+        max_pool=max(4, min(32, _env_int("FACTORIX_INGESTION_PG_POOL", 8))),
     )
     live_provider = TDengineLiveStateProvider(td_client)
     configure_live_state_provider(live_provider)
@@ -53,7 +61,9 @@ async def run_forever() -> None:
         tdengine=td_client,
         broker_cfg=broker_cfg,
         instance_id=os.environ.get("FACTORIX_INGESTION_INSTANCE_ID", DEFAULT_INSTANCE_ID),
-        batch_size=settings.ingestion_batch_size,
+        # Observations per lane batch. v2 envelopes carry up to ~500 observations each, so the
+        # legacy message-count setting (default 256) would split one envelope into several commits.
+        batch_size=max(settings.ingestion_batch_size, _env_int("FACTORIX_INGESTION_BATCH_OBS", 2000)),
         flush_ms=settings.ingestion_flush_ms,
         shadow_pg=settings.ingestion_shadow_pg,
         live_provider=live_provider,

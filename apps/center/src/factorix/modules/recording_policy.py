@@ -52,6 +52,9 @@ _DEFAULT_STRING_MAX_LEN = 1024
 _DEFAULT_JSON_MAX_LEN = 16384
 
 
+INTERVAL_SILENCE_GRACE_US = 60_000_000  # 60 s
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -109,6 +112,11 @@ class ManagedBindingTarget:
     policy_version: int = 1
     policy_enabled: bool = True
     custom_tags: tuple[tuple[str, str], ...] = ()
+    #: User-created STABLE (Storage Management): its real column names and the subtable's tag values
+    #: in STABLE order. When set, writes contain ONLY existing columns and the right tag tuple instead
+    #: of the operational ``acquired_at/raw_quality/...`` layout (review P0-2, contract H3).
+    user_columns: tuple[str, ...] = ()
+    user_tag_values: tuple[Any, ...] | None = None
 
     @property
     def is_paused(self) -> bool:
@@ -128,6 +136,8 @@ class ManagedBindingTarget:
         )
 
     def build_tags_tuple(self) -> tuple[Any, ...]:
+        if self.user_tag_values is not None:
+            return tuple(self.user_tag_values)
         return (
             self.tag_dataset_id,
             self.series_key,
@@ -302,6 +312,15 @@ def build_managed_target_from_storage_binding(row: Mapping[str, Any]) -> Managed
         mode = RecordingMode.ON_CHANGE
     v_type = str(row.get("data_type") or "FLOAT64").upper()
     series_k = f"{p_sub}:{col}"
+    stable_cols = _json_obj(row.get("stable_columns_json"))
+    user_columns: tuple[str, ...] = ()
+    if isinstance(stable_cols, Sequence) and not isinstance(stable_cols, (str, bytes)):
+        user_columns = tuple(str(c.get("name")) for c in stable_cols if isinstance(c, Mapping) and c.get("name"))
+    user_tag_values: tuple[Any, ...] | None = None
+    stable_tags = _json_obj(row.get("stable_tags_json"))
+    sub_tags = _json_obj(row.get("subtable_tags_json"))
+    if isinstance(stable_tags, Sequence) and not isinstance(stable_tags, (str, bytes)) and isinstance(sub_tags, Mapping):
+        user_tag_values = tuple(sub_tags.get(str(t.get("name"))) for t in stable_tags if isinstance(t, Mapping))
     return ManagedBindingTarget(
         design_id=bid,
         design_version_id=None,
@@ -331,6 +350,8 @@ def build_managed_target_from_storage_binding(row: Mapping[str, Any]) -> Managed
         transform_ast=None,
         mode=mode,
         policy_enabled=True,
+        user_columns=user_columns,
+        user_tag_values=user_tag_values,
     )
 
 
@@ -375,6 +396,8 @@ class ManagedSubtableWrite:
             val_out = to_utc_datetime(val_out)
         elif norm_vtype == "enum":
             norm_vtype = "string"
+        if self.target.user_columns:
+            return self._user_stable_item(write_ts, val_out, norm_vtype)
         return SubtableWriteItem(
             item_id=f"{self.target.dataset_id}:{self.target.series_key}:{self.event_uid}",
             stable=self.target.td_stable,
@@ -414,6 +437,52 @@ class ManagedSubtableWrite:
                 norm_vtype,
             ),
         )
+
+
+def _user_event_key(write: ManagedSubtableWrite) -> str:
+    import hashlib
+
+    raw = f"{write.target.td_database}.{write.target.td_subtable}:{write.target.field_key}|{write.event_uid}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _user_stable_item(self: ManagedSubtableWrite, write_ts: datetime, val_out: Any, norm_vtype: str) -> SubtableWriteItem:
+    """Row for a user STABLE: only columns that exist there (guide E1 names), never op-style extras."""
+    candidates: list[tuple[str, Any, str]] = [
+        ("ts", write_ts, "timestamp"),
+        ("event_key", _user_event_key(self), "string"),
+        ("source_timestamp", self.source_time, "timestamp"),
+        ("quality", self.raw_quality[:16], "string"),
+        ("quality_reason", self.reason_code[:128] if self.reason_code else None, "string"),
+        ("is_null", val_out is None, "bool"),
+        ("data_epoch", int(self.data_epoch), "int64"),
+        ("source_event_uid", self.event_uid[:256], "string"),
+        ("time_basis", "SOURCE_TIME" if self.target.time_axis == "source_time" else "ACQUIRED_AT", "string"),
+        (self.target.field_key, val_out, norm_vtype),
+    ]
+    present = set(self.target.user_columns)
+    ts_col = self.target.user_columns[0]
+    cols: list[str] = []
+    vals: list[Any] = []
+    types: list[str] = []
+    for name, value, vtype in candidates:
+        col = ts_col if name == "ts" else name
+        if col in present and col not in cols:
+            cols.append(col)
+            vals.append(value)
+            types.append(vtype)
+    return SubtableWriteItem(
+        item_id=f"{self.target.dataset_id}:{self.target.series_key}:{self.event_uid}",
+        stable=self.target.td_stable,
+        subtable=self.target.td_subtable,
+        tags=self.target.build_tags_tuple(),
+        columns=tuple(cols),
+        values=tuple(vals),
+        value_types=tuple(types),
+    )
+
+
+ManagedSubtableWrite._user_stable_item = _user_stable_item  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True, slots=True)
@@ -698,6 +767,10 @@ class DefaultRecordingPolicyEvaluator:
         )
         # Keyed by (tenant_id, dataset_id, series_key)
         self._states: dict[tuple[UUID, UUID, str], ManagedSeriesState] = {}
+        # Event-time watermark per tenant: the newest acquisition time evaluated so far. Interval gap
+        # markers are only closed up to this watermark, so a pipeline backlog (late but valid samples)
+        # never produces false gaps nor drops the late samples (review R1-A P2-3).
+        self._event_watermark_us: dict[UUID, int] = {}
         self.metrics = metrics or PolicyMetricsCounter()
         if write_operational is None:
             raw_env = os.environ.get("FACTORIX_RECORD_OPERATIONAL", "").strip().lower()
@@ -811,6 +884,10 @@ class DefaultRecordingPolicyEvaluator:
         update_metrics: bool = True,
     ) -> DetailedRecordingResult:
         """Evaluate Operational + Managed targets and produce both directives and write payloads."""
+        if obs.origin != Origin.TEST and obs.acquired_at is not None:
+            acq_us = to_td_timestamp_us(to_utc_datetime(obs.acquired_at) or _utcnow())
+            if acq_us > self._event_watermark_us.get(obs.tenant_id, 0):
+                self._event_watermark_us[obs.tenant_id] = acq_us
         if obs.origin == Origin.TEST:
             dec = RecordingDecision(write_operational=False, update_live_activity=False, managed_directives=())
             if update_metrics:
@@ -1492,6 +1569,13 @@ class DefaultRecordingPolicyEvaluator:
         """Materialize closed empty interval buckets for quiet/disconnected ``INTERVAL`` streams."""
         eval_now = to_utc_datetime(now) or _utcnow()
         now_us = to_td_timestamp_us(eval_now)
+        # Close buckets by event time, not wall clock: never beyond what the pipeline has delivered,
+        # so a backlog of late (valid) samples creates no false gaps. Only when the whole tenant has
+        # been silent for a grace period (source / pipeline down) does wall clock close buckets.
+        watermark_us = self._event_watermark_us.get(tenant_id)
+        if watermark_us is None:
+            return []
+        wall_now_us = now_us
         out: list[ManagedSubtableWrite] = []
         seen_keys: set[tuple[UUID, str]] = set()
         for target in targets:
@@ -1508,6 +1592,8 @@ class DefaultRecordingPolicyEvaluator:
             intv_ms = max(100, int(target.interval_ms or 60_000))
             intv_us = intv_ms * 1000
             tol_us = max(0, int(target.late_tolerance_ms or 0) * 1000)
+            grace_us = max(INTERVAL_SILENCE_GRACE_US, 10 * intv_us)
+            now_us = min(wall_now_us, max(watermark_us, wall_now_us - grace_us))
             if now_us <= tol_us:
                 continue
             max_closed_idx = ((now_us - tol_us) // intv_us) - 1

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { api } from '../../api/client';
 
 interface SignalSparklineProps {
@@ -46,8 +46,28 @@ function next(): void {
 
 export const SignalSparkline: React.FC<SignalSparklineProps> = ({ signalId, quality }) => {
   const [points, setPoints] = useState<number[] | null>(null);
+  // R1-25: only rows on screen load their history (was one request per signal of the catalog).
+  const hostRef = useRef<HTMLSpanElement | null>(null);
+  const [visible, setVisible] = useState(typeof IntersectionObserver === 'undefined');
 
   useEffect(() => {
+    const el = hostRef.current;
+    if (!el || visible || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '200px' },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [visible]);
+
+  useEffect(() => {
+    if (!visible) return;
     let isCurrent = true;
     const fetchHistory = async () => {
       try {
@@ -73,10 +93,14 @@ export const SignalSparkline: React.FC<SignalSparklineProps> = ({ signalId, qual
     return () => {
       isCurrent = false;
     };
-  }, [signalId]);
+  }, [signalId, visible]);
 
   if (!points || points.length < 1) {
-    return <span className="text-slate-300 text-[11px]">—</span>;
+    return (
+      <span ref={hostRef} className="text-slate-300 text-[11px]">
+        —
+      </span>
+    );
   }
 
   const renderPoints = points.length === 1 ? [points[0], points[0]] : points;

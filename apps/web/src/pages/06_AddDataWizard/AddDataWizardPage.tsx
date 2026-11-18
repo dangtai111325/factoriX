@@ -1569,7 +1569,7 @@ export const AddDataWizardPage: React.FC = () => {
           </div>
 
           {(protocol === 'opcua' || protocol === 'modbus') && (testing || testResult) && (
-            <TestResultPanel running={testing} result={testResult} successLabel="Values read by the Edge collector are shown in the table" />
+            <TestResultPanel running={testing} result={testResult} successLabel="Values read by the collector are shown in the table" />
           )}
           {protocol === 'opcua' && sourceTimeValue !== null && (
             <p className="text-[12px] text-[#334568]">
@@ -1622,7 +1622,7 @@ export const AddDataWizardPage: React.FC = () => {
         <Card className="p-5 border border-[#CBD5E1] bg-white space-y-4">
           <div>
             <h3 className="text-[14px] font-bold text-[#111B37]">Review and start collecting</h3>
-            <p className="text-[12px] text-[#657794]">The Edge collector reads the real source to verify the mapping.</p>
+            <p className="text-[12px] text-[#657794]">The collector reads the real source to verify the mapping.</p>
           </div>
 
           <dl className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-[12px] divide-y divide-slate-200">
@@ -1678,7 +1678,7 @@ export const AddDataWizardPage: React.FC = () => {
                 {testing ? 'Running test…' : 'Run test'}
               </Button>
             </div>
-            <TestResultPanel running={testing} runningLabel="The Edge collector is reading the source…" result={testResult} successLabel="All fields were read from the source" />
+            <TestResultPanel running={testing} runningLabel="The collector is reading the source…" result={testResult} successLabel="All fields were read from the source" />
             {testResult && (
               <div className="border border-slate-200 rounded-lg overflow-x-auto">
                 <table className="w-full min-w-[480px] text-left text-[11px]">

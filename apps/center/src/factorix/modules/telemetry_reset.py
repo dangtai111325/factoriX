@@ -11,7 +11,7 @@ Implements §10 / §13 of the Master Implementation Plan (RESET-01..17):
   ``storage_recording_policies``, ``saved_queries``, and ``alembic_version``.
 - Advances ``telemetry_generations.active_epoch`` atomically under a tenant-scoped advisory lock,
   fences in-flight producers/consumers via ``pg_notify``, softly purges RabbitMQ queues when
-  reachable, drops tenant TDengine time-series subtables while preserving STable schemas, deletes
+  reachable, deletes the rows of every tenant TDengine supertable (databases, supertables, subtables and tags are kept), deletes
   only tenant runtime/telemetry rows in PostgreSQL, invalidates ``LiveStateProvider`` cache,
   records an immutable ``storage_operations`` saga log and ``audit_events`` entry, and keeps the
   administrator authenticated.
@@ -57,6 +57,7 @@ from factorix.platform.tdengine import (
     TDEngineClient,
     TDEngineError,
     quote_fq_table,
+    quote_str,
     tenant_database_name,
     validate_identifier,
 )
@@ -834,108 +835,98 @@ class TelemetryResetService:
             }
 
             # ------------------------------------------------------------------
-            # R3 (CLEAR_TDENGINE): Drop all tenant subtables & re-ensure STables
+            # R3 (CLEAR_TDENGINE): delete telemetry ROWS only (plan §10: "delete rows, not schema").
+            # Every STABLE of every tenant-owned database is emptied with ``DELETE FROM db.stable``;
+            # databases, STABLEs, subtables, their TAG values and the storage registry are preserved,
+            # so user-created (UI) subtables survive a reset with their tags and bindings intact.
+            # Any TDengine failure aborts the reset (FAILED_FENCED) instead of being logged and ignored.
             # ------------------------------------------------------------------
             stage_details["current_stage"] = STAGE_R3_CLEAR_TDENGINE
             dropped_op = 0
             dropped_managed = 0
             dropped_subtables: list[str] = []
+            cleared_stables: list[str] = []
             td_db = tenant_database_name(tid)
 
             if eff_td is not None:
                 prefix = getattr(getattr(eff_td, "config", None), "db_prefix", "fx_t_") or "fx_t_"
                 td_db = tenant_database_name(tid, prefix=prefix)
                 validate_identifier(td_db, kind="database")
+                tenant_dbs: list[str] = [td_db]
                 try:
-                    live_subs = await eff_td.list_subtables(td_db)
-                except Exception as exc:  # noqa: BLE001
-                    if _is_missing_td_error(exc):
-                        live_subs = []
-                    else:
+                    db_rows = await fetch_all(
+                        session,
+                        """
+                        SELECT physical_name FROM storage_objects
+                        WHERE tenant_id = CAST(:tenant_id AS uuid) AND object_type = 'database'
+                          AND status <> 'PURGED'
+                        """,
+                        {"tenant_id": tid},
+                    )
+                except SQLAlchemyError:
+                    db_rows = []
+                for row in db_rows:
+                    name = str(row.get("physical_name") or "").strip()
+                    if name and name not in tenant_dbs:
+                        validate_identifier(name, kind="database")
+                        tenant_dbs.append(name)
+
+                for db_name in tenant_dbs:
+                    try:
+                        live_subs = await eff_td.list_subtables(db_name)
+                        st_rows = await eff_td.query_rows(
+                            "SELECT stable_name FROM information_schema.ins_stables "
+                            f"WHERE db_name = {quote_str(db_name)}"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        if _is_missing_td_error(exc):
+                            continue
                         raise AppError(
                             503,
                             "TDENGINE_UNAVAILABLE",
-                            f"TDengine failed while enumerating subtables for reset: {exc}",
+                            f"TDengine failed while enumerating {db_name} for reset: {exc}",
                             retryable=True,
                         ) from exc
-
-                all_subs_to_drop: list[str] = []
-                seen_subs: set[str] = set()
-                for cand in [*live_subs, *op_subs_before, *managed_subs_before]:
-                    c_name = str(cand).strip()
-                    if c_name and c_name not in seen_subs:
-                        seen_subs.add(c_name)
-                        all_subs_to_drop.append(c_name)
-
-                for sub in all_subs_to_drop:
-                    validate_identifier(sub, kind="subtable")
-                    fq = quote_fq_table(td_db, sub)
-                    try:
-                        await eff_td.execute_sql(f"DROP TABLE IF EXISTS {fq}")
-                        dropped_subtables.append(sub)
-                        if sub.startswith(("op_", "ms_")):
+                    for sub in live_subs or []:
+                        name = str(sub).strip()
+                        if not name:
+                            continue
+                        dropped_subtables.append(name)  # rows cleared (table kept)
+                        if name.startswith(("op_", "ms_")):
                             dropped_op += 1
                         else:
                             dropped_managed += 1
-                    except Exception as exc:  # noqa: BLE001
-                        if not _is_missing_td_error(exc):
+                    for st_row in st_rows or []:
+                        st_name = str(
+                            (st_row.get("stable_name") if isinstance(st_row, dict) else None) or ""
+                        ).strip()
+                        if not st_name:
+                            continue
+                        validate_identifier(st_name, kind="stable")
+                        fq = quote_fq_table(db_name, st_name)
+                        try:
+                            await eff_td.execute_sql(f"DELETE FROM {fq}")
+                        except Exception as exc:  # noqa: BLE001
+                            if _is_missing_td_error(exc):
+                                continue
                             raise AppError(
                                 503,
                                 "TDENGINE_RESET_FAILED",
-                                f"Failed dropping TDengine subtable {fq}: {exc}",
+                                f"Failed clearing TDengine rows of {fq}: {exc}",
                                 retryable=True,
                             ) from exc
+                        cleared_stables.append(f"{db_name}.{st_name}")
 
                 try:
                     await eff_td.ensure_operational_schema(tid)
                 except Exception as exc:  # noqa: BLE001
                     if not _is_missing_td_error(exc):
-                        logger.warning("Re-ensuring operational schema after reset returned warning: %s", exc)
-
-                # Re-create / ensure all active managed supertables and subtables
-                recreated_managed = 0
-                try:
-                    active_objects = await fetch_all(
-                        session,
-                        """
-                        SELECT physical_name, object_type, parent_name, schema_json, tags_json
-                        FROM storage_objects
-                        WHERE tenant_id = CAST(:tenant_id AS uuid) AND status != 'PURGED'
-                        ORDER BY CASE object_type WHEN 'database' THEN 1 WHEN 'supertable' THEN 2 WHEN 'subtable' THEN 3 ELSE 4 END
-                        """,
-                        {"tenant_id": tid},
-                    )
-                    for obj in active_objects:
-                        obj_type = str(obj.get("object_type") or "").lower()
-                        pname = str(obj.get("physical_name") or "")
-                        if not pname:
-                            continue
-                        if obj_type == "supertable":
-                            cols = obj.get("schema_json") or []
-                            tags = obj.get("tags_json") or []
-                            cols_sql = ", ".join(f"`{c['name']}` {c.get('type') or c.get('td_type', 'FLOAT')}" for c in cols if isinstance(c, dict) and "name" in c) or "`ts` TIMESTAMP, `value` DOUBLE"
-                            tags_sql = ", ".join(f"`{t['name']}` {t.get('type') or t.get('td_type', 'VARCHAR(64)')}" for t in tags if isinstance(t, dict) and "name" in t)
-                            tag_clause = f"TAGS ({tags_sql})" if tags_sql else "TAGS ()"
-                            st_sql = f"CREATE STABLE IF NOT EXISTS `{td_db}`.`{pname}` ({cols_sql}) {tag_clause}"
-                            await eff_td.execute_sql(st_sql)
-                        elif obj_type == "subtable":
-                            parent = str(obj.get("parent_name") or "st_default")
-                            tags = obj.get("tags_json") or {}
-                            tag_vals: list[str] = []
-                            if isinstance(tags, dict):
-                                for v in tags.values():
-                                    tag_vals.append(f"'{v}'" if isinstance(v, str) else str(v))
-                            elif isinstance(tags, list):
-                                for item in tags:
-                                    if isinstance(item, dict) and "value" in item:
-                                        v = item["value"]
-                                        tag_vals.append(f"'{v}'" if isinstance(v, str) else str(v))
-                            tag_clause = f"TAGS ({', '.join(tag_vals)})" if tag_vals else "TAGS ()"
-                            sub_sql = f"CREATE TABLE IF NOT EXISTS `{td_db}`.`{pname}` USING `{td_db}`.`{parent}` {tag_clause}"
-                            await eff_td.execute_sql(sub_sql)
-                            recreated_managed += 1
-                except Exception as rec_exc:
-                    logger.warning("Re-ensuring managed storage objects returned warning: %s", rec_exc)
+                        raise AppError(
+                            503,
+                            "TDENGINE_RESET_FAILED",
+                            f"Operational schema could not be verified after reset: {exc}",
+                            retryable=True,
+                        ) from exc
 
             stages_completed.append("R3")
             stage_details["stages_completed"] = list(stages_completed)
@@ -943,11 +934,12 @@ class TelemetryResetService:
                 "stage": STAGE_R3_CLEAR_TDENGINE,
                 "at": iso_ms(utcnow()),
                 "database": td_db,
-                "dropped_operational_subtables": dropped_op,
-                "dropped_managed_subtables": dropped_managed,
-                "dropped_subtables_total": len(dropped_subtables),
-                "recreated_managed_subtables": recreated_managed,
-                "preserved_managed_subtables": len(managed_subs_before),
+                "cleared_stables": cleared_stables,
+                "cleared_operational_subtables": dropped_op,
+                "cleared_managed_subtables": dropped_managed,
+                "cleared_subtables_total": len(dropped_subtables),
+                "dropped_subtables_total": 0,
+                "preserved_managed_subtables": max(dropped_managed, len(managed_subs_before)),
             }
 
             # ------------------------------------------------------------------
@@ -979,6 +971,24 @@ class TelemetryResetService:
             del_exports = await execute_rowcount(
                 session, "DELETE FROM export_jobs WHERE tenant_id = CAST(:tenant_id AS uuid)", p
             )
+            # Managed model-field recording state (WS-H, migration 0010) is telemetry-derived:
+            # the durable "last committed value" and undelivered outbox rows of the old epoch go.
+            del_field_state = 0
+            del_record_outbox = 0
+            reg = await fetch_one(
+                session,
+                "SELECT to_regclass('public.storage_field_state') IS NOT NULL AS has_state, "
+                "to_regclass('public.storage_record_outbox') IS NOT NULL AS has_outbox",
+                {},
+            )
+            if reg and reg.get("has_state"):
+                del_field_state = await execute_rowcount(
+                    session, "DELETE FROM storage_field_state WHERE tenant_id = CAST(:tenant_id AS uuid)", p
+                )
+            if reg and reg.get("has_outbox"):
+                del_record_outbox = await execute_rowcount(
+                    session, "DELETE FROM storage_record_outbox WHERE tenant_id = CAST(:tenant_id AS uuid)", p
+                )
             outbox_reset = await execute_rowcount(
                 session,
                 "UPDATE edge_nodes SET outbox_pending = 0 WHERE tenant_id = CAST(:tenant_id AS uuid) AND outbox_pending <> 0",
@@ -995,6 +1005,8 @@ class TelemetryResetService:
                 "commissioning_jobs": max(del_commissioning, pg_before["commissioning_jobs"]),
                 "export_jobs": max(del_exports, pg_before["export_jobs"]),
                 "edge_outbox_reset": outbox_reset,
+                "storage_field_state": del_field_state,
+                "storage_record_outbox": del_record_outbox,
                 "tdengine_operational_subtables": max(dropped_op, len(op_subs_before)),
                 "tdengine_managed_subtables": max(dropped_managed, len(managed_subs_before)),
                 "tdengine_subtables_total": max(

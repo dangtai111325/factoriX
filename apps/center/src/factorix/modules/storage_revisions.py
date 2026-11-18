@@ -1,30 +1,39 @@
-"""Storage Revisions, Drafts, and Operation Saga Manager.
+"""Storage Revisions, Drafts, and the physical-object creation saga.
 
-Manages physical object draft specifications, revision histories, and DDL
-execution sagas with idempotency and state transitions:
-  DRAFT -> PREPARED -> APPLYING -> APPLIED (or FAILED)
+Saga (one operation per object, durable in ``storage_operations``)::
 
-Works in tandem with ``storage_objects.py`` (which builds the DDL plans)
-and ``tdengine.py`` (which executes physical DDL against TDengine).
+    PREPARING -> APPLYING (DDL) -> VERIFYING (read-back) -> APPLIED
+                     \\-> FAILED (DDL error)      \\-> FAILED + compensation (object we created is dropped)
+
+Rules (review P1-1..P1-4, guide G-03 / D5, R1-04 / R1-05):
+
+* Everything is validated **before** any DDL runs: spec, parent supertable, tag values, and for a
+  subtable every binding (model field leaf, target column, type, single owner) or the explicit
+  "no binding" choice.
+* A name clash is detected up front (``information_schema``) and reported as ``NAME_CONFLICT``; DDL
+  has no ``IF NOT EXISTS`` that would hide a clash with another schema / other tag values.
+* Idempotency: ``(tenant, operation_type, idempotency_key)``; the default key is
+  ``<db>.<name>:<spec hash>`` so a double click or a retry after a timeout never creates twice.
+* Read-back compares the real schema (columns, types, lengths, composite key, tags) / tag values.
+* Registry, bindings and the APPLIED status are written in ONE PostgreSQL transaction; any error
+  rolls it back, drops the object this operation just created (it did not exist before) and marks
+  the operation FAILED. Nothing is swallowed with ``logger.debug``.
 """
 
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
+from datetime import timedelta
 import hashlib
 import json
 import logging
-from typing import Any, Literal
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from factorix.modules import storage_bindings as SB
 from factorix.modules.common import (
-    as_uuid,
-    audit,
     execute,
-    execute_rowcount,
     fetch_all,
     fetch_one,
     iso_ms,
@@ -32,6 +41,7 @@ from factorix.modules.common import (
     utcnow,
 )
 from factorix.modules.storage_objects import (
+    MAX_DISPLAY_NAME_LEN,
     ColumnSpec,
     DatabaseSpec,
     DdlStep,
@@ -43,489 +53,700 @@ from factorix.modules.storage_objects import (
     build_create_database_plan,
     build_create_stable_plan,
     build_create_subtable_plan,
+    generate_drop_stable_ddl,
+    generate_drop_table_ddl,
+    is_system_stable,
     validate_database_spec,
     validate_stable_spec,
     validate_subtable_spec,
 )
-from factorix.platform.tdengine import TDEngineClient, TDEngineError
+from factorix.platform.tdengine import TDEngineClient, quote_str
 
 logger = logging.getLogger(__name__)
 
-# In-memory drafts store for drafts not yet persisted to DB (or session drafts)
-# Key: (tenant_id, draft_id) -> draft dict
+# Drafts that could not be read back from PostgreSQL (unit tests with fake sessions).
 _IN_MEMORY_DRAFTS: dict[tuple[UUID, UUID], dict[str, Any]] = {}
 
+#: Columns the managed writer fills from the event contract (guide E1). They are never a binding
+#: target; a STABLE may have any subset of them (only the existing ones are written).
+WRITER_COLUMNS = frozenset({
+    "event_key", "source_timestamp", "publish_timestamp", "field_source_timestamp", "quality",
+    "quality_reason", "is_null", "model_ref", "model_field_path", "model_revision", "data_epoch",
+    "source_event_uid", "time_basis",
+})
+RECORDING_MODES = ("ON_CHANGE", "ON_NEW_EVENT", "EVERY_ACQUISITION")
+ROW_ASSEMBLY = ("INDEPENDENT_EVENTS", "ATOMIC_EVENT")
+IN_PROGRESS = ("PREPARING", "APPLYING", "VERIFYING")
+STUCK_AFTER = timedelta(minutes=5)
 
-def _compute_spec_hash(spec_dict: dict[str, Any]) -> str:
-    serialized = json.dumps(spec_dict, sort_keys=True, separators=(",", ":"))
+_HTTP_STATUS = {
+    "VALIDATION_FAILED": 422,
+    "BINDING_INVALID": 422,
+    "NAME_CONFLICT": 409,
+    "OPERATION_IN_PROGRESS": 409,
+    "SYSTEM_OBJECT": 403,
+    "DRAFT_NOT_FOUND": 404,
+    "STORAGE_ENGINE_UNAVAILABLE": 503,
+    "PUBLISH_FAILED": 502,
+    "VERIFICATION_FAILED": 502,
+    "REGISTRY_FAILED": 500,
+}
+
+
+def storage_error(code: str, message: str, errors: list[dict[str, Any]] | None = None) -> StorageObjectError:
+    exc = StorageObjectError(code, message)
+    exc.field_errors = errors or []  # type: ignore[attr-defined]
+    exc.http_status = _HTTP_STATUS.get(code, 422)  # type: ignore[attr-defined]
+    return exc
+
+
+def _compute_spec_hash(spec_dict: Any) -> str:
+    serialized = json.dumps(spec_dict, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:32]
 
 
+def _int_or(value: Any, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise storage_error("VALIDATION_FAILED", f"'{value}' is not a whole number.") from None
+
+
+# ---------------------------------------------------------------------------
+# Spec normalisation (accepts the wizard payloads; R1-04 root causes: vgroups=null, role='timestamp')
+# ---------------------------------------------------------------------------
+
 def _database_spec(data: dict[str, Any]) -> DatabaseSpec:
     retention_days = data.get("retention_days")
+    if retention_days not in (None, ""):
+        days = _int_or(retention_days, 3650)
+        keep = f"{days}d"
+    else:
+        keep = data.get("keep") or "3650d"
     return DatabaseSpec(
-        name=data.get("name") or data.get("physical_name") or "",
-        precision=data.get("precision", "ms"),
-        keep=data.get("keep") or ("3650d" if retention_days is None else f"{retention_days}d"),
-        vgroups=int(data.get("vgroups", 1)),
-        replica=int(data.get("replica", 1)),
-        cache_model=data.get("cache_model"),
-        description=data.get("description", ""),
+        name=str(data.get("name") or data.get("physical_name") or ""),
+        precision=str(data.get("precision") or "us"),
+        keep=keep,
+        vgroups=_int_or(data.get("vgroups"), 1),
+        replica=_int_or(data.get("replica"), 1),
+        cache_model=data.get("cache_model") or None,
+        description=str(data.get("description") or ""),
     )
 
 
+def _length(raw: Any) -> int | None:
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _type_and_length(td_type: Any, length: Any) -> tuple[str, int | None]:
+    """``VARCHAR(64)`` (wizard style) -> ``("VARCHAR", 64)``; an explicit length wins (R1-17c)."""
+    text = str(td_type or "").upper().strip()
+    base, _, rest = text.partition("(")
+    inline = _length(rest.rstrip(")").strip()) if rest else None
+    return base.strip(), _length(length) if _length(length) is not None else inline
+
+
+def stable_spec_from(data: dict[str, Any]) -> StableSpec:
+    cols: list[ColumnSpec] = []
+    for i, c in enumerate(data.get("columns") or []):
+        if not isinstance(c, dict):
+            continue
+        td_type, col_length = _type_and_length(c.get("td_type") or c.get("type") or "DOUBLE", c.get("length"))
+        role = str(c.get("role") or "").lower()
+        if i == 0 and td_type == "TIMESTAMP" and role in ("", "timestamp", "time_key", "ts", "time"):
+            role = "time_key"
+        cols.append(ColumnSpec(
+            name=str(c.get("name") or ""),
+            td_type=td_type,
+            length=col_length,
+            role="time_key" if role == "time_key" else "value",
+            nullable=bool(c.get("nullable", True)),
+            description=str(c.get("description") or ""),
+            primary_key=bool(c.get("primary_key") or c.get("composite_key")),
+        ))
+    tags = []
+    for t in data.get("tags") or []:
+        if not isinstance(t, dict):
+            continue
+        t_type, t_len = _type_and_length(t.get("td_type") or t.get("type") or "VARCHAR", t.get("length"))
+        tags.append(TagSpec(
+            name=str(t.get("name") or ""), td_type=t_type, length=t_len,
+            required=bool(t.get("required", False)), description=str(t.get("description") or ""),
+        ))
+    return StableSpec(
+        database=str(data.get("database") or data.get("database_name") or data.get("database_id") or ""),
+        name=str(data.get("name") or data.get("physical_name") or ""),
+        columns=cols,
+        tags=tags,
+        description=str(data.get("description") or ""),
+    )
+
+
+def _split_parent(data: dict[str, Any]) -> tuple[str, str]:
+    db = str(data.get("database") or data.get("database_name") or "")
+    stable = str(data.get("stable") or data.get("parent_stable") or data.get("stable_id") or "")
+    if stable.startswith("stable:"):
+        stable = stable[len("stable:"):]
+    if "." in stable:
+        db_part, stable = stable.split(".", 1)
+        db = db or db_part
+    return db, stable
+
+
+def tag_values_from(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    out: dict[str, Any] = {}
+    for tv in raw or []:
+        if isinstance(tv, dict):
+            key = tv.get("tag_name") or tv.get("name")
+            if key:
+                out[str(key)] = tv.get("value")
+    return out
+
+
+def subtable_spec_from(data: dict[str, Any]) -> SubtableSpec:
+    db, stable = _split_parent(data)
+    return SubtableSpec(
+        database=db,
+        stable=stable,
+        name=str(data.get("name") or data.get("physical_name") or ""),
+        tag_values=tag_values_from(data.get("tag_values")),
+        description=str(data.get("description") or ""),
+    )
+
+
+def recording_from(data: dict[str, Any]) -> dict[str, Any]:
+    rec = data.get("recording") if isinstance(data.get("recording"), dict) else {}
+    mode = str(rec.get("mode") or data.get("recording_mode") or "ON_CHANGE").upper()
+    row_assembly = str(
+        rec.get("row_assembly") or data.get("row_assembly_policy") or ("ATOMIC_EVENT" if mode == "ON_NEW_EVENT" else "INDEPENDENT_EVENTS")
+    ).upper()
+    start = rec.get("start_recording", data.get("start_recording", False))
+    identity = rec.get("identity_paths") or data.get("identity_paths") or []
+    return {
+        "mode": mode,
+        "row_assembly": row_assembly,
+        "start_recording": bool(start),
+        "identity_paths": [SB.normalize_field_path(p) for p in identity if str(p or "").strip()],
+        "quality_transitions": bool(rec.get("quality_transitions", True)),
+    }
+
+
+def _row_value(row: Any, key: str, index: int) -> Any:
+    if isinstance(row, dict):
+        for k in (key, key.capitalize(), key.upper()):
+            if k in row:
+                return row[k]
+        return None
+    if isinstance(row, (list, tuple)) and len(row) > index:
+        return row[index]
+    return None
+
+
+def _base_type(td_type: str) -> str:
+    return str(td_type or "").upper().split("(")[0].strip()
+
+
 class StorageRevisionService:
-    """Service for handling physical object drafts, validation, planning, and publishing."""
+    """Drafts, validation, physical plans and the publish saga for TDengine objects."""
 
     def __init__(self, td_client: TDEngineClient | None = None) -> None:
         self.td = td_client
 
     # ------------------------------------------------------------------
-    # Draft Lifecycle (CRUD)
+    # TDengine access helpers
+    # ------------------------------------------------------------------
+
+    async def _td_read(self, sql: str) -> list[Any]:
+        if self.td is None:
+            raise storage_error("STORAGE_ENGINE_UNAVAILABLE", "TDengine is not configured or not reachable.")
+        if hasattr(self.td, "query_rows"):
+            return list(await self.td.query_rows(sql) or [])
+        return list(await self.td.run_read(sql) or [])
+
+    async def _td_exec(self, sql: str) -> None:
+        if self.td is None:
+            raise storage_error("STORAGE_ENGINE_UNAVAILABLE", "TDengine is not configured or not reachable.")
+        if hasattr(self.td, "execute_sql"):
+            await self.td.execute_sql(sql)
+        else:
+            await self.td.run_write(sql)
+
+    async def object_exists(self, kind: str, database: str, name: str) -> bool:
+        if kind == "database":
+            rows = await self._td_read(
+                f"SELECT name FROM information_schema.ins_databases WHERE name = {quote_str(name)}"
+            )
+            return bool(rows)
+        stables = await self._td_read(
+            "SELECT stable_name FROM information_schema.ins_stables "
+            f"WHERE db_name = {quote_str(database)} AND stable_name = {quote_str(name)}"
+        )
+        if stables:
+            return True
+        tables = await self._td_read(
+            "SELECT table_name FROM information_schema.ins_tables "
+            f"WHERE db_name = {quote_str(database)} AND table_name = {quote_str(name)}"
+        )
+        return bool(tables)
+
+    async def describe(self, database: str, name: str) -> tuple[list[ColumnSpec], list[TagSpec]]:
+        rows = await self._td_read(f"DESCRIBE `{database}`.`{name}`")
+        cols: list[ColumnSpec] = []
+        tags: list[TagSpec] = []
+        for i, r in enumerate(rows):
+            field = str(_row_value(r, "field", 0) or "")
+            td_type = str(_row_value(r, "type", 1) or "")
+            length = _length(_row_value(r, "length", 2))
+            note = str(_row_value(r, "note", 3) or "").upper()
+            if not field:
+                continue
+            if "TAG" in note:
+                tags.append(TagSpec(name=field, td_type=_base_type(td_type), length=length))
+            else:
+                cols.append(ColumnSpec(
+                    name=field, td_type=_base_type(td_type), length=length,
+                    role="time_key" if i == 0 else "value", primary_key="COMPOSITE" in note or "PRIMARY" in note,
+                ))
+        return cols, tags
+
+    async def stable_schema(
+        self, session: AsyncSession, tenant_id: UUID, database: str, stable_name: str
+    ) -> tuple[list[ColumnSpec], list[TagSpec]]:
+        """Real schema of a parent STABLE: TDengine DESCRIBE first, then the registry."""
+        if not database or not stable_name:
+            return [], []
+        if self.td is not None:
+            try:
+                cols, tags = await self.describe(database, stable_name)
+                if cols:
+                    return cols, tags
+            except StorageObjectError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - missing parent is reported by validation
+                logger.info("DESCRIBE %s.%s failed: %s", database, stable_name, exc)
+        row = await fetch_one(
+            session,
+            """
+            SELECT schema_json, tags_json FROM storage_objects
+            WHERE tenant_id = :tenant_id AND object_type = 'stable'
+              AND physical_db = :db AND physical_name = :name AND status <> 'PURGED'
+            """,
+            {"tenant_id": tenant_id, "db": database, "name": stable_name},
+        )
+        if not row:
+            return [], []
+        reg = stable_spec_from({
+            "database": database, "name": stable_name,
+            "columns": _json_list(row.get("schema_json")),
+            "tags": _json_list(row.get("tags_json")),
+        })
+        return reg.columns, reg.tags
+
+    async def _resolve_stable_tags(
+        self, session: AsyncSession, tenant_id: UUID, database: str, stable_name: str
+    ) -> list[TagSpec]:
+        return (await self.stable_schema(session, tenant_id, database, stable_name))[1]
+
+    # ------------------------------------------------------------------
+    # Draft lifecycle
     # ------------------------------------------------------------------
 
     async def create_draft(
-        self,
-        session: AsyncSession,
-        tenant_id: UUID,
-        actor_id: UUID | None,
-        data: dict[str, Any],
+        self, session: AsyncSession, tenant_id: UUID, actor_id: UUID | None, data: dict[str, Any]
     ) -> dict[str, Any]:
-        """Create a new draft object and persist to PostgreSQL."""
         draft_id = uuid4()
         kind = str(data.get("kind") or data.get("object_kind") or "stable").lower()
-        name = str(data.get("name") or data.get("physical_name") or f"draft_{draft_id.hex[:8]}")
         spec = data.get("spec") or data
+        name = str(data.get("name") or spec.get("name") or spec.get("physical_name") or f"draft_{draft_id.hex[:8]}")
         now = utcnow()
         spec_hash = _compute_spec_hash(spec)
-
-        draft_record = {
-            "id": str(draft_id),
-            "tenant_id": str(tenant_id),
-            "object_kind": kind,
-            "name": name,
-            "revision": 1,
-            "spec": spec,
-            "state": "DRAFT",
-            "created_by": str(actor_id) if actor_id else None,
-            "created_at": iso_ms(now),
-            "updated_at": iso_ms(now),
-            "hash": spec_hash,
+        record = {
+            "id": str(draft_id), "tenant_id": str(tenant_id), "object_kind": kind, "name": name,
+            "revision": 1, "spec": spec, "state": "DRAFT", "created_by": str(actor_id) if actor_id else None,
+            "created_at": iso_ms(now), "updated_at": iso_ms(now), "hash": spec_hash,
         }
-
-        try:
-            await execute(
-                session,
-                """
-                INSERT INTO storage_object_drafts (
-                    id, tenant_id, object_kind, name, revision, spec_json,
-                    state, created_by, spec_hash, created_at, updated_at
-                ) VALUES (
-                    :id, :tenant_id, :kind, :name, 1, :spec,
-                    'DRAFT', :created_by, :spec_hash, :now, :now
-                )
-                """,
-                {
-                    "id": draft_id,
-                    "tenant_id": tenant_id,
-                    "kind": kind,
-                    "name": name,
-                    "spec": jsonb(spec),
-                    "created_by": actor_id,
-                    "spec_hash": spec_hash,
-                    "now": now,
-                },
+        await execute(
+            session,
+            """
+            INSERT INTO storage_object_drafts (
+                id, tenant_id, object_kind, name, revision, spec_json,
+                state, created_by, spec_hash, created_at, updated_at
+            ) VALUES (
+                :id, :tenant_id, :kind, :name, 1, :spec,
+                'DRAFT', :created_by, :spec_hash, :now, :now
             )
-            await session.commit()
-        except Exception as exc:
-            logger.debug("Persisting draft to storage_object_drafts fallback to in-memory: %s", exc)
+            """,
+            {"id": draft_id, "tenant_id": tenant_id, "kind": kind, "name": name, "spec": jsonb(spec),
+             "created_by": actor_id, "spec_hash": spec_hash, "now": now},
+        )
+        await session.commit()
+        _IN_MEMORY_DRAFTS[(tenant_id, draft_id)] = record
+        return record
 
-        _IN_MEMORY_DRAFTS[(tenant_id, draft_id)] = draft_record
-        return draft_record
-
-    async def get_draft(
-        self,
-        session: AsyncSession,
-        tenant_id: UUID,
-        draft_id: UUID,
-    ) -> dict[str, Any] | None:
-        """Fetch draft object from PostgreSQL or in-memory fallback."""
-        try:
-            row = await fetch_one(
-                session,
-                """
-                SELECT id, tenant_id, object_kind, name, revision, spec_json,
-                       state, created_by, spec_hash, created_at, updated_at
-                FROM storage_object_drafts
-                WHERE tenant_id = :tenant_id AND id = :draft_id
-                """,
-                {"tenant_id": tenant_id, "draft_id": draft_id},
-            )
-            if row:
-                spec = row["spec_json"]
-                if isinstance(spec, str):
-                    try:
-                        spec = json.loads(spec)
-                    except Exception:
-                        pass
-                return {
-                    "id": str(row["id"]),
-                    "tenant_id": str(row["tenant_id"]),
-                    "object_kind": str(row["object_kind"]),
-                    "name": str(row["name"]),
-                    "revision": int(row["revision"] or 1),
-                    "spec": spec,
-                    "state": str(row["state"]),
-                    "created_by": str(row["created_by"]) if row.get("created_by") else None,
-                    "created_at": iso_ms(row["created_at"]) if row.get("created_at") else None,
-                    "updated_at": iso_ms(row["updated_at"]) if row.get("updated_at") else None,
-                    "hash": str(row.get("spec_hash") or ""),
-                }
-        except Exception as exc:
-            logger.debug("get_draft from database fallback to in-memory: %s", exc)
-
+    async def get_draft(self, session: AsyncSession, tenant_id: UUID, draft_id: UUID) -> dict[str, Any] | None:
+        row = await fetch_one(
+            session,
+            """
+            SELECT id, tenant_id, object_kind, name, revision, spec_json,
+                   state, created_by, spec_hash, created_at, updated_at
+            FROM storage_object_drafts
+            WHERE tenant_id = :tenant_id AND id = :draft_id
+            """,
+            {"tenant_id": tenant_id, "draft_id": draft_id},
+        )
+        if row:
+            spec = row["spec_json"]
+            if isinstance(spec, str):
+                spec = json.loads(spec)
+            return {
+                "id": str(row["id"]), "tenant_id": str(row["tenant_id"]),
+                "object_kind": str(row["object_kind"]), "name": str(row["name"]),
+                "revision": int(row["revision"] or 1), "spec": spec, "state": str(row["state"]),
+                "created_by": str(row["created_by"]) if row.get("created_by") else None,
+                "created_at": iso_ms(row["created_at"]) if row.get("created_at") else None,
+                "updated_at": iso_ms(row["updated_at"]) if row.get("updated_at") else None,
+                "hash": str(row.get("spec_hash") or ""),
+            }
         return _IN_MEMORY_DRAFTS.get((tenant_id, draft_id))
 
+    async def list_drafts(self, session: AsyncSession, tenant_id: UUID, kind: str | None = None) -> list[dict[str, Any]]:
+        rows = await fetch_all(
+            session,
+            """
+            SELECT id, object_kind, name, revision, state, spec_json, updated_at
+            FROM storage_object_drafts
+            WHERE tenant_id = :tenant_id AND state = 'DRAFT'
+              AND (CAST(:kind AS text) IS NULL OR object_kind = :kind)
+            ORDER BY updated_at DESC
+            LIMIT 100
+            """,
+            {"tenant_id": tenant_id, "kind": kind},
+        )
+        return [
+            {"id": str(r["id"]), "object_kind": r["object_kind"], "name": r["name"],
+             "revision": int(r["revision"] or 1), "state": r["state"],
+             "spec": json.loads(r["spec_json"]) if isinstance(r["spec_json"], str) else r["spec_json"],
+             "updated_at": iso_ms(r["updated_at"]) if r.get("updated_at") else None}
+            for r in rows
+        ]
+
     async def patch_draft(
-        self,
-        session: AsyncSession,
-        tenant_id: UUID,
-        draft_id: UUID,
-        actor_id: UUID | None,
-        updates: dict[str, Any],
+        self, session: AsyncSession, tenant_id: UUID, draft_id: UUID, actor_id: UUID | None, updates: dict[str, Any]
     ) -> dict[str, Any]:
-        """Update draft specification with optimistic revision increment."""
         draft = await self.get_draft(session, tenant_id, draft_id)
         if not draft:
-            raise StorageObjectError("DRAFT_NOT_FOUND", f"Draft {draft_id} not found")
-
-        if "spec" in updates:
-            draft["spec"].update(updates["spec"])
+            raise storage_error("DRAFT_NOT_FOUND", f"Draft {draft_id} not found")
+        expected = updates.get("revision")
+        if expected is not None and int(expected) != int(draft.get("revision", 1)):
+            raise storage_error("OPERATION_IN_PROGRESS", "The draft was changed elsewhere; reload it.")
+        if "spec" in updates and isinstance(updates["spec"], dict):
+            draft["spec"] = {**draft["spec"], **updates["spec"]}
         if "name" in updates:
             draft["name"] = updates["name"]
-        if "description" in updates:
-            draft["spec"]["description"] = updates["description"]
-
-        draft["revision"] = draft.get("revision", 1) + 1
+        draft["revision"] = int(draft.get("revision", 1)) + 1
         now = utcnow()
         draft["updated_at"] = iso_ms(now)
         draft["hash"] = _compute_spec_hash(draft["spec"])
-
-        try:
-            await execute(
-                session,
-                """
-                UPDATE storage_object_drafts
-                SET name = :name,
-                    revision = :revision,
-                    spec_json = :spec,
-                    spec_hash = :hash,
-                    updated_at = :now
-                WHERE tenant_id = :tenant_id AND id = :id
-                """,
-                {
-                    "id": draft_id,
-                    "tenant_id": tenant_id,
-                    "name": draft["name"],
-                    "revision": draft["revision"],
-                    "spec": jsonb(draft["spec"]),
-                    "hash": draft["hash"],
-                    "now": now,
-                },
-            )
-            await session.commit()
-        except Exception as exc:
-            logger.debug("patch_draft in database fallback to in-memory: %s", exc)
-
+        await execute(
+            session,
+            """
+            UPDATE storage_object_drafts
+            SET name = :name, revision = :revision, spec_json = :spec, spec_hash = :hash, updated_at = :now
+            WHERE tenant_id = :tenant_id AND id = :id
+            """,
+            {"id": draft_id, "tenant_id": tenant_id, "name": draft["name"], "revision": draft["revision"],
+             "spec": jsonb(draft["spec"]), "hash": draft["hash"], "now": now},
+        )
+        await session.commit()
         _IN_MEMORY_DRAFTS[(tenant_id, draft_id)] = draft
         return draft
 
     # ------------------------------------------------------------------
-    # Validation & Planning
+    # Validation & planning
     # ------------------------------------------------------------------
 
-    async def _resolve_stable_tags(
-        self,
-        session: AsyncSession,
-        tenant_id: UUID,
-        database: str,
-        stable_name: str,
-    ) -> list[TagSpec]:
-        """Fetch real tag definitions for parent STable from TDengine, storage_objects, or drafts."""
-        tags: list[TagSpec] = []
-        if not database or not stable_name:
-            return tags
-
-        # 1. Try TDengine DESCRIBE if client is available
-        if self.td is not None:
-            try:
-                sql = f"DESCRIBE `{database}`.`{stable_name}`"
-                rows = await self.td.query_rows(sql) if hasattr(self.td, "query_rows") else await self.td.run_read(sql)
-                for r in (rows or []):
-                    note = str(
-                        r.get("Note") or r.get("note")
-                        or (r[3] if isinstance(r, (tuple, list)) and len(r) > 3 else "")
-                    ).upper()
-                    if "TAG" in note:
-                        tname = str(r.get("Field") or r.get("field") or (r[0] if isinstance(r, (tuple, list)) else ""))
-                        ttype = str(r.get("Type") or r.get("type") or (r[1] if isinstance(r, (tuple, list)) and len(r) > 1 else "NCHAR"))
-                        tlen = r.get("Length") or r.get("length") or (r[2] if isinstance(r, (tuple, list)) and len(r) > 2 else 64)
-                        try:
-                            tlen_int = int(tlen) if tlen is not None else 64
-                        except (ValueError, TypeError):
-                            tlen_int = 64
-                        tags.append(TagSpec(name=tname, td_type=ttype, length=tlen_int, required=False))
-                if tags:
-                    return tags
-            except Exception as exc:
-                logger.debug("Could not describe parent stable from TDengine: %s", exc)
-
-        # 2. Try storage_objects in PostgreSQL
-        try:
-            row = await fetch_one(
-                session,
-                """
-                SELECT tags_json FROM storage_objects
-                WHERE tenant_id = :tenant_id AND object_type = 'stable'
-                  AND physical_db = :db AND physical_name = :name
-                """,
-                {"tenant_id": tenant_id, "db": database, "name": stable_name},
-            )
-            if row and row.get("tags_json"):
-                tags_data = row["tags_json"]
-                if isinstance(tags_data, str):
-                    tags_data = json.loads(tags_data)
-                for t in tags_data:
-                    tags.append(TagSpec(
-                        name=t["name"],
-                        td_type=t.get("td_type") or t.get("type", "NCHAR"),
-                        length=int(t.get("length") or 64),
-                        required=bool(t.get("required", False)),
-                    ))
-                if tags:
-                    return tags
-        except Exception:
-            pass
-
-        # 3. Try storage_object_drafts in PostgreSQL
-        try:
-            row = await fetch_one(
-                session,
-                """
-                SELECT spec_json FROM storage_object_drafts
-                WHERE tenant_id = :tenant_id AND object_kind = 'stable'
-                  AND name = :name
-                ORDER BY updated_at DESC LIMIT 1
-                """,
-                {"tenant_id": tenant_id, "name": stable_name},
-            )
-            if row and row.get("spec_json"):
-                s_spec = row["spec_json"]
-                if isinstance(s_spec, str):
-                    s_spec = json.loads(s_spec)
-                for t in s_spec.get("tags", []):
-                    tags.append(TagSpec(
-                        name=t["name"],
-                        td_type=t.get("td_type") or t.get("type", "NCHAR"),
-                        length=int(t.get("length") or 64),
-                        required=bool(t.get("required", False)),
-                    ))
-                if tags:
-                    return tags
-        except Exception:
-            pass
-
-        return tags
-
-    async def validate_draft(
-        self,
-        session: AsyncSession,
-        tenant_id: UUID,
-        draft_id: UUID,
-        custom_spec: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Validate the draft specification."""
+    async def _spec_of(self, session: AsyncSession, tenant_id: UUID, draft_id: UUID | None,
+                       custom_spec: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
         if custom_spec:
             kind = str(custom_spec.get("kind") or "stable").lower()
-            spec_data = custom_spec.get("spec") or custom_spec
-        else:
-            draft = await self.get_draft(session, tenant_id, draft_id)
-            if not draft:
-                raise StorageObjectError("DRAFT_NOT_FOUND", f"Draft {draft_id} not found")
-            kind = draft["object_kind"]
-            spec_data = draft["spec"]
+            return kind, dict(custom_spec.get("spec") or custom_spec)
+        if draft_id is None:
+            raise storage_error("DRAFT_NOT_FOUND", "No draft or specification given.")
+        draft = await self.get_draft(session, tenant_id, draft_id)
+        if not draft:
+            raise storage_error("DRAFT_NOT_FOUND", f"Draft {draft_id} not found")
+        return draft["object_kind"], dict(draft["spec"])
 
-        if kind == "database":
-            v_res = validate_database_spec(_database_spec(spec_data))
-        elif kind == "stable":
-            cols: list[ColumnSpec] = []
-            for c in spec_data.get("columns", []):
-                cols.append(ColumnSpec(
-                    name=c["name"],
-                    td_type=c.get("td_type") or c.get("type", "DOUBLE"),
-                    length=c.get("length"),
-                    role=c.get("role", "value"),
-                    nullable=c.get("nullable", True),
-                    description=c.get("description", ""),
-                ))
-            tags: list[TagSpec] = []
-            for t in spec_data.get("tags", []):
-                tags.append(TagSpec(
-                    name=t["name"],
-                    td_type=t.get("td_type") or t.get("type", "NCHAR"),
-                    length=t.get("length", 64),
-                    required=t.get("required", False),
-                    description=t.get("description", ""),
-                ))
-            st_spec = StableSpec(
-                database=spec_data.get("database", ""),
-                name=spec_data.get("name") or spec_data.get("physical_name", ""),
-                columns=cols,
-                tags=tags,
-                description=spec_data.get("description", ""),
-            )
-            v_res = validate_stable_spec(st_spec)
-        elif kind == "subtable":
-            db_name = spec_data.get("database", "")
-            st_name = spec_data.get("stable") or spec_data.get("parent_stable", "")
-            stable_tags = await self._resolve_stable_tags(session, tenant_id, db_name, st_name)
-            sub_spec = SubtableSpec(
-                database=db_name,
-                stable=st_name,
-                name=spec_data.get("name") or spec_data.get("physical_name", ""),
-                tag_values=spec_data.get("tag_values", {}),
-                description=spec_data.get("description", ""),
-            )
-            v_res = validate_subtable_spec(sub_spec, stable_tags)
-        else:
-            v_res = ValidationResult(valid=True)
-
+    async def validate_draft(
+        self, session: AsyncSession, tenant_id: UUID, draft_id: UUID | None, custom_spec: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        kind, spec_data = await self._spec_of(session, tenant_id, draft_id, custom_spec)
+        try:
+            v_res, extra = await self._validate(session, tenant_id, kind, spec_data)
+        except StorageObjectError as exc:
+            errors = getattr(exc, "field_errors", None) or [{"field": exc.field or "", "code": exc.code, "message": str(exc)}]
+            return {"valid": False, "errors": errors, "warnings": [], "estimated_row_bytes": 0}
         return {
             "valid": v_res.valid,
             "errors": v_res.errors,
             "warnings": v_res.warnings,
             "estimated_row_bytes": getattr(v_res, "estimated_row_bytes", 0),
+            **({"bindings": extra.get("bindings")} if extra.get("bindings") is not None else {}),
         }
 
-    async def plan_draft(
+    async def _validate(
+        self, session: AsyncSession, tenant_id: UUID, kind: str, spec_data: dict[str, Any]
+    ) -> tuple[ValidationResult, dict[str, Any]]:
+        extra: dict[str, Any] = {}
+        display = str(spec_data.get("display_name") or "")
+        if kind == "database":
+            res = validate_database_spec(_database_spec(spec_data))
+        elif kind == "stable":
+            st = stable_spec_from(spec_data)
+            res = validate_stable_spec(st)
+            if spec_data.get("retention_days") not in (None, ""):
+                try:
+                    if int(spec_data["retention_days"]) < 1:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    res.errors.append({"field": "retention_days", "code": "INVALID_RETENTION",
+                                       "message": "Retention must be a positive number of days (supertables inherit the database retention)."})
+                    res.valid = False
+        elif kind == "subtable":
+            sub = subtable_spec_from(spec_data)
+            cols, tags = await self.stable_schema(session, tenant_id, sub.database, sub.stable)
+            res = validate_subtable_spec(sub, tags)
+            extra["stable_columns"] = cols
+            extra["stable_tags"] = tags
+            try:
+                extra["bindings"] = await self.resolve_bindings(session, tenant_id, sub, cols, spec_data)
+            except StorageObjectError as exc:
+                res.errors.extend(getattr(exc, "field_errors", None) or [{"field": "bindings", "code": exc.code, "message": str(exc)}])
+                res.valid = False
+        else:
+            res = ValidationResult(valid=False, errors=[{"field": "kind", "code": "UNKNOWN_KIND", "message": f"Unknown object kind '{kind}'."}])
+        if len(display) > MAX_DISPLAY_NAME_LEN:
+            res.errors.append({"field": "display_name", "code": "DISPLAY_NAME_TOO_LONG",
+                               "message": f"Display name is limited to {MAX_DISPLAY_NAME_LEN} characters."})
+            res.valid = False
+        return res, extra
+
+    async def resolve_bindings(
         self,
         session: AsyncSession,
         tenant_id: UUID,
-        draft_id: UUID,
-        custom_spec: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Generate execution DDL plan without executing anything."""
-        if custom_spec:
-            kind = str(custom_spec.get("kind") or "stable").lower()
-            spec_data = custom_spec.get("spec") or custom_spec
-        else:
-            draft = await self.get_draft(session, tenant_id, draft_id)
-            if not draft:
-                raise StorageObjectError("DRAFT_NOT_FOUND", f"Draft {draft_id} not found")
-            kind = draft["object_kind"]
-            spec_data = draft["spec"]
+        sub: SubtableSpec,
+        columns: list[ColumnSpec],
+        spec_data: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Validate and normalise the bindings of a subtable (G-02: model_id + field path persisted)."""
+        raw = [b for b in (spec_data.get("bindings") or []) if isinstance(b, dict)]
+        recording = recording_from(spec_data)
+        errors: list[dict[str, Any]] = []
 
+        def err(index: int | None, code: str, message: str) -> None:
+            errors.append({"field": "bindings" if index is None else f"bindings[{index}]", "code": code, "message": message})
+
+        if recording["mode"] not in RECORDING_MODES:
+            err(None, "INVALID_MODE", f"Recording mode must be one of {', '.join(RECORDING_MODES)}.")
+        if recording["row_assembly"] not in ROW_ASSEMBLY:
+            err(None, "INVALID_ROW_ASSEMBLY", f"Row assembly must be one of {', '.join(ROW_ASSEMBLY)}.")
+        if (recording["mode"] == "ON_NEW_EVENT") != (recording["row_assembly"] == "ATOMIC_EVENT"):
+            err(None, "EVENT_MODE_MISMATCH", "On new event recording writes one atomic row per event (row assembly ATOMIC_EVENT) and vice versa.")
+        if not raw:
+            if not spec_data.get("no_binding"):
+                err(None, "BINDING_REQUIRED", "Bind at least one source field, or choose 'Create without a binding' explicitly.")
+            if errors:
+                raise storage_error("BINDING_INVALID", errors[0]["message"], errors)
+            return []
+
+        col_by_name = {c.name: c for c in columns}
+        ts_col = columns[0].name if columns else "ts"
+        key_cols = {c.name for c in columns if c.primary_key}
+        models: dict[str, dict[str, Any]] = {}
+        model_ids = []
+        for b in raw:
+            if not b.get("model_id") and str(b.get("source_kind") or "") == "model_field":
+                try:
+                    model_ids.append(str(UUID(str(b.get("source_id") or ""))))
+                    continue
+                except ValueError:
+                    pass
+            mid = b.get("model_id") or (str(b.get("source_id") or b.get("canonical_id") or "").split(":")[1]
+                                        if str(b.get("source_id") or b.get("canonical_id") or "").startswith("mod:") else None)
+            if mid:
+                model_ids.append(str(mid))
+        if model_ids:
+            valid_ids = []
+            for mid in model_ids:
+                try:
+                    valid_ids.append(UUID(mid))
+                except ValueError:
+                    pass
+            if valid_ids:
+                rows = await fetch_all(
+                    session,
+                    """
+                    SELECT id, display_name, kind, version, spec_json, resource_id
+                    FROM output_groups
+                    WHERE tenant_id = :tenant_id AND status = 'ACTIVE' AND id = ANY(:ids)
+                    """,
+                    {"tenant_id": tenant_id, "ids": valid_ids},
+                )
+                for r in rows:
+                    models[str(r["id"])] = {
+                        "name": r["display_name"], "kind": r.get("kind"), "version": int(r.get("version") or 1),
+                        "leaves": {leaf["path"]: leaf for leaf in SB.model_leaf_fields(r.get("spec_json"))},
+                    }
+        owners = await SB.bound_model_fields(session, tenant_id)
+        out: list[dict[str, Any]] = []
+        used_cols: set[str] = set()
+        for i, b in enumerate(raw):
+            col = str(b.get("target_column") or b.get("column_name") or b.get("destination_column") or "")
+            kind = str(b.get("source_kind") or b.get("kind") or "").lower()
+            can = str(b.get("canonical_id") or b.get("source_id") or "")
+            if not kind:
+                kind = "model_field" if can.startswith("mod:") or b.get("model_id") else ("signal" if can.startswith("sig:") or b.get("signal_id") else "")
+            if kind == "model_field" and not b.get("model_id") and not can.startswith("mod:"):
+                try:
+                    b = {**b, "model_id": str(UUID(can))}  # a bare model id: the model, not a field
+                except ValueError:
+                    pass
+            if col not in col_by_name:
+                err(i, "UNKNOWN_COLUMN", f"Column '{col}' does not exist in supertable '{sub.stable}'.")
+                continue
+            if col == ts_col or col in key_cols or col in WRITER_COLUMNS:
+                err(i, "RESERVED_COLUMN", f"Column '{col}' is filled by the recorder (timestamp / key / audit); bind a value column.")
+                continue
+            if col in used_cols:
+                err(i, "DUPLICATE_COLUMN", f"Column '{col}' is bound twice.")
+                continue
+            used_cols.add(col)
+            column = col_by_name[col]
+            if kind == "model_field":
+                mid = str(b.get("model_id") or (can.split(":")[1] if can.startswith("mod:") else ""))
+                path = SB.normalize_field_path(
+                    b.get("model_field_path") or b.get("field_path") or b.get("source_path")
+                    or (can.split(":", 2)[2] if can.startswith("mod:") and can.count(":") >= 2 else "")
+                )
+                model = models.get(mid)
+                if model is None:
+                    err(i, "MODEL_NOT_FOUND", "The selected Data Model does not exist (or is archived) in this tenant.")
+                    continue
+                leaf = model["leaves"].get(path)
+                if leaf is None:
+                    err(i, "FIELD_NOT_FOUND", f"'{path or '(empty)'}' is not a field of '{model['name']}'. Pick a field, not the model.")
+                    continue
+                owner = owners.get((mid, path))
+                if owner and (owner["database"], owner["subtable"]) != (sub.database, sub.name):
+                    err(i, "FIELD_ALREADY_RECORDED",
+                        f"'{model['name']} · {path}' is already recorded in {owner['database']}.{owner['subtable']} (one owner per field).")
+                    continue
+                if not SB.model_type_compatible(leaf["value_type"], column.td_type):
+                    err(i, "TYPE_MISMATCH",
+                        f"Field '{path}' ({leaf['value_type']}) cannot be stored in column '{col}' ({column.td_type}).")
+                    continue
+                out.append({
+                    "source_kind": "model_field", "canonical_id": f"mod:{mid}:{path}", "model_id": mid,
+                    "model_field_path": path, "signal_id": None, "target_column": col,
+                    "source_data_type": leaf["value_type"], "model_name": model["name"],
+                    "model_revision": model["version"], "column_type": column.td_type,
+                })
+            elif kind == "signal":
+                sid = str(b.get("signal_id") or can.replace("sig:", ""))
+                try:
+                    sid_uuid = UUID(sid)
+                except ValueError:
+                    err(i, "SIGNAL_NOT_FOUND", "The selected signal id is not valid.")
+                    continue
+                sig = await fetch_one(
+                    session,
+                    "SELECT id, key, data_type FROM signal_definitions WHERE tenant_id = :tenant_id AND id = :id AND status = 'ACTIVE'",
+                    {"tenant_id": tenant_id, "id": sid_uuid},
+                )
+                if not sig:
+                    err(i, "SIGNAL_NOT_FOUND", "The selected signal does not exist or is not active.")
+                    continue
+                ok, msg = SB.StorageBindingService().validate_binding("signal", str(sig["data_type"]), column.td_type)
+                if not ok:
+                    err(i, "TYPE_MISMATCH", msg or "Type mismatch.")
+                    continue
+                out.append({
+                    "source_kind": "signal", "canonical_id": f"sig:{sid_uuid}", "model_id": None,
+                    "model_field_path": None, "signal_id": str(sid_uuid), "target_column": col,
+                    "source_data_type": str(sig["data_type"]), "column_type": column.td_type,
+                })
+            else:
+                err(i, "SOURCE_KIND_REQUIRED", "Choose a Data Model field (or a signal) as the source.")
+        if not errors and recording["row_assembly"] == "ATOMIC_EVENT":
+            mids = {b["model_id"] for b in out}
+            if len(mids) != 1 or any(b["source_kind"] != "model_field" for b in out):
+                err(None, "ATOMIC_EVENT_SOURCE", "An atomic event row takes all its fields from one Data Model.")
+        if not errors and recording["mode"] == "ON_NEW_EVENT":
+            leaves = models[out[0]["model_id"]]["leaves"] if out else {}
+            for p in recording["identity_paths"]:
+                if p not in leaves:
+                    err(None, "IDENTITY_FIELD_NOT_FOUND", f"Event identity field '{p}' is not a field of the model.")
+        if errors:
+            raise storage_error("BINDING_INVALID", errors[0]["message"], errors)
+        return out
+
+    async def plan_draft(
+        self, session: AsyncSession, tenant_id: UUID, draft_id: UUID | None, custom_spec: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """The exact DDL the saga will execute (Review step shows THIS, not a client-side guess)."""
+        kind, spec_data = await self._spec_of(session, tenant_id, draft_id, custom_spec)
         steps: list[DdlStep] = []
+        bindings: list[dict[str, Any]] | None = None
+        warnings: list[dict[str, Any]] = []
         if kind == "database":
             steps = build_create_database_plan(_database_spec(spec_data))
         elif kind == "stable":
-            cols = [
-                ColumnSpec(
-                    name=c["name"],
-                    td_type=c.get("td_type") or c.get("type", "DOUBLE"),
-                    length=c.get("length"),
-                    role=c.get("role", "value"),
-                    nullable=c.get("nullable", True),
-                )
-                for c in spec_data.get("columns", [])
-            ]
-            tags = [
-                TagSpec(
-                    name=t["name"],
-                    td_type=t.get("td_type") or t.get("type", "NCHAR"),
-                    length=t.get("length", 64),
-                    required=t.get("required", False),
-                )
-                for t in spec_data.get("tags", [])
-            ]
-            st_spec = StableSpec(
-                database=spec_data.get("database", ""),
-                name=spec_data.get("name") or spec_data.get("physical_name", ""),
-                columns=cols,
-                tags=tags,
-            )
-            steps = build_create_stable_plan(st_spec)
+            steps = build_create_stable_plan(stable_spec_from(spec_data))
         elif kind == "subtable":
-            db_name = spec_data.get("database", "")
-            st_name = spec_data.get("stable") or spec_data.get("parent_stable", "")
-            stable_tags = await self._resolve_stable_tags(session, tenant_id, db_name, st_name)
-            sub_spec = SubtableSpec(
-                database=db_name,
-                stable=st_name,
-                name=spec_data.get("name") or spec_data.get("physical_name", ""),
-                tag_values=spec_data.get("tag_values", {}),
-            )
-            steps = build_create_subtable_plan(sub_spec, stable_tags)
-
+            sub = subtable_spec_from(spec_data)
+            cols, tags = await self.stable_schema(session, tenant_id, sub.database, sub.stable)
+            steps = build_create_subtable_plan(sub, tags)
+            try:
+                bindings = await self.resolve_bindings(session, tenant_id, sub, cols, spec_data)
+            except StorageObjectError as exc:
+                warnings.extend(getattr(exc, "field_errors", []) or [])
+        else:
+            raise storage_error("VALIDATION_FAILED", f"Unknown object kind '{kind}'.")
         return {
-            "draft_id": str(draft_id),
+            "draft_id": str(draft_id) if draft_id else None,
             "kind": kind,
-            "steps": [
-                {
-                    "action": s.action,
-                    "sql": s.sql,
-                    "idempotent": s.idempotent,
-                    "description": s.description,
-                }
-                for s in steps
-            ],
+            "steps": [{"action": s.action, "sql": s.sql, "idempotent": s.idempotent, "description": s.description} for s in steps],
+            "ddl": [s.sql for s in steps],
+            "bindings": bindings,
+            "recording": recording_from(spec_data) if kind == "subtable" else None,
+            "warnings": warnings,
             "requires_downtime": False,
             "estimated_impact": f"{len(steps)} DDL statement(s)",
         }
 
-        return {
-            "draft_id": str(draft_id),
-            "kind": kind,
-            "steps": [
-                {
-                    "action": s.action,
-                    "sql": s.sql,
-                    "idempotent": s.idempotent,
-                    "description": s.description,
-                }
-                for s in steps
-            ],
-            "requires_downtime": False,
-            "estimated_impact": f"{len(steps)} DDL statement(s)",
-        }
-
-    async def simulate_draft(
-        self,
-        session: AsyncSession,
-        tenant_id: UUID,
-        draft_id: UUID,
-    ) -> dict[str, Any]:
-        """Simulate sample data generation / ingestion dry-run."""
+    async def simulate_draft(self, session: AsyncSession, tenant_id: UUID, draft_id: UUID) -> dict[str, Any]:
+        """No synthetic rows (G-09 / R1-18): report what a real write would contain, without data."""
         draft = await self.get_draft(session, tenant_id, draft_id)
-        spec = draft["spec"] if draft else {}
-        sample_rows = [
-            {
-                "ts": iso_ms(utcnow()),
-                "sample_index": i,
-                "status": "SIMULATED",
-                "preview_note": "Synthetic dry-run row preview",
-            }
-            for i in range(5)
-        ]
         return {
             "draft_id": str(draft_id),
             "simulated": True,
-            "sample_rows": sample_rows,
-            "row_assembly_result": "OK",
+            "sample_rows": [],
+            "note": "No sample rows are generated. Real rows appear after the object is created and recording is started.",
+            "spec_hash": draft.get("hash") if draft else None,
         }
 
     # ------------------------------------------------------------------
-    # Operation Saga & Publishing
+    # Publish saga
     # ------------------------------------------------------------------
 
     async def publish_draft(
@@ -536,438 +757,391 @@ class StorageRevisionService:
         actor_id: UUID | None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Execute DDL plan in TDengine within an idempotent saga with read-back verification."""
         draft = await self.get_draft(session, tenant_id, draft_id)
         if not draft:
-            raise StorageObjectError("DRAFT_NOT_FOUND", f"Draft {draft_id} not found")
-
-        op_id = uuid4()
-        now = utcnow()
-        kind = draft["object_kind"]
-        spec_data = draft["spec"]
+            raise storage_error("DRAFT_NOT_FOUND", f"Draft {draft_id} not found")
+        kind = str(draft["object_kind"])
+        spec_data = dict(draft["spec"])
         spec_hash = draft.get("hash") or _compute_spec_hash(spec_data)
+        op_type = f"CREATE_{kind.upper()}"
 
-        # Check existing operation with same idempotency_key
-        if idempotency_key:
-            row = await fetch_one(
+        if self.td is None:
+            raise storage_error("STORAGE_ENGINE_UNAVAILABLE", "TDengine is not configured or not reachable.")
+
+        # 1. Validate everything before touching TDengine.
+        v_res, extra = await self._validate(session, tenant_id, kind, spec_data)
+        if not v_res.valid:
+            first = v_res.errors[0]["message"] if v_res.errors else "Validation failed"
+            raise storage_error("VALIDATION_FAILED", first, v_res.errors)
+        if kind == "database":
+            db_spec = _database_spec(spec_data)
+            db_name, obj_name = db_spec.name, db_spec.name
+        elif kind == "stable":
+            st_spec = stable_spec_from(spec_data)
+            db_name, obj_name = st_spec.database, st_spec.name
+        else:
+            sub_spec = subtable_spec_from(spec_data)
+            db_name, obj_name = sub_spec.database, sub_spec.name
+        object_key = obj_name if kind == "database" else f"{db_name}.{obj_name}"
+        key = idempotency_key or f"{object_key}:{spec_hash}"
+
+        # 2. Idempotent replay / in-flight detection.
+        op_id: UUID | None = None
+        prior = await fetch_one(
+            session,
+            """
+            SELECT id, status, started_at, requested_at FROM storage_operations
+            WHERE tenant_id = :tenant_id AND operation_type = :op_type AND idempotency_key = :key
+            """,
+            {"tenant_id": tenant_id, "op_type": op_type, "key": key},
+        )
+        exists = await self.object_exists(kind, db_name, obj_name)
+        if prior:
+            st = str(prior["status"])
+            started = prior.get("started_at") or prior.get("requested_at")
+            if st in ("APPLIED", "COMPLETED") and exists:
+                return {"operation_id": str(prior["id"]), "status": "APPLIED", "idempotent_replay": True,
+                        "object_key": object_key}
+            if st in IN_PROGRESS and started is not None and utcnow() - started < STUCK_AFTER:
+                raise storage_error("OPERATION_IN_PROGRESS",
+                                    f"Creating {object_key} is already in progress (operation {prior['id']}).")
+            op_id = UUID(str(prior["id"]))
+        # 3. Name clash.
+        if exists:
+            raise storage_error(
+                "NAME_CONFLICT",
+                f"A {'database' if kind == 'database' else 'table or supertable'} named '{object_key}' already exists in TDengine. "
+                "Open it instead, or choose another name.",
+                [{"field": "name", "code": "NAME_CONFLICT", "message": f"'{obj_name}' already exists."}],
+            )
+        steps = (await self.plan_draft(session, tenant_id, draft_id))["steps"]
+        now = utcnow()
+        state = {"phase": "PREPARING", "steps_total": len(steps), "steps_done": 0, "object_key": object_key}
+        if op_id is None:
+            op_id = uuid4()
+            await execute(
                 session,
                 """
-                SELECT id, status, step_state_json, error_code, error_message
-                FROM storage_operations
-                WHERE tenant_id = :tenant_id AND idempotency_key = :key
-                """,
-                {"tenant_id": tenant_id, "key": idempotency_key},
-            )
-            if row:
-                st = str(row["status"])
-                norm_status = "APPLIED" if st in ("APPLIED", "COMPLETED") else st
-                return {
-                    "operation_id": str(row["id"]),
-                    "status": norm_status,
-                    "idempotent_replay": True,
-                }
-
-        # Rule FX-P0-04: Never mark APPLIED if TD client is null/unavailable
-        if self.td is None:
-            try:
-                await execute(
-                    session,
-                    """
-                    INSERT INTO storage_operations (
-                        id, tenant_id, operation_type, target_type, target_id,
-                        actor_id, idempotency_key, status, requested_at, completed_at,
-                        error_code, error_message, step_state_json
-                    ) VALUES (
-                        :id, :tenant_id, :op_type, :target_type, :target_id,
-                        :actor_id, :idempotency_key, 'FAILED', :now, :now,
-                        'STORAGE_ENGINE_UNAVAILABLE', 'TDengine client is not available or reachable',
-                        :step_state
-                    )
-                    """,
-                    {
-                        "id": op_id,
-                        "tenant_id": tenant_id,
-                        "op_type": f"CREATE_{kind.upper()}",
-                        "target_type": kind,
-                        "target_id": draft_id,
-                        "actor_id": actor_id,
-                        "idempotency_key": idempotency_key or str(uuid4()),
-                        "now": now,
-                        "step_state": jsonb({"phase": "FAILED", "reason": "STORAGE_ENGINE_UNAVAILABLE"}),
-                    },
+                INSERT INTO storage_operations (
+                    id, tenant_id, operation_type, target_type, target_id, actor_id, idempotency_key,
+                    status, requested_at, started_at, step_state_json, spec_hash, object_key
+                ) VALUES (
+                    :id, :tenant_id, :op_type, :target_type, :target_id, :actor_id, :key,
+                    'PREPARING', :now, :now, :state, :spec_hash, :object_key
                 )
-                await session.commit()
-            except Exception:
-                pass
-            raise StorageObjectError("STORAGE_ENGINE_UNAVAILABLE", "TDengine client is not available or reachable")
-
-        plan = await self.plan_draft(session, tenant_id, draft_id)
-        steps = plan["steps"]
-
-        # Phase 1: PREPARING
-        await execute(
-            session,
-            """
-            INSERT INTO storage_operations (
-                id, tenant_id, operation_type, target_type, target_id,
-                actor_id, idempotency_key, status, requested_at, started_at,
-                step_state_json, spec_hash
-            ) VALUES (
-                :id, :tenant_id, :op_type, :target_type, :target_id,
-                :actor_id, :idempotency_key, 'PREPARING', :now, :now,
-                :step_state, :spec_hash
+                """,
+                {"id": op_id, "tenant_id": tenant_id, "op_type": op_type, "target_type": kind, "target_id": draft_id,
+                 "actor_id": actor_id, "key": key, "now": now, "state": jsonb(state), "spec_hash": spec_hash,
+                 "object_key": object_key},
             )
-            """,
-            {
-                "id": op_id,
-                "tenant_id": tenant_id,
-                "op_type": f"CREATE_{kind.upper()}",
-                "target_type": kind,
-                "target_id": draft_id,
-                "actor_id": actor_id,
-                "idempotency_key": idempotency_key or str(uuid4()),
-                "now": now,
-                "step_state": jsonb({"phase": "PREPARING", "steps_total": len(steps), "steps_done": 0}),
-                "spec_hash": spec_hash,
-            },
-        )
+        else:
+            await execute(
+                session,
+                """
+                UPDATE storage_operations
+                SET status = 'PREPARING', started_at = :now, completed_at = NULL, error_code = NULL,
+                    error_message = NULL, step_state_json = :state, target_id = :target_id, object_key = :object_key
+                WHERE id = :id
+                """,
+                {"id": op_id, "now": now, "state": jsonb(state), "target_id": draft_id, "object_key": object_key},
+            )
         await session.commit()
 
-        # Phase 2: APPLYING
-        await execute(
-            session,
-            """
-            UPDATE storage_operations
-            SET status = 'APPLYING',
-                step_state_json = :step_state
-            WHERE id = :id
-            """,
-            {
-                "id": op_id,
-                "step_state": jsonb({"phase": "APPLYING", "steps_total": len(steps), "steps_done": 0}),
-            },
-        )
-        await session.commit()
+        async def mark_failed(code: str, message: str, phase_state: dict[str, Any]) -> None:
+            await session.rollback()
+            await execute(
+                session,
+                """
+                UPDATE storage_operations
+                SET status = 'FAILED', completed_at = :now, error_code = :code, error_message = :msg,
+                    step_state_json = :state
+                WHERE id = :id
+                """,
+                {"id": op_id, "now": utcnow(), "code": code, "msg": message[:2000], "state": jsonb(phase_state)},
+            )
+            await execute(
+                session,
+                "UPDATE storage_object_drafts SET state = 'FAILED', updated_at = :now WHERE tenant_id = :tenant_id AND id = :id",
+                {"id": draft_id, "tenant_id": tenant_id, "now": utcnow()},
+            )
+            await session.commit()
 
-        executed_sqls = []
+        # 4. DDL.
+        executed: list[str] = []
+        await execute(session, "UPDATE storage_operations SET status = 'APPLYING', step_state_json = :state WHERE id = :id",
+                      {"id": op_id, "state": jsonb({**state, "phase": "APPLYING"})})
+        await session.commit()
         try:
             for step in steps:
-                sql = step["sql"]
-                logger.info("Executing TDengine DDL: %s", sql)
-                if hasattr(self.td, "execute_sql"):
-                    await self.td.execute_sql(sql)
-                elif hasattr(self.td, "run_write"):
-                    await self.td.run_write(sql)
-                executed_sqls.append(sql)
+                logger.info("Executing TDengine DDL: %s", step["sql"])
+                await self._td_exec(step["sql"])
+                executed.append(step["sql"])
+        except Exception as exc:  # noqa: BLE001 - surfaced as FAILED + PUBLISH_FAILED
+            await mark_failed("DDL_EXECUTION_ERROR", str(exc), {**state, "phase": "FAILED", "executed_sqls": executed})
+            raise storage_error("PUBLISH_FAILED", f"TDengine rejected the DDL: {exc}") from exc
 
-            # Phase 3: VERIFYING with read-back
+        # 5. Read-back verification against the spec.
+        await execute(session, "UPDATE storage_operations SET status = 'VERIFYING', step_state_json = :state WHERE id = :id",
+                      {"id": op_id, "state": jsonb({**state, "phase": "VERIFYING", "executed_sqls": executed})})
+        await session.commit()
+        try:
+            verification = await self._verify(kind, spec_data, extra)
+        except Exception as exc:  # noqa: BLE001
+            verification = {"read_back_ok": False, "problems": [str(exc)]}
+        if not verification.get("read_back_ok"):
+            compensated = await self._compensate(kind, db_name, obj_name)
+            msg = "; ".join(verification.get("problems") or ["read-back mismatch"])
+            await mark_failed("VERIFICATION_FAILED", msg, {**state, "phase": "FAILED", "executed_sqls": executed,
+                                                           "verification": verification, "compensated": compensated})
+            raise storage_error("VERIFICATION_FAILED", f"The created object does not match the request ({msg}). "
+                                + ("It was removed again." if compensated else "It could not be removed automatically."))
+
+        # 6. Registry + bindings + APPLIED in one transaction.
+        try:
+            obj_id = await self._register(session, tenant_id, kind, spec_data, extra, db_name, obj_name, spec_hash)
             await execute(
                 session,
                 """
                 UPDATE storage_operations
-                SET status = 'VERIFYING',
-                    step_state_json = :step_state
+                SET status = 'APPLIED', completed_at = :now, verification_json = :v, step_state_json = :state
                 WHERE id = :id
                 """,
-                {
-                    "id": op_id,
-                    "step_state": jsonb({
-                        "phase": "VERIFYING",
-                        "steps_total": len(steps),
-                        "steps_done": len(executed_sqls),
-                        "executed_sqls": executed_sqls,
-                    }),
-                },
+                {"id": op_id, "now": utcnow(), "v": jsonb({**verification, "verified_at": iso_ms(utcnow())}),
+                 "state": jsonb({**state, "phase": "APPLIED", "steps_done": len(steps), "executed_sqls": executed,
+                                 "object_id": str(obj_id)})},
+            )
+            await execute(
+                session,
+                "UPDATE storage_object_drafts SET state = 'APPLIED', updated_at = :now WHERE tenant_id = :tenant_id AND id = :id",
+                {"id": draft_id, "tenant_id": tenant_id, "now": utcnow()},
             )
             await session.commit()
-
-            # Real metadata read-back verification
-            if kind == "database":
-                db_name = spec_data.get("name") or spec_data.get("physical_name", "")
-                if db_name:
-                    dbs = await (
-                        self.td.query_rows("SHOW DATABASES")
-                        if hasattr(self.td, "query_rows")
-                        else self.td.run_read("SHOW DATABASES")
-                    )
-                    db_names = {
-                        str(list(r.values())[0] if isinstance(r, dict) else r[0])
-                        for r in (dbs or [])
-                    }
-                    if db_name not in db_names:
-                        raise StorageObjectError("VERIFICATION_FAILED", f"Database '{db_name}' not found in TDengine after creation")
-            elif kind == "stable":
-                db_name = spec_data.get("database", "")
-                st_name = spec_data.get("name") or spec_data.get("physical_name", "")
-                if db_name and st_name:
-                    cols = await (
-                        self.td.query_rows(f"DESCRIBE `{db_name}`.`{st_name}`")
-                        if hasattr(self.td, "query_rows")
-                        else self.td.run_read(f"DESCRIBE `{db_name}`.`{st_name}`")
-                    )
-                    if not cols:
-                        raise StorageObjectError("VERIFICATION_FAILED", f"STable '{db_name}.{st_name}' not found in TDengine after creation")
-            elif kind == "subtable":
-                db_name = spec_data.get("database", "")
-                sub_name = spec_data.get("name") or spec_data.get("physical_name", "")
-                if db_name and sub_name:
-                    await (
-                        self.td.query_rows(f"SELECT * FROM `{db_name}`.`{sub_name}` TAGS")
-                        if hasattr(self.td, "query_rows")
-                        else self.td.run_read(f"SELECT * FROM `{db_name}`.`{sub_name}` TAGS")
-                    )
-
-            # Phase 4: Register in storage_objects & storage_physical_registry
-            obj_db = spec_data.get("database") or spec_data.get("name") or spec_data.get("physical_name", "")
-            obj_name = spec_data.get("name") or spec_data.get("physical_name", "")
-            parent_name = spec_data.get("stable") or spec_data.get("parent_stable")
-            schema_json_data = spec_data.get("columns", [])
-            tags_json_data = spec_data.get("tags") or spec_data.get("tag_values", {})
-
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Registry write failed for %s", object_key)
+            compensated = await self._compensate(kind, db_name, obj_name)
+            await mark_failed("REGISTRY_FAILED", str(exc), {**state, "phase": "FAILED", "executed_sqls": executed,
+                                                             "compensated": compensated})
+            raise storage_error("REGISTRY_FAILED", f"The object could not be registered: {exc}") from exc
+        draft["state"] = "APPLIED"
+        _IN_MEMORY_DRAFTS[(tenant_id, draft_id)] = draft
+        if kind == "subtable":
             try:
-                await execute(
-                    session,
-                    """
-                    INSERT INTO storage_objects (
-                        id, tenant_id, object_type, physical_db, physical_name,
-                        parent_name, display_name, description, status,
-                        schema_json, tags_json, binding_revision, revision,
-                        created_at, updated_at
-                    ) VALUES (
-                        :id, :tenant_id, :obj_type, :db, :name,
-                        :parent_name, :display_name, :desc, 'ACTIVE',
-                        :schema, :tags, 1, 1, :now, :now
-                    )
-                    ON CONFLICT (tenant_id, object_type, physical_db, physical_name)
-                    DO UPDATE SET
-                        status = 'ACTIVE',
-                        schema_json = EXCLUDED.schema_json,
-                        tags_json = EXCLUDED.tags_json,
-                        updated_at = EXCLUDED.updated_at
-                    """,
-                    {
-                        "id": uuid4(),
-                        "tenant_id": tenant_id,
-                        "obj_type": kind,
-                        "db": obj_db,
-                        "name": obj_name,
-                        "parent_name": parent_name,
-                        "display_name": spec_data.get("display_name") or obj_name,
-                        "desc": spec_data.get("description", ""),
-                        "schema": jsonb(schema_json_data),
-                        "tags": jsonb(tags_json_data),
-                        "now": utcnow(),
-                    },
-                )
-            except Exception as reg_exc:
-                logger.debug("Registering storage_object skipped: %s", reg_exc)
+                from factorix.modules import storage_model_recorder
 
-            if kind == "subtable":
-                st_parent = parent_name or "st_default"
-                series_k = f"{tenant_id}:{obj_db}:{obj_name}"
-                try:
-                    await execute(
-                        session,
-                        """
-                        INSERT INTO storage_physical_registry (
-                            id, tenant_id, tier, series_key, value_type,
-                            td_database, td_stable, td_subtable, physical_schema_hash,
-                            generation, status, created_at, updated_at
-                        ) VALUES (
-                            :id, :tenant_id, 'MANAGED', :series_key, 'float64',
-                            :db, :stable, :subtable, :schema_hash,
-                            1, 'ACTIVE', :now, :now
-                        )
-                        ON CONFLICT (td_database, td_subtable)
-                        DO UPDATE SET status = 'ACTIVE', updated_at = EXCLUDED.updated_at
-                        """,
-                        {
-                            "id": uuid4(),
-                            "tenant_id": tenant_id,
-                            "series_key": series_k,
-                            "db": obj_db,
-                            "stable": st_parent,
-                            "subtable": obj_name,
-                            "schema_hash": spec_hash,
-                            "now": utcnow(),
-                        },
-                    )
-                except Exception as phys_exc:
-                    logger.debug("Registering storage_physical_registry skipped: %s", phys_exc)
-
-                # Persist bindings if present in subtable spec
-                bindings_list = spec_data.get("bindings", [])
-                for b in bindings_list:
-                    can_id = b.get("canonical_id") or b.get("source_id") or ""
-                    tgt_col = b.get("target_column") or b.get("destination_column") or b.get("column_name") or ""
-                    skind = b.get("kind") or b.get("source_kind") or "signal"
-                    row_pol = b.get("row_assembly_policy") or "INDEPENDENT_EVENTS"
-                    sig_uuid = None
-                    mod_uuid = None
-                    mod_path = None
-                    if skind == "signal":
-                        raw_id = b.get("signal_id") or b.get("id") or can_id
-                        try:
-                            clean_id = raw_id.replace("sig:", "") if isinstance(raw_id, str) else str(raw_id)
-                            sig_uuid = UUID(clean_id)
-                        except Exception:
-                            sig_uuid = None
-                    elif skind == "model_field":
-                        raw_id = b.get("model_id") or b.get("id") or can_id
-                        try:
-                            clean_id = raw_id.replace("mod:", "").split(":")[0] if isinstance(raw_id, str) else str(raw_id)
-                            mod_uuid = UUID(clean_id)
-                        except Exception:
-                            mod_uuid = None
-                        mod_path = b.get("field_path")
-
-                    if tgt_col:
-                        try:
-                            await execute(
-                                session,
-                                """
-                                INSERT INTO storage_bindings (
-                                    id, tenant_id, physical_db, physical_subtable,
-                                    canonical_source_id, source_kind, target_column,
-                                    signal_id, model_id, model_field_path,
-                                    row_assembly_policy, policy_config_json,
-                                    binding_revision, status, created_at, updated_at
-                                ) VALUES (
-                                    :id, :tenant_id, :db, :subtable,
-                                    :can_id, :skind, :tgt_col,
-                                    :sig_id, :mod_id, :mod_path,
-                                    :row_pol, :p_cfg,
-                                    1, 'ACTIVE', :now, :now
-                                )
-                                ON CONFLICT (tenant_id, physical_db, physical_subtable, target_column)
-                                DO UPDATE SET
-                                    canonical_source_id = EXCLUDED.canonical_source_id,
-                                    updated_at = EXCLUDED.updated_at
-                                """,
-                                {
-                                    "id": uuid4(),
-                                    "tenant_id": tenant_id,
-                                    "db": obj_db,
-                                    "subtable": obj_name,
-                                    "can_id": can_id,
-                                    "skind": skind,
-                                    "tgt_col": tgt_col,
-                                    "sig_id": sig_uuid,
-                                    "mod_id": mod_uuid,
-                                    "mod_path": mod_path,
-                                    "row_pol": row_pol,
-                                    "p_cfg": jsonb(b.get("policy_config", {})),
-                                    "now": utcnow(),
-                                },
-                            )
-                        except Exception as bind_exc:
-                            logger.debug("Persisting storage_bindings skipped: %s", bind_exc)
-
-            # Mark APPLIED
-            await execute(
-                session,
-                """
-                UPDATE storage_operations
-                SET status = 'APPLIED',
-                    completed_at = :completed_at,
-                    verification_json = :v_json,
-                    step_state_json = :step_state
-                WHERE id = :id
-                """,
-                {
-                    "id": op_id,
-                    "completed_at": utcnow(),
-                    "v_json": jsonb({"read_back_ok": True, "object_kind": kind, "verified_at": iso_ms(utcnow())}),
-                    "step_state": jsonb({
-                        "phase": "APPLIED",
-                        "steps_total": len(steps),
-                        "steps_done": len(steps),
-                        "executed_sqls": executed_sqls,
-                    }),
-                },
-            )
-
-            # Update draft state in DB and memory
-            try:
-                await execute(
-                    session,
-                    """
-                    UPDATE storage_object_drafts
-                    SET state = 'APPLIED', updated_at = :now
-                    WHERE tenant_id = :tenant_id AND id = :id
-                    """,
-                    {"id": draft_id, "tenant_id": tenant_id, "now": utcnow()},
-                )
-            except Exception:
+                storage_model_recorder.invalidate_bindings(tenant_id)
+            except Exception:  # noqa: BLE001 - cache invalidation is best effort; TTL reloads anyway
                 pass
-
-            await session.commit()
-            draft["state"] = "APPLIED"
-            _IN_MEMORY_DRAFTS[(tenant_id, draft_id)] = draft
-        except Exception as exc:
-            logger.error("DDL execution/verification failed for op %s: %s", op_id, exc)
-            await execute(
-                session,
-                """
-                UPDATE storage_operations
-                SET status = 'FAILED',
-                    completed_at = :completed_at,
-                    error_code = 'DDL_EXECUTION_ERROR',
-                    error_message = :err,
-                    step_state_json = :step_state
-                WHERE id = :id
-                """,
-                {
-                    "id": op_id,
-                    "completed_at": utcnow(),
-                    "err": str(exc),
-                    "step_state": jsonb({
-                        "phase": "FAILED",
-                        "executed_sqls": executed_sqls,
-                    }),
-                },
-            )
-            try:
-                await execute(
-                    session,
-                    """
-                    UPDATE storage_object_drafts
-                    SET state = 'FAILED', updated_at = :now
-                    WHERE tenant_id = :tenant_id AND id = :id
-                    """,
-                    {"id": draft_id, "tenant_id": tenant_id, "now": utcnow()},
-                )
-            except Exception:
-                pass
-            await session.commit()
-            draft["state"] = "FAILED"
-            _IN_MEMORY_DRAFTS[(tenant_id, draft_id)] = draft
-            raise StorageObjectError("PUBLISH_FAILED", f"Publish failed: {exc}")
-
         return {
             "operation_id": str(op_id),
             "status": "APPLIED",
-            "executed_steps": len(executed_sqls),
+            "executed_steps": len(executed),
+            "object_key": object_key,
+            "object_id": str(obj_id),
+            "ddl": executed,
+            "verification": verification,
         }
 
-    # ------------------------------------------------------------------
-    # Operation Status
-    # ------------------------------------------------------------------
+    async def _compensate(self, kind: str, database: str, name: str) -> bool:
+        """Drop an object THIS operation created (it did not exist before the saga started)."""
+        try:
+            if kind == "database":
+                sql = f"DROP DATABASE IF EXISTS `{database}`"
+            elif kind == "stable":
+                sql = generate_drop_stable_ddl(database, name)
+            else:
+                sql = generate_drop_table_ddl(database, name)
+            await self._td_exec(sql)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Compensation failed for %s %s.%s: %s", kind, database, name, exc)
+            return False
 
-    async def get_operation(
+    async def _verify(self, kind: str, spec_data: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+        problems: list[str] = []
+        if kind == "database":
+            spec = _database_spec(spec_data)
+            rows = await self._td_read(
+                f"SELECT name, `precision` FROM information_schema.ins_databases WHERE name = {quote_str(spec.name)}"
+            )
+            if not rows:
+                problems.append(f"database '{spec.name}' not found")
+            else:
+                prec = str(_row_value(rows[0], "precision", 1) or "").lower()
+                if prec and prec != spec.precision.lower():
+                    problems.append(f"precision is {prec}, expected {spec.precision}")
+        elif kind == "stable":
+            spec = stable_spec_from(spec_data)
+            cols, tags = await self.describe(spec.database, spec.name)
+            if [c.name for c in cols] != [c.name for c in spec.columns]:
+                problems.append("columns differ: " + ", ".join(c.name for c in cols))
+            for want, got in zip(spec.columns, cols, strict=False):
+                if _base_type(want.td_type) != _base_type(got.td_type):
+                    problems.append(f"{want.name}: type {got.td_type}, expected {want.td_type}")
+                if want.length and got.length and int(want.length) != int(got.length):
+                    problems.append(f"{want.name}: length {got.length}, expected {want.length}")
+                if want.primary_key != got.primary_key:
+                    problems.append(f"{want.name}: composite key {'missing' if want.primary_key else 'unexpected'}")
+            if [t.name for t in tags] != [t.name for t in spec.tags]:
+                problems.append("tags differ: " + ", ".join(t.name for t in tags))
+        else:
+            spec = subtable_spec_from(spec_data)
+            rows = await self._td_read(
+                "SELECT table_name, stable_name FROM information_schema.ins_tables "
+                f"WHERE db_name = {quote_str(spec.database)} AND table_name = {quote_str(spec.name)}"
+            )
+            if not rows:
+                problems.append(f"subtable '{spec.name}' not found")
+            elif str(_row_value(rows[0], "stable_name", 1) or "") != spec.stable:
+                problems.append(f"parent is {_row_value(rows[0], 'stable_name', 1)}, expected {spec.stable}")
+            tag_rows = await self._td_read(
+                "SELECT tag_name, tag_value FROM information_schema.ins_tags "
+                f"WHERE db_name = {quote_str(spec.database)} AND table_name = {quote_str(spec.name)}"
+            )
+            got_tags = {str(_row_value(r, "tag_name", 0)): _row_value(r, "tag_value", 1) for r in tag_rows}
+            for tag in extra.get("stable_tags") or []:
+                want = spec.tag_values.get(tag.name)
+                got = got_tags.get(tag.name)
+                if want is None:
+                    continue
+                if str(got) != str(want):
+                    problems.append(f"tag {tag.name}={got!r}, expected {want!r}")
+        return {"read_back_ok": not problems, "problems": problems, "object_kind": kind}
+
+    async def _register(
         self,
         session: AsyncSession,
         tenant_id: UUID,
-        operation_id: UUID,
-    ) -> dict[str, Any] | None:
-        """Fetch operation status by ID with unified status enum."""
+        kind: str,
+        spec_data: dict[str, Any],
+        extra: dict[str, Any],
+        db_name: str,
+        obj_name: str,
+        spec_hash: str,
+    ) -> UUID:
+        now = utcnow()
+        parent_name: str | None = None
+        parent_id: Any = None
+        recording: dict[str, Any] = {}
+        status = "ACTIVE"
+        if kind == "stable":
+            st = stable_spec_from(spec_data)
+            schema = [{"name": c.name, "td_type": c.td_type, "length": c.length, "role": c.role,
+                       "primary_key": c.primary_key} for c in st.columns]
+            tags: Any = [{"name": t.name, "td_type": t.td_type, "length": t.length} for t in st.tags]
+            recording = {"default_mode": recording_from(spec_data)["mode"]}
+        elif kind == "subtable":
+            sub = subtable_spec_from(spec_data)
+            parent_name = sub.stable
+            schema = []
+            tags = sub.tag_values
+            recording = recording_from(spec_data)
+            status = "ACTIVE" if recording["start_recording"] else "PAUSED"
+            prow = await fetch_one(
+                session,
+                """
+                SELECT id FROM storage_objects WHERE tenant_id = :tenant_id AND object_type = 'stable'
+                  AND physical_db = :db AND physical_name = :name AND status <> 'PURGED'
+                """,
+                {"tenant_id": tenant_id, "db": db_name, "name": sub.stable},
+            )
+            parent_id = prow["id"] if prow else None
+        else:
+            db = _database_spec(spec_data)
+            schema = []
+            tags = {"precision": db.precision, "keep": db.keep}
+        obj_id = uuid4()
         row = await fetch_one(
             session,
             """
-            SELECT id, tenant_id, operation_type, target_type, target_id,
-                   actor_id, idempotency_key, status, requested_at,
-                   started_at, completed_at, step_state_json, error_code,
-                   error_message, trace_id
+            INSERT INTO storage_objects (
+                id, tenant_id, object_type, physical_db, physical_name, parent_id, parent_name,
+                display_name, description, status, schema_json, tags_json, recording_json,
+                binding_revision, revision, created_at, updated_at
+            ) VALUES (
+                :id, :tenant_id, :kind, :db, :name, :parent_id, :parent_name,
+                :display_name, :description, :status, :schema, :tags, :recording, 1, 1, :now, :now
+            )
+            ON CONFLICT (tenant_id, object_type, physical_db, physical_name) DO UPDATE SET
+                parent_id = EXCLUDED.parent_id, parent_name = EXCLUDED.parent_name,
+                display_name = EXCLUDED.display_name, description = EXCLUDED.description,
+                status = EXCLUDED.status, schema_json = EXCLUDED.schema_json, tags_json = EXCLUDED.tags_json,
+                recording_json = EXCLUDED.recording_json, revision = storage_objects.revision + 1,
+                updated_at = EXCLUDED.updated_at
+            WHERE storage_objects.status = 'PURGED'
+            RETURNING id
+            """,
+            {"id": obj_id, "tenant_id": tenant_id, "kind": kind, "db": db_name, "name": obj_name,
+             "parent_id": parent_id, "parent_name": parent_name,
+             "display_name": str(spec_data.get("display_name") or obj_name),
+             "description": str(spec_data.get("description") or ""), "status": status,
+             "schema": jsonb(schema), "tags": jsonb(tags), "recording": jsonb(recording), "now": now},
+        )
+        if not row:
+            raise storage_error("NAME_CONFLICT", f"'{db_name}.{obj_name}' is already registered.")
+        obj_id = UUID(str(row["id"]))
+        if kind == "subtable":
+            bindings = extra.get("bindings") or []
+            first_type = bindings[0]["source_data_type"] if bindings else "none"
+            await execute(
+                session,
+                """
+                INSERT INTO storage_physical_registry (
+                    id, tenant_id, tier, series_key, value_type, td_database, td_stable, td_subtable,
+                    physical_schema_hash, generation, status, created_at, updated_at
+                ) VALUES (
+                    :id, :tenant_id, 'MANAGED', :series_key, :value_type, :db, :stable, :sub,
+                    :hash, 1, :status, :now, :now
+                )
+                ON CONFLICT (td_database, td_subtable) DO UPDATE SET
+                    td_stable = EXCLUDED.td_stable, value_type = EXCLUDED.value_type, status = EXCLUDED.status,
+                    physical_schema_hash = EXCLUDED.physical_schema_hash,
+                    generation = storage_physical_registry.generation + 1, updated_at = EXCLUDED.updated_at
+                """,
+                {"id": uuid4(), "tenant_id": tenant_id, "series_key": f"{db_name}.{obj_name}",
+                 "value_type": str(first_type)[:32], "db": db_name, "stable": parent_name, "sub": obj_name,
+                 "hash": spec_hash, "status": "ACTIVE" if status == "ACTIVE" else "PAUSED", "now": now},
+            )
+            # The physical table did not exist before this saga: older binding/state rows of a purged
+            # table with the same name are stale and must not leak into the new object.
+            params = {"tenant_id": tenant_id, "db": db_name, "sub": obj_name}
+            await execute(session, "DELETE FROM storage_bindings WHERE tenant_id = :tenant_id AND physical_db = :db AND physical_subtable = :sub", params)
+            await execute(session, "DELETE FROM storage_field_state WHERE tenant_id = :tenant_id AND physical_db = :db AND physical_subtable = :sub", params)
+            for b in bindings:
+                await execute(
+                    session,
+                    """
+                    INSERT INTO storage_bindings (
+                        id, tenant_id, subtable_id, physical_db, physical_subtable, canonical_source_id,
+                        source_kind, target_column, signal_id, model_id, model_field_path,
+                        row_assembly_policy, policy_config_json, binding_revision, status,
+                        source_data_type, created_at, updated_at
+                    ) VALUES (
+                        :id, :tenant_id, :subtable_id, :db, :sub, :can, :kind, :col, :sig, :mid, :path,
+                        :row_pol, :cfg, 1, 'ACTIVE', :dtype, :now, :now
+                    )
+                    """,
+                    {"id": uuid4(), "tenant_id": tenant_id, "subtable_id": obj_id, "db": db_name, "sub": obj_name,
+                     "can": b["canonical_id"], "kind": b["source_kind"], "col": b["target_column"],
+                     "sig": UUID(b["signal_id"]) if b.get("signal_id") else None,
+                     "mid": UUID(b["model_id"]) if b.get("model_id") else None, "path": b.get("model_field_path"),
+                     "row_pol": recording["row_assembly"],
+                     "cfg": jsonb({"mode": recording["mode"], "identity_paths": recording["identity_paths"],
+                                   "quality_transitions": recording["quality_transitions"]}),
+                     "dtype": b.get("source_data_type"), "now": now},
+                )
+        return obj_id
+
+    # ------------------------------------------------------------------
+    # Operation status
+    # ------------------------------------------------------------------
+
+    async def get_operation(self, session: AsyncSession, tenant_id: UUID, operation_id: UUID) -> dict[str, Any] | None:
+        row = await fetch_one(
+            session,
+            """
+            SELECT id, tenant_id, operation_type, target_type, target_id, actor_id, idempotency_key, status,
+                   requested_at, started_at, completed_at, step_state_json, error_code, error_message, trace_id,
+                   object_key
             FROM storage_operations
             WHERE id = :id AND tenant_id = :tenant_id
             """,
@@ -975,23 +1149,20 @@ class StorageRevisionService:
         )
         if not row:
             return None
-
         step_state = row["step_state_json"]
         if isinstance(step_state, str):
             try:
                 step_state = json.loads(step_state)
-            except Exception:
+            except ValueError:
                 step_state = {}
-
         raw_status = str(row["status"])
-        norm_status = "APPLIED" if raw_status in ("APPLIED", "COMPLETED") else raw_status
-
         return {
             "id": str(row["id"]),
             "operation_type": row["operation_type"],
             "target_type": row["target_type"],
             "target_id": str(row["target_id"]) if row["target_id"] else None,
-            "status": norm_status,
+            "object_key": row.get("object_key"),
+            "status": "APPLIED" if raw_status in ("APPLIED", "COMPLETED") else raw_status,
             "requested_at": iso_ms(row["requested_at"]) if row["requested_at"] else None,
             "started_at": iso_ms(row["started_at"]) if row["started_at"] else None,
             "completed_at": iso_ms(row["completed_at"]) if row["completed_at"] else None,
@@ -999,3 +1170,16 @@ class StorageRevisionService:
             "error_code": row["error_code"],
             "error_message": row["error_message"],
         }
+
+
+def _json_list(raw: Any) -> list[Any]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    return raw if isinstance(raw, list) else []
+
+
+def is_user_stable(name: str) -> bool:
+    return not is_system_stable(name)

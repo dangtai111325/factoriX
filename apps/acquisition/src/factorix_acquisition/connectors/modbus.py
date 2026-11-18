@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from pymodbus.client import AsyncModbusTcpClient
@@ -27,16 +31,91 @@ _EXCEPTION_NAMES = {
 }
 
 
-_endpoint_locks: dict[tuple[int, str, int], asyncio.Lock] = {}
+class EndpointScheduler:
+    """The single request scheduler of one Modbus TCP endpoint (host:port) in this process.
+
+    Modbus TCP devices and gateways answer one request at a time, so every job, connection and
+    commissioning probe that targets the endpoint is queued here, FIFO, with a priority lane for
+    interactive commissioning ("Test read") so an operator never waits behind a full poll cycle.
+    The time spent queued is measured separately and is NOT part of any request's timeout: a request's
+    budget starts when it gets the endpoint (``request_budget_s``), so a busy endpoint slows the poll
+    rate instead of producing false timeouts.
+    """
+
+    def __init__(self) -> None:
+        self._busy = False
+        self._normal: deque[asyncio.Future[None]] = deque()
+        self._priority: deque[asyncio.Future[None]] = deque()
+        self.requests = 0
+        self.total_wait_s = 0.0
+        self.max_wait_s = 0.0
+
+    @property
+    def queued(self) -> int:
+        return sum(1 for fut in (*self._normal, *self._priority) if not fut.done())
+
+    def locked(self) -> bool:
+        return self._busy
+
+    async def acquire(self, *, priority: bool = False) -> float:
+        started = time.monotonic()
+        if not self._busy and not self.queued:
+            self._busy = True
+        else:
+            fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            (self._priority if priority else self._normal).append(fut)
+            try:
+                await fut
+            except asyncio.CancelledError:
+                if fut.done() and not fut.cancelled():
+                    self.release()  # granted just as we were cancelled: hand the endpoint on
+                raise
+        waited = time.monotonic() - started
+        self.requests += 1
+        self.total_wait_s += waited
+        self.max_wait_s = max(self.max_wait_s, waited)
+        return waited
+
+    def release(self) -> None:
+        for lane in (self._priority, self._normal):
+            while lane:
+                fut = lane.popleft()
+                if not fut.done():
+                    fut.set_result(None)  # ownership passes directly; _busy stays True
+                    return
+        self._busy = False
+
+    @asynccontextmanager
+    async def slot(self, *, priority: bool = False) -> AsyncIterator[float]:
+        waited = await self.acquire(priority=priority)
+        try:
+            yield waited
+        finally:
+            self.release()
+
+    async def __aenter__(self) -> "EndpointScheduler":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.release()
 
 
-def endpoint_lock(host: str, port: int) -> asyncio.Lock:
-    """One request at a time per Modbus device endpoint, across every connector of this process."""
+_endpoint_schedulers: dict[tuple[int, str, int], EndpointScheduler] = {}
+
+
+def endpoint_scheduler(host: str, port: int) -> EndpointScheduler:
+    """One scheduler per Modbus device endpoint, shared by every connector of this event loop."""
     key = (id(asyncio.get_running_loop()), host.lower(), int(port))
-    lock = _endpoint_locks.get(key)
-    if lock is None:
-        lock = _endpoint_locks[key] = asyncio.Lock()
-    return lock
+    scheduler = _endpoint_schedulers.get(key)
+    if scheduler is None:
+        scheduler = _endpoint_schedulers[key] = EndpointScheduler()
+    return scheduler
+
+
+def endpoint_lock(host: str, port: int) -> EndpointScheduler:
+    """Backward-compatible name: ``async with endpoint_lock(host, port):`` takes one normal slot."""
+    return endpoint_scheduler(host, port)
 
 
 def request_budget_s(timeout_s: float, retries: int) -> float:
@@ -53,11 +132,13 @@ class ModbusConnector:
 
     can_write = False
 
-    def __init__(self, host: str, port: int, timeout_s: float = 3.0, retries: int = 0) -> None:
+    def __init__(self, host: str, port: int, timeout_s: float = 3.0, retries: int = 0, *, priority: bool = False) -> None:
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
         self.retries = max(0, int(retries))
+        self.priority = bool(priority)
+        self.last_wait_s = 0.0
         self.client = AsyncModbusTcpClient(host, port=port, timeout=timeout_s, retries=self.retries, reconnect_delay=0)
 
     @property
@@ -82,17 +163,20 @@ class ModbusConnector:
 
     async def read_raw(self, block: ReadBlock) -> list[int] | list[bool]:
         """Execute one read request. Library and device errors become ConnectorError."""
-        async with endpoint_lock(self.host, self.port):
+        async with endpoint_scheduler(self.host, self.port).slot(priority=self.priority) as waited:
+            # The request budget starts here, after the queue: waiting for the endpoint is not a timeout.
+            self.last_wait_s = waited
             await self.ensure_connected()
             try:
                 if block.area == "holding":
-                    response = await self.client.read_holding_registers(block.start, count=block.count, device_id=block.unit_id)
+                    request = self.client.read_holding_registers(block.start, count=block.count, device_id=block.unit_id)
                 elif block.area == "input":
-                    response = await self.client.read_input_registers(block.start, count=block.count, device_id=block.unit_id)
+                    request = self.client.read_input_registers(block.start, count=block.count, device_id=block.unit_id)
                 elif block.area == "coil":
-                    response = await self.client.read_coils(block.start, count=block.count, device_id=block.unit_id)
+                    request = self.client.read_coils(block.start, count=block.count, device_id=block.unit_id)
                 else:
-                    response = await self.client.read_discrete_inputs(block.start, count=block.count, device_id=block.unit_id)
+                    request = self.client.read_discrete_inputs(block.start, count=block.count, device_id=block.unit_id)
+                response = await bounded(request, timeout=self.request_budget_s + 1.0)
             except ConnectionException as exc:
                 self.client.close()
                 raise ConnectorError("NETWORK", f"Modbus TCP {self.host}:{self.port} is not connected.") from exc

@@ -30,6 +30,8 @@ from uuid import UUID
 
 import taosws
 
+from factorix.domain.canonical import intern_uuid, uuid_str
+
 logger = logging.getLogger(__name__)
 
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -60,11 +62,60 @@ MODEL_SNAPSHOTS_STABLE = "model_snapshots"
 
 
 class TDEngineError(RuntimeError):
-    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+    def __init__(self, code: str, message: str, *, retryable: bool = False, native_code: int | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.native_code = native_code if native_code is not None else parse_native_code(message)
+
+    @property
+    def schema_missing(self) -> bool:
+        return td_error_is_schema_missing(self.message, self.native_code)
+
+
+# ---------------------------------------------------------------------------
+# Error classification by exception type and TDengine native error code.
+# ---------------------------------------------------------------------------
+# taos-ws-py raises ``taosws.ConnectionError`` for transport failures and reports server
+# errors as ``[0xNNNN] message``. Classification order: exception type, then the native
+# code, and only for code-less errors the legacy message heuristics.
+_NATIVE_CODE_RE = re.compile(r"\[(?:0x|0X)([0-9A-Fa-f]{1,8})\]")
+# Schema objects missing (re-run ensure_operational_schema, then retry):
+# 0x0388 database not exist, 0x0362 stable not exist, 0x2603 table does not exist.
+TD_SCHEMA_MISSING_CODES = frozenset({0x0388, 0x0362, 0x2603})
+# Transient server states: 0x000B unable to establish connection, 0x0396 database in creating status.
+TD_RETRYABLE_CODES = frozenset({0x000B, 0x0396})
+# Client-side transport range of the WebSocket connector (e.g. 0xE001 IO / connection refused).
+TD_CLIENT_TRANSPORT_RANGE = range(0xE000, 0xF000)
+# Parser errors are deterministic for a given statement (bad SQL / value), never worth retrying.
+TD_PARSER_RANGE = range(0x2600, 0x2700)
+
+
+_DSN_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s:]+)(:[^/@\s]*)?@")
+
+
+def _scrub(text: Any) -> str:
+    """Strip ``user:password@`` from DSNs/URLs that drivers may echo in error text."""
+    return _DSN_CREDENTIALS_RE.sub(r"\1***:***@", str(text))
+
+
+def parse_native_code(text: Any) -> int | None:
+    match = _NATIVE_CODE_RE.search(str(text or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1), 16)
+    except ValueError:
+        return None
+
+
+def td_error_is_schema_missing(message: str, native_code: int | None = None) -> bool:
+    code = native_code if native_code is not None else parse_native_code(message)
+    if code is not None:
+        return code in TD_SCHEMA_MISSING_CODES
+    low = str(message or "").lower()
+    return any(tok in low for tok in ("not exist", "doesn't exist", "does not exist"))
 
 
 def validate_identifier(name: str, *, kind: str = "identifier") -> str:
@@ -91,7 +142,7 @@ def quote_str(value: str) -> str:
 def tenant_database_name(tenant_id: UUID | str, prefix: str = "fx_t_") -> str:
     if not _PREFIX_RE.fullmatch(prefix):
         raise TDEngineError("INVALID_PREFIX", f"Invalid database prefix: {prefix!r}")
-    uid_hex = UUID(str(tenant_id)).hex
+    uid_hex = intern_uuid(tenant_id).hex
     return f"{prefix}{uid_hex}"
 
 
@@ -104,7 +155,7 @@ def op_stable_for_type(value_type: str) -> str:
 
 def op_subtable_name(signal_id: UUID | str, value_type: str) -> str:
     stable = op_stable_for_type(value_type)
-    sig_hex = UUID(str(signal_id)).hex
+    sig_hex = intern_uuid(signal_id).hex
     return f"{stable}_{sig_hex}"
 
 
@@ -175,8 +226,10 @@ class TDEngineConfig:
     default_cache_mb: int = 16
     default_vgroups: int | None = 1
     max_workers: int = 4
-    batch_chunk_rows: int = 200
-    max_sql_bytes: int = 240 * 1024
+    # Rows per INSERT statement (~620 B/row for operational rows) and statement size cap
+    # (TDengine accepts statements up to 1 MiB; stay well below).
+    batch_chunk_rows: int = 1000
+    max_sql_bytes: int = 512 * 1024
     connect_timeout_s: float = 10.0
     query_timeout_s: float = 15.0
     ddl_timeout_s: float = 45.0
@@ -192,6 +245,8 @@ class SubtableWriteItem:
     columns: tuple[str, ...]
     values: tuple[Any, ...]
     value_types: tuple[str, ...] = ()
+    # Optional pre-rendered "(v1, v2, ...)" literal built by a typed fast path from ``values``.
+    values_sql: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +256,10 @@ class BatchWriteFailure:
     code: str
     message: str
     retryable: bool = False
+
+    @property
+    def schema_missing(self) -> bool:
+        return td_error_is_schema_missing(self.message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +281,9 @@ class TDEngineHealth:
 
 
 def _is_creating_or_warming_error(exc: BaseException) -> bool:
+    code = parse_native_code(exc)
+    if code is not None and code == 0x0396:
+        return True
     text = str(exc).lower()
     return any(
         needle in text
@@ -239,6 +301,17 @@ def _is_creating_or_warming_error(exc: BaseException) -> bool:
 
 
 def _is_retryable_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
+        return True
+    ws_connection_error = getattr(taosws, "ConnectionError", None)
+    if isinstance(ws_connection_error, type) and isinstance(exc, ws_connection_error):
+        return True
+    code = parse_native_code(exc)
+    if code is not None:
+        if code in TD_RETRYABLE_CODES or code in TD_CLIENT_TRANSPORT_RANGE:
+            return True
+        if code in TD_PARSER_RANGE or code in TD_SCHEMA_MISSING_CODES:
+            return False
     if _is_creating_or_warming_error(exc):
         return True
     text = str(exc).lower()
@@ -298,7 +371,7 @@ class TDEngineClient:
         try:
             conn = taosws.connect(self._config.dsn)
         except Exception as exc:
-            raise TDEngineError("TDENGINE_CONNECT_FAILED", f"Failed to connect to TDengine: {exc}", retryable=True) from exc
+            raise TDEngineError("TDENGINE_CONNECT_FAILED", f"Failed to connect to TDengine: {_scrub(exc)}", retryable=True) from exc
         self._local.conn = conn
         with self._conns_lock:
             self._conns.append(conn)
@@ -333,13 +406,15 @@ class TDEngineClient:
                     time.sleep(0.15 * (attempt + 1))
                     continue
                 if attempt < 1 and allow_reconnect and _is_retryable_error(exc):
-                    logger.warning("TDengine transport drop detected (%s); reconnecting.", exc)
+                    logger.warning("TDengine transport drop detected (%s); reconnecting.", _scrub(exc))
                     self._drop_thread_conn()
                     continue
                 retryable = _is_retryable_error(exc)
-                raise TDEngineError("TDENGINE_QUERY_FAILED", str(exc), retryable=retryable) from exc
+                raise TDEngineError(
+                    "TDENGINE_QUERY_FAILED", _scrub(exc), retryable=retryable, native_code=parse_native_code(exc)
+                ) from exc
         assert last_exc is not None
-        raise TDEngineError("TDENGINE_QUERY_FAILED", str(last_exc), retryable=True) from last_exc
+        raise TDEngineError("TDENGINE_QUERY_FAILED", _scrub(last_exc), retryable=True) from last_exc
 
     async def close(self) -> None:
         self._closed = True
@@ -520,6 +595,8 @@ class TDEngineClient:
         return f"{fq_sub} ({cols_sql}) USING {fq_st} TAGS ({tag_sql})"
 
     def _format_values_tuple(self, item: SubtableWriteItem) -> str:
+        if item.values_sql is not None:
+            return item.values_sql
         if item.value_types:
             val_sql = ", ".join(
                 sql_literal(v, value_type=vt) for v, vt in zip(item.values, item.value_types, strict=True)
@@ -537,10 +614,15 @@ class TDEngineClient:
         succeeded: list[str] = []
         failures: list[BatchWriteFailure] = []
         prepared: list[tuple[SubtableWriteItem, str, str]] = []
+        # Identifier validation/quoting of the subtable header once per distinct subtable, not per row.
+        headers: dict[tuple[str, str, tuple[Any, ...], tuple[str, ...]], str] = {}
 
         for item in items:
             try:
-                header = self._format_subtable_header(database, item)
+                header_key = (item.subtable, item.stable, item.tags, item.columns)
+                header = headers.get(header_key)
+                if header is None:
+                    header = headers[header_key] = self._format_subtable_header(database, item)
                 val_tuple = self._format_values_tuple(item)
                 prepared.append((item, header, val_tuple))
             except TDEngineError as exc:
@@ -581,50 +663,74 @@ class TDEngineClient:
         if cur_items:
             chunks.append((cur_items, cur_groups, cur_flat))
 
-        for index, (chunk_items, grouped, flat_chunk) in enumerate(chunks):
-            stmt = "INSERT INTO " + " ".join(f"{hdr} VALUES {', '.join(vals)}" for hdr, vals in grouped.items())
+        # Independent chunks run concurrently (bounded, leaving pool threads for reads).
+        # A retryable failure only fails its own chunk; the caller retries exactly those ids.
+        # A permanent failure is isolated by bisection: O(log n) statements per bad row instead
+        # of one INSERT per row of the chunk.
+        limiter = asyncio.Semaphore(max(1, int(self._config.max_workers) // 2))
+        abort: list[TDEngineError] = []
 
+        async def run_chunk(grouped: dict[str, list[str]], flat_chunk: list[tuple[SubtableWriteItem, str, str]]) -> tuple[list[str], list[BatchWriteFailure]]:
+            async with limiter:
+                if abort:
+                    # TDengine is unavailable: do not spend one timeout per remaining chunk.
+                    err = abort[0]
+                    return [], [
+                        BatchWriteFailure(it.item_id, it.subtable, err.code, err.message, retryable=True)
+                        for it, _, _ in flat_chunk
+                    ]
+                stmt = "INSERT INTO " + " ".join(f"{hdr} VALUES {', '.join(vals)}" for hdr, vals in grouped.items())
+                try:
+                    await self.execute_sql(stmt)
+                    return [it.item_id for it, _, _ in flat_chunk], []
+                except TDEngineError as exc:
+                    if exc.retryable:
+                        abort.append(exc)
+                    if exc.retryable or len(flat_chunk) == 1:
+                        return [], [
+                            BatchWriteFailure(it.item_id, it.subtable, exc.code, exc.message, retryable=exc.retryable)
+                            for it, _, _ in flat_chunk
+                        ]
+                    return await self._bisect_insert(flat_chunk)
+
+        results = await asyncio.gather(*(run_chunk(grouped, flat) for _items, grouped, flat in chunks))
+        for ok_ids, chunk_failures in results:
+            succeeded.extend(ok_ids)
+            failures.extend(chunk_failures)
+        return BatchWriteResult(succeeded_ids=tuple(succeeded), failures=tuple(failures))
+
+    async def _bisect_insert(
+        self, flat: list[tuple[SubtableWriteItem, str, str]]
+    ) -> tuple[list[str], list[BatchWriteFailure]]:
+        """Isolate permanently rejected rows of a failed statement by halving it."""
+        if len(flat) == 1:
+            item, hdr, val_tuple = flat[0]
+            try:
+                await self.execute_sql(f"INSERT INTO {hdr} VALUES {val_tuple}")
+                return [item.item_id], []
+            except TDEngineError as exc:
+                return [], [BatchWriteFailure(item.item_id, item.subtable, exc.code, exc.message, retryable=exc.retryable)]
+        mid = len(flat) // 2
+        succeeded: list[str] = []
+        failures: list[BatchWriteFailure] = []
+        for half in (flat[:mid], flat[mid:]):
+            grouped: dict[str, list[str]] = {}
+            for _item, hdr, val_tuple in half:
+                grouped.setdefault(hdr, []).append(val_tuple)
+            stmt = "INSERT INTO " + " ".join(f"{hdr} VALUES {', '.join(vals)}" for hdr, vals in grouped.items())
             try:
                 await self.execute_sql(stmt)
-                succeeded.extend(it.item_id for it in chunk_items)
+                succeeded.extend(it.item_id for it, _, _ in half)
             except TDEngineError as exc:
                 if exc.retryable:
-                    # Let the caller back off and retry, instead of sending a separate
-                    # request for every row while the database is unavailable.
                     failures.extend(
-                        BatchWriteFailure(item.item_id, item.subtable, exc.code, exc.message, retryable=True)
-                        for remaining_items, _, _ in chunks[index:]
-                        for item in remaining_items
-                    )
-                    break
-                if len(flat_chunk) == 1:
-                    only_item = flat_chunk[0][0]
-                    failures.append(
-                        BatchWriteFailure(
-                            only_item.item_id,
-                            only_item.subtable,
-                            exc.code,
-                            exc.message,
-                            retryable=exc.retryable,
-                        )
+                        BatchWriteFailure(it.item_id, it.subtable, exc.code, exc.message, retryable=True) for it, _, _ in half
                     )
                     continue
-                for sub_item, hdr, val_tuple in flat_chunk:
-                    try:
-                        await self.execute_sql(f"INSERT INTO {hdr} VALUES {val_tuple}")
-                        succeeded.append(sub_item.item_id)
-                    except TDEngineError as item_exc:
-                        failures.append(
-                            BatchWriteFailure(
-                                sub_item.item_id,
-                                sub_item.subtable,
-                                item_exc.code,
-                                item_exc.message,
-                                retryable=item_exc.retryable,
-                            )
-                        )
-
-        return BatchWriteResult(succeeded_ids=tuple(succeeded), failures=tuple(failures))
+                ok, bad = await self._bisect_insert(half)
+                succeeded.extend(ok)
+                failures.extend(bad)
+        return succeeded, failures
 
     async def write_operational_observations(
         self,
@@ -652,12 +758,23 @@ class TDEngineClient:
             "record_kind",
         )
         seen_ts: dict[str, dict[int, str]] = {}
+        str_lits: dict[str, str] = {}
+
+        def text(value: str | None) -> str:
+            # Same literal as sql_literal(value, value_type="string"); repeated strings rendered once.
+            if value is None:
+                return "NULL"
+            lit = str_lits.get(value)
+            if lit is None:
+                lit = str_lits[value] = quote_str(value)
+            return lit
+
         for rec in records:
             vtype = str(rec["value_type"])
             stable = op_stable_for_type(vtype)
-            sig_id = str(UUID(str(rec["signal_id"])))
-            res_id = str(UUID(str(rec["resource_id"])))
-            conn_id = str(UUID(str(rec["connection_id"]))) if rec.get("connection_id") else ""
+            sig_id = uuid_str(intern_uuid(rec["signal_id"]))
+            res_id = uuid_str(intern_uuid(rec["resource_id"]))
+            conn_id = uuid_str(intern_uuid(rec["connection_id"])) if rec.get("connection_id") else ""
             subtable = op_subtable_name(sig_id, vtype)
             ev_ts = to_utc_datetime(rec["event_time"])
             assert ev_ts is not None
@@ -676,6 +793,22 @@ class TDEngineClient:
             if vtype == "timestamp" and isinstance(val, datetime):
                 val = to_td_timestamp_us(val)
                 norm_vtype = "int64"
+            raw_quality = str(rec.get("raw_quality") or "GOOD")[:16]
+            reason = str(rec["reason_code"])[:64] if rec.get("reason_code") else None
+            origin = str(rec.get("origin") or "LIVE")[:16]
+            unit = str(rec["unit"])[:32] if rec.get("unit") is not None else None
+            config_rev = int(rec.get("config_revision") or 1)
+            data_epoch = int(rec.get("data_epoch") or 1)
+            source_seq = int(rec["source_seq"]) if rec.get("source_seq") is not None else None
+            assert acq_ts is not None
+            # Typed fast path: identical literals to sql_literal() per column type, without
+            # re-converting timestamps and re-dispatching on every value.
+            values_sql = (
+                f"({ts_us}, {sql_literal(val, value_type=norm_vtype)}, {to_td_timestamp_us(acq_ts)}, "
+                f"{to_td_timestamp_us(src_ts) if src_ts is not None else 'NULL'}, {text(raw_quality)}, {text(reason)}, "
+                f"{text(origin)}, {text(unit)}, {text(ev_uid)}, {config_rev}, {data_epoch}, "
+                f"{source_seq if source_seq is not None else 'NULL'}, {text(record_kind[:24])})"
+            )
             items.append(
                 SubtableWriteItem(
                     item_id=str(rec["event_uid"]),
@@ -688,14 +821,14 @@ class TDEngineClient:
                         val,
                         acq_ts,
                         src_ts,
-                        str(rec.get("raw_quality") or "GOOD")[:16],
-                        str(rec["reason_code"])[:64] if rec.get("reason_code") else None,
-                        str(rec.get("origin") or "LIVE")[:16],
-                        str(rec["unit"])[:32] if rec.get("unit") is not None else None,
-                        str(rec["event_uid"])[:64],
-                        int(rec.get("config_revision") or 1),
-                        int(rec.get("data_epoch") or 1),
-                        int(rec["source_seq"]) if rec.get("source_seq") is not None else None,
+                        raw_quality,
+                        reason,
+                        origin,
+                        unit,
+                        ev_uid,
+                        config_rev,
+                        data_epoch,
+                        source_seq,
                         record_kind[:24],
                     ),
                     value_types=(
@@ -713,6 +846,7 @@ class TDEngineClient:
                         "int64",
                         "string",
                     ),
+                    values_sql=values_sql,
                 )
             )
         return await self.write_batch(db, items)

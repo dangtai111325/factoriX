@@ -21,6 +21,18 @@ from uuid import UUID
 # TDengine identifier rules
 # ---------------------------------------------------------------------------
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_MAX_IDENT_LEN = 64
+MAX_DESCRIPTION_LEN = 1000
+MAX_DISPLAY_NAME_LEN = 200
+#: Database names starting with this prefix are reserved for the canonical per-tenant database
+#: that FactoriX creates itself (``fx_t_<tenant hex>``); users cannot create another one.
+TENANT_DB_PREFIX = "fx_t_"
+#: Physical objects FactoriX owns (operational history + model snapshots). They are read-only in
+#: the Storage UI: never a parent of a user subtable, never altered, retired or dropped by a user.
+SYSTEM_STABLES = frozenset({"op_bool", "op_float64", "op_int64", "op_string", "op_json", "model_snapshots"})
+SYSTEM_SUBTABLE_PREFIXES = ("op_", "ms_")
+#: Column types TDengine accepts for the composite (second) primary key column (3.4.3.9 verified).
+COMPOSITE_KEY_TYPES = frozenset({"INT", "INT UNSIGNED", "BIGINT", "BIGINT UNSIGNED", "VARCHAR", "BINARY", "VARBINARY"})
 _DB_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,15}$")
 _RESERVED_DB_PREFIXES = {"information_schema", "performance_schema", "log", "sys"}
 _MAX_COLUMNS = 4096
@@ -51,6 +63,7 @@ _SUPPORTED_COLUMN_TYPES: dict[str, int | None] = {
     "JSON": None,  # only for tags
 }
 _TAG_ONLY_TYPES = {"JSON"}
+_VARIABLE_LENGTH_TYPES = {"BINARY", "NCHAR", "VARCHAR", "VARBINARY", "GEOMETRY"}
 _SUPPORTED_DB_PRECISION = {"ms", "us", "ns"}
 _SUPPORTED_CACHE_MODELS = {"none", "last_row", "last_value", "both"}
 
@@ -74,6 +87,9 @@ class ColumnSpec:
     role: Literal["time_key", "value"] = "value"
     nullable: bool = True
     description: str = ""
+    #: Second column only: TDengine composite primary key (``<name> <type> COMPOSITE KEY``) so two
+    #: rows with the same ``ts`` but a different key are both kept (guide D2 / E3).
+    primary_key: bool = False
 
 
 @dataclass
@@ -88,7 +104,7 @@ class TagSpec:
 @dataclass
 class DatabaseSpec:
     name: str
-    precision: str = "ms"
+    precision: str = "us"
     keep: str = "3650d"
     vgroups: int = 1
     replica: int = 1
@@ -131,7 +147,10 @@ class TDengineCapabilities:
     """Feature flags for TDengine 3.4.3.9 (Community edition)."""
 
     VIRTUAL_TABLES = False
-    COMPOSITE_KEY = False
+    # Verified on tdengine/tsdb:3.4.3.9: `CREATE STABLE ... (ts TIMESTAMP, k VARCHAR(64) COMPOSITE KEY, ...)`
+    # is accepted (`PRIMARY KEY` is an alias); DESCRIBE reports note "COMPOSITE KEY"; two rows with the
+    # same ts and different keys are both kept, the same (ts, key) is an upsert.
+    COMPOSITE_KEY = True
     PER_STABLE_RETENTION = False
     TAG_INDEXES = True
     MAX_PRECISION = "us"  # ns supported but not recommended in community
@@ -164,7 +183,21 @@ class TDengineCapabilities:
 # Validators
 # ---------------------------------------------------------------------------
 
+def is_system_stable(name: str | None) -> bool:
+    return bool(name) and str(name) in SYSTEM_STABLES
+
+
+def is_system_subtable(name: str | None) -> bool:
+    return bool(name) and str(name).startswith(SYSTEM_SUBTABLE_PREFIXES)
+
+
 def validate_identifier(name: str, kind: str = "identifier") -> None:
+    if isinstance(name, str) and len(name) > _MAX_IDENT_LEN:
+        raise StorageObjectError(
+            "IDENTIFIER_TOO_LONG",
+            f"The {kind} is {len(name)} characters long; TDengine allows at most {_MAX_IDENT_LEN}.",
+            field=kind,
+        )
     if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
         raise StorageObjectError(
             "INVALID_IDENTIFIER",
@@ -188,6 +221,17 @@ def validate_database_spec(spec: DatabaseSpec) -> ValidationResult:
             "field": "name",
             "code": "RESERVED_NAME",
             "message": f"Database name '{spec.name}' is a reserved system name.",
+        })
+    if spec.name.lower().startswith(TENANT_DB_PREFIX):
+        errors.append({
+            "field": "name",
+            "code": "RESERVED_PREFIX",
+            "message": f"Names starting with '{TENANT_DB_PREFIX}' are reserved for the tenant database FactoriX manages.",
+        })
+    if len(spec.description or "") > MAX_DESCRIPTION_LEN:
+        errors.append({
+            "field": "description", "code": "DESCRIPTION_TOO_LONG",
+            "message": f"Description is limited to {MAX_DESCRIPTION_LEN} characters.",
         })
 
     # Precision
@@ -280,9 +324,44 @@ def validate_stable_spec(spec: StableSpec) -> ValidationResult:
             "message": "The TIMESTAMP column must be the first column in the supertable.",
         })
 
+    if is_system_stable(spec.name):
+        errors.append({
+            "field": "name", "code": "SYSTEM_OBJECT",
+            "message": f"'{spec.name}' is a FactoriX system supertable and cannot be created or changed here.",
+        })
+    if len(spec.description or "") > MAX_DESCRIPTION_LEN:
+        errors.append({
+            "field": "description", "code": "DESCRIPTION_TOO_LONG",
+            "message": f"Description is limited to {MAX_DESCRIPTION_LEN} characters.",
+        })
+
     seen_col_names: set[str] = set()
     total_row_bytes = 0
     for i, col in enumerate(spec.columns):
+        base_type = col.td_type.upper().split("(")[0].strip()
+        if col.primary_key:
+            if i != 1:
+                errors.append({
+                    "field": f"columns[{i}].primary_key", "code": "COMPOSITE_KEY_POSITION",
+                    "message": "Only the second column (directly after the timestamp) can be the composite primary key.",
+                })
+            elif base_type not in COMPOSITE_KEY_TYPES:
+                errors.append({
+                    "field": f"columns[{i}].primary_key", "code": "COMPOSITE_KEY_TYPE",
+                    "message": f"A composite key column must be one of {sorted(COMPOSITE_KEY_TYPES)}, not {col.td_type}.",
+                })
+        if base_type in _VARIABLE_LENGTH_TYPES:
+            max_len = _SUPPORTED_COLUMN_TYPES.get(base_type) or 65517
+            if col.length is None or int(col.length) < 1:
+                errors.append({
+                    "field": f"columns[{i}].length", "code": "LENGTH_REQUIRED",
+                    "message": f"Column '{col.name}' of type {col.td_type} needs a length.",
+                })
+            elif int(col.length) > max_len:
+                errors.append({
+                    "field": f"columns[{i}].length", "code": "LENGTH_TOO_LARGE",
+                    "message": f"Column '{col.name}' length {col.length} exceeds the TDengine maximum {max_len}.",
+                })
         try:
             validate_identifier(col.name, f"column[{i}].name")
         except StorageObjectError as exc:
@@ -342,6 +421,12 @@ def validate_stable_spec(spec: StableSpec) -> ValidationResult:
 
     seen_tag_names: set[str] = set()
     for i, tag in enumerate(spec.tags):
+        base_tag_type = tag.td_type.upper().split("(")[0].strip()
+        if base_tag_type in _VARIABLE_LENGTH_TYPES and (tag.length is None or int(tag.length) < 1):
+            errors.append({
+                "field": f"tags[{i}].length", "code": "LENGTH_REQUIRED",
+                "message": f"Tag '{tag.name}' of type {tag.td_type} needs a length.",
+            })
         try:
             validate_identifier(tag.name, f"tag[{i}].name")
         except StorageObjectError as exc:
@@ -380,6 +465,37 @@ def validate_subtable_spec(spec: SubtableSpec, stable_tags: list[TagSpec]) -> Va
         validate_identifier(spec.name, "subtable name")
     except StorageObjectError as exc:
         errors.append({"field": "name", "code": exc.code, "message": str(exc)})
+
+    if is_system_stable(spec.stable):
+        errors.append({
+            "field": "stable", "code": "SYSTEM_PARENT",
+            "message": f"'{spec.stable}' is a FactoriX system supertable; choose one of your own supertables.",
+        })
+    if is_system_subtable(spec.name):
+        errors.append({
+            "field": "name", "code": "RESERVED_PREFIX",
+            "message": "Subtable names starting with 'op_' or 'ms_' are reserved for FactoriX.",
+        })
+    if not stable_tags:
+        errors.append({
+            "field": "stable", "code": "PARENT_NOT_FOUND",
+            "message": f"Supertable '{spec.database}.{spec.stable}' was not found or has no tags.",
+        })
+    missing_values = [t.name for t in stable_tags if spec.tag_values.get(t.name) in (None, "")]
+    if stable_tags and missing_values:
+        errors.append({
+            "field": "tag_values", "code": "MISSING_TAG_VALUES",
+            "message": "Enter a value for every tag: " + ", ".join(missing_values) + ".",
+        })
+    for t in stable_tags:
+        val = spec.tag_values.get(t.name)
+        if isinstance(val, str) and t.length and t.td_type.upper().split("(")[0].strip() in _VARIABLE_LENGTH_TYPES:
+            size = len(val.encode("utf-8"))
+            if size > int(t.length):
+                errors.append({
+                    "field": f"tag_values.{t.name}", "code": "TAG_TOO_LONG",
+                    "message": f"Tag '{t.name}' allows {t.length} bytes; the value has {size}.",
+                })
 
     required_tags = {t.name for t in stable_tags if t.required}
     missing = required_tags - set(spec.tag_values.keys())
@@ -423,9 +539,9 @@ def generate_create_database_ddl(spec: DatabaseSpec) -> str:
     """Generate CREATE DATABASE DDL from spec.
 
     Example:
-        CREATE DATABASE `mydb` PRECISION 'ms' KEEP 3650d VGROUPS 1 REPLICA 1;
+        CREATE DATABASE `mydb` PRECISION 'us' KEEP 3650d VGROUPS 1 REPLICA 1
     """
-    parts = [f"CREATE DATABASE IF NOT EXISTS {_quote(spec.name)}"]
+    parts = [f"CREATE DATABASE {_quote(spec.name)}"]
     parts.append(f"PRECISION '{spec.precision}'")
     if spec.keep:
         parts.append(f"KEEP {spec.keep}")
@@ -441,8 +557,8 @@ def generate_create_database_ddl(spec: DatabaseSpec) -> str:
 def generate_create_stable_ddl(spec: StableSpec) -> str:
     """Generate CREATE STABLE DDL from spec."""
     col_defs = ", ".join(
-        f"{_quote(c.name)} {_type_sql(c.td_type, c.length)}"
-        for c in spec.columns
+        f"{_quote(c.name)} {_type_sql(c.td_type, c.length)}" + (" COMPOSITE KEY" if c.primary_key and i == 1 else "")
+        for i, c in enumerate(spec.columns)
     )
     if spec.tags:
         tag_defs = ", ".join(
@@ -450,13 +566,13 @@ def generate_create_stable_ddl(spec: StableSpec) -> str:
             for t in spec.tags
         )
         return (
-            f"CREATE STABLE IF NOT EXISTS "
+            f"CREATE STABLE "
             f"{_quote(spec.database)}.{_quote(spec.name)} "
             f"({col_defs}) "
             f"TAGS ({tag_defs})"
         )
     return (
-        f"CREATE STABLE IF NOT EXISTS "
+        f"CREATE STABLE "
         f"{_quote(spec.database)}.{_quote(spec.name)} "
         f"({col_defs}) "
         f"TAGS ()"
@@ -473,14 +589,14 @@ def generate_create_subtable_ddl(spec: SubtableSpec, stable_tag_specs: list[TagS
 
     if tag_names:
         return (
-            f"CREATE TABLE IF NOT EXISTS "
+            f"CREATE TABLE "
             f"{_quote(spec.database)}.{_quote(spec.name)} "
             f"USING {_quote(spec.database)}.{_quote(spec.stable)} "
             f"({tag_name_sql}) "
             f"TAGS ({tag_val_sql})"
         )
     return (
-        f"CREATE TABLE IF NOT EXISTS "
+        f"CREATE TABLE "
         f"{_quote(spec.database)}.{_quote(spec.name)} "
         f"USING {_quote(spec.database)}.{_quote(spec.stable)}"
     )

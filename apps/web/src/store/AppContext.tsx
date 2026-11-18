@@ -19,6 +19,7 @@ import {
   HealthMsg,
   LatestMsg,
   getPushedSignalIds,
+  onStreamResync,
   onPushCoverageChange,
   subscribeHealth,
   subscribeSignals,
@@ -292,7 +293,13 @@ interface LiveState {
   connectionHealth?: string
   brokerHealth?: string
   storageHealth?: string
+  /** Server verdict: FRESH | DELAYED | STALE (DELAYED = current at the source, late in the pipeline). */
+  freshness?: string
+  deliveryLagMs?: number
 }
+
+/** Push and polling both missing for this long beyond the threshold: the client marks the value stale. */
+const CLIENT_SAFETY_MARGIN_MS = 15000
 
 function timeOf(iso: string): number {
   if (!iso) return 0
@@ -327,6 +334,8 @@ function liveFromRow(row: Record<string, unknown>): LiveState {
     connectionHealth: text(row.connection_health) || undefined,
     brokerHealth: text(row.broker_health) || undefined,
     storageHealth: text(row.storage_health) || undefined,
+    freshness: text(row.freshness) || undefined,
+    deliveryLagMs: optNumber(row.delivery_lag_ms),
   }
 }
 
@@ -408,6 +417,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [clockTick, setClockTick] = useState(0)
   const flushTimer = useRef<number | null>(null)
   const signalIdsRef = useRef<string[]>([])
+  const metaSeqRef = useRef(0)
+  const metaAppliedRef = useRef(0)
 
   const scheduleLiveFlush = useCallback(() => {
     if (flushTimer.current !== null) return
@@ -452,7 +463,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         current.connectionHealth === next.connectionHealth &&
         current.brokerHealth === next.brokerHealth &&
         current.storageHealth === next.storageHealth &&
-        current.staleAfterMs === next.staleAfterMs
+        current.staleAfterMs === next.staleAfterMs &&
+        current.freshness === next.freshness
       ) {
         return false
       }
@@ -495,6 +507,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!connectivityLost) return scoped
     return scoped.map((item) => ({ ...item, status: 'unknown', noConnection: true }))
   }, [allResources, connections, currentPlant.id, connectivityLost])
+
+  // Ids the server currently pushes (socket open + heartbeat-verified); their verdicts are current.
+  const [pushedIds, setPushedIds] = useState<Set<string>>(() => getPushedSignalIds())
+  useEffect(() => onPushCoverageChange(() => setPushedIds(getPushedSignalIds())), [])
 
   const signals = useMemo<SignalItem[]>(() => {
     void liveTick
@@ -546,14 +562,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       if (!live) return meta
       const value = live.value as SignalItem['value']
-      // Same rule as the Center (max(2 x interval, 12 s) since last_acquired_at), adjusted by
-      // server clock offset so staleness transitions match server evaluation without browser clock skew.
+      // The server is the single evaluator of freshness (FRESH / DELAYED / STALE): it pushes every
+      // transition for subscribed signals and the REST poll returns a fresh verdict. The browser does
+      // NOT flip GOOD to STALE by its own clock any more (that turned every pipeline delay into
+      // "Stale" and blanked the value). Safety net only: when neither push nor polling produced a
+      // verdict for threshold + 15 s, the value is marked stale.
       const staleAfter = live.staleAfterMs || Math.max(2 * (meta.expectedIntervalMs || 1000), 12000)
       const acquiredTime = live.lastAcquiredAt || live.receivedTime
-      const acquiredTs = timeOf(acquiredTime)
       const approxNow = now + serverOffsetMsRef.current
-      const becameStale = live.quality === 'GOOD' && acquiredTs > 0 && approxNow - acquiredTs > staleAfter
+      const evaluatedTs = timeOf(live.evaluatedAt || '') || timeOf(acquiredTime)
+      const pushedLive = pushedIds.has(meta.id)
+      const verdictExpired = !pushedLive && evaluatedTs > 0 && approxNow - evaluatedTs > staleAfter + CLIENT_SAFETY_MARGIN_MS
+      const becameStale = live.quality === 'GOOD' && verdictExpired
       const quality = becameStale ? 'STALE' : live.quality
+      const freshness = becameStale ? 'STALE' : live.freshness
       const reasonCode = becameStale ? 'NO_FRESH_ACQUISITION' : live.reasonCode || undefined
       return {
         ...meta,
@@ -574,9 +596,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         connectionHealth: live.connectionHealth,
         brokerHealth: live.brokerHealth,
         storageHealth: live.storageHealth,
+        freshness,
+        deliveryLagMs: freshness === 'DELAYED' ? live.deliveryLagMs : undefined,
       }
     })
-  }, [signalMeta, liveTick, clockTick, connectivityLost, connections])
+  }, [signalMeta, liveTick, clockTick, connectivityLost, connections, pushedIds])
 
   const scopedSignals = useMemo(
     () => signals.filter((item) => !currentPlant.id || resourceIds.has(item.resourceId)),
@@ -584,6 +608,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   )
 
   const loadMetadata = useCallback(async () => {
+    // U2: ordering guard. A refresh that started earlier but resolves later must not put old lists back.
+    const seq = ++metaSeqRef.current
     type Page = { items: Array<Record<string, unknown>> }
     // Secondary lists must not block the core load: on failure they keep their previous content.
     const optional = (path: string) =>
@@ -599,6 +625,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       optional('/api/v1/audit-events?limit=50'),
       api<Page>('/api/v1/edges'),
     ])
+    if (seq < metaAppliedRef.current) return
+    metaAppliedRef.current = seq
     const mappedResources: ResourceNode[] = (resourcePage.items || []).map((row) => ({
       id: text(row.id),
       name: text(row.name),
@@ -685,7 +713,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (enrolled.length) {
       setCollectorLabel(`Collector: ${enrolled[0].health || 'ENROLLED'}`)
     } else if (mappedEdges.length) {
-      setCollectorLabel(`Collector: not enrolled (${mappedEdges[0].name || 'Edge'})`)
+      setCollectorLabel(`Collector: not enrolled (${mappedEdges[0].name || 'built-in collector'})`)
     } else if (siteCount === 0 && mappedEdges.length === 0) {
       setCollectorLabel('Collector: waiting for a site')
     } else {
@@ -797,6 +825,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         connectionHealth: msg.connection_health ? text(msg.connection_health) : current?.connectionHealth,
         brokerHealth: msg.broker_health ? text(msg.broker_health) : current?.brokerHealth,
         storageHealth: msg.storage_health ? text(msg.storage_health) : current?.storageHealth,
+        freshness: msg.freshness ? text(msg.freshness) : undefined,
+        deliveryLagMs: optNumber(msg.delivery_lag_ms),
       }
       if (applyLive(id, next)) scheduleLiveFlush()
     }
@@ -884,10 +914,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const offRestored = onConnectivityRestored(() => {
       if (!inFlight) schedule(0)
     })
+    const offResync = onStreamResync(() => {
+      void fetchLatest(signalIdsRef.current)
+    })
     return () => {
       active = false
       offCoverage()
       offRestored()
+      offResync()
       if (timer !== null) window.clearTimeout(timer)
     }
   }, [fetchLatest, isStreaming])

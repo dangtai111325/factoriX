@@ -36,7 +36,7 @@ def test_database_validation_and_ddl():
     assert len(res.errors) == 0
 
     ddl = SO.generate_create_database_ddl(spec)
-    assert "CREATE DATABASE IF NOT EXISTS `fx_test_db`" in ddl
+    assert "CREATE DATABASE `fx_test_db`" in ddl
     assert "PRECISION 'ms'" in ddl
     assert "KEEP 3650d" in ddl
     assert "VGROUPS 2" in ddl
@@ -103,7 +103,7 @@ def test_stable_validation_and_ddl():
     assert res.estimated_row_bytes > 0
 
     ddl = SO.generate_create_stable_ddl(spec)
-    assert "CREATE STABLE IF NOT EXISTS `fx_test`.`meters_st`" in ddl
+    assert "CREATE STABLE `fx_test`.`meters_st`" in ddl
     assert "`ts` TIMESTAMP" in ddl
     assert "`temperature` DOUBLE" in ddl
     assert "`status` VARCHAR(32)" in ddl
@@ -141,7 +141,7 @@ def test_subtable_validation_and_ddl():
     assert res.valid is True
 
     ddl = SO.generate_create_subtable_ddl(spec, stable_tags)
-    assert "CREATE TABLE IF NOT EXISTS `fx_test`.`meter_001`" in ddl
+    assert "CREATE TABLE `fx_test`.`meter_001`" in ddl
     assert "USING `fx_test`.`meters_st` (`device_id`, `site_code`)" in ddl
     assert "TAGS ('DEV-001', 'SITE-A')" in ddl
 

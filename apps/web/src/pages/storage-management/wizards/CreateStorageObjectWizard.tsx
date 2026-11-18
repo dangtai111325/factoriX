@@ -30,6 +30,7 @@ import {
   StableRecordingStep,
   StableReviewStep,
   StableWizardData,
+  stableSpecFromWizard,
 } from './StableWizardSteps';
 import {
   SubtableIdentityStep,
@@ -38,13 +39,16 @@ import {
   SubtableRowAssemblyStep,
   SubtableReviewStep,
   SubtableWizardData,
+  buildSubtableSpec,
 } from './SubtableWizardSteps';
+import { ApiError } from '../../../api/client';
 import {
   createDatabase,
   createStable,
   createSubtable,
   getOperation,
   getStable,
+  getStorageObject,
   TDStable,
   StorageOperation,
   ColumnDefinition,
@@ -61,7 +65,7 @@ const INITIAL_DB_DATA: DatabaseWizardData = {
   physical_name: '',
   display_name: '',
   description: '',
-  precision: 'ms',
+  precision: 'us',
   retention_days: null,
   vgroups: null,
   cache_mb: null,
@@ -78,14 +82,14 @@ const INITIAL_STABLE_DATA: StableWizardData = {
     { name: 'value', td_type: 'DOUBLE', nullable: true },
   ],
   tags: [
-    { name: 'resource_id', td_type: 'VARCHAR(64)' },
+    { name: 'machine_ref', td_type: 'VARCHAR(36)' },
   ],
   source_mapping_template: [],
   default_recording_mode: 'ON_CHANGE',
   retention_days: null,
-  max_checkpoint_interval: 60,
+  max_checkpoint_interval: null,
   late_tolerance: 10,
-  skip_source_mapping: false,
+  skip_source_mapping: true,
   confirmed: false,
 };
 
@@ -102,9 +106,22 @@ const INITIAL_SUBTABLE_DATA: SubtableWizardData = {
   recording_mode: 'ON_CHANGE',
   max_age_seconds: 5,
   time_bucket_seconds: 5,
-  start_recording: true,
+  start_recording: false,
+  no_binding: false,
   confirmed: false,
 };
+
+/** Human message of a failed create: server message + field errors (R1-04 / R1-27). */
+function describeError(err: unknown): string {
+  if (err instanceof ApiError) {
+    const details = (err as unknown as { details?: { field_errors?: { field?: string; message: string }[] } }).details;
+    const fieldErrors = details?.field_errors || [];
+    const extra = fieldErrors.filter((f) => f.message && f.message !== err.message).slice(0, 5)
+      .map((f) => `${f.field ? `${f.field}: ` : ''}${f.message}`);
+    return [err.message, ...extra].join(' \u2022 ');
+  }
+  return err instanceof Error ? err.message : 'An error occurred during submission.';
+}
 
 // ============================================================================
 // Helper: Poll Operation until terminal
@@ -148,6 +165,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
 
   // Operation In-Progress State
   const [activeOperation, setActiveOperation] = useState<StorageOperation | null>(null);
+  const [created, setCreated] = useState<{ kind: string; name: string; objectId: string } | null>(null);
 
   // Database wizard state
   const dbDraft = useWizardDraft<DatabaseWizardData>('fx_wizard_draft_database', INITIAL_DB_DATA);
@@ -192,24 +210,90 @@ export const CreateStorageObjectWizard: React.FC = () => {
     setCurrentStep(0);
     setErrors({});
     setSubmitError(null);
+    setCreated(null);
   }, [kind]);
+
+  // "New Subtable" from a supertable passes ?stable=<db>.<stable>: preselect it (review §1.5).
+  // Duplicate (?duplicate=<object id>): start a new object from an existing one — the copy gets a
+  // new name; for a subtable the same parent and machine/line tags, the field binding is cleared.
+  const duplicateParam = searchParams.get('duplicate');
+  useEffect(() => {
+    if (!duplicateParam || (kind !== 'stable' && kind !== 'subtable')) return;
+    let active = true;
+    getStorageObject(duplicateParam)
+      .then((obj) => {
+        if (!active) return;
+        const o = obj as unknown as Record<string, any>;
+        if (kind === 'stable' && Array.isArray(o.columns)) {
+          stableDraft.updateData((d) => ({
+            ...d,
+            database_name: o.database_name || d.database_name,
+            physical_name: `${o.physical_name}_copy`.slice(0, 63),
+            display_name: o.display_name ? `${o.display_name} (copy)` : '',
+            description: o.description || '',
+            columns: o.columns.map((c: any, i: number) => ({
+              name: c.name, td_type: String(c.td_type || '').toUpperCase(), length: c.length ?? null,
+              nullable: i !== 0, immutable: i === 0, primary_key: i === 1 && !!c.primary_key,
+            })),
+            tags: (o.tags || []).map((t: any) => ({ name: t.name, td_type: t.length ? `${String(t.td_type).toUpperCase()}(${t.length})` : String(t.td_type).toUpperCase() })),
+            confirmed: false,
+          }));
+        }
+        if (kind === 'subtable' && o.stable_name) {
+          const stableRef = `${o.database_name}.${o.stable_name}`;
+          subtableDraft.updateData((d) => ({
+            ...d,
+            stable_id: stableRef,
+            stable_name: o.stable_name,
+            database_name: o.database_name,
+            physical_name: '',
+            display_name: '',
+            description: o.description || '',
+            tag_values: (o.tag_values || []).map((t: any) => ({ tag_name: t.name, value: t.name === 'field_key' ? '' : String(t.value ?? '') })),
+            bindings: [],
+            no_binding: false,
+            recording_mode: (o.recording?.mode as RecordingMode) || 'ON_CHANGE',
+            confirmed: false,
+          }));
+        }
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [duplicateParam, kind]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const stableParam = searchParams.get('stable');
+  useEffect(() => {
+    if (kind !== 'subtable' || !stableParam || !stableParam.includes('.')) return;
+    const [db, st] = stableParam.split('.', 2);
+    updateSubtableDraft((draft) => (draft.stable_id === stableParam ? draft : {
+      ...draft, stable_id: stableParam, stable_name: st, database_name: db, tag_values: [], bindings: [],
+    }));
+  }, [kind, stableParam, updateSubtableDraft]);
+
+  // Clear the stale error banner as soon as the user edits again (R1-27).
+  useEffect(() => { setSubmitError(null); }, [currentStep]);
 
   // Handle operation polling execution
   const executeWithPolling = async (opPromise: Promise<StorageOperation>) => {
     setSubmitting(true);
     setSubmitError(null);
 
+    const finish = (op: StorageOperation) => {
+      const key = String((op as unknown as { object_key?: string }).object_key || op.object_name || '');
+      setCreated({ kind: kind || 'object', name: key, objectId: kind === 'database' ? `db:${key}` : `${kind}:${key}` });
+      setSubmitting(false);
+      setActiveOperation(null);
+    };
     try {
       const initialOp = await opPromise;
       if (!initialOp || !initialOp.id) {
-        // Direct success without async operation
         navigate('/historian/storage?tab=objects');
         return;
       }
 
-      // If initial operation is already terminal
+      // The backend saga is synchronous: APPLIED means DDL, read-back and registry all succeeded.
       if (initialOp.status === 'APPLIED') {
-        navigate('/historian/storage?tab=objects');
+        finish(initialOp);
         return;
       }
 
@@ -226,15 +310,14 @@ export const CreateStorageObjectWizard: React.FC = () => {
       });
 
       if (terminalOp.status === 'APPLIED') {
-        navigate('/historian/storage?tab=objects');
+        finish(terminalOp);
       } else {
         setSubmitError(terminalOp.error_message || 'Operation failed during execution.');
         setSubmitting(false);
         setActiveOperation(null);
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'An error occurred during submission.';
-      setSubmitError(msg);
+      setSubmitError(describeError(err));
       setSubmitting(false);
       setActiveOperation(null);
     }
@@ -262,7 +345,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
       if (dbDraft.data.retention_days != null) {
         if (dbDraft.data.retention_days < 30) {
           errs.retention_days =
-            'Retention days must be at least 30 days (TDengine requires KEEP >= 3 × DURATION).';
+            'Retention days must be at least 30 days (TDengine requires KEEP >= 3 x DURATION).';
         } else if (!Number.isInteger(dbDraft.data.retention_days) || dbDraft.data.retention_days > 365000) {
           errs.retention_days = 'Enter a whole number of days up to 365,000.';
         }
@@ -384,7 +467,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
         physical_name: stableDraft.data.physical_name,
         display_name: stableDraft.data.display_name || undefined,
         description: stableDraft.data.description || undefined,
-        columns: stableDraft.data.columns,
+        columns: (stableSpecFromWizard(stableDraft.data).columns as ColumnDefinition[]),
         tags: stableDraft.data.tags,
         default_recording_mode: stableDraft.data.default_recording_mode,
         retention_days: stableDraft.data.retention_days,
@@ -443,9 +526,13 @@ export const CreateStorageObjectWizard: React.FC = () => {
           }
         }
       }
+    } else if (step === 2) {
+      if (subtableDraft.data.bindings.length === 0 && !subtableDraft.data.no_binding) {
+        errs.bindings = 'Bind a Data Model field, or tick "Create this subtable without a binding".';
+      }
     } else if (step === 4) {
       if (!subtableDraft.data.confirmed) {
-        errs.confirmed = 'You must confirm before instantiating the Subtable.';
+        errs.confirmed = 'You must confirm before creating the subtable.';
       }
     }
     setErrors(errs);
@@ -463,21 +550,9 @@ export const CreateStorageObjectWizard: React.FC = () => {
 
     executeWithPolling(
       createSubtable({
+        ...(buildSubtableSpec(subtableDraft.data) as unknown as Parameters<typeof createSubtable>[0]),
         stable_id: subtableDraft.data.stable_id,
-        physical_name: subtableDraft.data.physical_name,
-        display_name: subtableDraft.data.display_name || undefined,
-        description: subtableDraft.data.description || undefined,
-        tag_values: subtableDraft.data.tag_values,
-        bindings: subtableDraft.data.bindings,
-        row_assembly_policy: subtableDraft.data.row_assembly_policy,
-        recording_mode: subtableDraft.data.recording_mode,
-        max_age_seconds: subtableDraft.data.max_age_seconds,
-        time_bucket_seconds: subtableDraft.data.time_bucket_seconds,
-        start_recording: subtableDraft.data.start_recording,
-      }).then((res) => {
-        subtableDraft.clearDraft();
-        return res;
-      })
+      }).then((res) => res)
     );
   };
 
@@ -651,6 +726,43 @@ export const CreateStorageObjectWizard: React.FC = () => {
     );
   };
 
+  if (created) {
+    const again = () => {
+      setCreated(null);
+      setCurrentStep(0);
+      if (kind === 'subtable') {
+        // Keep parent, mode and tag values of the same machine/line; clear name, field and binding.
+        subtableDraft.updateData((d) => ({
+          ...d, physical_name: '', display_name: '', description: '', bindings: [], no_binding: false, confirmed: false,
+          tag_values: d.tag_values.map((t) => (t.tag_name === 'field_key' ? { ...t, value: '' } : t)),
+        }));
+      } else if (kind === 'stable') {
+        stableDraft.clearDraft();
+      } else {
+        dbDraft.clearDraft();
+      }
+    };
+    return (
+      <div className="max-w-2xl mx-auto py-10 px-4">
+        <div className="bg-white border border-[#E3EAF3] rounded-xl p-6 space-y-4">
+          <div className="flex items-center gap-3">
+            <CheckCircle2 className="w-6 h-6 text-[#0DBA67]" />
+            <div>
+              <h1 className="text-[18px] font-bold text-[#111B37]">Created {created.kind}</h1>
+              <p className="text-[13px] text-[#657794] font-mono">{created.name}</p>
+            </div>
+          </div>
+          <p className="text-[13px] text-[#334568]">The object exists in TDengine, its schema and tags were read back, and it is registered.</p>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={again} className="h-9 px-4 rounded-lg bg-[#EF1B24] text-white text-[13px] font-semibold">Create another</button>
+            <Link to={`/historian/storage/object/${encodeURIComponent(created.objectId)}`} className="h-9 px-4 inline-flex items-center rounded-lg border border-[#D4DFEC] text-[13px] font-semibold text-[#334568]">Open {created.kind}</Link>
+            <Link to="/historian/storage?tab=objects" className="h-9 px-4 inline-flex items-center rounded-lg text-[13px] font-semibold text-[#657794] hover:bg-[#F1F5FA]">Back to Storage Management</Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // ==========================================================================
   // Render: Kind === 'database'
   // ==========================================================================
@@ -801,7 +913,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
       {renderOperationModal()}
       <StorageWizardLayout
         title="Create Subtable"
-        subtitle="Instantiate a subtable from a Supertable template and bind operational data sources."
+        subtitle="One subtable of a supertable, bound to a Data Model field."
         badge={
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-[#F5F3FF] text-[#7C3AED] border border-[#DDD6FE]">
             <Table className="w-3 h-3" />
@@ -823,7 +935,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
         lastSavedAt={subtableDraft.lastSavedAt}
         loading={submitting}
         error={submitError}
-        submitLabel="Instantiate Subtable"
+        submitLabel="Create Subtable"
       >
         {currentStep === 0 && (
           <SubtableIdentityStep
@@ -855,6 +967,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
             data={subtableDraft.data}
             onChange={subtableDraft.updateData}
             errors={errors}
+            parentStable={parentStable}
           />
         )}
         {currentStep === 4 && (

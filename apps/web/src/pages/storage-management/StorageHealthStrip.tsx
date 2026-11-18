@@ -33,14 +33,14 @@ export const StorageHealthStrip: React.FC<StorageHealthStripProps> = ({
 
       {/* Supertables */}
       <div className="flex items-center gap-2 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg shadow-xs">
-        <Layers className="w-4 h-4 text-[#0284C7]" />
+        <Layers className="w-4 h-4 text-[#2A82E7]" />
         <span className="text-[12px] font-medium text-[#657794]">Supertables</span>
         <span className="text-[13px] font-bold text-[#111B37]">{stableCount}</span>
       </div>
 
       {/* Subtables */}
       <div className="flex items-center gap-2 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg shadow-xs">
-        <Table className="w-4 h-4 text-[#7C3AED]" />
+        <Table className="w-4 h-4 text-[#8858EA]" />
         <span className="text-[12px] font-medium text-[#657794]">Subtables</span>
         <span className="text-[13px] font-bold text-[#111B37]">{subtableCount}</span>
       </div>
@@ -52,11 +52,11 @@ export const StorageHealthStrip: React.FC<StorageHealthStripProps> = ({
         <button
           type="button"
           onClick={() => onFilterStatus?.('ACTIVE')}
-          className="flex items-center gap-1 text-[12px] font-semibold text-[#0DBA67] hover:underline"
-          title="Active subtables"
+          className={`flex items-center gap-1 text-[12px] font-semibold hover:underline ${recordingActive > 0 ? 'text-[#0DBA67]' : 'text-[#657794]'}`}
+          title="Subtables that are recording (active, with at least one binding)"
         >
-          <CheckCircle2 className="w-3.5 h-3.5" />
-          <span>{recordingActive} active</span>
+          {recordingActive > 0 && <CheckCircle2 className="w-3.5 h-3.5" />}
+          <span>{recordingActive} recording</span>
         </button>
         {recordingPaused > 0 && (
           <button

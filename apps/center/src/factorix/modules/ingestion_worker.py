@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import time
 from typing import Any
 from uuid import UUID, uuid4
@@ -27,7 +28,18 @@ from uuid import UUID, uuid4
 import asyncpg
 from aio_pika.abc import AbstractIncomingMessage
 
-from factorix.domain.canonical import CanonicalObservation, LatencySLIs, measure_latency_slis, redact_provenance
+from factorix.domain.canonical import (
+    OBS_BATCH_CONTENT_TYPE,
+    OBS_BATCH_HEADER,
+    OBS_BATCH_HEADER_VALUE,
+    OBS_BATCH_SCHEMA,
+    CanonicalObservation,
+    LatencySLIs,
+    decode_observation_batch,
+    intern_uuid,
+    measure_latency_slis,
+    redact_provenance,
+)
 from factorix.domain.formula import FormulaError, bind, evaluate, output_quality, parse_expression
 from factorix.domain.health import NO_DATA_PREFIX, effective_connection_health
 from factorix.domain.observation import ObservationError, resolve_times
@@ -52,6 +64,7 @@ from factorix.platform.tdengine import (
     TDEngineError,
     op_stable_for_type,
     op_subtable_name,
+    td_error_is_schema_missing,
     tenant_database_name,
     to_td_timestamp_us,
     to_utc_datetime,
@@ -60,12 +73,21 @@ from factorix.platform.tdengine import (
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_BYTES = 262_144
+# v2 batch envelopes carry up to MAX_OBS_PER_BATCH observations; the publisher caps them far lower.
+MAX_BATCH_MESSAGE_BYTES = 4 * 1024 * 1024
+MAX_BATCH_ITEMS = 5000
 DEFAULT_INSTANCE_ID = "local-ingestion-1"
 NOTIFY_CHANNEL_STREAM = "factorix_stream_events"
 NOTIFY_CHANNEL_HEALTH = "factorix_health_changed"
-NOTIFY_CHUNK_MAX_EVENTS = 20
-NOTIFY_CHUNK_MAX_BYTES = 7000
+# Same {"events":[...]} wire format; pack as many events as fit one PG NOTIFY (< 8000 bytes).
+NOTIFY_CHUNK_MAX_EVENTS = 64
+NOTIFY_CHUNK_MAX_BYTES = 7800
 MAX_FORMULA_DEPTH = 4
+# Replay (history) lane yields to pending/busy live work for at most this long per batch,
+# so live latest-state is never stuck behind a replay batch, yet replay is never starved.
+REPLAY_YIELD_MAX_S = 0.25
+LANE_LIVE = "live"
+LANE_LEGACY = "legacy"
 
 
 def to_asyncpg_dsn(dsn: str) -> str:
@@ -265,29 +287,52 @@ class _PreparedObs:
 
 @dataclass(slots=True)
 class _PendingEnvelope:
+    """One observation awaiting durable persistence (a v1 message, or one item of a v2 batch)."""
+
     raw_body: bytes
     message_id: str | None
     headers: Mapping[str, Any]
     redelivered: bool
     ingested_at: datetime
     future: asyncio.Future[ConsumeOutcome]
+    payload: Mapping[str, Any] | None = None
+    batch_tenant: UUID | None = None
+    delivery_count: int = 0
+
+
+class _WakeAll:
+    """Fan-out wake handle for the per-lane batchers (kept as ``_wake_batcher`` for callers/tests)."""
+
+    def __init__(self, *events: asyncio.Event) -> None:
+        self._events = events
+
+    def set(self) -> None:
+        for event in self._events:
+            event.set()
+
+    def clear(self) -> None:
+        for event in self._events:
+            event.clear()
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
 
 
 def _default_owned_check(catalog: TenantCatalog, obs: CanonicalObservation, received_time: datetime) -> dict[str, Any] | None:
     row = select_binding(catalog.bindings.get(obs.signal_id, []), received_time)
     if row is None:
         return None
-    if obs.resource_id != UUID(str(row["resource_id"])):
+    if obs.resource_id != intern_uuid(row["resource_id"]):
         return None
-    if obs.connection_id is not None and obs.connection_id != UUID(str(row["connection_id"])):
+    if obs.connection_id is not None and obs.connection_id != intern_uuid(row["connection_id"]):
         return None
-    if obs.source_field_id is not None and obs.source_field_id != UUID(str(row["source_field_id"])):
+    if obs.source_field_id is not None and obs.source_field_id != intern_uuid(row["source_field_id"]):
         return None
     if obs.provenance and obs.provenance.source_field_id is not None:
-        if obs.provenance.source_field_id != UUID(str(row["source_field_id"])):
+        if obs.provenance.source_field_id != intern_uuid(row["source_field_id"]):
             return None
     row_site = row.get("site_id")
-    if obs.site_id is not None and row_site is not None and obs.site_id != UUID(str(row_site)):
+    if obs.site_id is not None and row_site is not None and obs.site_id != intern_uuid(row_site):
         return None
     return row
 
@@ -300,6 +345,19 @@ class PgIngestionStore:
         self._min_pool = max(1, int(min_pool))
         self._max_pool = max(self._min_pool, int(max_pool))
         self._pool: asyncpg.Pool | None = None
+        # latest_signal_state.ingested_at (migration 0011) is written only once it exists, so a
+        # worker deployed before the migration ran keeps working.
+        self.has_ingested_at = False
+        # latest_signal_state is a derived read model (rebuildable from TDengine history); its
+        # commits do not need to wait for the WAL flush. FACTORIX_INGESTION_SYNC_COMMIT=on opts out.
+        # Stream NOTIFY wire format: "v1" = full {"events":[...]} (default), "v2" = compact latest_ids.
+        self.notify_format = "v2" if os.environ.get("FACTORIX_NOTIFY_FORMAT", "v1").strip().lower() == "v2" else "v1"
+        self.async_latest_commit = os.environ.get("FACTORIX_INGESTION_SYNC_COMMIT", "off").strip().lower() not in {
+            "on",
+            "true",
+            "1",
+            "yes",
+        }
 
     @property
     def pool(self) -> asyncpg.Pool | None:
@@ -313,6 +371,22 @@ class PgIngestionStore:
                 max_size=self._max_pool,
                 command_timeout=15.0,
             )
+            try:
+                async with self._pool.acquire() as conn:
+                    self.has_ingested_at = bool(
+                        await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                            "WHERE table_name = $1 AND column_name = $2)",
+                            "latest_signal_state",
+                            "ingested_at",
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001 - optional column probe; keep the legacy write path
+                logger.warning(
+                    "Could not probe latest_signal_state.ingested_at (%s); ingested_at is not stored",
+                    type(exc).__name__,
+                )
+                self.has_ingested_at = False
 
     async def close(self) -> None:
         pool = self._pool
@@ -511,23 +585,37 @@ class PgIngestionStore:
                            sb.status AS binding_status,
                            COALESCE(so.parent_name, pr.td_stable, '') AS td_stable,
                            s.data_type,
-                           s.resource_id
+                           s.resource_id,
+                           so.tags_json AS subtable_tags_json,
+                           pso.tags_json AS stable_tags_json,
+                           pso.schema_json AS stable_columns_json
                     FROM storage_bindings sb
                     LEFT JOIN storage_objects so
                       ON so.tenant_id = sb.tenant_id
                      AND so.physical_db = sb.physical_db
                      AND so.physical_name = sb.physical_subtable
+                    LEFT JOIN storage_objects pso
+                      ON pso.tenant_id = sb.tenant_id
+                     AND pso.object_type = 'stable'
+                     AND pso.physical_db = sb.physical_db
+                     AND pso.physical_name = so.parent_name
                     LEFT JOIN storage_physical_registry pr
                       ON pr.tenant_id = sb.tenant_id
                      AND pr.td_database = sb.physical_db
                      AND pr.td_subtable = sb.physical_subtable
                     LEFT JOIN signal_definitions s ON s.id = sb.signal_id
-                    WHERE sb.tenant_id = $1 AND sb.status = 'ACTIVE'
+                    WHERE sb.tenant_id = $1 AND sb.status = 'ACTIVE' AND sb.source_kind = 'signal'
                     """,
                     tenant_id,
                 )
                 for r in sb_rows:
-                    target = build_managed_target_from_storage_binding(dict(r))
+                    try:
+                        target = build_managed_target_from_storage_binding(dict(r))
+                    except Exception as exc:  # noqa: BLE001 - one bad binding must not poison the tenant catalog
+                        logger.warning(
+                            "Skipping storage binding %s: invalid definition (%s)", r.get("binding_id"), type(exc).__name__
+                        )
+                        continue
                     all_managed.append(target)
                     if target.signal_id is not None:
                         managed_by_signal.setdefault(target.signal_id, []).append(target)
@@ -693,6 +781,7 @@ class PgIngestionStore:
         stream_events: list[dict[str, Any]],
         shadow_pg_rows: Sequence[dict[str, Any]],
         now: datetime,
+        connection_ids_for_notify: Iterable[Any] | None = None,
     ) -> tuple[set[UUID], list[dict[str, Any]]]:
         """Atomically persist latest_signal_state + connection liveness + optional shadow PG + PG NOTIFY."""
         assert self._pool is not None
@@ -703,6 +792,8 @@ class PgIngestionStore:
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                if self.async_latest_commit and not shadow_pg_rows:
+                    await conn.execute("SET LOCAL synchronous_commit = off")
                 if shadow_pg_rows:
                     await self._insert_shadow_pg(conn, tenant_id, shadow_pg_rows, now)
 
@@ -734,31 +825,38 @@ class PgIngestionStore:
                         r["event_time"] if (r["quality"] == "GOOD" and r["value"] is not None) else None
                         for r in ordered
                     ]
+                    with_ingested = self.has_ingested_at
+                    ingested_col = ", ingested_at" if with_ingested else ""
+                    ingested_val = ", t.ingested_at" if with_ingested else ""
+                    ingested_arr = ", $22::timestamptz[]" if with_ingested else ""
+                    ingested_set = "ingested_at = EXCLUDED.ingested_at," if with_ingested else ""
+                    extra_args: list[Any] = [[r.get("ingested_at") for r in ordered]] if with_ingested else []
 
                     ret_rows = await conn.fetch(
-                        """
+                        f"""
                         INSERT INTO latest_signal_state (
                             tenant_id, signal_id, resource_id, observation_id, value_type, value_json, unit, quality,
                             event_time, received_time, source_time, config_revision, origin, last_good_value_json,
                             last_good_event_time, updated_at, last_acquired_at, last_value_changed_at,
-                            data_epoch, source_sequence, reason_code, event_uid
+                            data_epoch, source_sequence, reason_code, event_uid{ingested_col}
                         )
                         SELECT $1::uuid, t.signal_id, t.resource_id, t.observation_id, t.value_type, t.value_json::jsonb,
                                t.unit, t.quality, t.event_time, t.received_time, t.source_time, t.config_rev, t.origin,
                                t.good_json::jsonb, t.good_time, $2::timestamptz, t.last_acquired_at, t.event_time,
-                               t.data_epoch, t.source_seq, t.reason_code, t.event_uid
+                               t.data_epoch, t.source_seq, t.reason_code, t.event_uid{ingested_val}
                         FROM unnest(
                             $3::uuid[], $4::uuid[], $5::uuid[], $6::text[], $7::text[], $8::text[],
                             $9::text[], $10::timestamptz[], $11::timestamptz[], $12::timestamptz[],
                             $13::timestamptz[], $14::bigint[], $15::text[], $16::bigint[], $17::bigint[],
-                            $18::text[], $19::text[], $20::text[], $21::timestamptz[]
+                            $18::text[], $19::text[], $20::text[], $21::timestamptz[]{ingested_arr}
                         ) AS t(
                             signal_id, resource_id, observation_id, value_type, value_json, unit,
                             quality, event_time, received_time, last_acquired_at,
                             source_time, config_rev, origin, data_epoch, source_seq,
-                            reason_code, event_uid, good_json, good_time
+                            reason_code, event_uid, good_json, good_time{ingested_col}
                         )
                         ON CONFLICT (tenant_id, signal_id) DO UPDATE SET
+                            {ingested_set}
                             resource_id = EXCLUDED.resource_id,
                             observation_id = EXCLUDED.observation_id,
                             value_type = EXCLUDED.value_type,
@@ -828,8 +926,9 @@ class PgIngestionStore:
                         uids,
                         goods,
                         good_times,
+                        *extra_args,
                     )
-                    returned_rows = {UUID(str(r["signal_id"])): dict(r) for r in ret_rows}
+                    returned_rows = {intern_uuid(r["signal_id"]): dict(r) for r in ret_rows}
                     replaced_signals = set(returned_rows.keys())
                 else:
                     returned_rows = {}
@@ -898,13 +997,41 @@ class PgIngestionStore:
                             {"kind": "health", "tenant_id": str(tenant_id), "payload": payload}
                         )
 
+                if self.notify_format == "v2":
+                    # Compact v2: committed signal ids only; the API bridge reads the rows itself
+                    # (contract WS-Q Q1). One small NOTIFY per ~180 changed signals per batch.
+                    changed_ids: list[str] = []
+                    other_events: list[dict[str, Any]] = []
+                    for ev in stream_events:
+                        if ev.get("kind") != "latest":
+                            other_events.append(ev)
+                        elif intern_uuid(ev["signal_id"]) in replaced_signals:
+                            changed_ids.append(str(ev["signal_id"]))
+                    connection_ids = sorted({str(c) for c in connection_ids_for_notify or ()})
+                    max_acquired = max(
+                        (r["last_acquired_at"] for r in returned_rows.values() if r.get("last_acquired_at") is not None),
+                        default=None,
+                    )
+                    payloads = _latest_ids_payloads(tenant_id, changed_ids, connection_ids, max_acquired)
+                    if payloads:
+                        await conn.execute(
+                            "SELECT pg_notify($1, payload) FROM unnest($2::text[]) WITH ORDINALITY AS chunks(payload, position) ORDER BY position",
+                            NOTIFY_CHANNEL_STREAM,
+                            payloads,
+                        )
+                    other_events.extend(health_events)
+                    await _emit_chunked_notify(conn, NOTIFY_CHANNEL_STREAM, other_events)
+                    if health_events:
+                        await _emit_chunked_notify(conn, NOTIFY_CHANNEL_HEALTH, health_events)
+                    return replaced_signals, health_events
+
                 # Filter stream latest events to signals that actually advanced in latest_signal_state
                 to_notify: list[dict[str, Any]] = []
                 for ev in stream_events:
                     if ev.get("kind") != "latest":
                         to_notify.append(ev)
                         continue
-                    sid = UUID(str(ev["signal_id"]))
+                    sid = intern_uuid(ev["signal_id"])
                     if sid not in replaced_signals:
                         continue
                     meta_row = returned_rows.get(sid) or {}
@@ -1036,6 +1163,29 @@ class PgIngestionStore:
             )
 
 
+def _latest_ids_payloads(
+    tenant_id: UUID,
+    signal_ids: Sequence[str],
+    connection_ids: Sequence[str],
+    max_acquired_at: datetime | None,
+) -> list[str]:
+    """Pack committed signal ids into v2 ``latest_ids`` NOTIFY payloads, each < NOTIFY_CHUNK_MAX_BYTES."""
+    if not signal_ids:
+        return []
+    head: dict[str, Any] = {"v": 2, "kind": "latest_ids", "tenant_id": str(tenant_id)}
+    if max_acquired_at is not None:
+        head["max_acquired_at"] = iso_ms(max_acquired_at)
+    if connection_ids:
+        head["connection_ids"] = list(connection_ids)[:32]
+    base = len(json.dumps({**head, "signal_ids": []}, separators=(",", ":")))
+    per_id = 39  # '"<36-char uuid>",'
+    per_payload = max(1, (NOTIFY_CHUNK_MAX_BYTES - base) // per_id)
+    return [
+        json.dumps({**head, "signal_ids": list(signal_ids[i : i + per_payload])}, separators=(",", ":"))
+        for i in range(0, len(signal_ids), per_payload)
+    ]
+
+
 async def _emit_chunked_notify(conn: asyncpg.Connection, channel: str, events: Sequence[dict[str, Any]]) -> None:
     if not events:
         return
@@ -1090,7 +1240,7 @@ class IngestionWorker:
         self.td = tdengine
         self.broker_cfg = broker_cfg
         self.instance_id = instance_id
-        self.batch_size = max(1, min(1000, int(batch_size)))
+        self.batch_size = max(1, min(MAX_BATCH_ITEMS, int(batch_size)))
         self._legacy_wake_size = self.batch_size
         self._live_wake_size = self.batch_size
         if broker_cfg is not None:
@@ -1132,11 +1282,24 @@ class IngestionWorker:
         self._legacy_consumer: RabbitMQConsumer | None = None
         self._live_consumer: RabbitMQConsumer | None = None
 
+        # Two independent lanes (live / legacy=replay): each has its own queue, wake event and
+        # batcher task, so a replay batch (or its retries) never blocks live latest-state.
         self._pending_live: deque[_PendingEnvelope] = deque()
         self._pending_legacy: deque[_PendingEnvelope] = deque()
-        self._serve_legacy_next = False
         self._pending_lock = asyncio.Lock()
-        self._wake_batcher = asyncio.Event()
+        self._wake_live = asyncio.Event()
+        self._wake_legacy = asyncio.Event()
+        self._wake_batcher = _WakeAll(self._wake_live, self._wake_legacy)
+        self._live_idle = asyncio.Event()
+        self._live_idle.set()
+        self._lane_busy: dict[str, bool] = {LANE_LIVE: False, LANE_LEGACY: False}
+        self._lane_waiting_msgs: dict[str, int] = {LANE_LIVE: 0, LANE_LEGACY: 0}
+        self._lane_batch_started: dict[str, float | None] = {LANE_LIVE: None, LANE_LEGACY: None}
+        self._lane_batches: dict[str, int] = {LANE_LIVE: 0, LANE_LEGACY: 0}
+        self._lane_items: dict[str, int] = {LANE_LIVE: 0, LANE_LEGACY: 0}
+        self._quarantine_failed: set[str] = set()
+        self.envelopes_received = 0
+        self.delivery_limit = int(broker_cfg.delivery_limit) if broker_cfg is not None else 5
         self._stop_event = asyncio.Event()
         self._stopping = False
 
@@ -1240,45 +1403,135 @@ class IngestionWorker:
         lane = "live" if rkey.startswith("telemetry.live.v1.") else "legacy"
         return await self._enqueue_incoming_message(message, lane=lane)
 
+    @staticmethod
+    def _is_batch_message(message: AbstractIncomingMessage, headers: Mapping[str, Any], raw_body: bytes) -> bool:
+        if headers.get(OBS_BATCH_HEADER) == OBS_BATCH_HEADER_VALUE:
+            return True
+        if getattr(message, "content_type", None) == OBS_BATCH_CONTENT_TYPE:
+            return True
+        # Header-less fallback (e.g. re-published from the DLQ by an operator).
+        return f'"schema":"{OBS_BATCH_SCHEMA}"'.encode() in raw_body[:64]
+
     async def _enqueue_incoming_message(self, message: AbstractIncomingMessage, lane: str = "live") -> ConsumeOutcome:
+        """Consume one AMQP message: a legacy v1 observation or a v2 batch envelope.
+
+        The message settles only after every contained observation is durably stored (or
+        quarantined with durable evidence). Outcome per message: any item RETRY -> RETRY
+        (redelivery is idempotent by event_uid); per-item rejects inside a batch are kept as
+        quarantine rows and the message is ACKed; if such evidence could not be written the
+        message is retried (and after the delivery limit dead-lettered whole to the DLQ).
+        """
+        lane = LANE_LIVE if lane == LANE_LIVE else LANE_LEGACY
         self.metrics.received_total += 1
         raw_body = bytes(message.body)
-        if len(raw_body) > MAX_MESSAGE_BYTES:
-            tid = self._header_tenant_uuid(message.headers)
-            uid = str(message.message_id or "oversize")[:256]
+        headers = dict(message.headers or {})
+        is_batch = self._is_batch_message(message, headers, raw_body)
+        limit = MAX_BATCH_MESSAGE_BYTES if is_batch else MAX_MESSAGE_BYTES
+        message_id = str(message.message_id) if message.message_id else None
+        if len(raw_body) > limit:
+            tid = self._header_tenant_uuid(headers)
+            uid = str(message_id or "oversize")[:256]
             await self._safe_quarantine(
                 tenant_id=tid,
                 edge_id=None,
                 event_uid=uid,
-                reason=f"OVERSIZE_PAYLOAD: {len(raw_body)} bytes > {MAX_MESSAGE_BYTES}",
+                reason=f"OVERSIZE_PAYLOAD: {len(raw_body)} bytes > {limit}",
                 payload={"bytes": len(raw_body)},
             )
             self.metrics.dlq_total += 1
             return ConsumeOutcome.DEAD_LETTER
 
-        fut: asyncio.Future[ConsumeOutcome] = asyncio.get_running_loop().create_future()
-        env = _PendingEnvelope(
-            raw_body=raw_body,
-            message_id=str(message.message_id) if message.message_id else None,
-            headers=dict(message.headers or {}),
-            redelivered=bool(getattr(message, "redelivered", False)),
-            ingested_at=_utcnow(),
-            future=fut,
-        )
-        async with self._pending_lock:
-            if lane == "live":
-                self._pending_live.append(env)
-            else:
-                self._pending_legacy.append(env)
-            live_count, legacy_count = len(self._pending_live), len(self._pending_legacy)
-            available_slots = (
-                (self._live_wake_size if live_count else 0)
-                + (self._legacy_wake_size if legacy_count else 0)
+        loop = asyncio.get_running_loop()
+        ingested_at = _utcnow()
+        redelivered = bool(getattr(message, "redelivered", False))
+        try:
+            delivery_count = int(headers.get("x-delivery-count") or 0)
+        except (TypeError, ValueError):
+            delivery_count = 0
+        envelopes: list[_PendingEnvelope] = []
+        if is_batch:
+            try:
+                batch = decode_observation_batch(raw_body)
+            except ObservationError as exc:
+                tid = self._header_tenant_uuid(headers)
+                await self._safe_quarantine(
+                    tenant_id=tid,
+                    edge_id=None,
+                    event_uid=str(message_id or "invalid-batch")[:256],
+                    reason=f"INVALID_BATCH ({exc.code}): {exc}",
+                    payload={"message_id": message_id, "bytes": len(raw_body)},
+                )
+                self.metrics.dlq_total += 1
+                # The whole envelope goes to the DLQ: the durable copy is the evidence.
+                return ConsumeOutcome.DEAD_LETTER
+            self.envelopes_received += 1
+            for index, item in enumerate(batch.items):
+                uid = item.get("event_uid") if isinstance(item, Mapping) else None
+                envelopes.append(
+                    _PendingEnvelope(
+                        raw_body=b"",
+                        message_id=str(uid or f"{batch.batch_id}#{index}")[:256],
+                        headers=headers,
+                        redelivered=redelivered,
+                        ingested_at=ingested_at,
+                        future=loop.create_future(),
+                        payload=item,
+                        batch_tenant=batch.tenant_id,
+                        delivery_count=delivery_count,
+                    )
+                )
+            # Each additional item is an observation received inside this message.
+            self.metrics.received_total += len(envelopes) - 1
+        else:
+            envelopes.append(
+                _PendingEnvelope(
+                    raw_body=raw_body,
+                    message_id=message_id,
+                    headers=headers,
+                    redelivered=redelivered,
+                    ingested_at=ingested_at,
+                    future=loop.create_future(),
+                    delivery_count=delivery_count,
+                )
             )
-            should_wake = live_count + legacy_count >= min(self.batch_size, available_slots)
+
+        queue = self._pending_live if lane == LANE_LIVE else self._pending_legacy
+        wake_size = self._live_wake_size if lane == LANE_LIVE else self._legacy_wake_size
+        async with self._pending_lock:
+            queue.extend(envelopes)
+            self._lane_waiting_msgs[lane] += 1
+            should_wake = len(queue) >= self.batch_size or self._lane_waiting_msgs[lane] >= max(1, wake_size)
         if should_wake:
-            self._wake_batcher.set()
-        return await fut
+            (self._wake_live if lane == LANE_LIVE else self._wake_legacy).set()
+        try:
+            outcomes = [await env.future for env in envelopes]
+        finally:
+            self._lane_waiting_msgs[lane] = max(0, self._lane_waiting_msgs[lane] - 1)
+        return self._aggregate_outcome(envelopes, outcomes)
+
+    def _aggregate_outcome(self, envelopes: Sequence[_PendingEnvelope], outcomes: Sequence[ConsumeOutcome]) -> ConsumeOutcome:
+        if len(outcomes) == 1:
+            if envelopes[0].payload is not None and outcomes[0] == ConsumeOutcome.DEAD_LETTER:
+                return self._settle_batch_rejects(envelopes, outcomes)
+            return outcomes[0]
+        if any(outcome == ConsumeOutcome.RETRY for outcome in outcomes):
+            self._discard_quarantine_marks(envelopes)
+            return ConsumeOutcome.RETRY
+        return self._settle_batch_rejects(envelopes, outcomes)
+
+    def _settle_batch_rejects(self, envelopes: Sequence[_PendingEnvelope], outcomes: Sequence[ConsumeOutcome]) -> ConsumeOutcome:
+        """Per-item rejects in a batch: ACK when their quarantine evidence is durable, else retry."""
+        missing_evidence = any(
+            outcome == ConsumeOutcome.DEAD_LETTER and (env.message_id or "") in self._quarantine_failed
+            for env, outcome in zip(envelopes, outcomes)
+        )
+        self._discard_quarantine_marks(envelopes)
+        return ConsumeOutcome.RETRY if missing_evidence else ConsumeOutcome.ACK
+
+    def _discard_quarantine_marks(self, envelopes: Sequence[_PendingEnvelope]) -> None:
+        if self._quarantine_failed:
+            for env in envelopes:
+                self._quarantine_failed.discard(env.message_id or "")
 
     async def ingest_direct_bytes(
         self,
@@ -1349,49 +1602,113 @@ class IngestionWorker:
                 payload=payload,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to record quarantine entry (%s): %s", event_uid, exc)
+            logger.warning("Failed to record quarantine entry (%s): %s", event_uid, type(exc).__name__)
+            if len(self._quarantine_failed) < 100_000:
+                self._quarantine_failed.add(str(event_uid))
 
-    def _take_pending_batch(self) -> list[_PendingEnvelope]:
-        live_count = min(len(self._pending_live), self.batch_size)
-        legacy_count = min(len(self._pending_legacy), self.batch_size)
-        if live_count and legacy_count:
-            if self.batch_size == 1:
-                live_count = int(not self._serve_legacy_next)
-                legacy_count = 1 - live_count
-                self._serve_legacy_next = not self._serve_legacy_next
-            else:
-                live_quota = max(1, self.batch_size * 3 // 4)
-                live_count = min(live_count, max(live_quota, self.batch_size - legacy_count))
-                legacy_count = min(legacy_count, self.batch_size - live_count)
-        batch = [self._pending_live.popleft() for _ in range(live_count)]
-        batch.extend(self._pending_legacy.popleft() for _ in range(legacy_count))
-        return batch
+    def _lane_queue(self, lane: str) -> deque[_PendingEnvelope]:
+        return self._pending_live if lane == LANE_LIVE else self._pending_legacy
+
+    def _take_lane_batch(self, lane: str) -> list[_PendingEnvelope]:
+        queue = self._lane_queue(lane)
+        count = min(len(queue), self.batch_size)
+        return [queue.popleft() for _ in range(count)]
 
     async def _batcher_loop(self) -> None:
-        while not self._stop_event.is_set() or self._pending_live or self._pending_legacy:
+        """Run both lane batchers until stopped (live and legacy/replay are independent tasks)."""
+        await asyncio.gather(self._lane_loop(LANE_LIVE), self._lane_loop(LANE_LEGACY))
+
+    async def _yield_to_live(self) -> None:
+        deadline = time.monotonic() + REPLAY_YIELD_MAX_S
+        while (self._pending_live or self._lane_busy[LANE_LIVE]) and not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._live_idle.clear()
             try:
-                await asyncio.wait_for(self._wake_batcher.wait(), timeout=self.flush_interval_s)
+                await asyncio.wait_for(self._live_idle.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return
+
+    async def _lane_loop(self, lane: str) -> None:
+        queue = self._lane_queue(lane)
+        wake = self._wake_live if lane == LANE_LIVE else self._wake_legacy
+        while not self._stop_event.is_set() or queue:
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=self.flush_interval_s)
             except asyncio.TimeoutError:
                 pass
-            self._wake_batcher.clear()
+            wake.clear()
+            if lane == LANE_LEGACY and queue:
+                await self._yield_to_live()
 
             async with self._pending_lock:
-                batch = self._take_pending_batch()
-                if self._pending_live or self._pending_legacy:
-                    self._wake_batcher.set()
-            if batch:
-                batch_started_at = time.monotonic()
-                try:
-                    await self._process_batch(batch)
-                except Exception as exc:  # noqa: BLE001 - ensure all futures resolve on unexpected error
-                    logger.exception("Unexpected error in ingestion batcher; marking retry")
-                    self.metrics.last_error = str(exc)[:300]
-                    for env in batch:
-                        if not env.future.done():
-                            env.future.set_result(ConsumeOutcome.RETRY)
-                            self.metrics.retried_total += 1
-                finally:
-                    self.hist.record_batch_stage("batch_processing", batch_started_at)
+                batch = self._take_lane_batch(lane)
+                if queue:
+                    wake.set()
+            if not batch:
+                if lane == LANE_LIVE:
+                    self._live_idle.set()
+                continue
+            batch_started_at = time.monotonic()
+            self._lane_busy[lane] = True
+            self._lane_batch_started[lane] = batch_started_at
+            try:
+                await self._process_batch_isolated(batch)
+            finally:
+                self._lane_busy[lane] = False
+                self._lane_batch_started[lane] = None
+                self._lane_batches[lane] += 1
+                self._lane_items[lane] += len(batch)
+                self.hist.record_batch_stage("batch_processing", batch_started_at)
+                self.hist.record_batch_stage(f"batch_processing_{lane}", batch_started_at)
+                if lane == LANE_LIVE and not queue:
+                    self._live_idle.set()
+
+    async def _process_batch_isolated(self, batch: list[_PendingEnvelope]) -> None:
+        """Process a batch; an unexpected exception is isolated to the item(s) that cause it.
+
+        A bug or poison item must not send every innocent neighbour around the delivery limit
+        into the DLQ: on failure the unresolved items are re-processed one by one. An item that
+        keeps failing is retried until its last allowed delivery, then quarantined with durable
+        evidence (DEAD_LETTER for a v1 message, quarantine row inside a batch envelope).
+        """
+        try:
+            await self._process_batch(batch)
+            return
+        except Exception as exc:  # noqa: BLE001 - every future must resolve
+            logger.exception("Unexpected error in ingestion batch of %d; isolating", len(batch))
+            self.metrics.last_error = f"Batch exception: {type(exc).__name__}"[:300]
+            first_error: BaseException = exc
+        unresolved = [env for env in batch if not env.future.done()]
+        if len(unresolved) == 1 or len(batch) == 1:
+            for env in unresolved:
+                await self._resolve_poison(env, first_error)
+            return
+        for env in unresolved:
+            if env.future.done():
+                continue
+            try:
+                await self._process_batch([env])
+            except Exception as item_exc:  # noqa: BLE001
+                await self._resolve_poison(env, item_exc)
+
+    async def _resolve_poison(self, env: _PendingEnvelope, exc: BaseException) -> None:
+        if env.future.done():
+            return
+        if env.delivery_count + 1 < max(1, self.delivery_limit):
+            env.future.set_result(ConsumeOutcome.RETRY)
+            self.metrics.retried_total += 1
+            return
+        await self._safe_quarantine(
+            tenant_id=env.batch_tenant or self._header_tenant_uuid(env.headers),
+            edge_id=None,
+            event_uid=str(env.message_id or "poison")[:256],
+            reason=f"INGEST_EXCEPTION ({type(exc).__name__}) after {env.delivery_count + 1} deliveries",
+            payload={"message_id": env.message_id, "bytes": len(env.raw_body)},
+        )
+        self.metrics.dlq_total += 1
+        env.future.set_result(ConsumeOutcome.DEAD_LETTER)
 
     async def _get_catalog(self, tenant_id: UUID, *, need_signal: UUID | None = None) -> TenantCatalog:
         lock = self._catalog_locks.setdefault(tenant_id, asyncio.Lock())
@@ -1488,9 +1805,14 @@ class IngestionWorker:
         decoded_candidates: list[tuple[_PendingEnvelope, CanonicalObservation, datetime, datetime, datetime | None, str, str | None]] = []
         for env in batch:
             try:
-                obs = CanonicalObservation.from_json_bytes(env.raw_body)
-            except (ObservationError, ValueError, TypeError, KeyError) as exc:
-                tid = self._header_tenant_uuid(env.headers)
+                if env.payload is not None:
+                    obs = CanonicalObservation.from_dict(env.payload)
+                    if env.batch_tenant is not None and obs.tenant_id != env.batch_tenant:
+                        raise ObservationError("TENANT_MISMATCH", "Batch item tenant differs from its envelope tenant.")
+                else:
+                    obs = CanonicalObservation.from_json_bytes(env.raw_body)
+            except (ObservationError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                tid = env.batch_tenant or self._header_tenant_uuid(env.headers)
                 uid = str(env.message_id or "invalid")[:256]
                 await self._safe_quarantine(
                     tenant_id=tid,
@@ -1543,9 +1865,14 @@ class IngestionWorker:
 
         # 2. Epoch fencing, lifecycle pause gate, catalog ownership, in-memory dedup
         batch_seen_uids: set[tuple[UUID, str]] = set()
+        lifecycle_cache: dict[tuple[UUID, int], TenantCatalog] = {}
         for env, obs, ev_time, rx_time, src_time, norm_quality, reason_code in decoded_candidates:
             try:
-                cat = await self._wait_for_active_lifecycle(obs.tenant_id, obs.data_epoch)
+                life_key = (obs.tenant_id, int(obs.data_epoch))
+                cat = lifecycle_cache.get(life_key)  # type: ignore[assignment]
+                if cat is None:
+                    cat = await self._wait_for_active_lifecycle(obs.tenant_id, obs.data_epoch)
+                    lifecycle_cache[life_key] = cat
             except _WorkerStoppingRetry:
                 if not env.future.done():
                     env.future.set_result(ConsumeOutcome.RETRY)
@@ -1599,6 +1926,7 @@ class IngestionWorker:
             if obs.signal_id not in cat.bindings:
                 try:
                     cat = await self._get_catalog(obs.tenant_id, need_signal=obs.signal_id)
+                    lifecycle_cache[(obs.tenant_id, int(obs.data_epoch))] = cat
                 except _WorkerStoppingRetry:
                     if not env.future.done():
                         env.future.set_result(ConsumeOutcome.RETRY)
@@ -1744,8 +2072,8 @@ class IngestionWorker:
         return succeeded_all, perm_failures, False
 
     def _handle_possible_schema_error(self, tenant_id: UUID, message: str) -> bool:
-        low = message.lower()
-        if any(tok in low for tok in ("not exist", "doesn't exist", "does not exist")):
+        # Classified by TDengine native code ([0x0388]/[0x0362]/[0x2603]); text only for code-less errors.
+        if td_error_is_schema_missing(message):
             self._ensured_tenants.discard(tenant_id)
             return True
         return False
@@ -1795,8 +2123,7 @@ class IngestionWorker:
                 try:
                     row = await self.td.query_last_row(target.td_database, target.td_subtable)
                 except TDEngineError as exc:
-                    low = exc.message.lower()
-                    if any(tok in low for tok in ("not exist", "doesn't exist", "does not exist")):
+                    if exc.schema_missing:
                         row = None
                     elif exc.retryable:
                         self.metrics.tdengine_retryable_errors += 1
@@ -2074,50 +2401,31 @@ class IngestionWorker:
         shadow_rows: list[dict[str, Any]] = []
         formula_triggers: list[_PreparedObs] = []
 
+        # committed_items is sorted ascending by the ordering key (event_uids are unique after
+        # dedup), so the last item per signal is its newest candidate. Build each latest row once
+        # per signal instead of once per observation.
+        newest_prep: dict[UUID, _PreparedObs] = {}
+        shadow_obs_ids: dict[str, UUID] = {}
         for _env, prep in committed_items:
             obs = prep.obs
-            obs_id = uuid4()
-            cand_key = (obs.data_epoch, prep.received_time, obs.source_sequence if obs.source_sequence is not None else -1, obs.event_uid)
-            prev_cand = newest_map.get(obs.signal_id)
-            if prev_cand is None or cand_key > prev_cand["_sort_key"]:
-                newest_map[obs.signal_id] = {
-                    "_sort_key": cand_key,
-                    "signal_id": obs.signal_id,
-                    "resource_id": UUID(str(prep.owned["resource_id"])),
-                    "observation_id": obs_id,
-                    "value_type": obs.value_type,
-                    "value": obs.value,
-                    "unit": obs.unit,
-                    "quality": prep.norm_quality,
-                    "event_time": prep.event_time,
-                    "received_time": prep.received_time,
-                    "last_acquired_at": prep.received_time,
-                    "source_time": prep.source_time,
-                    "config_revision": obs.config_revision,
-                    "origin": obs.origin.value,
-                    "data_epoch": obs.data_epoch,
-                    "source_sequence": obs.source_sequence,
-                    "reason_code": prep.reason_code,
-                    "event_uid": obs.event_uid,
-                    "expected_interval_ms": prep.owned.get("expected_interval_ms"),
-                    "nullable": bool(prep.owned.get("nullable")),
-                }
+            newest_prep[obs.signal_id] = prep
             if self.update_connection_liveness and prep.norm_quality in {"GOOD", "UNCERTAIN"}:
-                connection_id = UUID(str(prep.owned["connection_id"]))
+                connection_id = intern_uuid(prep.owned["connection_id"])
                 previous_sample = connection_sample_times.get(connection_id)
                 if previous_sample is None or prep.received_time > previous_sample:
                     connection_sample_times[connection_id] = prep.received_time
             if self.shadow_pg:
+                obs_id = shadow_obs_ids[obs.event_uid] = uuid4()
                 provenance = obs.provenance.to_dict() if obs.provenance else {}
                 if prep.reason_code:
                     provenance["reason"] = prep.reason_code
                 shadow_rows.append(
                     {
                         "observation_id": obs_id,
-                        "site_id": UUID(str(prep.owned["site_id"])) if prep.owned.get("site_id") else obs.site_id,
-                        "resource_id": UUID(str(prep.owned["resource_id"])),
+                        "site_id": intern_uuid(prep.owned["site_id"]) if prep.owned.get("site_id") else obs.site_id,
+                        "resource_id": intern_uuid(prep.owned["resource_id"]),
                         "signal_id": obs.signal_id,
-                        "connection_id": UUID(str(prep.owned["connection_id"])),
+                        "connection_id": intern_uuid(prep.owned["connection_id"]),
                         "event_uid": obs.event_uid,
                         "event_time": prep.event_time,
                         "received_time": prep.received_time,
@@ -2133,6 +2441,37 @@ class IngestionWorker:
                 )
             if obs.signal_id in cat.formula_inputs:
                 formula_triggers.append(prep)
+
+        for sig_id, prep in newest_prep.items():
+            obs = prep.obs
+            newest_map[sig_id] = {
+                "_sort_key": (
+                    obs.data_epoch,
+                    prep.received_time,
+                    obs.source_sequence if obs.source_sequence is not None else -1,
+                    obs.event_uid,
+                ),
+                "signal_id": sig_id,
+                "resource_id": intern_uuid(prep.owned["resource_id"]),
+                "observation_id": shadow_obs_ids.get(obs.event_uid) or uuid4(),
+                "value_type": obs.value_type,
+                "value": obs.value,
+                "unit": obs.unit,
+                "quality": prep.norm_quality,
+                "event_time": prep.event_time,
+                "received_time": prep.received_time,
+                "last_acquired_at": prep.received_time,
+                "source_time": prep.source_time,
+                "config_revision": obs.config_revision,
+                "origin": obs.origin.value,
+                "data_epoch": obs.data_epoch,
+                "source_sequence": obs.source_sequence,
+                "reason_code": prep.reason_code,
+                "event_uid": obs.event_uid,
+                "expected_interval_ms": prep.owned.get("expected_interval_ms"),
+                "nullable": bool(prep.owned.get("nullable")),
+                "ingested_at": prep.ingested_at,
+            }
 
         # Evaluate synchronous published formulas (depth <= 4) & write calculated outputs to TDengine before PG commit
         calc_td: list[dict[str, Any]] = []
@@ -2244,6 +2583,7 @@ class IngestionWorker:
         latest_list = []
         t_cache_preview = self._live_cache.get(tenant_id, {})
         stream_events = []
+        compact_notify = getattr(self.pg, "notify_format", "v1") == "v2"
         for r in newest_map.values():
             prev_rec_preview = t_cache_preview.get(r["signal_id"])
             # The raw and managed history writes have already run. A strictly
@@ -2255,6 +2595,10 @@ class IngestionWorker:
             ):
                 continue
             latest_list.append(r)
+            if compact_notify:
+                # v2 NOTIFY carries ids only; skip building the full stream payload.
+                stream_events.append({"kind": "latest", "signal_id": str(r["signal_id"])})
+                continue
             preview_changed = (
                 prev_rec_preview is None
                 or prev_rec_preview.data_epoch != int(r["data_epoch"])
@@ -2307,6 +2651,7 @@ class IngestionWorker:
                     stream_events=stream_events,
                     shadow_pg_rows=shadow_rows,
                     now=now_commit,
+                    connection_ids_for_notify={p.owned.get("connection_id") for _e, p in committed_items},
                 )
             )
         except _WorkerStoppingRetry:
@@ -2322,6 +2667,14 @@ class IngestionWorker:
             if sig_id not in replaced_signals and sig_id in t_cache:
                 continue
             prev_rec = t_cache.get(sig_id)
+            # The live and replay lanes commit concurrently: never let a slower, older commit
+            # overwrite a newer cached state (PG's upsert guard enforces the same order).
+            if (
+                prev_rec is not None
+                and prev_rec.received_time is not None
+                and (int(row["data_epoch"]), row["received_time"]) < (prev_rec.data_epoch, prev_rec.received_time)
+            ):
+                continue
             val_changed = (
                 prev_rec is None
                 or prev_rec.data_epoch != int(row["data_epoch"])
@@ -2373,7 +2726,12 @@ class IngestionWorker:
                 item[1].obs.event_uid,
             ),
         )
+        # The provider keeps only the newest state per signal, so feeding the newest committed
+        # observation of each signal gives the same final state at a fraction of the cost.
+        newest_for_live: dict[UUID, _PreparedObs] = {}
         for _env, prep in ordered_for_live:
+            newest_for_live[prep.obs.signal_id] = prep
+        for prep in newest_for_live.values():
             await self.live_provider.apply_observation(
                 prep.obs,
                 expected_interval_ms=prep.owned.get("expected_interval_ms"),
@@ -2392,7 +2750,7 @@ class IngestionWorker:
                 committed_at=committed_at,
             )
             conn_raw = prep.owned.get("connection_id")
-            conn_uuid = conn_raw if isinstance(conn_raw, UUID) else (UUID(str(conn_raw)) if conn_raw else None)
+            conn_uuid = conn_raw if isinstance(conn_raw, UUID) else (intern_uuid(conn_raw) if conn_raw else None)
             self.hist.record(tenant_id, sli, connection_id=conn_uuid)
             self.metrics.acked_total += 1
             if not env.future.done():
@@ -2665,7 +3023,7 @@ class IngestionWorker:
                     td_ok = bool(health.reachable)
                 except Exception:  # noqa: BLE001
                     td_ok = False
-                broker_ok = bool(self._consumer is not None)
+                broker_ok = self._consumers_connected()
                 rates = self.hist.tenant_rates_per_min()
                 conn_rates = self.hist.connection_rates_per_min()
                 slis = self.hist.snapshot()
@@ -2684,6 +3042,9 @@ class IngestionWorker:
                     "managed_write_errors": self.metrics.managed_write_errors,
                     "managed_skips_by_reason": dict(self.metrics.managed_skips_by_reason),
                     "tdengine_ok": td_ok,
+                    "envelopes_received": self.envelopes_received,
+                    "lanes": self.lane_metrics(),
+                    "pg_ingested_at": bool(getattr(self.pg, "has_ingested_at", False)),
                     **slis,
                 }
                 status = "HEALTHY" if td_ok else "DEGRADED"
@@ -2702,6 +3063,31 @@ class IngestionWorker:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 pass
+
+    def _consumers_connected(self) -> bool:
+        consumers = [c for c in (self._live_consumer, self._legacy_consumer) if c is not None]
+        if not consumers:
+            return self._consumer is not None
+        for consumer in consumers:
+            channel = getattr(consumer, "_channel", None)
+            if channel is None or bool(getattr(channel, "is_closed", False)):
+                return False
+        return True
+
+    def lane_metrics(self) -> dict[str, Any]:
+        now = time.monotonic()
+        out: dict[str, Any] = {}
+        for lane in (LANE_LIVE, LANE_LEGACY):
+            started = self._lane_batch_started[lane]
+            out[lane] = {
+                "pending_items": len(self._lane_queue(lane)),
+                "waiting_messages": self._lane_waiting_msgs[lane],
+                "batches": self._lane_batches[lane],
+                "items": self._lane_items[lane],
+                "busy": self._lane_busy[lane],
+                "stalled_batch_age_s": round(now - started, 3) if started is not None else None,
+            }
+        return out
 
     def _on_pg_notify(self, _conn: Any, _pid: int, channel: str, payload: str) -> None:
         tid: UUID | None = None

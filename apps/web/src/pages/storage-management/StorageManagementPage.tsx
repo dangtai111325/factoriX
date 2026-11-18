@@ -180,21 +180,16 @@ export const StorageManagementPage: React.FC = () => {
   return (
     <div className="space-y-4">
       {/* Top Header */}
-      <div className="flex flex-wrap items-center justify-between gap-4 pb-2 border-b border-[#E3EAF3]">
-        <div>
-          <div className="flex items-center gap-2 text-[12px] font-medium text-[#657794] mb-0.5">
-            <span>Historian & Storage</span>
-            <span>/</span>
-            <span className="text-[#111B37] font-semibold">Storage Management</span>
-          </div>
-          <h1 className="text-[20px] font-bold text-[#111B37] leading-tight">Storage Management</h1>
-          <p className="text-[13px] text-[#657794] mt-0.5">
-            Manage physical TDengine databases, supertables, subtables, and their source bindings.
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-[20px] font-bold text-[#111B37]">Storage Management</h1>
+          <p className="text-[13px] text-[#657794]">
+            Databases, supertables and subtables in TDengine, and the Data Model fields recorded into them.
           </p>
         </div>
 
         {/* Header Right Actions */}
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2.5">
           {/* Engine Switcher */}
           <StorageEngineSwitcher activeEngine={engine} onChange={setEngine} />
 
@@ -205,19 +200,25 @@ export const StorageManagementPage: React.FC = () => {
                 type="button"
                 onClick={refreshTDengine}
                 disabled={loading || catalogLoading}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-[#E3EAF3] rounded-lg text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC] shadow-xs transition-colors"
+                className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD] transition-colors"
                 title="Refresh physical metadata"
               >
-                <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-[#EF1B24]' : 'text-[#657794]'}`} />
+                <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
                 <span>Refresh</span>
               </button>
 
               {/* + New Dropdown */}
-              <div className="relative">
+              <div
+                className="relative"
+                onKeyDown={(e) => { if (e.key === 'Escape') setNewMenuOpen(false); }}
+                onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setNewMenuOpen(false); }}
+              >
                 <button
                   type="button"
+                  aria-haspopup="menu"
+                  aria-expanded={newMenuOpen}
                   onClick={() => setNewMenuOpen(!newMenuOpen)}
-                  className="flex items-center gap-1.5 px-3.5 py-1.5 bg-[#EF1B24] hover:bg-[#DC2626] text-white rounded-lg text-[13px] font-bold shadow-xs transition-colors"
+                  className="flex items-center gap-1.5 h-10 px-5 bg-[#EF1B24] hover:bg-[#D9141D] text-white rounded-lg text-[14px] font-semibold shadow-sm transition-colors"
                 >
                   <Plus className="w-4 h-4" />
                   <span>New</span>
@@ -246,7 +247,7 @@ export const StorageManagementPage: React.FC = () => {
                       onClick={() => navigate('/historian/storage/create?kind=stable')}
                       className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC]"
                     >
-                      <Layers className="w-4 h-4 text-[#0284C7]" />
+                      <Layers className="w-4 h-4 text-[#2A82E7]" />
                       <div>
                         <div>Supertable (STable)</div>
                         <div className="text-[11px] font-normal text-[#657794]">Define time-series schema</div>
@@ -258,10 +259,22 @@ export const StorageManagementPage: React.FC = () => {
                       onClick={() => navigate('/historian/storage/create?kind=subtable')}
                       className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC]"
                     >
-                      <Table className="w-4 h-4 text-[#7C3AED]" />
+                      <Table className="w-4 h-4 text-[#8858EA]" />
                       <div>
                         <div>Subtable</div>
-                        <div className="text-[11px] font-normal text-[#657794]">Bind data sources to table</div>
+                        <div className="text-[11px] font-normal text-[#657794]">One table bound to a Data Model field</div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => navigate('/historian/storage/bulk')}
+                      className="w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC] border-t border-[#E3EAF3]"
+                    >
+                      <Layers className="w-4 h-4 text-[#2A82E7]" />
+                      <div>
+                        <div>Subtables from Data Models</div>
+                        <div className="text-[11px] font-normal text-[#657794]">Machines x fields, in one go</div>
                       </div>
                     </button>
                   </div>

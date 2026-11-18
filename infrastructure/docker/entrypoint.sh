@@ -9,7 +9,10 @@ if [ -n "$DB_URL" ] && ! echo "$DB_URL" | grep -q "127.0.0.1"; then
 fi
 
 if [ "$USE_EXTERNAL_PG" = true ]; then
-  echo "Configured for external PostgreSQL: $DB_URL"
+  # Never print the DSN itself: it carries the database password (R1 P1-12).
+  DB_TARGET="${DB_URL#*://}"
+  DB_TARGET="${DB_TARGET##*@}"
+  echo "Configured for external PostgreSQL: ${DB_TARGET%%\?*}"
   until python -c "
 import asyncio, os, sys, asyncpg
 dsn = os.environ.get('FACTORIX_DATABASE_URL', '')

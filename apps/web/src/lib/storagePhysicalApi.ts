@@ -34,11 +34,13 @@ export type EdgeKind =
 
 export type RowAssemblyPolicy =
   | 'INDEPENDENT_EVENTS'
+  | 'ATOMIC_EVENT'
   | 'LATEST_AS_OF_TRIGGER'
   | 'TIME_BUCKET'
   | 'EXACT_TIMESTAMP';
 
-export type RecordingMode = 'ON_CHANGE' | 'EVERY_ACQUISITION' | 'INTERVAL';
+/** ON_NEW_EVENT = one atomic row per new event identity (completion events, guide F4). */
+export type RecordingMode = 'ON_CHANGE' | 'ON_NEW_EVENT' | 'EVERY_ACQUISITION' | 'INTERVAL';
 
 export type ColumnRole = 'timestamp' | 'value' | 'tag';
 
@@ -53,6 +55,8 @@ export interface TDColumn {
   td_type: string;         // e.g. TIMESTAMP, DOUBLE, VARCHAR(255)
   nullable: boolean;
   role: ColumnRole;
+  /** Second column only: TDengine composite primary key (`... COMPOSITE KEY`). */
+  primary_key?: boolean;
   immutable?: boolean;     // ts column is immutable
   length?: number | null;
   default_value?: string | null;
@@ -61,6 +65,7 @@ export interface TDColumn {
 export interface TDTag {
   name: string;
   td_type: string;
+  length?: number | null;
   value?: string | null;   // subtable-level value (subtable inspector)
 }
 
@@ -237,7 +242,16 @@ export type SourceView = 'hierarchy' | 'collector' | 'models';
 
 export interface SourceRef {
   id: string;
-  kind: 'signal' | 'model_field' | 'resource_context';
+  kind: 'signal' | 'model_field' | 'resource_context' | 'subtable';
+  key?: string | null;
+  name?: string | null;
+  field_path?: string | null;
+  value_type?: string | null;
+  freshness?: string | null;
+  has_last_value?: boolean;
+  bound_to?: { database: string; subtable: string; column: string } | null;
+  resource_code?: string | null;
+  is_timestamp?: boolean;
   display_name: string;
   path: string;
   data_type?: string | null;
@@ -255,9 +269,35 @@ export interface SourceRef {
   revision?: number | null;
 }
 
+export interface FactoryRef {
+  id: string;
+  name: string;
+  code: string;
+  type_key: string;
+}
+
+/** A Data Model group of the `models` view: never bindable itself, only its `fields` are. */
+export interface ModelSourceGroup {
+  id: string;
+  kind: 'model';
+  name: string;
+  display_name: string;
+  key?: string;
+  model_kind?: string;
+  model_revision?: number;
+  resource: FactoryRef | null;
+  ancestors: FactoryRef[];
+  fields: SourceRef[];
+  fields_count: number;
+  freshness?: string;
+  quality?: string;
+}
+
 export interface SourcesResponse {
   view: SourceView;
   items: SourceRef[];
+  groups?: unknown[];
+  leaves?: SourceRef[];
   total: number;
   next_cursor?: string | null;
 }
@@ -344,11 +384,14 @@ export interface ColumnDefinition {
   nullable?: boolean;
   length?: number | null;
   immutable?: boolean;
+  role?: ColumnRole;
+  primary_key?: boolean;
 }
 
 export interface TagDefinition {
   name: string;
   td_type: string;
+  length?: number | null;
 }
 
 export interface CreateStableIntent {
@@ -373,11 +416,21 @@ export interface FieldBindingIntent {
   source_kind: 'signal' | 'model_field' | 'resource_context';
   source_id: string;
   source_path: string;
+  /** Data Model field binding (G-02): the model and the leaf path, both persisted. */
+  model_id?: string | null;
+  field_path?: string | null;
+  signal_id?: string | null;
 }
 
 export interface CreateSubtableIntent {
   stable_id: string;
+  database?: string;
+  stable?: string;
+  name?: string;
   physical_name: string;
+  /** Explicit choice to create a subtable without any binding (nothing will be recorded). */
+  no_binding?: boolean;
+  identity_paths?: string[];
   display_name?: string;
   description?: string;
   tag_values: TagValueAssignment[];
@@ -429,9 +482,10 @@ export async function getDatabase(nameOrId: string): Promise<TDDatabase> {
   return api(`/api/v1/storage/td/databases/${encodeURIComponent(nameOrId)}`);
 }
 
-export async function createDatabase(intent: CreateDatabaseIntent): Promise<StorageOperation> {
+export async function createDatabase(intent: CreateDatabaseIntent, idempotencyKey?: string): Promise<StorageOperation> {
   return api('/api/v1/storage/td/databases', {
     method: 'POST',
+    headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
     body: JSON.stringify(intent),
   });
 }
@@ -454,9 +508,10 @@ export async function getStable(id: string): Promise<TDStable> {
   return api(`/api/v1/storage/td/stables/${encodeURIComponent(id)}`);
 }
 
-export async function createStable(intent: CreateStableIntent): Promise<StorageOperation> {
+export async function createStable(intent: CreateStableIntent, idempotencyKey?: string): Promise<StorageOperation> {
   return api('/api/v1/storage/td/stables', {
     method: 'POST',
+    headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
     body: JSON.stringify(intent),
   });
 }
@@ -490,11 +545,124 @@ export async function getSubtable(id: string): Promise<TDSubtable> {
   return api(`/api/v1/storage/td/subtables/${encodeURIComponent(id)}`);
 }
 
-export async function createSubtable(intent: CreateSubtableIntent): Promise<StorageOperation> {
+export async function createSubtable(intent: CreateSubtableIntent, idempotencyKey?: string): Promise<StorageOperation> {
   return api('/api/v1/storage/td/subtables', {
     method: 'POST',
+    headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
     body: JSON.stringify(intent),
   });
+}
+
+// --- Backend plan (exact DDL), bulk, templates, drafts, recording health ---
+
+export interface StoragePlan {
+  valid: boolean;
+  exists: boolean;
+  errors: { field?: string; code?: string; message: string }[];
+  warnings: { field?: string; code?: string; message: string }[];
+  ddl: string[];
+  steps: { action: string; sql: string; description?: string }[];
+  bindings?: {
+    source_kind: string; model_id?: string | null; model_field_path?: string | null;
+    signal_id?: string | null; target_column: string; source_data_type?: string; model_name?: string;
+  }[] | null;
+  recording?: { mode: RecordingMode; row_assembly: RowAssemblyPolicy; start_recording: boolean; identity_paths: string[] } | null;
+}
+
+/** POST /api/v1/storage/td/plan — validation + the DDL the backend will execute (Review step). */
+export async function planStorageObject(kind: TDObjectType, spec: Record<string, unknown>): Promise<StoragePlan> {
+  return api('/api/v1/storage/td/plan', { method: 'POST', body: JSON.stringify({ kind, spec }) });
+}
+
+export interface BulkRowResult {
+  name: string;
+  database?: string;
+  stable?: string;
+  status: 'CREATED' | 'EXISTS' | 'VALID' | 'INVALID' | 'FAILED';
+  operation_id?: string;
+  replay?: boolean;
+  code?: string;
+  message?: string;
+  errors?: { field?: string; code?: string; message: string }[];
+  ddl?: string[];
+}
+
+/** POST /api/v1/storage/td/subtables/bulk — at most 50 rows per call; one idempotent saga per row. */
+export async function bulkCreateSubtables(
+  rows: Record<string, unknown>[],
+  dryRun: boolean,
+): Promise<{ items: BulkRowResult[]; summary: Record<string, number>; dry_run: boolean }> {
+  return api('/api/v1/storage/td/subtables/bulk', { method: 'POST', body: JSON.stringify({ rows, dry_run: dryRun }) });
+}
+
+export interface StableTemplate {
+  id: string;
+  name: string;
+  description: string;
+  columns: ColumnDefinition[];
+  value_columns: ColumnDefinition[];
+  tags: TagDefinition[];
+  recording_mode: RecordingMode;
+}
+
+export async function listStableTemplates(): Promise<{ items: StableTemplate[] }> {
+  return api('/api/v1/storage/td/templates');
+}
+
+export interface StorageDraftItem {
+  id: string;
+  object_kind: TDObjectType;
+  name: string;
+  revision: number;
+  state: string;
+  spec: Record<string, unknown>;
+  updated_at?: string | null;
+}
+
+export async function listStorageDrafts(kind?: TDObjectType): Promise<{ items: StorageDraftItem[]; total: number }> {
+  return api(`/api/v1/storage/td/drafts${kind ? `?kind=${kind}` : ''}`);
+}
+
+export interface RecordingStatus {
+  pending: number;
+  failed: number;
+  confirmed_last_hour: number;
+  last_write_at: string | null;
+  oldest_pending_at: string | null;
+  dispatcher_running: boolean;
+  failed_by_target: { database: string; subtable: string; error: string; count: number }[];
+}
+
+export async function getRecordingStatus(signal?: AbortSignal): Promise<RecordingStatus> {
+  return api('/api/v1/storage/recording/status', { signal });
+}
+
+// --- Lifecycle (user objects only; FactoriX system objects answer 403) ---
+
+export async function pauseStorageObject(objectId: string): Promise<{ status: string }> {
+  return api(`/api/v1/storage/td/objects/${encodeURIComponent(objectId)}/pause`, { method: 'POST' });
+}
+
+export async function resumeStorageObject(objectId: string): Promise<{ status: string }> {
+  return api(`/api/v1/storage/td/objects/${encodeURIComponent(objectId)}/resume`, { method: 'POST' });
+}
+
+export async function retireStorageObject(objectId: string): Promise<{ status: string }> {
+  return api(`/api/v1/storage/td/objects/${encodeURIComponent(objectId)}/retire`, { method: 'POST' });
+}
+
+export async function purgeStorageObject(objectId: string, confirmName: string): Promise<{ status: string }> {
+  return api(
+    `/api/v1/storage/td/objects/${encodeURIComponent(objectId)}?confirm_name=${encodeURIComponent(confirmName)}`,
+    { method: 'DELETE' },
+  );
+}
+
+/** FactoriX-owned objects (operational history / snapshots): read-only in the Storage UI. */
+export const SYSTEM_STABLES = new Set(['op_bool', 'op_float64', 'op_int64', 'op_string', 'op_json', 'model_snapshots']);
+export function isSystemStorageName(name: string | null | undefined): boolean {
+  if (!name) return false;
+  return SYSTEM_STABLES.has(name) || name.startsWith('op_') || name.startsWith('ms_');
 }
 
 // --- Generic object lookup (by objectId which may be db/stable/subtable) ---
@@ -622,6 +790,69 @@ export interface HistorianRow {
   [key: string]: unknown;
 }
 
+export interface HistorianSeriesPoint {
+  id: string;
+  ts: string;
+  value: unknown;
+  quality: string | null;
+  record_kind: string;
+  min?: number | null;
+  max?: number | null;
+  count?: number;
+  source_time?: string | null;
+  reason_code?: string | null;
+  event_uid?: string | null;
+  data_epoch?: number | null;
+  virtual?: boolean;
+  series_key: string;
+  signal_key?: string | null;
+}
+
+export interface HistorianSeriesResult {
+  series_key: string;
+  source_kind: 'signal' | 'model_field' | 'subtable';
+  display_name: string;
+  resource_name?: string | null;
+  value_type?: string | null;
+  unit?: string | null;
+  status: 'OK' | 'NO_DATA' | 'NOT_FOUND' | 'UNAVAILABLE' | 'ERROR' | 'NO_TABLE' | 'NO_VALUE_COLUMN';
+  fidelity: string;
+  points: HistorianSeriesPoint[];
+  total: number;
+  downsampled: boolean;
+  bucket_ms?: number | null;
+  truncated: boolean;
+  next_cursor?: string | null;
+  column?: string | null;
+  coverage_notes: string[];
+  stats: {
+    min: number | null; max: number | null; avg: number | null; last: unknown; last_ts: string | null;
+    count: number; total: number; good_pct: number | null;
+  };
+}
+
+export interface HistorianMultiQuery {
+  sources: string[];
+  start: string;
+  end: string;
+  mode: 'operational' | 'recorded' | 'reconstructed';
+  resolution?: 'auto' | 'raw' | 'bucket';
+  max_points?: number;
+  bucket_ms?: number;
+  cursor?: string;
+}
+
+/** POST /api/v1/historian/query — every series in one call; values are in `point.value`. */
+export async function queryHistorianSeries(params: HistorianMultiQuery): Promise<{
+  series_list: HistorianSeriesResult[];
+  downsampled: boolean;
+  history_available: boolean;
+  coverage_notes: string[];
+  next_cursor: string | null;
+}> {
+  return api('/api/v1/historian/query', { method: 'POST', body: JSON.stringify(params) });
+}
+
 export async function queryHistorian(params: HistorianQueryParams): Promise<{
   rows: HistorianRow[];
   total: number;
@@ -674,11 +905,16 @@ export interface ExportJob {
 }
 
 export async function createExportJob(params: {
-  source_kind: string;
-  source_id: string;
+  source_kind?: string;
+  source_id?: string;
+  sources?: string[];
   from_ts: string;
   to_ts: string;
+  start?: string;
+  end?: string;
+  mode?: string;
   format: 'csv' | 'json';
+  file_name?: string;
 }): Promise<ExportJob> {
   return api('/api/v1/historian/exports', {
     method: 'POST',

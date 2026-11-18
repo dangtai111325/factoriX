@@ -49,6 +49,7 @@ import {
   ApiError,
 } from '../../../lib/storagePhysicalApi';
 import { api } from '../../../api/client';
+import { isSystemStorageName } from '../../../lib/storagePhysicalApi';
 
 // ============================================================================
 // Type guards
@@ -465,6 +466,22 @@ export const EditStorageObjectWizard: React.FC = () => {
           >
             Back to Storage Management
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  // FactoriX system objects (operational history / snapshots / the tenant database) are read-only
+  // (R1-16): no wizard, no "creation" review, no fake diff.
+  const physicalName = String((originalObject as { physical_name?: string }).physical_name || '');
+  const isSystemObject = isSystemStorageName(physicalName) || (objectKind === 'database' && physicalName.startsWith('fx_t_'));
+  if (isSystemObject) {
+    return (
+      <div className="max-w-xl mx-auto py-10 px-4">
+        <div className="bg-white border border-[#E3EAF3] rounded-xl p-6 space-y-3">
+          <h1 className="text-[18px] font-bold text-[#111B37]">Read-only system object</h1>
+          <p className="text-[13px] text-[#334568]"><span className="font-mono">{physicalName}</span> is managed by FactoriX (operational history). Its schema cannot be edited here.</p>
+          <button type="button" onClick={() => navigate(-1)} className="h-9 px-4 rounded-lg border border-[#D4DFEC] text-[13px] font-semibold text-[#334568]">Back</button>
         </div>
       </div>
     );

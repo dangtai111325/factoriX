@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 WATCHDOG_MIN_S = 5.0
 CONNECT_FACTOR = 3
+MAX_READ_TIMEOUTS_BEFORE_RESET = 2
 
 _AUTH_STATUS = {
     "BadUserAccessDenied",
@@ -111,6 +112,7 @@ class OpcUaConnector:
         self.client: Client | None = None
         self.generation = 0
         self._lost = False
+        self._read_timeouts = 0
         self._lock = asyncio.Lock()
 
     @property
@@ -139,6 +141,7 @@ class OpcUaConnector:
             raise translate(exc, self.endpoint) from exc
         self.client = client
         self._lost = False
+        self._read_timeouts = 0
         self.generation += 1
 
     async def ensure_connected(self) -> Client:
@@ -173,11 +176,31 @@ class OpcUaConnector:
         try:
             values = await client.uaclient.read(params)
         except Exception as exc:  # noqa: BLE001 - asyncua raises many types; translated below
-            self._lost = True
+            if self._session_broken(exc):
+                self._lost = True
             raise translate(exc, self.endpoint) from exc
+        self._read_timeouts = 0
         for (index, _), data in zip(valid, values):
             rows[index].update(data_value_row(data))
         return rows
+
+    def _session_broken(self, exc: BaseException) -> bool:
+        """Reset the session only for transport-level failures, not for one slow or refused read.
+
+        A service fault (``UaStatusCodeError``, e.g. BadTooManyOperations) leaves the secure channel
+        intact; one timeout under CPU load is retried on the same session. Two consecutive timeouts,
+        a socket error, or a client that is no longer CONNECTED do reset it (handshake is expensive:
+        ~10 s measured in the starved acquisition process versus a 16 ms read).
+        """
+        client = self.client
+        if client is None or client.uaclient.state is not UaClientState.CONNECTED:
+            return True
+        if isinstance(exc, ua.UaStatusCodeError):
+            return False
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            self._read_timeouts += 1
+            return self._read_timeouts >= MAX_READ_TIMEOUTS_BEFORE_RESET
+        return True  # socket errors and anything unknown: re-open the session
 
     async def subscribe(
         self,

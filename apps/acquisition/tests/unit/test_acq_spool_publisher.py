@@ -90,10 +90,27 @@ def test_dead_letter_after_max_attempts(spool: AcquisitionSpool) -> None:
     assert spool.count_by_state() == {"DEAD": 1}
 
 
-def test_cap_drops_oldest_pending(spool: AcquisitionSpool) -> None:
+def test_count_cap_never_evicts_pending_and_reports_full(spool: AcquisitionSpool) -> None:
     spool.add_many([_row(f"r{i}", "A") for i in range(10)])
-    assert spool.enforce_cap(4) == 6
-    assert [r["event_uid"] for r in spool.pending(10)] == ["r6", "r7", "r8", "r9"]
+    assert spool.enforce_cap(4) == 0
+    assert [r["event_uid"] for r in spool.pending(10)] == [f"r{i}" for i in range(10)]
+    assert spool.is_full(4, 0) is True
+    assert spool.is_full(11, 0) is False
+
+
+@pytest.mark.asyncio
+async def test_full_spool_rejects_new_spills_explicitly_without_dropping_pending(spool: AcquisitionSpool) -> None:
+    spool.add_many([_row(f"r{i}", "A") for i in range(100)])
+    pub = ObservationPublisher(None, spool, max_pending=100, max_memory_queue=100)
+    batch = [_obs(f"new-{i}", "B") for i in range(150)]
+    assert await pub._spill(batch) is None  # spool full: nothing written, nothing evicted
+    assert spool.pending_count() == 100
+    assert "spool full" in (pub.storage_error or "").lower()
+    # Broker down + spool full: RAM absorbs up to its cap, the rest is a counted, alarmed gap.
+    accepted = pub._admit_to_ram(batch, "modbus_tcp", "test")
+    assert accepted == 100 and pub.fast_buffered == 100
+    assert pub.gap_rejected == 50
+    assert pub.publish_metrics()["gap_rejected_by_protocol"] == {"modbus_tcp": 50}
 
 
 def test_expiry_updates_pending_index_and_keeps_terminal_rows(spool: AcquisitionSpool, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -138,7 +155,10 @@ async def test_corrupt_and_backpressure_rows_handled_cleanly(spool: AcquisitionS
 
     acked2, failed2 = await pub.flush_once(budget_s=5)
     assert acked2 == 0 and failed2 is True
-    assert spool.count_by_state() == {"ACKED": 1, "QUARANTINED": 1, "DEAD": 1}
+    # Queue-full backpressure is never an outage and never turns a pending row DEAD.
+    assert spool.count_by_state() == {"ACKED": 1, "QUARANTINED": 1, "PENDING": 1}
+    assert pub.broker_ok is True and pub.ingest_backpressure is True
+    assert pub.publish_metrics()["backpressure_events"] == 2
 
 
 @pytest.mark.asyncio
@@ -166,13 +186,13 @@ def test_pending_count_and_latest_index_stay_exact(tmp_path: Path) -> None:
     assert [r["event_uid"] for r in box.latest_pending(500)] == ["b1", "c1"]
     box.note_attempt(["c1"], max_attempts=1)
     assert box.pending_count() == 2
-    assert box.enforce_cap(1) == 1
-    assert box.pending_count() == 1 == box.count_by_state()["PENDING"]
+    assert box.enforce_cap(1) == 0  # over budget is reported, pending rows are kept
+    assert box.pending_count() == 2 == box.count_by_state()["PENDING"]
     box.add_many([_row("b2", "B")])
     box.close()
     reopened = AcquisitionSpool(tmp_path / "o.sqlite")
-    assert reopened.pending_count() == reopened.count_by_state()["PENDING"] == 2
-    assert [r["event_uid"] for r in reopened.latest_pending(500)] == ["b2"]
+    assert reopened.pending_count() == reopened.count_by_state()["PENDING"] == 3
+    assert [r["event_uid"] for r in reopened.latest_pending(500)] == ["a1", "b2"]
     reopened.close()
 
 

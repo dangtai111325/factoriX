@@ -29,7 +29,40 @@ import {
   SourceRef,
   SourceView,
   TDDatabase,
+  StoragePlan,
+  StableTemplate,
+  listStableTemplates,
+  planStorageObject,
 } from '../../../lib/storagePhysicalApi';
+
+/** Variable-length TDengine types: a length is mandatory and is always sent (R1-17c). */
+export const VAR_LENGTH_TYPES = ['VARCHAR', 'NCHAR', 'BINARY', 'VARBINARY'];
+/** Types TDengine 3.4.3.9 accepts for the composite (second) primary key column. */
+export const COMPOSITE_KEY_TYPES = ['INT', 'BIGINT', 'VARCHAR', 'BINARY', 'VARBINARY'];
+
+/** `name TYPE[(len)] [KEY]` per line, e.g. `event_key VARCHAR(64) KEY`, `value_f64 DOUBLE`. */
+export function parseColumnList(text: string): { columns: ColumnDefinition[]; errors: string[] } {
+  const columns: ColumnDefinition[] = [];
+  const errors: string[] = [];
+  text.split(/\r?\n/).forEach((raw, i) => {
+    const line = raw.replace(/[,;]+$/, '').trim();
+    if (!line || line.startsWith('--') || line.startsWith('#')) return;
+    const m = line.replace(/`/g, '').match(/^([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z]+)(?:\s*\(\s*(\d+)\s*\))?\s*(COMPOSITE KEY|PRIMARY KEY|KEY)?$/i);
+    if (!m) {
+      errors.push(`Line ${i + 1}: "${raw.trim()}" is not "name TYPE(length)".`);
+      return;
+    }
+    const type = m[2].toUpperCase();
+    columns.push({
+      name: m[1].toLowerCase(),
+      td_type: type,
+      length: m[3] ? Number(m[3]) : VAR_LENGTH_TYPES.includes(type) ? 64 : null,
+      nullable: true,
+      primary_key: !!m[4],
+    });
+  });
+  return { columns, errors };
+}
 
 // ============================================================================
 // Types
@@ -77,9 +110,9 @@ export const TD_COLUMN_TYPES = [
   'VARCHAR',
   'NCHAR',
   'BINARY',
-  'JSON',
+  'VARBINARY',
   'TIMESTAMP',
-] as const;
+] as const; // JSON is tag-only in TDengine, so it is not offered for columns
 
 export const TD_TAG_TYPES = [
   'VARCHAR(64)',
@@ -244,6 +277,36 @@ export const StableTargetStep: React.FC<StableStepProps> = ({ data, onChange, er
 // ============================================================================
 
 export const StableColumnsStep: React.FC<StableStepProps> = ({ data, onChange, errors = {} }) => {
+  const [templates, setTemplates] = useState<StableTemplate[]>([]);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [pasteErrors, setPasteErrors] = useState<string[]>([]);
+  useEffect(() => {
+    listStableTemplates().then((r) => setTemplates(r.items || [])).catch(() => setTemplates([]));
+  }, []);
+
+  const applyTemplate = (id: string) => {
+    const tpl = templates.find((t) => t.id === id);
+    if (!tpl) return;
+    const cols = [...tpl.columns, ...tpl.value_columns].map((c, i) => ({
+      ...c, nullable: i !== 0, immutable: i === 0, primary_key: i === 1 && !!c.primary_key,
+    }));
+    onChange({
+      columns: cols,
+      tags: tpl.tags.map((t) => ({ name: t.name, td_type: t.length ? `${t.td_type}(${t.length})` : t.td_type })),
+      default_recording_mode: tpl.recording_mode,
+    });
+  };
+
+  const applyPaste = () => {
+    const { columns, errors: errs } = parseColumnList(pasteText);
+    setPasteErrors(errs);
+    if (errs.length || columns.length === 0) return;
+    const rest = columns.filter((c) => c.name !== 'ts');
+    onChange({ columns: [data.columns[0] || { name: 'ts', td_type: 'TIMESTAMP', nullable: false, immutable: true }, ...rest] });
+    setPasteOpen(false);
+  };
+
   const addColumn = () => {
     const nextIndex = data.columns.length;
     const newCol: ColumnDefinition = {
@@ -286,15 +349,40 @@ export const StableColumnsStep: React.FC<StableStepProps> = ({ data, onChange, e
             is mandatory and locked as the primary index.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={addColumn}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-[#D4DFEC] hover:bg-[#F9FAFD] text-[#111B37] rounded-lg text-[13px] font-semibold transition-colors shadow-2xs"
-        >
-          <Plus className="w-4 h-4 text-[#EF1B24]" />
-          <span>Add Column</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <select aria-label="Start from template" value="" onChange={(e) => applyTemplate(e.target.value)}
+            className="h-9 px-2 rounded-lg border border-[#D4DFEC] bg-white text-[13px]">
+            <option value="">Start from template…</option>
+            {templates.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+          <button type="button" onClick={() => setPasteOpen((v) => !v)}
+            className="h-9 px-3 rounded-lg border border-[#D4DFEC] bg-white text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
+            Paste column list
+          </button>
+          <button
+            type="button"
+            onClick={addColumn}
+            className="flex items-center gap-1.5 h-9 px-3 bg-white border border-[#D4DFEC] hover:bg-[#F9FAFD] text-[#111B37] rounded-lg text-[13px] font-semibold transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Add Column</span>
+          </button>
+        </div>
       </div>
+
+      {pasteOpen && (
+        <div className="p-3 border border-[#E3EAF3] rounded-xl bg-white space-y-2">
+          <p className="text-[12px] text-[#657794]">One column per line: <code className="font-mono">name TYPE(length)</code>; add <code className="font-mono">KEY</code> to the second column for a composite key. The existing columns after <code className="font-mono">ts</code> are replaced.</p>
+          <textarea rows={8} value={pasteText} onChange={(e) => setPasteText(e.target.value)}
+            className="w-full px-3 py-2 rounded-lg border border-[#D4DFEC] text-[12px] font-mono focus:outline-none focus:border-[#EF1B24]"
+            placeholder={'event_key VARCHAR(64) KEY\nquality VARCHAR(16)\nvalue_f64 DOUBLE'} />
+          {pasteErrors.map((e) => <p key={e} className="text-[12px] text-[#F2343B]">{e}</p>)}
+          <div className="flex gap-2">
+            <button type="button" onClick={applyPaste} className="h-8 px-3 rounded-lg bg-[#EF1B24] text-white text-[12px] font-semibold">Apply</button>
+            <button type="button" onClick={() => setPasteOpen(false)} className="h-8 px-3 rounded-lg text-[12px] font-semibold text-[#657794] hover:bg-[#F1F5FA]">Cancel</button>
+          </div>
+        </div>
+      )}
 
       {errors.columns && (
         <div className="p-3 bg-[#FEF2F2] border border-[#FAC6C9] rounded-lg text-[13px] text-[#EF1B24] flex items-center gap-2">
@@ -313,13 +401,14 @@ export const StableColumnsStep: React.FC<StableStepProps> = ({ data, onChange, e
               <th className="py-2.5 px-3 w-44">TDengine Type</th>
               <th className="py-2.5 px-3 w-28">Length/Prec</th>
               <th className="py-2.5 px-3 w-24 text-center">Nullable</th>
+              <th className="py-2.5 px-3 w-28 text-center" title="Composite primary key (second column only): rows with the same timestamp but a different key are all kept.">Composite key</th>
               <th className="py-2.5 px-3 w-24 text-center">Actions</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-[#E3EAF3]">
             {data.columns.map((col, idx) => {
               const isTs = idx === 0 || col.immutable;
-              const needsLength = ['VARCHAR', 'NCHAR', 'BINARY'].includes(col.td_type);
+              const needsLength = VAR_LENGTH_TYPES.includes(col.td_type);
 
               return (
                 <tr key={idx} className={isTs ? 'bg-[#F9FAFD]' : 'bg-white hover:bg-[#FBFDFE]'}>
@@ -356,7 +445,14 @@ export const StableColumnsStep: React.FC<StableStepProps> = ({ data, onChange, e
                     ) : (
                       <select
                         value={col.td_type}
-                        onChange={(e) => updateColumn(idx, { td_type: e.target.value })}
+                        onChange={(e) => {
+                          const t = e.target.value;
+                          updateColumn(idx, {
+                            td_type: t,
+                            length: VAR_LENGTH_TYPES.includes(t) ? col.length ?? 64 : null,
+                            primary_key: col.primary_key && COMPOSITE_KEY_TYPES.includes(t),
+                          });
+                        }}
                         className="w-full h-8 px-2 rounded-lg border border-[#D4DFEC] bg-white text-[12px] font-mono focus:outline-none focus:border-[#EF1B24]"
                       >
                         {TD_COLUMN_TYPES.map((t) => (
@@ -397,6 +493,23 @@ export const StableColumnsStep: React.FC<StableStepProps> = ({ data, onChange, e
                         onChange={(e) => updateColumn(idx, { nullable: e.target.checked })}
                         className="rounded border-[#D4DFEC] text-[#EF1B24] focus:ring-[#EF1B24]"
                       />
+                    )}
+                  </td>
+
+                  {/* Composite key (2nd column) */}
+                  <td className="py-2.5 px-3 text-center">
+                    {idx === 1 ? (
+                      <input
+                        type="checkbox"
+                        aria-label="Composite primary key"
+                        checked={!!col.primary_key}
+                        disabled={!COMPOSITE_KEY_TYPES.includes(col.td_type)}
+                        onChange={(e) => updateColumn(idx, { primary_key: e.target.checked, nullable: !e.target.checked })}
+                        className="rounded border-[#D4DFEC] text-[#EF1B24] focus:ring-[#EF1B24]"
+                        title={COMPOSITE_KEY_TYPES.includes(col.td_type) ? 'Composite key' : `Composite key needs ${COMPOSITE_KEY_TYPES.join(', ')}`}
+                      />
+                    ) : (
+                      <span className="text-[11px] text-[#94A3B8]">—</span>
                     )}
                   </td>
 
@@ -612,7 +725,7 @@ export const StableSourceMappingStep: React.FC<StableStepProps> = ({ data, onCha
     const newMapping: SourceTemplateMapping = {
       column_name: colName,
       source_id: src.id,
-      source_kind: src.kind,
+      source_kind: src.kind === 'subtable' ? 'resource_context' : src.kind,
       source_path: src.path,
       source_type: src.data_type || undefined,
       source_unit: src.unit || undefined,
@@ -844,8 +957,13 @@ export const StableRecordingStep: React.FC<StableStepProps> = ({ data, onChange 
             {[
               {
                 id: 'ON_CHANGE' as RecordingMode,
-                title: 'On Change (Deadband & Value Transitions)',
-                desc: 'Writes a row only when signal values change. Saves disk I/O and bandwidth.',
+                title: 'On Change',
+                desc: 'Baseline first, then a row only when the value, null-state or quality changes.',
+              },
+              {
+                id: 'ON_NEW_EVENT' as RecordingMode,
+                title: 'On New Event (atomic row per event)',
+                desc: 'One row with all bound fields per new event identity, e.g. a completion. Repeated identical events are not written again.',
               },
               {
                 id: 'EVERY_ACQUISITION' as RecordingMode,
@@ -976,9 +1094,38 @@ ${tagParts.join(',\n')}
 // Step 6: StableReviewStep
 // ============================================================================
 
+export function stableSpecFromWizard(data: StableWizardData): Record<string, unknown> {
+  return {
+    database: data.database_name,
+    name: data.physical_name,
+    display_name: data.display_name || undefined,
+    description: data.description || undefined,
+    columns: data.columns.map((c, i) => ({
+      ...c,
+      role: i === 0 ? 'timestamp' : 'value',
+      length: VAR_LENGTH_TYPES.includes(c.td_type) ? c.length ?? 64 : c.length ?? null,
+      primary_key: i === 1 && !!c.primary_key,
+    })),
+    tags: data.tags,
+    default_recording_mode: data.default_recording_mode,
+  };
+}
+
 export const StableReviewStep: React.FC<StableStepProps> = ({ data, onChange, errors = {} }) => {
   const [copied, setCopied] = useState(false);
-  const ddl = generateStableDDL(data);
+  const [plan, setPlan] = useState<StoragePlan | null>(null);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const specKey = JSON.stringify(stableSpecFromWizard(data));
+  useEffect(() => {
+    let active = true;
+    setPlanError(null);
+    planStorageObject('stable', JSON.parse(specKey))
+      .then((p) => active && setPlan(p))
+      .catch((err: Error) => active && setPlanError(err.message || 'The plan could not be computed.'));
+    return () => { active = false; };
+  }, [specKey]);
+  // The DDL shown is the backend compiler output (P1-4), never a client-side guess.
+  const ddl = plan ? plan.ddl.join(';\n') : planError ? '' : 'Computing…';
 
   const handleCopy = () => {
     navigator.clipboard.writeText(ddl);
@@ -1025,11 +1172,18 @@ export const StableReviewStep: React.FC<StableStepProps> = ({ data, onChange, er
         </div>
       </div>
 
+      {(planError || (plan && plan.errors.length > 0)) && (
+        <div className="p-3 rounded-xl border border-[#FAC6C9] bg-[#FFF0F1] text-[12px] text-[#334568] space-y-1">
+          {planError && <div>{planError}</div>}
+          {plan?.errors.map((e, i) => <div key={i}><span className="font-semibold">{e.field || 'spec'}:</span> {e.message}</div>)}
+        </div>
+      )}
+
       {/* DDL Preview Box */}
       <div>
         <div className="flex items-center justify-between mb-1.5">
           <span className="text-[12px] font-bold text-[#111B37] uppercase tracking-wider">
-            Generated Physical DDL
+            Physical DDL (from the backend)
           </span>
           <button
             type="button"
@@ -1082,6 +1236,7 @@ export const StableReviewStep: React.FC<StableStepProps> = ({ data, onChange, er
           <input
             type="checkbox"
             checked={!!data.confirmed}
+            disabled={!plan || !plan.valid}
             onChange={(e) => onChange({ confirmed: e.target.checked })}
             className="mt-0.5 rounded border-[#D4DFEC] text-[#EF1B24] focus:ring-[#EF1B24]"
           />

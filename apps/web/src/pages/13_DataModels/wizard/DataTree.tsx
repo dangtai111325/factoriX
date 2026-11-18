@@ -238,7 +238,7 @@ export const DataTree: React.FC<Props> = ({ index, loading, error, onReload, tar
         />
       </div>
       <p className="text-[11px] text-[#657794] mb-2">
-        Click a signal to add it to <span className="font-semibold text-[#334568]">{targetLabel}</span>, or drag it onto a row. <Wand2 className="inline w-3 h-3 text-[#134074]" aria-hidden="true" /> maps everything under a resource.
+        Click a signal to add it to <span className="font-semibold text-[#334568]">{targetLabel}</span>, or drag it onto a row. The <span className="inline-flex items-center gap-0.5 font-semibold text-[#134074] whitespace-nowrap"><Wand2 className="w-3 h-3" aria-hidden="true" />Map all</span> button next to a resource maps every signal under it.
       </p>
       {error && <p className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1 mb-2">{error}</p>}
       <div

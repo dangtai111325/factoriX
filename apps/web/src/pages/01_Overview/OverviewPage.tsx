@@ -773,6 +773,10 @@ export const OverviewPage: React.FC = () => {
                         </td>
                         <td className={`py-2.5 px-3 font-semibold tabular-nums font-mono whitespace-nowrap overflow-hidden text-ellipsis ${connectionLost ? 'text-[#94A3B8]' : 'text-[#111B37]'}`}>
                           {formatCurrentSignalValue(sig.value, connectionLost ? 'NO_CONNECTION' : sig.quality)}
+                          {/* Unit next to a shown value (as in the accepted release). */}
+                          {sig.unit && formatCurrentSignalValue(sig.value, connectionLost ? 'NO_CONNECTION' : sig.quality) !== '—' ? (
+                            <span className="font-normal font-sans text-[#657794] text-[11px] ml-1">{sig.unit}</span>
+                          ) : null}
                         </td>
                         <td className="py-2.5 px-3 whitespace-nowrap">
                           <StatusBadge status={normalizeQuality(sig.quality)} />

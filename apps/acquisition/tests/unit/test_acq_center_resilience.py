@@ -88,9 +88,11 @@ async def test_cached_secret_survives_new_revision_when_pg_is_unavailable() -> N
 
 
 class _Host:
-    def __init__(self) -> None:
+    def __init__(self, min_degrade_s: float = 0.0) -> None:
         self.failures: list[ConnectorError] = []
         self.emitted: list[Any] = []
+        # 0 disables the BAD-sample hysteresis so state and BAD rows are observable at once.
+        self.min_degrade_s = min_degrade_s
 
     async def connector(self, spec):  # noqa: ANN001
         raise AssertionError
@@ -102,10 +104,10 @@ class _Host:
         self.emitted.extend(samples)
         return len(samples)
 
-    def record_ok(self, connection_id, read_ms, samples, at=None) -> None:  # noqa: ANN001
+    def record_ok(self, connection_id, read_ms, samples, at=None, *, job_id=None) -> None:  # noqa: ANN001
         return None
 
-    def record_failure(self, connection_id, error) -> None:  # noqa: ANN001
+    def record_failure(self, connection_id, error, *, job_id=None) -> None:  # noqa: ANN001
         self.failures.append(error)
 
 
@@ -138,6 +140,22 @@ async def test_device_failure_is_reported_at_once() -> None:
     runner = JobRunner(_spec(), host)
     await runner._failed(ConnectorError("TIMEOUT", "late"))
     assert [e.code for e in host.failures] == ["TIMEOUT"] and len(host.emitted) == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_failure_does_not_blank_values_with_bad_samples() -> None:
+    """WS-Q: with the default 10 s hysteresis one failed read records the error but emits no BAD rows."""
+    host = _Host(min_degrade_s=10.0)
+    runner = JobRunner(_spec(), host)
+    runner._mark_ok()
+    await runner._failed(ConnectorError("TIMEOUT", "late"))
+    assert [e.code for e in host.failures] == ["TIMEOUT"]
+    assert host.emitted == []
+    # Sustained: no success for the whole window -> BAD once, not on every retry.
+    runner._last_ok_mono = runner._last_ok_mono - 11.0  # type: ignore[operator]
+    await runner._failed(ConnectorError("TIMEOUT", "late"))
+    await runner._failed(ConnectorError("TIMEOUT", "late"))
+    assert len(host.emitted) == 1 and host.emitted[0].quality == "BAD"
     await runner._failed(ConnectorError("TIMEOUT", "late"))
     assert len(host.emitted) == 1
 

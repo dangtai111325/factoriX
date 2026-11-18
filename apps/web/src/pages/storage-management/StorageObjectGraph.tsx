@@ -293,6 +293,23 @@ export const StorageObjectGraph: React.FC<StorageObjectGraphProps> = ({
           });
           subY += 56;
         });
+        const totalChildren = (st.metadata?.subtable_count as number) || 0;
+        if (totalChildren > childSubtables.length) {
+          // Honest totals (G-08 / R1-37): the canvas draws a few children, the rest is counted here.
+          result.push({
+            id: `${st.node_id}::more`,
+            type: 'subtable',
+            position: { x: stX + 310, y: subY },
+            data: {
+              label: `+${totalChildren - childSubtables.length} more — see Objects table`,
+              physicalName: `${totalChildren} subtables in total`,
+              status: 'ACTIVE',
+              selected: false,
+              onSelect: () => undefined,
+            },
+          });
+          subY += 56;
+        }
 
         stableY = Math.max(curStY + 120, subY + 20);
       });

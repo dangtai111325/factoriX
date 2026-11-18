@@ -470,39 +470,83 @@ class LkgSnapshotStore:
         return snapshot, int(body.get("revision") or 0), digest or computed
 
 
-class PgLeaderLock:
-    """PostgreSQL session advisory lock gatekeeper (F-26 dual-worker active/standby)."""
+LEADER_PROBE_TIMEOUT_S = 5.0
+# A probe that cannot reach PostgreSQL says nothing about whether another instance took the lock
+# (the standby cannot reach PostgreSQL either). Leadership is kept for this many failed probes in a
+# row (about 3 x 2 s) before demoting, so one PG blip no longer stops every acquisition job.
+LEADER_GRACE_PROBES = 3
 
-    def __init__(self, dsn: str, lock_key: int = DEFAULT_LOCK_KEY) -> None:
+
+class PgLeaderLock:
+    """PostgreSQL session advisory lock gatekeeper (F-26 dual-worker active/standby).
+
+    The lock lives as long as the PG session. On a probe error the session is re-opened and the lock
+    re-tried at once; only if another instance holds it (pg_try_advisory_lock returns false) does this
+    instance demote immediately. While PostgreSQL is unreachable the current role is kept for
+    ``grace_probes`` probes.
+    """
+
+    def __init__(self, dsn: str, lock_key: int = DEFAULT_LOCK_KEY, *, grace_probes: int = LEADER_GRACE_PROBES) -> None:
         self.dsn = to_asyncpg_dsn(dsn)
         self.lock_key = int(lock_key)
+        self.grace_probes = max(0, int(grace_probes))
         self._conn: asyncpg.Connection | None = None
         self._is_leader = False
+        self._failed_probes = 0
 
     @property
     def is_leader(self) -> bool:
-        return self._is_leader and self._conn is not None and not self._conn.is_closed()
+        return self._is_leader
+
+    async def _try_lock(self) -> bool:
+        if self._conn is None or self._conn.is_closed():
+            self._conn = await asyncpg.connect(self.dsn, timeout=LEADER_PROBE_TIMEOUT_S)
+            # A fresh session holds no lock until pg_try_advisory_lock succeeds.
+            acquired = await self._conn.fetchval("SELECT pg_try_advisory_lock($1)", self.lock_key, timeout=LEADER_PROBE_TIMEOUT_S)
+            return bool(acquired)
+        if self._is_leader:
+            held = await self._conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' AND granted)",
+                timeout=LEADER_PROBE_TIMEOUT_S,
+            )
+            if held:
+                return True
+        acquired = await self._conn.fetchval("SELECT pg_try_advisory_lock($1)", self.lock_key, timeout=LEADER_PROBE_TIMEOUT_S)
+        return bool(acquired)
 
     async def probe(self) -> bool:
         """Maintain or attempt acquisition of the session advisory lock. Never raises."""
-        try:
-            if self._conn is None or self._conn.is_closed():
-                self._is_leader = False
-                self._conn = await asyncpg.connect(self.dsn, timeout=5.0)
-            if self._is_leader:
-                held = await self._conn.fetchval(
-                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' AND granted)"
-                )
-                self._is_leader = bool(held)
-                if self._is_leader:
+        for attempt in (1, 2):
+            try:
+                self._is_leader = await self._try_lock()
+                self._failed_probes = 0
+                return self._is_leader
+            except Exception as exc:  # noqa: BLE001 - transient PG hiccup: re-open the session once
+                await self._drop_conn()
+                if attempt == 1:
+                    continue
+                self._failed_probes += 1
+                if self._is_leader and self._failed_probes <= self.grace_probes:
+                    logger.warning(
+                        "Advisory lock probe failed (%r); keeping leadership (%d/%d) while PostgreSQL is unreachable",
+                        exc,
+                        self._failed_probes,
+                        self.grace_probes,
+                    )
                     return True
-            acquired = await self._conn.fetchval("SELECT pg_try_advisory_lock($1)", self.lock_key)
-            self._is_leader = bool(acquired)
-            return self._is_leader
-        except Exception as exc:  # noqa: BLE001 - standby or transient PG hiccup demotes safely
-            logger.warning("Advisory lock probe failed (%r); demoting to standby", exc)
-            await self.release()
-            return False
+                if self._is_leader:
+                    logger.warning("Advisory lock probe failed %d times (%r); demoting to standby", self._failed_probes, exc)
+                self._is_leader = False
+                return False
+        return self._is_leader
+
+    async def _drop_conn(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None and not conn.is_closed():
+            try:
+                await conn.close(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                conn.terminate()
 
     async def release(self) -> None:
         self._is_leader = False
@@ -582,7 +626,8 @@ class PgNotifyListener:
                 backoff = 0.5
                 while not self._stop.is_set() and not conn.is_closed():
                     await asyncio.sleep(5.0)
-                    await conn.execute("SELECT 1")
+                    # Bounded keep-alive: a half-open socket must not hang the listener forever.
+                    await conn.execute("SELECT 1", timeout=5.0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001

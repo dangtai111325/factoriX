@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 from aiormq.exceptions import DeliveryError, PublishError
@@ -24,6 +25,15 @@ from factorix.platform.broker import (
     tenant_routing_key,
 )
 from factorix.platform.settings import Settings
+from factorix.domain.canonical import (
+    OBS_BATCH_CONTENT_TYPE,
+    OBS_BATCH_HEADER,
+    OBS_BATCH_HEADER_VALUE,
+    CanonicalObservation,
+    CanonicalProvenance,
+    decode_observation_batch,
+)
+from factorix.domain.quality import Quality
 
 
 def test_broker_config_and_redaction() -> None:
@@ -83,28 +93,98 @@ async def test_publisher_keeps_unroutable_delivery_distinct_from_broker_nack(mon
     assert publisher.metrics.published_ok == 1
 
 
+def _obs(i: int, *, tenant: UUID | None = None, age_s: float = 0.0) -> CanonicalObservation:
+    return CanonicalObservation(
+        event_uid=f"uid-{i}",
+        tenant_id=tenant or UUID("11111111-2222-3333-4444-555555555555"),
+        signal_id=uuid5(NAMESPACE_URL, f"sig-{i % 7}"),
+        resource_id=uuid5(NAMESPACE_URL, "res"),
+        acquired_at=datetime.now(timezone.utc) - timedelta(seconds=age_s),
+        value_type="float64",
+        value=float(i),
+        quality=Quality.GOOD,
+        source_sequence=i,
+        provenance=CanonicalProvenance(protocol="modbus_tcp", address_summary="10.0.0.1:502"),
+    )
+
+
+def test_build_envelopes_batches_by_lane_and_round_trips_every_observation() -> None:
+    publisher = RabbitMQPublisher(BrokerConfig(amqp_url="amqp://localhost/", batch_max_obs=4, envelope_mode="batch"))
+    fresh = [_obs(i) for i in range(6)]
+    stale = [_obs(100 + i, age_s=60) for i in range(2)]
+    envelopes = publisher.build_envelopes([fresh[0], stale[0], *fresh[1:], stale[1]])
+    lanes = [(env.routing_key.startswith("telemetry.live.v1."), len(env.observations)) for env in envelopes]
+    assert sorted(lanes) == [(False, 2), (True, 2), (True, 4)]
+    decoded: list[CanonicalObservation] = []
+    for env in envelopes:
+        assert env.content_type == OBS_BATCH_CONTENT_TYPE
+        assert env.headers[OBS_BATCH_HEADER] == OBS_BATCH_HEADER_VALUE
+        batch = decode_observation_batch(env.body)
+        assert batch.batch_id == env.message_id and len(batch.items) == len(env.observations)
+        decoded.extend(CanonicalObservation.from_dict(item) for item in batch.items)
+    assert sorted(decoded, key=lambda o: o.event_uid) == sorted([*fresh, *stale], key=lambda o: o.event_uid)
+
+    small = RabbitMQPublisher(BrokerConfig(amqp_url="amqp://localhost/", batch_max_obs=500, batch_max_bytes=4096))
+    sized = small.build_envelopes([_obs(i) for i in range(40)])
+    assert len(sized) > 1 and all(len(env.body) <= 4096 + 512 for env in sized)
+
+    legacy = RabbitMQPublisher(BrokerConfig(amqp_url="amqp://localhost/", envelope_mode="single"))
+    singles = legacy.build_envelopes(fresh[:3])
+    assert [env.message_id for env in singles] == ["uid-0", "uid-1", "uid-2"]
+    assert CanonicalObservation.from_json_bytes(singles[0].body) == fresh[0]
+
+
 @pytest.mark.asyncio
-async def test_publish_batch_deadline_keeps_prior_confirms_and_cleans_up_pending_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
-    publisher = RabbitMQPublisher(BrokerConfig(amqp_url="amqp://localhost/", confirm_timeout_s=0.05))
-    items = [SimpleNamespace(event_uid=f"msg-{i}") for i in range(4)]
-    slot = asyncio.Semaphore(1)
-    finished = []
+async def test_publish_window_fails_fast_after_unavailable_and_keeps_confirms(monkeypatch: pytest.MonkeyPatch) -> None:
+    publisher = RabbitMQPublisher(
+        BrokerConfig(amqp_url="amqp://localhost/", confirm_timeout_s=0.05, max_inflight_publishes=1, batch_max_obs=1)
+    )
+    items = [_obs(i) for i in range(4)]
+    attempted: list[str] = []
 
-    async def publish(obs):
-        try:
-            async with slot:
-                if obs is not items[0]:
-                    await asyncio.Event().wait()
-        finally:
-            finished.append(obs.event_uid)
+    async def publish(**kwargs):
+        attempted.append(kwargs["message_id"])
+        if len(attempted) == 2:
+            error = BrokerUnavailableError("confirm timeout")
+            error.__cause__ = TimeoutError()
+            raise error
 
-    monkeypatch.setattr(publisher, "publish_observation", publish)
+    monkeypatch.setattr(publisher, "_publish_unbounded", publish)
     confirmed, failed = await asyncio.wait_for(publisher.publish_observations_partial(items), timeout=1)
-    assert confirmed == ["msg-0"]
-    assert [obs.event_uid for obs, _ in failed] == ["msg-1", "msg-2", "msg-3"]
+    assert confirmed == ["uid-0"]
+    assert [obs.event_uid for obs, _ in failed] == ["uid-1", "uid-2", "uid-3"]
+    # The stalled broker costs ONE confirm timeout: later envelopes are not even attempted.
+    assert len(attempted) == 2
     assert all(isinstance(error, BrokerUnavailableError) and isinstance(error.__cause__, TimeoutError) for _, error in failed)
-    assert sorted(finished) == ["msg-0", "msg-1", "msg-2", "msg-3"]
-    assert publisher.metrics.publish_errors == 3
+
+
+@pytest.mark.asyncio
+async def test_publish_window_keeps_going_on_backpressure_and_overlaps_confirms(monkeypatch: pytest.MonkeyPatch) -> None:
+    publisher = RabbitMQPublisher(BrokerConfig(amqp_url="amqp://localhost/", max_inflight_publishes=8, batch_max_obs=1))
+    items = [_obs(i) for i in range(8)]
+    active = 0
+    peak = 0
+
+    async def publish(**kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        if b"uid-3" in kwargs["payload"]:
+            raise BrokerBackpressureError("queue full")
+
+    monkeypatch.setattr(publisher, "_publish_unbounded", publish)
+    confirmed, failed = await publisher.publish_observations_partial(items)
+    assert peak > 1  # several envelopes awaiting confirms at once (sliding window)
+    assert [obs.event_uid for obs, _ in failed] == ["uid-3"]
+    assert isinstance(failed[0][1], BrokerBackpressureError)
+    assert len(confirmed) == 7 and publisher.envelopes_published == 7
+
+
+def test_scrub_secrets_removes_url_credentials() -> None:
+    assert broker.scrub_secrets("connect amqp://mq:s3cr3t@host:5672/ failed") == "connect amqp://***:***@host:5672/ failed"
+    assert "pw" not in broker.scrub_secrets("postgresql+asyncpg://user:pw@db:5432/x")
 
 
 def test_two_lane_broker_config_and_routing_keys() -> None:

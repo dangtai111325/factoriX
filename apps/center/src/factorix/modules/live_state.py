@@ -42,6 +42,10 @@ from factorix.platform.tdengine import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_SIGNALS_PER_TENANT = 50_000
+# Cold-recovery tuning (R1-25: /observations/latest took 5 s because every call re-queried, one
+# by one, every signal without a TDengine row).
+WARM_CONCURRENCY = 4
+WARM_NEGATIVE_TTL_S = 60.0
 
 
 def _utcnow() -> datetime:
@@ -263,6 +267,8 @@ class TDengineLiveStateProvider:
         self._verified: dict[UUID, set[UUID]] = {}
         self._lock = asyncio.Lock()
         self.started_at: datetime = _utcnow()
+        # (tenant, signal) -> (epoch, monotonic expiry): signals known to have no recoverable row.
+        self._warm_misses: dict[tuple[UUID, UUID], tuple[int, float]] = {}
 
     def set_active_epoch(self, tenant_id: UUID, epoch: int) -> None:
         eff = max(1, int(epoch))
@@ -553,23 +559,41 @@ class TDengineLiveStateProvider:
             else:
                 missing.append((sid, spec))
 
-        for sid, spec in missing:
-            vtype = str(spec.get("data_type") or spec.get("value_type") or "float64")
-            try:
-                subtable = op_subtable_name(sid, vtype)
-                row = await self._td.query_last_row(db, subtable)
-            except TDEngineError as exc:
-                low = exc.message.lower()
-                if any(tok in low for tok in ("not exist", "doesn't exist", "does not exist")):
-                    continue
-                logger.warning("TDengine LAST_ROW recovery skipped for %s.%s: %s", db, sid, exc.message)
-                continue
+        import time as _time
 
-            if not row:
+        now_mono = _time.monotonic()
+        todo: list[tuple[UUID, Mapping[str, Any]]] = []
+        for sid, spec in missing:
+            miss = self._warm_misses.get((tenant_id, sid))
+            if miss is not None and miss[0] == eff_epoch and miss[1] > now_mono:
+                continue
+            todo.append((sid, spec))
+        gate = asyncio.Semaphore(WARM_CONCURRENCY)
+
+        async def _last_row(sid: UUID, spec: Mapping[str, Any]) -> tuple[UUID, Mapping[str, Any], dict[str, Any] | None]:
+            vtype_q = str(spec.get("data_type") or spec.get("value_type") or "float64")
+            async with gate:
+                try:
+                    return sid, spec, await self._td.query_last_row(db, op_subtable_name(sid, vtype_q))  # type: ignore[union-attr]
+                except TDEngineError as exc:
+                    low = exc.message.lower()
+                    if not any(tok in low for tok in ("not exist", "doesn't exist", "does not exist")):
+                        logger.warning("TDengine LAST_ROW recovery skipped for %s.%s: %s", db, sid, exc.message)
+                        return sid, spec, {"__error__": True}
+                    return sid, spec, None
+
+        fetched = await asyncio.gather(*(_last_row(sid, spec) for sid, spec in todo)) if todo else []
+        for sid, spec, row in fetched:
+            vtype = str(spec.get("data_type") or spec.get("value_type") or "float64")
+            if row is not None and row.get("__error__"):
+                continue  # transient error: retry next time
+            if not row or int(row.get("data_epoch") or 1) < eff_epoch:
+                self._warm_misses[(tenant_id, sid)] = (eff_epoch, now_mono + WARM_NEGATIVE_TTL_S)
+                if len(self._warm_misses) > 4 * self._max_per_tenant:
+                    self._warm_misses.clear()
                 continue
             row_epoch = int(row.get("data_epoch") or 1)
-            if row_epoch < eff_epoch:
-                continue
+            subtable = op_subtable_name(sid, vtype)
 
             val = _decode_td_value(row.get("val"), vtype)
             raw_quality = str(row.get("raw_quality") or "GOOD").upper()
@@ -689,8 +713,15 @@ class TDengineLiveStateProvider:
         storage_ok: bool | None = None,
         now: datetime | None = None,
         require_session_verification: bool = True,
+        connection_id: Any = None,
+        evidence: PipelineEvidence | None = None,
     ) -> EvaluatedLiveSignal:
         entry = self.get_entry(tenant_id, signal_id)
+        pipeline = evidence or get_pipeline_evidence()
+        if connection_id is not None:
+            pipeline.note_signal(signal_id, connection_id, expected_interval_ms)
+        freshness_evidence = pipeline.evidence_for(signal_id, connection_id)
+        fallback_interval_ms = pipeline.interval_of(signal_id)
         rec = entry.record if entry is not None else None
         eval_now = now or _utcnow()
 
@@ -735,7 +766,11 @@ class TDengineLiveStateProvider:
             raw_value=rec.value,
             event_time=rec.event_time,
             last_acquired_at=rec.last_acquired_at,
-            expected_interval_ms=expected_interval_ms if expected_interval_ms is not None else entry.expected_interval_ms,
+            expected_interval_ms=(
+                expected_interval_ms
+                if expected_interval_ms is not None
+                else (entry.expected_interval_ms if entry.expected_interval_ms is not None else fallback_interval_ms)
+            ),
             last_good_value=rec.last_good_value,
             last_good_time=rec.last_good_at,
             raw_reason_code=rec.reason_code,
@@ -746,6 +781,9 @@ class TDengineLiveStateProvider:
             connection_paused=connection_paused,
             restored_unverified=unverified,
             now=eval_now,
+            source_ok_at=freshness_evidence.get("source_ok_at"),
+            source_reported_at=freshness_evidence.get("source_reported_at"),
+            delivered_at=freshness_evidence.get("delivered_at"),
         )
         dims = compute_health_dimensions(
             signal_effective_status=ev.effective_status,
@@ -829,6 +867,198 @@ def record_from_pg_row(
         updated_at=upd_at,
     )
     return rec, seq, upd_at
+
+
+class PipelineEvidence:
+    """Per-connection evidence that separates a silent source from a late pipeline (WS-Q).
+
+    * ``source_ok`` / ``source_reported_at``: acquisition's own last successful read of each
+      connection (``connections.last_success_at``) and its heartbeat time - written by acquisition
+      straight to PostgreSQL, independent of RabbitMQ / ingestion.
+    * ``delivered``: newest acquisition time Center has received per connection (from every live
+      event that passes the hub).
+    * ``signal_connection`` / ``signal_interval``: signal -> connection and expected interval
+      (signal ``expected_interval_ms`` falling back to the job ``interval_ms``).
+
+    Pure in-memory state of the API process; refreshed from PostgreSQL by the health loop.
+    """
+
+    def __init__(self) -> None:
+        self.signal_connection: dict[str, str] = {}
+        self.signal_interval: dict[str, int] = {}
+        self.source_ok: dict[str, datetime] = {}
+        self.source_reported_at: datetime | None = None
+        self.delivered: dict[str, datetime] = {}
+        self.mapping_loaded_at: datetime | None = None
+
+    def connection_of(self, signal_id: Any) -> str | None:
+        return self.signal_connection.get(str(signal_id).lower())
+
+    def interval_of(self, signal_id: Any) -> int | None:
+        return self.signal_interval.get(str(signal_id).lower())
+
+    def set_mapping(self, rows: Sequence[Mapping[str, Any]], *, now: datetime | None = None) -> None:
+        mapping: dict[str, str] = {}
+        intervals: dict[str, int] = {}
+        for row in rows:
+            sid = str(row.get("signal_id") or "").lower()
+            cid = row.get("connection_id")
+            if not sid or cid is None:
+                continue
+            mapping[sid] = str(cid).lower()
+            interval = row.get("expected_interval_ms") or row.get("interval_ms")
+            if interval:
+                try:
+                    intervals[sid] = int(interval)
+                except (TypeError, ValueError):
+                    pass
+        self.signal_connection = mapping
+        self.signal_interval = intervals
+        self.mapping_loaded_at = now or _utcnow()
+
+    def note_signal(self, signal_id: Any, connection_id: Any, interval_ms: Any = None) -> None:
+        if signal_id is None or connection_id is None:
+            return
+        sid = str(signal_id).lower()
+        self.signal_connection[sid] = str(connection_id).lower()
+        if interval_ms:
+            try:
+                self.signal_interval[sid] = int(interval_ms)
+            except (TypeError, ValueError):
+                pass
+
+    def set_source(self, rows: Sequence[Mapping[str, Any]], reported_at: Any) -> None:
+        for row in rows:
+            cid = row.get("id") or row.get("connection_id")
+            ok = _utc(row.get("last_success_at"))
+            if cid is not None and ok is not None:
+                key = str(cid).lower()
+                prev = self.source_ok.get(key)
+                if prev is None or ok > prev:
+                    self.source_ok[key] = ok
+        reported = _utc(reported_at)
+        if reported is not None and (self.source_reported_at is None or reported > self.source_reported_at):
+            self.source_reported_at = reported
+
+    def note_source(self, connection_id: Any, last_success_at: Any) -> None:
+        ok = _utc(last_success_at) if last_success_at is not None else None
+        if connection_id is None or ok is None:
+            return
+        key = str(connection_id).lower()
+        prev = self.source_ok.get(key)
+        if prev is None or ok > prev:
+            self.source_ok[key] = ok
+
+    def note_delivery(self, signal_id: Any, acquired_at: Any, connection_id: Any = None) -> str | None:
+        cid = str(connection_id).lower() if connection_id else self.connection_of(signal_id)
+        acquired = _utc(acquired_at) if acquired_at is not None else None
+        if cid is None or acquired is None:
+            return cid
+        prev = self.delivered.get(cid)
+        if prev is None or acquired > prev:
+            self.delivered[cid] = acquired
+        return cid
+
+    def evidence_for(self, signal_id: Any, connection_id: Any = None) -> dict[str, Any]:
+        cid = str(connection_id).lower() if connection_id else self.connection_of(signal_id)
+        if cid is None:
+            return {}
+        return {
+            "source_ok_at": self.source_ok.get(cid),
+            "source_reported_at": self.source_reported_at,
+            "delivered_at": self.delivered.get(cid),
+        }
+
+    def pipeline_summary(self, now: datetime | None = None) -> dict[str, dict[str, Any]]:
+        """Per connection: source evidence and newest delivered acquisition time (for the stream heartbeat)."""
+        current = now or _utcnow()
+        out: dict[str, dict[str, Any]] = {}
+        for cid in set(self.source_ok) | set(self.delivered):
+            delivered = self.delivered.get(cid)
+            out[cid] = {
+                "source_ok_at": _iso(self.source_ok.get(cid)),
+                "delivered_at": _iso(delivered),
+                "delivery_lag_ms": int((current - delivered).total_seconds() * 1000) if delivered else None,
+            }
+        return out
+
+
+def _iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+_PIPELINE_EVIDENCE = PipelineEvidence()
+
+
+def get_pipeline_evidence() -> PipelineEvidence:
+    return _PIPELINE_EVIDENCE
+
+
+def _parse_time(value: Any) -> datetime | None:
+    try:
+        return _utc(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def refresh_live_message(
+    message: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    evidence: PipelineEvidence | None = None,
+) -> dict[str, Any]:
+    """Re-evaluate the time-based part of a ``latest`` push message at dispatch / sweep time.
+
+    Ingestion evaluates freshness at commit time without pipeline evidence, so a value that is only
+    late in the pipeline arrived as STALE. The API is the single evaluator: GOOD/STALE/DELAYED is
+    decided here with ``classify_freshness``. Non time-based states (BAD, UNCERTAIN, PAUSED,
+    DISABLED, NO_DATA, restored-unverified) keep their status; only ``freshness`` is annotated.
+    Returns the same dict when nothing changed, a new dict otherwise.
+    """
+    from factorix.domain.signal_state import canonical_stale_after_ms, classify_freshness
+
+    ev = evidence or _PIPELINE_EVIDENCE
+    acquired = _parse_time(message.get("last_acquired_at") or message.get("received_time"))
+    if acquired is None:
+        return message
+    status = str(message.get("effective_status") or "").upper()
+    reason = str(message.get("reason_code") or "").upper()
+    if status in {"DISABLED", "PAUSED", "NO_DATA"}:
+        return message
+    raw_quality = str(message.get("quality") or "GOOD").upper()
+    sid = message.get("signal_id")
+    interval = ev.interval_of(sid)
+    stale_after = canonical_stale_after_ms(interval) if interval else int(message.get("stale_after_ms") or canonical_stale_after_ms(None))
+    current = now or _utcnow()
+    cid = message.get("connection_id") or ev.connection_of(sid)
+    evid = ev.evidence_for(sid, cid)
+    verdict = classify_freshness(last_acquired_at=acquired, now=current, stale_after_ms=stale_after, **evid)
+    out = dict(message)
+    out["stale_after_ms"] = stale_after
+    out["freshness"] = verdict.freshness
+    out["age_ms"] = verdict.age_ms
+    out["evaluated_at"] = _iso(current)
+    if cid:
+        out["connection_id"] = cid
+    if verdict.delivery_lag_ms is not None:
+        out["delivery_lag_ms"] = verdict.delivery_lag_ms
+    else:
+        out.pop("delivery_lag_ms", None)
+    time_based = raw_quality == "GOOD" and status in {"GOOD", "STALE"} and reason != "UNVERIFIED_AFTER_RESTART"
+    if time_based:
+        if verdict.freshness == "FRESH":
+            out["effective_status"] = "GOOD"
+            if reason in {"NO_FRESH_ACQUISITION", "DELIVERY_DELAYED", "DELIVERY_STALLED"}:
+                out["reason_code"] = "OK"
+        elif verdict.freshness == "DELAYED":
+            out["effective_status"] = "GOOD"
+            out["reason_code"] = "DELIVERY_DELAYED"
+        else:
+            out["effective_status"] = "STALE"
+            out["reason_code"] = verdict.reason_code or "NO_FRESH_ACQUISITION"
+    return out
 
 
 _GLOBAL_LIVE_STATE_PROVIDER: TDengineLiveStateProvider | None = None

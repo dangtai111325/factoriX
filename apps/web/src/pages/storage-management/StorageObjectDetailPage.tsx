@@ -28,6 +28,7 @@ import {
   StorageObjectStatus,
 } from '../../lib/storagePhysicalApi';
 import { RemoteErrorState, RemoteLoadingState } from '../../components/common/RemoteResourceState';
+import { StorageLifecycleDialog, LifecycleTarget, lifecycleTargetOf, isProtectedTarget } from './StorageLifecycleDialog';
 
 export const StorageObjectDetailPage: React.FC = () => {
   const { objectId } = useParams<{ objectId: string }>();
@@ -39,6 +40,9 @@ export const StorageObjectDetailPage: React.FC = () => {
     ((TDDatabase | TDStable | TDSubtable) & { object_type: 'database' | 'stable' | 'subtable' }) | null
   >(null);
   const [activeTab, setActiveTab] = useState<'overview' | 'schema' | 'subtables' | 'bindings' | 'ddl'>('overview');
+  const [lifecycle, setLifecycle] = useState<LifecycleTarget | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   const fetchObject = () => {
     if (!objectId) return;
@@ -61,7 +65,7 @@ export const StorageObjectDetailPage: React.FC = () => {
 
   useEffect(() => {
     fetchObject();
-  }, [objectId]);
+  }, [objectId, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (loading) {
     return <RemoteLoadingState subject="storage object" />;
@@ -109,7 +113,7 @@ export const StorageObjectDetailPage: React.FC = () => {
           <div className="flex items-center gap-3">
             <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl">
               {objectData.object_type === 'database' && <Database className="w-6 h-6 text-[#EF1B24]" />}
-              {objectData.object_type === 'stable' && <Layers className="w-6 h-6 text-[#0284C7]" />}
+              {objectData.object_type === 'stable' && <Layers className="w-6 h-6 text-[#2A82E7]" />}
               {objectData.object_type === 'subtable' && <Table className="w-6 h-6 text-[#7C3AED]" />}
             </div>
             <div>
@@ -129,54 +133,72 @@ export const StorageObjectDetailPage: React.FC = () => {
           </div>
 
           {/* Action buttons */}
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => navigate(`/historian/storage/edit/${encodeURIComponent(objectData.id)}`)}
-              className="flex items-center gap-1.5 px-3.5 py-2 bg-white border border-[#E3EAF3] rounded-lg text-[13px] font-semibold text-[#111B37] hover:bg-[#F8FAFC] shadow-xs"
-            >
-              <Edit className="w-4 h-4 text-[#657794]" />
-              <span>Edit Schema</span>
-            </button>
-
-            {objectData.object_type === 'database' && (
-              <button
-                type="button"
-                onClick={() =>
-                  navigate(`/historian/storage/create?kind=stable&database=${encodeURIComponent(objectData.physical_name)}`)
-                }
-                className="flex items-center gap-1.5 px-3.5 py-2 bg-[#EF1B24] text-white rounded-lg text-[13px] font-bold hover:bg-[#DC2626] shadow-xs"
-              >
-                <Plus className="w-4 h-4" />
-                <span>New Supertable</span>
-              </button>
-            )}
-
-            {objectData.object_type === 'stable' && (
-              <button
-                type="button"
-                onClick={() =>
-                  navigate(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(objectData.physical_name)}`)
-                }
-                className="flex items-center gap-1.5 px-3.5 py-2 bg-[#0284C7] text-white rounded-lg text-[13px] font-bold hover:bg-[#0369A1] shadow-xs"
-              >
-                <Plus className="w-4 h-4" />
-                <span>New Subtable</span>
-              </button>
-            )}
-
-            {objectData.object_type === 'subtable' && (
-              <button
-                type="button"
-                onClick={() => navigate(`/historian/historian?source_id=${encodeURIComponent(objectData.id)}`)}
-                className="flex items-center gap-1.5 px-3.5 py-2 bg-[#EF1B24] text-white rounded-lg text-[13px] font-bold hover:bg-[#DC2626] shadow-xs"
-              >
-                <Activity className="w-4 h-4" />
-                <span>Open in Historian</span>
-              </button>
-            )}
-          </div>
+          {(() => {
+            const target = lifecycleTargetOf(objectData.id, (objectData as { status?: string }).status);
+            const locked = isProtectedTarget(target);
+            const ref = objectData.id.replace(/^(stable|subtable):/, '');
+            return (
+              <div className="flex flex-wrap items-center gap-2">
+                {locked ? (
+                  <span className="text-[12px] text-[#657794] px-2">FactoriX system object · read-only</span>
+                ) : (
+                  <>
+                    <button type="button" onClick={() => navigate(`/historian/storage/edit/${encodeURIComponent(objectData.id)}`)}
+                      className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
+                      <Edit className="w-4 h-4" /><span>Edit details</span>
+                    </button>
+                    {objectData.object_type !== 'database' && (
+                      <button type="button" onClick={() => navigate(`/historian/storage/create?kind=${objectData.object_type}&duplicate=${encodeURIComponent(objectData.id)}`)}
+                        className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
+                        <span>Duplicate</span>
+                      </button>
+                    )}
+                    <button type="button" onClick={() => setLifecycle(target)}
+                      className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
+                      <span>Pause / Retire / Delete</span>
+                    </button>
+                  </>
+                )}
+                {objectData.object_type === 'database' && (
+                  <button type="button" onClick={() => navigate(`/historian/storage/create?kind=stable&database=${encodeURIComponent(objectData.physical_name)}`)}
+                    className="flex items-center gap-1.5 h-10 px-5 bg-[#EF1B24] text-white rounded-lg text-[14px] font-semibold hover:bg-[#D9141D] shadow-sm">
+                    <Plus className="w-4 h-4" /><span>New Supertable</span>
+                  </button>
+                )}
+                {objectData.object_type === 'stable' && !locked && (
+                  <>
+                    <button type="button" onClick={() => navigate(`/historian/storage/bulk?stable=${encodeURIComponent(ref)}`)}
+                      className="flex items-center gap-1.5 h-9 px-4 bg-white border border-[#D4DFEC] rounded-lg text-[13px] font-semibold text-[#334568] hover:bg-[#F9FAFD]">
+                      <Plus className="w-4 h-4" /><span>Subtables from Data Models</span>
+                    </button>
+                    <button type="button" onClick={() => navigate(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(ref)}`)}
+                      className="flex items-center gap-1.5 h-10 px-5 bg-[#EF1B24] text-white rounded-lg text-[14px] font-semibold hover:bg-[#D9141D] shadow-sm">
+                      <Plus className="w-4 h-4" /><span>New Subtable</span>
+                    </button>
+                  </>
+                )}
+                {objectData.object_type === 'subtable' && (
+                  <button type="button" onClick={() => navigate(`/historian/historian?source_id=${encodeURIComponent(objectData.id.startsWith('subtable:') ? objectData.id : `subtable:${objectData.id}`)}&kind=subtable&range=24h`)}
+                    className="flex items-center gap-1.5 h-10 px-5 bg-[#EF1B24] text-white rounded-lg text-[14px] font-semibold hover:bg-[#D9141D] shadow-sm">
+                    <Activity className="w-4 h-4" /><span>Open in Historian</span>
+                  </button>
+                )}
+              </div>
+            );
+          })()}
         </div>
+        {notice && (
+          <div role="status" className="mt-3 px-3 py-2 rounded-lg border border-[#E3EAF3] bg-[#F9FAFD] text-[12px] text-[#334568]">{notice}</div>
+        )}
+        {lifecycle && (
+          <StorageLifecycleDialog target={lifecycle} onClose={() => setLifecycle(null)}
+            onDone={(msg) => {
+              setLifecycle(null);
+              setNotice(msg);
+              if (msg.startsWith('Deleted')) navigate('/historian/storage?tab=objects');
+              else setReloadKey((k) => k + 1);
+            }} />
+        )}
 
         {/* Tabs */}
         <div className="flex border-b border-[#E3EAF3] mt-6 -mb-6 text-[13px]">
@@ -275,7 +297,7 @@ export const StorageObjectDetailPage: React.FC = () => {
                   </div>
                   <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg">
                     <div className="text-[11px] font-semibold text-[#657794] uppercase">Subtables</div>
-                    <div className="text-[13px] font-bold text-[#0284C7] mt-1">{stableObj.subtable_count}</div>
+                    <div className="text-[13px] font-bold text-[#2A82E7] mt-1">{stableObj.subtable_count}</div>
                   </div>
                 </>
               )}
@@ -302,7 +324,7 @@ export const StorageObjectDetailPage: React.FC = () => {
           <div className="space-y-6">
             <div>
               <h3 className="text-[15px] font-bold text-[#111B37] mb-3 flex items-center gap-2">
-                <Columns className="w-4 h-4 text-[#0284C7]" />
+                <Columns className="w-4 h-4 text-[#2A82E7]" />
                 <span>Columns ({stableObj.columns.length})</span>
               </h3>
               <table className="w-full text-left text-[13px] border border-[#E3EAF3] rounded-lg overflow-hidden">
@@ -325,7 +347,7 @@ export const StorageObjectDetailPage: React.FC = () => {
                           </span>
                         )}
                       </td>
-                      <td className="py-2.5 px-4 font-mono text-[#0284C7]">{c.td_type}</td>
+                      <td className="py-2.5 px-4 font-mono text-[#2A82E7]">{c.td_type}</td>
                       <td className="py-2.5 px-4 text-[#657794] capitalize">{c.role}</td>
                       <td className="py-2.5 px-4 text-[#657794]">{c.nullable ? 'YES' : 'NO'}</td>
                     </tr>
@@ -336,7 +358,7 @@ export const StorageObjectDetailPage: React.FC = () => {
 
             <div>
               <h3 className="text-[15px] font-bold text-[#111B37] mb-3 flex items-center gap-2">
-                <Tag className="w-4 h-4 text-[#0284C7]" />
+                <Tag className="w-4 h-4 text-[#2A82E7]" />
                 <span>Tags ({stableObj.tags.length})</span>
               </h3>
               <table className="w-full text-left text-[13px] border border-[#E3EAF3] rounded-lg overflow-hidden">
@@ -350,7 +372,7 @@ export const StorageObjectDetailPage: React.FC = () => {
                   {stableObj.tags.map((t) => (
                     <tr key={t.name} className="hover:bg-[#F8FAFC]">
                       <td className="py-2.5 px-4 font-mono font-semibold text-[#111B37]">{t.name}</td>
-                      <td className="py-2.5 px-4 font-mono text-[#0284C7]">{t.td_type}</td>
+                      <td className="py-2.5 px-4 font-mono text-[#2A82E7]">{t.td_type}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -369,19 +391,22 @@ export const StorageObjectDetailPage: React.FC = () => {
               <p className="text-[13px] text-[#657794]">No data sources currently bound to this subtable.</p>
             ) : (
               <div className="space-y-2">
-                {subtableObj.bindings.map((b) => (
-                  <div key={b.id} className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-lg text-[13px]">
-                    <div className="flex items-center justify-between font-bold text-[#111B37] mb-1">
-                      <span>Column: {b.destination_column}</span>
-                      <span className="px-2 py-0.5 bg-[#E8FAF0] text-[#0DBA67] rounded text-[11px] font-bold">
-                        {b.status}
-                      </span>
+                {subtableObj.bindings.map((raw) => {
+                  const b = raw as typeof raw & { column_name?: string; model_name?: string; model_field_path?: string; signal_key?: string };
+                  return (
+                    <div key={b.id} className="p-3 bg-white border border-[#E3EAF3] rounded-lg text-[13px]">
+                      <div className="flex items-center justify-between font-semibold text-[#111B37] mb-1">
+                        <span>Column <span className="font-mono">{b.column_name || b.destination_column}</span></span>
+                        <span className="text-[11px] font-semibold text-[#657794]">{b.status} · {b.recording_mode || 'ON_CHANGE'}</span>
+                      </div>
+                      <div className="text-[12px] text-[#657794]">
+                        {b.source_kind === 'model_field' ? 'Data Model field' : 'Signal'}:{' '}
+                        <span className="text-[#334568]">{b.model_name || b.signal_key || ''}</span>{' '}
+                        <span className="font-mono text-[#334568]">{b.model_field_path || b.source_path}</span>
+                      </div>
                     </div>
-                    <div className="text-[12px] text-[#657794]">
-                      Source Path: <span className="font-mono text-[#334155]">{b.source_path}</span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -391,21 +416,21 @@ export const StorageObjectDetailPage: React.FC = () => {
           <div className="space-y-3">
             <h3 className="text-[15px] font-bold text-[#111B37] flex items-center gap-2">
               <FileCode className="w-4 h-4 text-[#EF1B24]" />
-              <span>Exact TDengine DDL</span>
+              <span>Schema as DDL (reconstructed from DESCRIBE)</span>
             </h3>
             <pre className="p-4 bg-[#111B37] text-white rounded-xl font-mono text-[12px] overflow-x-auto leading-relaxed">
               {objectData.object_type === 'database' && (
-                `CREATE DATABASE IF NOT EXISTS \`${objectData.physical_name}\` PRECISION '${dbObj?.precision || 'ms'}';`
+                `CREATE DATABASE \`${objectData.physical_name}\` PRECISION '${dbObj?.precision || 'us'}';`
               )}
               {objectData.object_type === 'stable' && stableObj && (
                 `CREATE STABLE \`${stableObj.database_name}\`.\`${stableObj.physical_name}\` (\n` +
                 `  ts TIMESTAMP,\n` +
                 stableObj.columns
                   .filter((c) => c.name !== 'ts')
-                  .map((c) => `  \`${c.name}\` ${c.td_type}${c.nullable ? '' : ' NOT NULL'}`)
+                  .map((c) => `  \`${c.name}\` ${c.td_type}${c.length && ['VARCHAR', 'NCHAR', 'BINARY', 'VARBINARY'].includes(String(c.td_type).toUpperCase()) ? `(${c.length})` : ''}${c.primary_key ? ' COMPOSITE KEY' : ''}`)
                   .join(',\n') +
                 `\n) TAGS (\n` +
-                stableObj.tags.map((t) => `  \`${t.name}\` ${t.td_type}`).join(',\n') +
+                stableObj.tags.map((t) => `  \`${t.name}\` ${t.td_type}${t.length && ['VARCHAR', 'NCHAR', 'BINARY'].includes(String(t.td_type).toUpperCase()) ? `(${t.length})` : ''}`).join(',\n') +
                 `\n);`
               )}
               {objectData.object_type === 'subtable' && subtableObj && (

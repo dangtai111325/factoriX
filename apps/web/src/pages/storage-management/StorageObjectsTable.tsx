@@ -21,6 +21,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { getTDStorageCatalog, StorageCatalogRow, StorageObjectStatus } from '../../lib/storagePhysicalApi';
+import { StorageLifecycleDialog, LifecycleTarget, lifecycleTargetOf, isProtectedTarget } from './StorageLifecycleDialog';
 import { RemoteErrorState, RemoteLoadingState } from '../../components/common/RemoteResourceState';
 
 const PAGE_SIZE = 15;
@@ -50,6 +51,18 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
+  const [lifecycle, setLifecycle] = useState<LifecycleTarget | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  // Row menus close on outside click and Escape (R1-23).
+  useEffect(() => {
+    if (!activeMenuId) return;
+    const close = () => setActiveMenuId(null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    document.addEventListener('click', close);
+    document.addEventListener('keydown', onKey);
+    return () => { document.removeEventListener('click', close); document.removeEventListener('keydown', onKey); };
+  }, [activeMenuId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -129,7 +142,7 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
       case 'database':
         return <Database className="w-4 h-4 text-[#EF1B24]" />;
       case 'stable':
-        return <Layers className="w-4 h-4 text-[#0284C7]" />;
+        return <Layers className="w-4 h-4 text-[#657794]" />;
       case 'subtable':
         return <Table className="w-4 h-4 text-[#7C3AED]" />;
       default:
@@ -295,17 +308,33 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
                           <span>View Details</span>
                         </button>
 
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setActiveMenuId(null);
-                            navigate(`/historian/storage/edit/${encodeURIComponent(obj.id)}`);
-                          }}
-                          className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#111B37] hover:bg-[#F8FAFC]"
-                        >
-                          <Edit className="w-3.5 h-3.5 text-[#657794]" />
-                          <span>Edit Schema</span>
-                        </button>
+                        {!isProtectedTarget(lifecycleTargetOf(obj.id)) && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveMenuId(null);
+                              navigate(`/historian/storage/edit/${encodeURIComponent(obj.id)}`);
+                            }}
+                            className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#111B37] hover:bg-[#F8FAFC]"
+                          >
+                            <Edit className="w-3.5 h-3.5 text-[#657794]" />
+                            <span>Edit details</span>
+                          </button>
+                        )}
+
+                        {obj.object_type === 'subtable' && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveMenuId(null);
+                              navigate(`/historian/historian?source_id=${encodeURIComponent(obj.id)}&kind=subtable&range=24h`);
+                            }}
+                            className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#111B37] hover:bg-[#F8FAFC]"
+                          >
+                            <Activity className="w-3.5 h-3.5 text-[#657794]" />
+                            <span>Open in Historian</span>
+                          </button>
+                        )}
 
                         {obj.object_type === 'database' && (
                           <button
@@ -316,23 +345,36 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
                             }}
                             className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#111B37] hover:bg-[#F8FAFC]"
                           >
-                            <Plus className="w-3.5 h-3.5 text-[#0284C7]" />
+                            <Plus className="w-3.5 h-3.5 text-[#657794]" />
                             <span>New Supertable</span>
                           </button>
                         )}
 
-                        {obj.object_type === 'stable' && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setActiveMenuId(null);
-                              navigate(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(obj.physical_name)}`);
-                            }}
-                            className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#111B37] hover:bg-[#F8FAFC]"
-                          >
-                            <Plus className="w-3.5 h-3.5 text-[#7C3AED]" />
-                            <span>New Subtable</span>
-                          </button>
+                        {obj.object_type === 'stable' && !isProtectedTarget(lifecycleTargetOf(obj.id)) && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveMenuId(null);
+                                navigate(`/historian/storage/create?kind=subtable&stable=${encodeURIComponent(obj.id.replace(/^stable:/, ''))}`);
+                              }}
+                              className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#111B37] hover:bg-[#F8FAFC]"
+                            >
+                              <Plus className="w-3.5 h-3.5 text-[#657794]" />
+                              <span>New Subtable</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveMenuId(null);
+                                navigate(`/historian/storage/bulk?stable=${encodeURIComponent(obj.id.replace(/^stable:/, ''))}`);
+                              }}
+                              className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#111B37] hover:bg-[#F8FAFC]"
+                            >
+                              <Plus className="w-3.5 h-3.5 text-[#657794]" />
+                              <span>Subtables from Data Models</span>
+                            </button>
+                          </>
                         )}
 
                         <div className="border-t border-[#F1F5FA] my-1" />
@@ -341,12 +383,12 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
                           type="button"
                           onClick={() => {
                             setActiveMenuId(null);
-                            onSelectObject(obj.id);
+                            setLifecycle(lifecycleTargetOf(obj.id, obj.status));
                           }}
-                          className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#DC2626] hover:bg-[#FEF2F2]"
+                          className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-[#F2343B] hover:bg-[#FFF0F1]"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
-                          <span>Retire / Purge</span>
+                          <span>{isProtectedTarget(lifecycleTargetOf(obj.id)) ? 'System object (read-only)' : 'Pause / Retire / Delete'}</span>
                         </button>
                       </div>
                     )}
@@ -385,6 +427,19 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
             </button>
           </div>
         </div>
+      )}
+      {notice && (
+        <div role="status" className="mt-2 px-3 py-2 rounded-lg border border-[#E3EAF3] bg-white text-[12px] text-[#334568] flex justify-between">
+          <span>{notice}</span>
+          <button type="button" onClick={() => setNotice(null)} className="text-[#657794]">Dismiss</button>
+        </div>
+      )}
+      {lifecycle && (
+        <StorageLifecycleDialog
+          target={lifecycle}
+          onClose={() => setLifecycle(null)}
+          onDone={(msg) => { setLifecycle(null); setNotice(msg); onRefresh(); }}
+        />
       )}
     </div>
   );

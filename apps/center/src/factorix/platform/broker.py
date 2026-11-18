@@ -8,8 +8,11 @@ consumers with graceful drain, and AMQP / Management HTTP health inspection.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -17,16 +20,37 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 from urllib.parse import quote, urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import aio_pika
 import aiormq.exceptions
 import httpx
 from aio_pika.abc import AbstractIncomingMessage, AbstractRobustChannel, AbstractRobustConnection, AbstractRobustExchange, AbstractRobustQueue
 
-from factorix.domain.canonical import CanonicalObservation
+from factorix.domain.canonical import (
+    OBS_BATCH_CONTENT_TYPE,
+    OBS_BATCH_ENVELOPE_VERSION,
+    OBS_BATCH_HEADER,
+    OBS_BATCH_HEADER_VALUE,
+    OBS_BATCH_SCHEMA,
+    CanonicalObservation,
+)
 
 logger = logging.getLogger(__name__)
+
+_URL_CREDENTIALS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s:]+)(:[^/@\s]*)?@")
+
+
+def scrub_secrets(text: Any) -> str:
+    """Remove URL userinfo (``scheme://user:pass@``) from arbitrary error text before it is logged or stored."""
+    return _URL_CREDENTIALS_RE.sub(r"\1***:***@", str(text))
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
 
 
 class BrokerError(RuntimeError):
@@ -72,6 +96,10 @@ class BrokerConfig:
     consumer_concurrency: int = 32
     live_consumer_concurrency: int = 256
     reconnect_interval_s: float = 2.0
+    # Wire format of the publisher: "batch" = v2 envelopes (default), "single" = legacy one-message-per-observation.
+    envelope_mode: str = field(default_factory=lambda: os.environ.get("FACTORIX_PUBLISH_ENVELOPE", "batch").strip().lower() or "batch")
+    batch_max_obs: int = field(default_factory=lambda: _env_int("FACTORIX_PUBLISH_BATCH_MAX_OBS", 500))
+    batch_max_bytes: int = field(default_factory=lambda: _env_int("FACTORIX_PUBLISH_BATCH_MAX_BYTES", 192 * 1024, minimum=4096))
 
     @classmethod
     def from_settings(cls, settings: Any) -> "BrokerConfig":
@@ -273,11 +301,35 @@ async def connect_with_backoff(
             jitter = random.uniform(0.0, 0.2 * delay)
             await asyncio.sleep(min(delay + jitter, 5.0))
             delay *= 2.0
-    raise BrokerUnavailableError(f"Failed connecting to RabbitMQ ({redact_amqp_url(amqp_url)}): {last_exc}") from last_exc
+    raise BrokerUnavailableError(
+        f"Failed connecting to RabbitMQ ({redact_amqp_url(amqp_url)}): {scrub_secrets(last_exc)}"
+    ) from last_exc
+
+
+@dataclass(slots=True)
+class _Envelope:
+    """One AMQP message: either a v2 batch of observations or (legacy mode) a single v1 observation."""
+
+    observations: list[CanonicalObservation]
+    routing_key: str
+    body: bytes
+    message_id: str
+    headers: dict[str, Any]
+    content_type: str
+    correlation_id: str | None = None
 
 
 class RabbitMQPublisher:
-    """Thread/async-safe durable publisher with publisher confirms and bounded in-flight semaphore."""
+    """Durable publisher with publisher confirms and a sliding window of in-flight envelopes.
+
+    ``publish_observations_partial`` packs observations into v2 batch envelopes (one AMQP
+    message per tenant/lane chunk, bounded by ``batch_max_obs`` / ``batch_max_bytes``) and
+    publishes them concurrently, at most ``max_inflight_publishes`` unconfirmed at a time.
+    Each envelope has its own confirm timeout; there is no batch-wide deadline that cancels
+    already-sent messages. When an envelope fails because the broker is unreachable, the
+    envelopes that were not sent yet fail fast without waiting for their own timeout, so a
+    stalled connection costs one timeout per call, not one per wave.
+    """
 
     def __init__(self, cfg: BrokerConfig) -> None:
         self.cfg = cfg
@@ -286,19 +338,49 @@ class RabbitMQPublisher:
         self._channel: AbstractRobustChannel | None = None
         self._exchange: AbstractRobustExchange | None = None
         self._lock = asyncio.Lock()
-        self._inflight = asyncio.Semaphore(cfg.max_inflight_publishes)
+        self._inflight = asyncio.Semaphore(max(1, int(cfg.max_inflight_publishes)))
+        self._reconnect_listeners: list[Callable[[], None]] = []
+        self.envelopes_published = 0
+        self.observations_published = 0
+
+    def add_reconnect_listener(self, callback: Callable[[], None]) -> None:
+        """Register a callback fired when the robust connection re-establishes itself."""
+        self._reconnect_listeners.append(callback)
+
+    def _fire_reconnect(self, *_args: Any, **_kwargs: Any) -> None:
+        for callback in list(self._reconnect_listeners):
+            try:
+                callback()
+            except Exception:  # noqa: BLE001
+                logger.debug("Reconnect listener failed", exc_info=True)
 
     async def start(self) -> None:
         async with self._lock:
             if self._exchange is not None and self._channel is not None and not self._channel.is_closed:
                 return
-            self._conn = await connect_with_backoff(
-                self.cfg.amqp_url,
-                reconnect_interval_s=self.cfg.reconnect_interval_s,
-                max_attempts=3,
-                connect_timeout_s=self.cfg.confirm_timeout_s,
-            )
-            self._channel = await self._conn.channel(publisher_confirms=True, on_return_raises=True)  # type: ignore[assignment]
+            conn = self._conn
+            if conn is not None and getattr(conn, "is_closed", True):
+                # Never leak a dead connection when replacing it (A-P2-10).
+                try:
+                    await conn.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug("Ignoring close failure of a dead publisher connection", exc_info=True)
+                conn = None
+            if conn is None:
+                conn = await connect_with_backoff(
+                    self.cfg.amqp_url,
+                    reconnect_interval_s=self.cfg.reconnect_interval_s,
+                    max_attempts=3,
+                    connect_timeout_s=self.cfg.confirm_timeout_s,
+                )
+                callbacks = getattr(conn, "reconnect_callbacks", None)
+                if callbacks is not None and hasattr(callbacks, "add"):
+                    try:
+                        callbacks.add(self._fire_reconnect)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("Robust reconnect callback registration failed", exc_info=True)
+                self._conn = conn
+            self._channel = await conn.channel(publisher_confirms=True, on_return_raises=True)  # type: ignore[assignment]
             self._exchange, _, _ = await declare_telemetry_topology(self._channel, self.cfg)
 
     async def close(self) -> None:
@@ -330,7 +412,17 @@ class RabbitMQPublisher:
         assert self._exchange is not None
         return self._exchange
 
-    async def publish_observation(self, obs: CanonicalObservation, routing_key: str | None = None) -> None:
+    # ------------------------------------------------------------------ routing & encoding
+
+    def _routing_key_for(self, obs: CanonicalObservation, now: datetime) -> str:
+        acq_at = obs.acquired_at if obs.acquired_at.tzinfo else obs.acquired_at.replace(tzinfo=timezone.utc)
+        age_s = (now - acq_at).total_seconds()
+        if 0.0 <= age_s <= float(getattr(self.cfg, "freshness_window_s", 12.0)):
+            return tenant_live_routing_key(obs.tenant_id)
+        return tenant_routing_key(obs.tenant_id)
+
+    @staticmethod
+    def _single_headers(obs: CanonicalObservation) -> dict[str, Any]:
         headers: dict[str, Any] = {
             "x-schema-version": int(obs.schema_version),
             "x-data-epoch": int(obs.data_epoch),
@@ -341,61 +433,179 @@ class RabbitMQPublisher:
         }
         if obs.source_sequence is not None:
             headers["x-source-sequence"] = int(obs.source_sequence)
+        return headers
 
+    def _single_envelope(self, obs: CanonicalObservation, routing_key: str) -> _Envelope:
+        return _Envelope(
+            observations=[obs],
+            routing_key=routing_key,
+            body=obs.to_json_bytes(),
+            message_id=obs.event_uid,
+            headers=self._single_headers(obs),
+            content_type="application/json",
+            correlation_id=obs.correlation_id,
+        )
+
+    def build_envelopes(self, observations: Sequence[CanonicalObservation]) -> list[_Envelope]:
+        """Group observations by (tenant, lane) preserving order and cut them into bounded envelopes."""
+        now = datetime.now(timezone.utc)
+        if self.cfg.envelope_mode == "single":
+            return [self._single_envelope(obs, self._routing_key_for(obs, now)) for obs in observations]
+
+        max_obs = max(1, int(self.cfg.batch_max_obs))
+        max_bytes = max(4096, int(self.cfg.batch_max_bytes))
+        created = now.isoformat().replace("+00:00", "Z")
+        # (tenant, routing_key) -> [observations, encoded items, approx bytes]
+        groups: dict[tuple[UUID, str], list[Any]] = {}
+        out: list[_Envelope] = []
+
+        def close(key: tuple[UUID, str]) -> None:
+            obs_list, parts, _size = groups.pop(key)
+            if obs_list:
+                out.append(self._batch_envelope(key[0], key[1], obs_list, parts, created))
+
+        for obs in observations:
+            rkey = self._routing_key_for(obs, now)
+            key = (obs.tenant_id, rkey)
+            encoded = json.dumps(obs.to_compact_dict(), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+            item_bytes = len(encoded) if encoded.isascii() else len(encoded.encode("utf-8"))
+            current = groups.get(key)
+            if current is not None and (len(current[0]) >= max_obs or current[2] + item_bytes + 1 > max_bytes):
+                close(key)
+                current = None
+            if current is None:
+                current = [[], [], 256]
+                groups[key] = current
+            current[0].append(obs)
+            current[1].append(encoded)
+            current[2] += item_bytes + 1
+        for key in list(groups):
+            close(key)
+        return out
+
+    @staticmethod
+    def _batch_envelope(
+        tenant_id: UUID, routing_key: str, obs_list: list[CanonicalObservation], parts: list[str], created: str
+    ) -> _Envelope:
+        batch_id = f"fxb-{uuid4().hex}"
+        head = json.dumps(
+            {
+                "schema": OBS_BATCH_SCHEMA,
+                "envelope_version": OBS_BATCH_ENVELOPE_VERSION,
+                "batch_id": batch_id,
+                "tenant_id": str(tenant_id),
+                "created_at": created,
+                "count": len(obs_list),
+            },
+            separators=(",", ":"),
+        )
+        body = (head[:-1] + ',"observations":[' + ",".join(parts) + "]}").encode("utf-8")
+        first = obs_list[0]
+        return _Envelope(
+            observations=obs_list,
+            routing_key=routing_key,
+            body=body,
+            message_id=batch_id,
+            headers={
+                OBS_BATCH_HEADER: OBS_BATCH_HEADER_VALUE,
+                "x-tenant-id": str(tenant_id),
+                "x-data-epoch": int(first.data_epoch),
+                "x-observation-count": len(obs_list),
+            },
+            content_type=OBS_BATCH_CONTENT_TYPE,
+        )
+
+    # ------------------------------------------------------------------ publishing
+
+    async def publish_observation(self, obs: CanonicalObservation, routing_key: str | None = None) -> None:
+        """Publish ONE observation as a legacy v1 message (tools/tests; the hot path sends envelopes)."""
         if routing_key is None:
-            now = datetime.now(timezone.utc)
-            acq_at = obs.acquired_at if obs.acquired_at.tzinfo else obs.acquired_at.replace(tzinfo=timezone.utc)
-            age_s = (now - acq_at).total_seconds()
-            freshness_window = getattr(self.cfg, "freshness_window_s", 12.0)
-            if 0.0 <= age_s <= freshness_window:
-                routing_key = tenant_live_routing_key(obs.tenant_id)
-            else:
-                routing_key = tenant_routing_key(obs.tenant_id)
-
+            routing_key = self._routing_key_for(obs, datetime.now(timezone.utc))
         await self.publish_bytes(
             payload=obs.to_json_bytes(),
             routing_key=routing_key,
             message_id=obs.event_uid,
             correlation_id=obs.correlation_id,
-            headers=headers,
+            headers=self._single_headers(obs),
         )
 
     async def publish_observations_partial(
         self,
         observations: Sequence[CanonicalObservation],
     ) -> tuple[list[str], list[tuple[CanonicalObservation, BrokerError]]]:
-        """Publish observations concurrently (bounded by ``max_inflight_publishes``) with confirms.
+        """Publish observations as confirmed envelopes through the sliding window.
 
-        Returns ``(confirmed_event_uids, failed_items_with_errors)`` so outage spooling only
-        stores observations that RabbitMQ did not confirm.
+        Returns ``(confirmed_event_uids, failed_items_with_errors)`` so the caller spools only
+        observations whose envelope RabbitMQ did not confirm. Both lists keep input order.
         """
         if not observations:
             return [], []
-        tasks = [asyncio.create_task(self.publish_observation(obs)) for obs in observations]
+        envelopes = self.build_envelopes(observations)
+        results = await self.publish_envelopes(envelopes)
+        order = {obs.event_uid: idx for idx, obs in enumerate(observations)}
+        confirmed: list[str] = []
+        failed: list[tuple[CanonicalObservation, BrokerError]] = []
+        for env, error in zip(envelopes, results):
+            if error is None:
+                confirmed.extend(obs.event_uid for obs in env.observations)
+            else:
+                failed.extend((obs, error) for obs in env.observations)
+        confirmed.sort(key=lambda uid: order.get(uid, 0))
+        failed.sort(key=lambda item: order.get(item[0].event_uid, 0))
+        return confirmed, failed
+
+    async def publish_envelopes(self, envelopes: Sequence[_Envelope]) -> list[BrokerError | None]:
+        """Publish envelopes concurrently (window = ``max_inflight_publishes``); one result per envelope."""
+        results: list[BrokerError | None] = [None] * len(envelopes)
+        abort: list[BrokerError] = []
+
+        async def one(index: int, env: _Envelope) -> None:
+            if abort:
+                results[index] = self._not_attempted(env, abort[0])
+                return
+            async with self._inflight:
+                if abort:
+                    results[index] = self._not_attempted(env, abort[0])
+                    return
+                try:
+                    await self._publish_unbounded(
+                        payload=env.body,
+                        routing_key=env.routing_key,
+                        message_id=env.message_id,
+                        correlation_id=env.correlation_id,
+                        headers=env.headers,
+                        content_type=env.content_type,
+                    )
+                except BrokerBackpressureError as exc:
+                    # Queue full: the other lane may still accept, keep publishing it.
+                    results[index] = exc
+                except BrokerError as exc:
+                    if not abort:
+                        abort.append(exc)
+                    results[index] = exc
+                else:
+                    self.envelopes_published += 1
+                    self.observations_published += len(env.observations)
+
+        if len(envelopes) == 1:
+            await one(0, envelopes[0])
+            return results
+        tasks = [asyncio.create_task(one(i, env)) for i, env in enumerate(envelopes)]
         try:
-            # Include waiting for an in-flight slot in the batch deadline.
-            # A stalled connection must not consume one timeout per wave.
-            await asyncio.wait(tasks, timeout=self.cfg.confirm_timeout_s)
-        finally:
+            await asyncio.gather(*tasks)
+        except BaseException:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        confirmed: list[str] = []
-        failed: list[tuple[CanonicalObservation, BrokerError]] = []
-        for obs, outcome in zip(observations, results):
-            if outcome is None:
-                confirmed.append(obs.event_uid)
-            elif isinstance(outcome, BrokerError):
-                failed.append((obs, outcome))
-            elif isinstance(outcome, asyncio.CancelledError):
-                self.metrics.publish_errors += 1
-                error = BrokerUnavailableError(f"RabbitMQ batch deadline reached for {obs.event_uid}")
-                error.__cause__ = TimeoutError()
-                failed.append((obs, error))
-            elif isinstance(outcome, BaseException):
-                failed.append((obs, BrokerUnavailableError(f"RabbitMQ publish failed for {obs.event_uid}: {outcome}")))
-        return confirmed, failed
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return results
+
+    def _not_attempted(self, env: _Envelope, cause: BrokerError) -> BrokerError:
+        self.metrics.publish_errors += 1
+        error = BrokerUnavailableError(f"RabbitMQ unavailable; envelope {env.message_id} not attempted: {cause}")
+        error.__cause__ = cause.__cause__ or cause
+        return error
 
     async def publish_bytes(
         self,
@@ -408,35 +618,61 @@ class RabbitMQPublisher:
         content_type: str = "application/json",
     ) -> None:
         async with self._inflight:
-            exchange = await self._ensure_exchange()
-            msg = aio_pika.Message(
-                body=payload,
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                content_type=content_type,
+            await self._publish_unbounded(
+                payload=payload,
+                routing_key=routing_key,
                 message_id=message_id,
                 correlation_id=correlation_id,
-                timestamp=datetime.now(timezone.utc),
-                headers=headers or {},
+                headers=headers,
+                content_type=content_type,
             )
-            started = time.monotonic()
-            try:
-                await exchange.publish(
-                    msg,
-                    routing_key=routing_key,
-                    mandatory=True,
-                    timeout=self.cfg.confirm_timeout_s,
-                )
-            except aiormq.exceptions.PublishError as exc:
-                self.metrics.publish_errors += 1
-                raise BrokerUnavailableError(f"RabbitMQ could not route message {message_id}: {exc}") from exc
-            except aiormq.exceptions.DeliveryError as exc:
-                self.metrics.publish_backpressure += 1
-                raise BrokerBackpressureError(f"RabbitMQ rejected message {message_id}: {exc}") from exc
-            except (TimeoutError, aio_pika.exceptions.AMQPError, aiormq.exceptions.AMQPException, OSError) as exc:
-                self.metrics.publish_errors += 1
-                raise BrokerUnavailableError(f"RabbitMQ publish failed for {message_id}: {exc}") from exc
-            self.metrics.published_ok += 1
-            self.metrics.last_confirm_latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+
+    async def _publish_unbounded(
+        self,
+        *,
+        payload: bytes,
+        routing_key: str,
+        message_id: str,
+        correlation_id: str | None = None,
+        headers: dict[str, Any] | None = None,
+        content_type: str = "application/json",
+    ) -> None:
+        try:
+            exchange = await self._ensure_exchange()
+        except BrokerError:
+            self.metrics.publish_errors += 1
+            raise
+        except (TimeoutError, aio_pika.exceptions.AMQPError, aiormq.exceptions.AMQPException, OSError) as exc:
+            self.metrics.publish_errors += 1
+            raise BrokerUnavailableError(f"RabbitMQ channel unavailable: {scrub_secrets(exc)}") from exc
+        msg = aio_pika.Message(
+            body=payload,
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            content_type=content_type,
+            message_id=message_id,
+            correlation_id=correlation_id,
+            timestamp=datetime.now(timezone.utc),
+            headers=headers or {},
+        )
+        started = time.monotonic()
+        try:
+            await exchange.publish(
+                msg,
+                routing_key=routing_key,
+                mandatory=True,
+                timeout=self.cfg.confirm_timeout_s,
+            )
+        except aiormq.exceptions.PublishError as exc:
+            self.metrics.publish_errors += 1
+            raise BrokerUnavailableError(f"RabbitMQ could not route message {message_id}: {scrub_secrets(exc)}") from exc
+        except aiormq.exceptions.DeliveryError as exc:
+            self.metrics.publish_backpressure += 1
+            raise BrokerBackpressureError(f"RabbitMQ rejected message {message_id}: {scrub_secrets(exc)}") from exc
+        except (TimeoutError, aio_pika.exceptions.AMQPError, aiormq.exceptions.AMQPException, OSError) as exc:
+            self.metrics.publish_errors += 1
+            raise BrokerUnavailableError(f"RabbitMQ publish failed for {message_id}: {scrub_secrets(exc)}") from exc
+        self.metrics.published_ok += 1
+        self.metrics.last_confirm_latency_ms = round((time.monotonic() - started) * 1000.0, 3)
 
 
 MessageHandler = Callable[[AbstractIncomingMessage], Awaitable[ConsumeOutcome]]
@@ -508,30 +744,41 @@ class RabbitMQConsumer:
                 logger.exception("Unhandled consumer exception; NACKing with requeue=True")
                 outcome = ConsumeOutcome.RETRY
 
-            if outcome == ConsumeOutcome.ACK:
-                await message.ack()
-                self.metrics.consumed_ack += 1
-            elif outcome == ConsumeOutcome.RETRY:
-                deliv_count = int(
-                    (message.headers or {}).get("x-delivery-count")
-                    or (message.headers or {}).get("x-acquired-count")
-                    or 0
+            try:
+                await self._settle(message, outcome)
+            except Exception as exc:  # noqa: BLE001 - channel lost after processing; broker redelivers unacked
+                logger.warning(
+                    "Could not settle message %s (%s): %s; it will be redelivered",
+                    message.message_id,
+                    outcome,
+                    scrub_secrets(exc),
                 )
-                if self.cfg.delivery_limit and deliv_count >= self.cfg.delivery_limit:
-                    logger.warning(
-                        "Message %s exceeded delivery limit (%s >= %s); routing to DLQ",
-                        message.message_id,
-                        deliv_count,
-                        self.cfg.delivery_limit,
-                    )
-                    await message.reject(requeue=False)
-                    self.metrics.consumed_dlq += 1
-                else:
-                    await message.nack(requeue=True)
-                    self.metrics.consumed_retry += 1
-            elif outcome == ConsumeOutcome.DEAD_LETTER:
+
+    async def _settle(self, message: AbstractIncomingMessage, outcome: ConsumeOutcome) -> None:
+        if outcome == ConsumeOutcome.ACK:
+            await message.ack()
+            self.metrics.consumed_ack += 1
+        elif outcome == ConsumeOutcome.RETRY:
+            deliv_count = int(
+                (message.headers or {}).get("x-delivery-count")
+                or (message.headers or {}).get("x-acquired-count")
+                or 0
+            )
+            if self.cfg.delivery_limit and deliv_count >= self.cfg.delivery_limit:
+                logger.warning(
+                    "Message %s exceeded delivery limit (%s >= %s); routing to DLQ",
+                    message.message_id,
+                    deliv_count,
+                    self.cfg.delivery_limit,
+                )
                 await message.reject(requeue=False)
                 self.metrics.consumed_dlq += 1
+            else:
+                await message.nack(requeue=True)
+                self.metrics.consumed_retry += 1
+        elif outcome == ConsumeOutcome.DEAD_LETTER:
+            await message.reject(requeue=False)
+            self.metrics.consumed_dlq += 1
 
     async def stop(self, *, drain_timeout_s: float = 15.0) -> None:
         self._stopping = True
@@ -579,17 +826,17 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
                 q_res = await channel.declare_queue(cfg.queue_name, passive=True)
                 legacy_ready = int(q_res.declaration_result.message_count or 0)
             except Exception as exc:  # noqa: BLE001
-                warnings.append(f"Legacy queue {cfg.queue_name} unavailable: {exc}")
+                warnings.append(f"Legacy queue {cfg.queue_name} unavailable: {scrub_secrets(exc)}")
             try:
                 live_res = await channel.declare_queue(cfg.live_queue_name, passive=True)
                 live_ready = int(live_res.declaration_result.message_count or 0)
             except Exception as exc:  # noqa: BLE001
-                warnings.append(f"Live queue {cfg.live_queue_name} unavailable: {exc}")
+                warnings.append(f"Live queue {cfg.live_queue_name} unavailable: {scrub_secrets(exc)}")
             try:
                 dlq_res = await channel.declare_queue(cfg.dlq_name, passive=True)
                 dlq_count = int(dlq_res.declaration_result.message_count or 0)
             except Exception as exc:  # noqa: BLE001
-                warnings.append(f"DLQ {cfg.dlq_name} unavailable: {exc}")
+                warnings.append(f"DLQ {cfg.dlq_name} unavailable: {scrub_secrets(exc)}")
         finally:
             await conn.close()
     except Exception as exc:  # noqa: BLE001
@@ -600,7 +847,7 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
             dlq_count=None,
             oldest_queued_age_s=None,
             checked_at=checked_at,
-            error=str(exc),
+            error=scrub_secrets(exc),
             warnings=warnings,
             live_ready_count=None,
             live_unacked_count=None,
@@ -647,7 +894,7 @@ async def probe_broker_health(cfg: BrokerConfig) -> BrokerHealthSnapshot:
                     if dlq_count is None:
                         dlq_count = int(dlq_data.get("messages_ready", 0))
         except Exception as exc:  # noqa: BLE001
-            warnings.append(f"Management HTTP probe unavailable: {exc}")
+            warnings.append(f"Management HTTP probe unavailable: {scrub_secrets(exc)}")
 
     # Total combined ready and unacked for backwards compatibility
     total_ready = None

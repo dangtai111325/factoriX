@@ -1096,10 +1096,13 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                 sig_meta_by_id = {}
 
             if sig_meta_by_id:
+                # Only signals with neither a cached entry nor a PostgreSQL latest row need TDengine
+                # cold recovery (the PG rows are seeded just below).
+                pg_ids = {as_uuid(r["signal_id"]) for r in rows}
                 missing_specs = {
                     sid_u: meta
                     for sid_u, meta in sig_meta_by_id.items()
-                    if live_provider.get_entry(tenant_id, sid_u) is None
+                    if sid_u not in pg_ids and live_provider.get_entry(tenant_id, sid_u) is None
                 }
                 if missing_specs:
                     await live_provider.warm_from_tdengine(
@@ -1112,7 +1115,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
     for row in rows:
         nb_conn_health = row.pop("nb_connection_health", None)
         nb_conn_status = row.pop("nb_connection_status", None)
-        row.pop("nb_connection_id", None)
+        nb_conn_id = row.pop("nb_connection_id", None)
         nb_binding_enabled = bool(row.pop("nb_binding_enabled", True))
         nb_signal_status = str(row.pop("nb_signal_status", "ACTIVE") or "ACTIVE")
         raw_reason = row.pop("raw_reason", None)
@@ -1155,6 +1158,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                 broker_ok=broker_ok,
                 storage_ok=storage_ok,
                 now=now,
+                connection_id=nb_conn_id,
             )
             rec = evaluated.record
             eval_result = evaluated.evaluation
@@ -1213,6 +1217,9 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
 
         row["source_quality"] = eval_result.source_quality
         row["freshness"] = eval_result.freshness
+        row["delivery_lag_ms"] = eval_result.delivery_lag_ms
+        if nb_conn_id is not None:
+            row["connection_id"] = str(nb_conn_id)
         row["effective_status"] = eval_result.effective_status
         row["reason_code"] = eval_result.reason_code
         row["evaluated_at"] = iso_ms(now)
@@ -1259,6 +1266,7 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                 broker_ok=broker_ok,
                 storage_ok=storage_ok,
                 now=now,
+                connection_id=meta.get("connection_id"),
             )
             rec = evaluated.record
             if rec is None:
@@ -1294,6 +1302,8 @@ async def latest_states(session: AsyncSession, tenant_id: UUID, signal_ids: list
                     "value": rec.value,
                     "source_quality": eval_result.source_quality,
                     "freshness": eval_result.freshness,
+                    "delivery_lag_ms": eval_result.delivery_lag_ms,
+                    "connection_id": str(meta["connection_id"]) if meta.get("connection_id") else None,
                     "effective_status": eval_result.effective_status,
                     "reason_code": eval_result.reason_code,
                     "evaluated_at": iso_ms(now),

@@ -6,6 +6,28 @@ services:
     image: postgres:17-alpine
     container_name: factorix-postgres
     hostname: factorix-postgres
+    # Tuning for the ingestion write load (R1 P1-14). The stock image runs with 128 MB
+    # shared_buffers and frequent checkpoints. Durability stays on for the control plane;
+    # only the derived latest_signal_state commits use SET LOCAL synchronous_commit=off.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+    shm_size: 256mb
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-factorix}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}

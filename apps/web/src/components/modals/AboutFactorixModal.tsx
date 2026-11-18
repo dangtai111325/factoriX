@@ -60,7 +60,7 @@ export const AboutFactorixModal: React.FC<AboutFactorixModalProps> = ({ isOpen, 
                 </div>
                 <div className="flex justify-between">
                   <span className="text-[#64748B]">Platform</span>
-                  <span className="text-[#0F172A]">Enterprise Edge Appliance</span>
+                  <span className="text-[#0F172A]">Industrial data appliance (built-in collector)</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-[#64748B]">Publisher</span>

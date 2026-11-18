@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import gzip
 import json
+import mimetypes
 import logging
 import os
 import time
@@ -31,8 +34,11 @@ from factorix.modules.live_state import (
     configure_live_state_provider,
     extract_runtime_health,
     get_live_state_provider,
+    get_pipeline_evidence,
+    refresh_live_message,
 )
 from factorix.modules.providers import LiveSignalRecord
+from factorix.modules.storage_objects import StorageObjectError
 from factorix.transport import data_models_api, storage_api
 from factorix.modules import usage
 from factorix.modules.collect import (
@@ -61,11 +67,12 @@ from factorix.domain.health import (
     effective_edge_health,
     heartbeat_fresh,
     no_data_message,
+    no_data_threshold_s,
 )
 from factorix.modules.common import as_uuid, audit, execute, execute_rowcount, fetch_all, fetch_one, iso_ms, parse_uuid, queue_stream_event, utcnow
 from factorix.modules.ingestion_worker import to_asyncpg_dsn
 from factorix.platform.after_commit import flush, listen
-from factorix.transport.hub import Channel, Hub, origin_allowed, parse_pg_notify_events
+from factorix.transport.hub import HEARTBEAT_INTERVAL_S, Channel, Hub, origin_allowed, parse_pg_notify_events
 from factorix.modules.identity import (
     SESSION_COOKIE,
     BootstrapIn,
@@ -242,7 +249,7 @@ async def _evaluate_connections(session: AsyncSession) -> None:
             acq_runtime = await fetch_one(
                 session,
                 """
-                SELECT health, last_heartbeat
+                SELECT health, last_heartbeat, queues_json
                 FROM collector_runtime_status
                 WHERE role = 'acquisition'
                 ORDER BY last_heartbeat DESC
@@ -252,6 +259,11 @@ async def _evaluate_connections(session: AsyncSession) -> None:
             )
     except SQLAlchemyError:
         acq_runtime = None
+    acq_info = _acquisition_runtime_info(acq_runtime)
+    # Connections whose jobs acquisition runs are judged by acquisition's own windowed evidence
+    # (single owner). This sweep only covers bound connections acquisition runs nothing for.
+    running = set(acq_info.get("connections_running") or []) if isinstance(acq_info.get("connections_running"), list) else set()
+    acq_since = [moment for moment in (_opt_time(acq_info.get("leader_since")), _opt_time(acq_info.get("started_at"))) if moment]
 
     rows = await fetch_all(
         session,
@@ -269,7 +281,7 @@ async def _evaluate_connections(session: AsyncSession) -> None:
             JOIN source_fields f ON f.acquisition_job_id = j.id
             JOIN signal_bindings b ON b.source_field_id = f.id
             JOIN signal_definitions s ON s.id = b.signal_id
-            WHERE j.connection_id = c.id AND b.enabled = TRUE AND b.valid_to IS NULL AND s.status = 'ACTIVE'
+            WHERE j.connection_id = c.id AND j.enabled = TRUE AND b.enabled = TRUE AND b.valid_to IS NULL AND s.status = 'ACTIVE'
         ) bnd ON TRUE
         WHERE c.status = 'ACTIVE' AND c.health <> 'DEGRADED'
         ORDER BY c.id
@@ -294,15 +306,27 @@ async def _evaluate_connections(session: AsyncSession) -> None:
                 continue
             if str(acq_runtime.get("health") or "").upper() in {"OFFLINE", "DOWN"}:
                 continue
+            if str(row["id"]) in running:
+                continue
         since_candidates = [row.get(key) for key in ("bindings_since", "created_at", "updated_at", "activated_at") if row.get(key)]
+        if row.get("edge_id") is None:
+            # Acquisition (re)start / promotion: evidence from before it is not "no samples".
+            since_candidates.extend(acq_since)
         since = max(since_candidates) if since_candidates else None
         if not connection_no_data_due(last_success_at=row.get("last_success_at"), since=since, interval_ms=row.get("interval_ms"), now=now):
             continue
         message = no_data_message(row.get("interval_ms"))
+        cutoff = now - timedelta(seconds=no_data_threshold_s(row.get("interval_ms")))
+        # The predicate is re-checked atomically: if acquisition advanced last_success_at after the
+        # SELECT above (data arrived), this UPDATE matches nothing (no read-then-update race).
         changed = await execute_rowcount(
             session,
-            "UPDATE connections SET health = 'DEGRADED', last_error = :error WHERE id = :id AND status = 'ACTIVE' AND health <> 'DEGRADED'",
-            {"id": row["id"], "error": message},
+            """
+            UPDATE connections SET health = 'DEGRADED', last_error = :error
+            WHERE id = :id AND status = 'ACTIVE' AND health <> 'DEGRADED'
+              AND (last_success_at IS NULL OR last_success_at < :cutoff)
+            """,
+            {"id": row["id"], "error": message, "cutoff": cutoff},
         )
         if not changed:
             continue
@@ -330,6 +354,20 @@ async def _evaluate_connections(session: AsyncSession) -> None:
                 last_success_at=row.get("last_success_at"),
             ),
         )
+
+
+def _acquisition_runtime_info(acq_runtime: dict[str, Any] | None) -> dict[str, Any]:
+    """``queues_json.runtime`` of the acquisition heartbeat (started_at, leader_since, connections_running)."""
+    if not acq_runtime:
+        return {}
+    queues = acq_runtime.get("queues_json")
+    if isinstance(queues, str):
+        try:
+            queues = json.loads(queues)
+        except json.JSONDecodeError:
+            return {}
+    info = queues.get("runtime") if isinstance(queues, dict) else None
+    return info if isinstance(info, dict) else {}
 
 
 def commissioning_timeout(status: str, timeout_s: int) -> tuple[str, str]:
@@ -541,131 +579,296 @@ def _opt_time(value: Any) -> datetime | None:
     return None
 
 
+def _seed_live_cache(events: list[dict[str, Any]]) -> None:
+    """Advance the API live cache from pushed ``latest`` events (ordering guards in the provider)."""
+    provider = get_live_state_provider()
+    if provider is not None:
+        for ev in events:
+            if ev.get("kind") != "latest":
+                continue
+            p = ev.get("payload")
+            if not isinstance(p, dict) or not p.get("signal_id"):
+                continue
+            try:
+                tid_u = UUID(str(ev["tenant_id"]))
+                sid_u = UUID(str(p["signal_id"]))
+                prev_entry = provider.get_entry(tid_u, sid_u)
+                res_raw = ev.get("resource_id") or (prev_entry.record.resource_id if prev_entry else sid_u)
+                res_u = res_raw if isinstance(res_raw, UUID) else UUID(str(res_raw))
+                acq_dt = _opt_time(p.get("last_acquired_at") or p.get("received_time")) or utcnow()
+                ev_dt = _opt_time(p.get("received_time")) or acq_dt
+                chg_dt = _opt_time(p.get("last_value_changed_at")) or (
+                    prev_entry.record.last_value_changed_at if prev_entry else ev_dt
+                )
+                src_dt = _opt_time(p.get("source_time"))
+                qual = str(p.get("quality") or "GOOD").upper()
+                epoch_val = max(
+                    1,
+                    int(
+                        p.get("data_epoch")
+                        or (prev_entry.record.data_epoch if prev_entry else 1)
+                    ),
+                )
+                seq_raw = ev.get("source_sequence")
+                seq_val = int(seq_raw) if seq_raw is not None else None
+                vtype = str(ev.get("value_type") or (prev_entry.record.value_type if prev_entry else "float64"))
+                rec = LiveSignalRecord(
+                    tenant_id=tid_u,
+                    signal_id=sid_u,
+                    resource_id=res_u,
+                    observation_id=None,
+                    event_uid=str(ev.get("event_uid") or "") or None,
+                    data_epoch=epoch_val,
+                    value_type=vtype,
+                    value=p.get("value"),
+                    unit=(
+                        ev.get("unit")
+                        if ev.get("unit") is not None
+                        else (prev_entry.record.unit if prev_entry else None)
+                    ),
+                    raw_quality=qual,
+                    reason_code=str(p["reason_code"]) if p.get("reason_code") else None,
+                    event_time=ev_dt,
+                    last_acquired_at=acq_dt,
+                    last_value_changed_at=chg_dt,
+                    source_time=src_dt,
+                    config_revision=max(
+                        1,
+                        int(
+                            ev.get("config_revision")
+                            or (prev_entry.record.config_revision if prev_entry else 1)
+                        ),
+                    ),
+                    origin=str(ev.get("origin") or "LIVE"),
+                    last_good_value=p.get("value") if (qual == "GOOD" and p.get("value") is not None) else None,
+                    last_good_at=acq_dt if (qual == "GOOD" and p.get("value") is not None) else None,
+                    updated_at=utcnow(),
+                )
+                provider.seed_from_record(rec, source_sequence=seq_val, restored_unverified=False)
+            except Exception:  # noqa: BLE001
+                logger.debug("Live cache notify seed skipped", exc_info=True)
+
+
+_NOTIFY_FETCH_CHUNK = 200
+_bridge_state: dict[str, Any] = {"connected": False, "last_event_at": None, "reconnects": 0, "last_error": None}
+
+
+def notify_bridge_status() -> dict[str, Any]:
+    return dict(_bridge_state)
+
+
+def _note_health_evidence(events: list[dict[str, Any]]) -> None:
+    evidence = get_pipeline_evidence()
+    for ev in events:
+        if ev.get("kind") != "health":
+            continue
+        payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
+        if str(payload.get("entity") or "") == "connection" and payload.get("last_success_at"):
+            evidence.note_source(payload.get("id"), payload.get("last_success_at"))
+
+
+async def _dispatch_latest_ids(tenant_id: str, signal_ids: list[str]) -> None:
+    """NOTIFY v2 (``{"v":2,"kind":"latest_ids",...}``): read the committed rows and push them."""
+    try:
+        tid = UUID(str(tenant_id))
+    except ValueError:
+        return
+    ids: list[UUID] = []
+    for raw in signal_ids:
+        try:
+            ids.append(UUID(str(raw)))
+        except ValueError:
+            continue
+    if not ids:
+        return
+    async with session_factory()() as session:
+        for start in range(0, len(ids), _NOTIFY_FETCH_CHUNK):
+            rows = await telemetry.latest_states(session, tid, ids[start : start + _NOTIFY_FETCH_CHUNK])
+            hub.dispatch(
+                [{"kind": "latest", "tenant_id": str(tid), "signal_id": str(row["signal_id"]), "payload": _latest_message(row)} for row in rows]
+            )
+
+
+async def _latest_ids_worker(queue: "asyncio.Queue[tuple[str, list[str]]]") -> None:
+    while True:
+        tenant_id, ids = await queue.get()
+        merged: dict[str, set[str]] = {tenant_id: set(ids)}
+        while not queue.empty():  # coalesce a burst of NOTIFYs into one read per tenant
+            more_tenant, more_ids = queue.get_nowait()
+            merged.setdefault(more_tenant, set()).update(more_ids)
+        for tid, tid_ids in merged.items():
+            try:
+                await _dispatch_latest_ids(tid, sorted(tid_ids))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.warning("Live push of %d committed signal(s) failed", len(tid_ids), exc_info=True)
+
+
+def _parse_latest_ids(payload: str) -> tuple[str, list[str]] | None:
+    try:
+        data = json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("signal_ids"), list) or not data.get("tenant_id"):
+        return None
+    evidence = get_pipeline_evidence()
+    max_acq = _opt_time(data.get("max_acquired_at"))
+    if max_acq is not None:
+        for cid in data.get("connection_ids") or []:
+            evidence.note_delivery(None, max_acq, connection_id=cid)
+    return str(data["tenant_id"]), [str(item) for item in data["signal_ids"]]
+
+
 async def _pg_notify_bridge_loop() -> None:
-    """Subscribe to PG LISTEN/NOTIFY channels so out-of-process IngestionWorker pushes /stream live."""
+    """Subscribe to PG LISTEN/NOTIFY channels so out-of-process IngestionWorker pushes /stream live.
+
+    Accepts the v1 ``{"events": [...]}`` payload, health payloads, and the v2 ``latest_ids`` payload
+    (see v6_contracts.md Q1). Liveness: bounded keep-alive, WARN on loss, and a ``resync`` frame to
+    every socket after a reconnect so browsers refetch what was missed while the bridge was down.
+    """
     dsn = to_asyncpg_dsn(_settings().database_url)
     if not dsn.startswith("postgresql://"):
+        logger.warning("PG NOTIFY bridge disabled: database URL is not PostgreSQL; live push will not work")
         return
     backoff = 0.5
-    while True:
-        conn: asyncpg.Connection | None = None
+    ids_queue: asyncio.Queue[tuple[str, list[str]]] = asyncio.Queue(maxsize=10_000)
+    worker = asyncio.create_task(_latest_ids_worker(ids_queue), name="pg-notify-latest-ids")
+    had_connection = False
+    try:
+        while True:
+            conn: asyncpg.Connection | None = None
+            try:
+                conn = await asyncpg.connect(dsn, timeout=5.0)
+                stop_ev = asyncio.Event()
+
+                def _on_notify(_c: Any, _pid: int, channel: str, payload: str) -> None:
+                    _bridge_state["last_event_at"] = time.monotonic()
+                    if channel == "factorix_epoch_changed":
+                        provider = get_live_state_provider()
+                        if provider is not None and payload:
+                            try:
+                                data = json.loads(payload)
+                            except json.JSONDecodeError:
+                                data = {}
+                            if isinstance(data, dict) and (data.get("active_epoch") or data.get("new_epoch")):
+                                try:
+                                    tid_raw = data.get("tenant_id")
+                                    tid_u = UUID(str(tid_raw)) if tid_raw else None
+                                    new_epoch = int(data.get("active_epoch") or data.get("new_epoch"))
+                                    provider.invalidate_epoch_sync(tid_u, new_epoch)
+                                except (TypeError, ValueError):
+                                    pass
+                        return
+                    if channel == "factorix_stream_events" and '"signal_ids"' in (payload or ""):
+                        request = _parse_latest_ids(payload)
+                        if request is not None:
+                            try:
+                                ids_queue.put_nowait(request)
+                            except asyncio.QueueFull:
+                                logger.warning("Live push queue full; dropping %d signal id(s)", len(request[1]))
+                            return
+                    events = _parse_pg_notify_events(channel, payload)
+                    if events:
+                        _seed_live_cache(events)
+                        _note_health_evidence(events)
+                        hub.dispatch(events)
+
+                def _on_close(_c: Any) -> None:
+                    stop_ev.set()
+
+                conn.add_termination_listener(_on_close)
+                await conn.add_listener("factorix_stream_events", _on_notify)
+                await conn.add_listener("factorix_health_changed", _on_notify)
+                await conn.add_listener("factorix_epoch_changed", _on_notify)
+                backoff = 0.5
+                _bridge_state["connected"] = True
+                _bridge_state["last_error"] = None
+                if had_connection:
+                    _bridge_state["reconnects"] += 1
+                    logger.info("PG NOTIFY bridge reconnected; asking browsers to resync")
+                    for channel in list(hub.channels):
+                        channel.offer({"type": "resync", "reason": "notify_bridge_reconnected"})
+                had_connection = True
+                while not stop_ev.is_set() and not conn.is_closed():
+                    try:
+                        await asyncio.wait_for(stop_ev.wait(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        # Bounded keep-alive: a half-open socket must not hang the bridge forever.
+                        await conn.execute("SELECT 1", timeout=5.0)
+                raise ConnectionError("LISTEN connection closed")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                _bridge_state["connected"] = False
+                _bridge_state["last_error"] = type(exc).__name__
+                log = logger.warning if backoff <= 0.5 else logger.info
+                log("PG NOTIFY bridge unavailable (%s); live push paused, reconnecting in %.1fs", type(exc).__name__, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(10.0, backoff * 2.0)
+            finally:
+                if conn is not None and not conn.is_closed():
+                    try:
+                        await conn.close(timeout=2.0)
+                    except Exception:  # noqa: BLE001
+                        conn.terminate()
+    finally:
+        worker.cancel()
         try:
-            conn = await asyncpg.connect(dsn, timeout=5.0)
-            stop_ev = asyncio.Event()
+            await worker
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
 
-            def _on_notify(_c: Any, _pid: int, channel: str, payload: str) -> None:
-                if channel == "factorix_epoch_changed":
-                    provider = get_live_state_provider()
-                    if provider is not None and payload:
-                        try:
-                            data = json.loads(payload)
-                        except json.JSONDecodeError:
-                            data = {}
-                        if isinstance(data, dict) and (data.get("active_epoch") or data.get("new_epoch")):
-                            try:
-                                tid_raw = data.get("tenant_id")
-                                tid_u = UUID(str(tid_raw)) if tid_raw else None
-                                new_epoch = int(data.get("active_epoch") or data.get("new_epoch"))
-                                provider.invalidate_epoch_sync(tid_u, new_epoch)
-                            except (TypeError, ValueError):
-                                pass
-                    return
 
-                events = _parse_pg_notify_events(channel, payload)
-                if events:
-                    provider = get_live_state_provider()
-                    if provider is not None:
-                        for ev in events:
-                            if ev.get("kind") != "latest":
-                                continue
-                            p = ev.get("payload")
-                            if not isinstance(p, dict) or not p.get("signal_id"):
-                                continue
-                            try:
-                                tid_u = UUID(str(ev["tenant_id"]))
-                                sid_u = UUID(str(p["signal_id"]))
-                                prev_entry = provider.get_entry(tid_u, sid_u)
-                                res_raw = ev.get("resource_id") or (prev_entry.record.resource_id if prev_entry else sid_u)
-                                res_u = res_raw if isinstance(res_raw, UUID) else UUID(str(res_raw))
-                                acq_dt = _opt_time(p.get("last_acquired_at") or p.get("received_time")) or utcnow()
-                                ev_dt = _opt_time(p.get("received_time")) or acq_dt
-                                chg_dt = _opt_time(p.get("last_value_changed_at")) or (
-                                    prev_entry.record.last_value_changed_at if prev_entry else ev_dt
-                                )
-                                src_dt = _opt_time(p.get("source_time"))
-                                qual = str(p.get("quality") or "GOOD").upper()
-                                epoch_val = max(
-                                    1,
-                                    int(
-                                        p.get("data_epoch")
-                                        or (prev_entry.record.data_epoch if prev_entry else 1)
-                                    ),
-                                )
-                                seq_raw = ev.get("source_sequence")
-                                seq_val = int(seq_raw) if seq_raw is not None else None
-                                vtype = str(ev.get("value_type") or (prev_entry.record.value_type if prev_entry else "float64"))
-                                rec = LiveSignalRecord(
-                                    tenant_id=tid_u,
-                                    signal_id=sid_u,
-                                    resource_id=res_u,
-                                    observation_id=None,
-                                    event_uid=str(ev.get("event_uid") or "") or None,
-                                    data_epoch=epoch_val,
-                                    value_type=vtype,
-                                    value=p.get("value"),
-                                    unit=(
-                                        ev.get("unit")
-                                        if ev.get("unit") is not None
-                                        else (prev_entry.record.unit if prev_entry else None)
-                                    ),
-                                    raw_quality=qual,
-                                    reason_code=str(p["reason_code"]) if p.get("reason_code") else None,
-                                    event_time=ev_dt,
-                                    last_acquired_at=acq_dt,
-                                    last_value_changed_at=chg_dt,
-                                    source_time=src_dt,
-                                    config_revision=max(
-                                        1,
-                                        int(
-                                            ev.get("config_revision")
-                                            or (prev_entry.record.config_revision if prev_entry else 1)
-                                        ),
-                                    ),
-                                    origin=str(ev.get("origin") or "LIVE"),
-                                    last_good_value=p.get("value") if (qual == "GOOD" and p.get("value") is not None) else None,
-                                    last_good_at=acq_dt if (qual == "GOOD" and p.get("value") is not None) else None,
-                                    updated_at=utcnow(),
-                                )
-                                provider.seed_from_record(rec, source_sequence=seq_val, restored_unverified=False)
-                            except Exception:  # noqa: BLE001
-                                logger.debug("Live cache notify seed skipped", exc_info=True)
-                    hub.dispatch(events)
+EVIDENCE_MAPPING_EVERY_TICKS = 6  # signal -> connection map every 30 s
 
-            def _on_close(_c: Any) -> None:
-                stop_ev.set()
 
-            conn.add_termination_listener(_on_close)
-            await conn.add_listener("factorix_stream_events", _on_notify)
-            await conn.add_listener("factorix_health_changed", _on_notify)
-            await conn.add_listener("factorix_epoch_changed", _on_notify)
-            backoff = 0.5
-            while not stop_ev.is_set() and not conn.is_closed():
-                try:
-                    await asyncio.wait_for(stop_ev.wait(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    await conn.execute("SELECT 1")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("PG NOTIFY bridge unavailable (%s); reconnecting in %.1fs", type(exc).__name__, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(10.0, backoff * 2.0)
-        finally:
-            if conn is not None and not conn.is_closed():
-                try:
-                    await conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
+async def _refresh_pipeline_evidence(session: AsyncSession, *, with_mapping: bool = False) -> None:
+    """Source evidence for DELAYED vs STALE: acquisition's last successful read per connection and
+    its heartbeat time, read straight from PostgreSQL (never through the broker)."""
+    evidence = get_pipeline_evidence()
+    if with_mapping or evidence.mapping_loaded_at is None:
+        rows = await fetch_all(
+            session,
+            """
+            SELECT b.signal_id, j.connection_id, s.expected_interval_ms, j.interval_ms
+            FROM signal_bindings b
+            JOIN source_fields f ON f.id = b.source_field_id
+            JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+            JOIN signal_definitions s ON s.id = b.signal_id
+            WHERE b.enabled = TRUE AND b.valid_to IS NULL
+            """,
+            {},
+        )
+        evidence.set_mapping(rows, now=utcnow())
+    sources = await fetch_all(session, "SELECT id, last_success_at FROM connections WHERE status = 'ACTIVE'", {})
+    beat = None
+    try:
+        async with session.begin_nested():
+            beat_row = await fetch_one(
+                session, "SELECT max(last_heartbeat) AS beat FROM collector_runtime_status WHERE role = 'acquisition'", {}
+            )
+            beat = (beat_row or {}).get("beat")
+    except SQLAlchemyError:
+        beat = None
+    evidence.set_source(sources, beat)
+
+
+def _wire_hub_freshness() -> None:
+    """The API is the single evaluator of live freshness (v6_contracts.md Q2)."""
+    evidence = get_pipeline_evidence()
+
+    def _observe(event: dict[str, Any], message: dict[str, Any]) -> None:
+        evidence.note_delivery(
+            message.get("signal_id"),
+            message.get("last_acquired_at") or message.get("received_time"),
+            event.get("connection_id") or message.get("connection_id"),
+        )
+
+    hub.observer = _observe
+    hub.refresher = lambda message: refresh_live_message(message, evidence=evidence)
+    hub.summary = evidence.pipeline_summary
+    hub.connection_of = evidence.connection_of
 
 
 async def _background_health_loop() -> None:
@@ -677,6 +880,10 @@ async def _background_health_loop() -> None:
             break
         tick += 1
         try:
+            mapping = tick % EVIDENCE_MAPPING_EVERY_TICKS == 1
+            await _run_step(
+                "pipeline_evidence", lambda session, mapping=mapping: _refresh_pipeline_evidence(session, with_mapping=mapping)
+            )
             await _run_step("edge_health", _evaluate_edges)
             await _run_step("connection_health", _evaluate_connections)
             await _run_step("commissioning_reaper", _reap_commissioning)
@@ -728,15 +935,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     task = asyncio.create_task(_background_health_loop(), name="health-loop")
     enroll_task = asyncio.create_task(_appliance_auto_enroll(), name="appliance-enroll")
     notify_task = asyncio.create_task(_pg_notify_bridge_loop(), name="pg-notify-bridge")
+    _wire_hub_freshness()
+    stream_heartbeat_task = asyncio.create_task(hub.heartbeat_loop(lambda: iso_ms(utcnow())), name="stream-heartbeat")
     # Data Model v2: one sampling scheduler, the only writer of model_state / model_snapshots.
     models_engine.ENGINE.start()
-    app.state.background_tasks = (task, enroll_task, notify_task)
+    # Managed recording of Data Model fields into user subtables (outbox -> TDengine), WS-H.
+    from factorix.modules import storage_model_recorder
+
+    if td_client is not None:
+        storage_model_recorder.DISPATCHER.start(td_client)
+    app.state.background_tasks = (task, enroll_task, notify_task, stream_heartbeat_task)
     try:
         yield
     finally:
+        await _stop(stream_heartbeat_task)
         await _stop(notify_task)
         await _stop(enroll_task)
         await models_engine.ENGINE.stop()
+        await storage_model_recorder.DISPATCHER.stop()
         await _stop(task)
         configure_live_state_provider(None)
         configure_history_provider(None)
@@ -789,6 +1005,19 @@ async def app_error(request: Request, exc: AppError) -> JSONResponse:
         retryable=exc.retryable,
         headers=headers,
         extra={key: value for key, value in exc.extra.items() if key != "secret"},
+    )
+
+
+@app.exception_handler(StorageObjectError)
+async def storage_object_error(request: Request, exc: StorageObjectError) -> JSONResponse:
+    """Storage validation / saga errors are client-visible errors with a code, never a bare 500 (R1-04)."""
+    return json_error(
+        int(getattr(exc, "http_status", 422)),
+        exc.code or "STORAGE_OPERATION_FAILED",
+        str(exc),
+        correlation_id=correlation_id(request),
+        field_errors=getattr(exc, "field_errors", None) or [],
+        retryable=exc.code in ("STORAGE_ENGINE_UNAVAILABLE", "PUBLISH_FAILED"),
     )
 
 
@@ -917,15 +1146,25 @@ async def revert_zero(body: RevertIn, response: Response, principal: dict[str, A
 
 
 @app.get("/api/v1/auth/status")
-async def auth_status(session: AsyncSession = Depends(db_session)) -> dict[str, bool]:
+async def auth_status(request: Request, session: AsyncSession = Depends(db_session)) -> dict[str, Any]:
     cfg = _settings()
     existing = await fetch_one(session, "SELECT id FROM admin_accounts WHERE disabled_at IS NULL LIMIT 1", {})
     open_first_run = cfg.environment == "development" and not cfg.bootstrap_token
+    # R1-25 / R1-45: the app boots with one request. A valid session cookie also returns the signed-in
+    # user (same body as /auth/me); without one, ``user`` is null instead of a 401 on the login page.
+    user: dict[str, Any] | None = None
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        try:
+            user = await identity.touch_me(await principal_from_token(session, token))
+        except AppError:
+            user = None
     return {
         "admin_exists": existing is not None,
         "bootstrap_enabled": bool(cfg.bootstrap_token) or open_first_run,
         "setup_code_required": bool(cfg.bootstrap_token),
         "appliance": cfg.appliance,
+        "user": user,
     }
 
 
@@ -1421,7 +1660,7 @@ async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSessio
             session,
             """
             SELECT instance_id, role, health, software_version, config_revision,
-                   spool_pending, fast_buffered, broker_ok, last_heartbeat
+                   spool_pending, fast_buffered, broker_ok, last_heartbeat, diagnostic
             FROM collector_runtime_status
             WHERE role = 'acquisition'
             ORDER BY last_heartbeat DESC NULLS LAST
@@ -1431,9 +1670,17 @@ async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSessio
         if run_status:
             items = []
             now = utcnow()
+            pipeline = get_pipeline_evidence().pipeline_summary(now)
+            lags = [int(v["delivery_lag_ms"]) for v in pipeline.values() if v.get("delivery_lag_ms") is not None]
+            max_lag_ms = max(lags) if lags else None
             for r in run_status:
                 last_hb = r.get("last_heartbeat")
-                is_fresh = last_hb and (now - last_hb).total_seconds() < 30
+                # One liveness rule for every surface (domain.health.heartbeat_fresh, 15 s); was 30 s here.
+                is_fresh = heartbeat_fresh(last_hb, now)
+                raw = str(r.get("health") or "HEALTHY").upper()
+                # R1-03: a collector that reports itself DEGRADED (jobs not running, broker down, ...)
+                # is not shown as a green "online".
+                effective = "OFFLINE" if not is_fresh else ("DEGRADED" if raw == "DEGRADED" else "ONLINE")
                 items.append({
                     "id": str(r["instance_id"]),
                     "name": "Data Collector (Acquisition Runtime)",
@@ -1443,8 +1690,11 @@ async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSessio
                     "active_revision": int(r.get("config_revision") or 1),
                     "last_heartbeat": iso_ms(last_hb),
                     "health": "ONLINE" if is_fresh else "OFFLINE",
-                    "effective_health": "ONLINE" if is_fresh else "OFFLINE",
+                    "effective_health": effective,
                     "health_raw": str(r.get("health") or "HEALTHY"),
+                    "diagnostic": r.get("diagnostic"),
+                    # Age of the newest data Center received, worst connection (DELAYED vs fresh).
+                    "delivery_lag_ms": max_lag_ms,
                     "software_version": str(r.get("software_version") or "1.0.0"),
                     "outbox_pending": int(r.get("spool_pending") or 0),
                     "queues": {},
@@ -2007,6 +2257,9 @@ def _latest_message(row: dict[str, Any]) -> dict[str, Any]:
     for key in (
         "evaluated_at",
         "stale_after_ms",
+        "freshness",
+        "delivery_lag_ms",
+        "connection_id",
         "data_epoch",
         "last_acquired_at",
         "last_value_changed_at",
@@ -2020,7 +2273,7 @@ def _latest_message(row: dict[str, Any]) -> dict[str, Any]:
     return msg
 
 
-async def _stream_subscribe_signals(channel: Channel, tenant_id: UUID, message: dict[str, Any]) -> int:
+async def _stream_subscribe_signals(channel: Channel, tenant_id: UUID, message: dict[str, Any]) -> tuple[int, list[str]]:
     requested = _stream_ids(message.get("signal_ids"), STREAM_MAX_SIGNALS)
     valid: list[UUID] = []
     async with session_factory()() as session:
@@ -2038,7 +2291,9 @@ async def _stream_subscribe_signals(channel: Channel, tenant_id: UUID, message: 
         for start in range(0, len(valid), 200):
             for row in await telemetry.latest_states(session, tenant_id, valid[start : start + 200]):
                 channel.offer(_latest_message(row))
-    return len(channel.signals)
+    accepted = {str(item) for item in valid}
+    rejected = [str(item) for item in message.get("signal_ids") or [] if str(item) not in accepted][:200]
+    return len(channel.signals), rejected
 
 
 async def _stream_subscribe_models(channel: Channel, tenant_id: UUID, message: dict[str, Any]) -> int:
@@ -2073,7 +2328,10 @@ async def stream(socket: WebSocket) -> None:
             await socket.close(code=4401)
             return
     tenant_id = as_uuid(principal["tenant_id"])
-    channel = Channel(socket.send_json, str(tenant_id))
+    async def _close_socket() -> None:
+        await socket.close(code=1011)
+
+    channel = Channel(socket.send_json, str(tenant_id), on_close=_close_socket)
     hub.register(channel)
     sender = asyncio.create_task(channel.run(), name="stream-sender")
     try:
@@ -2087,8 +2345,8 @@ async def stream(socket: WebSocket) -> None:
                 continue
             op = message.get("op")
             if op == "subscribe":
-                count = await _stream_subscribe_signals(channel, tenant_id, message)
-                channel.offer({"type": "subscribed", "count": count})
+                count, rejected = await _stream_subscribe_signals(channel, tenant_id, message)
+                channel.offer({"type": "subscribed", "count": count, "rejected": rejected, "heartbeat_s": HEARTBEAT_INTERVAL_S})
             elif op == "subscribe_models":
                 count = await _stream_subscribe_models(channel, tenant_id, message)
                 channel.offer({"type": "subscribed_models", "count": count})
@@ -2096,8 +2354,9 @@ async def stream(socket: WebSocket) -> None:
                 # Health events are delivered to every socket of the tenant; acknowledged for clients.
                 channel.offer({"type": "subscribed_health"})
             elif op == "ping":
-                channel.offer({"type": "pong"})
-    except WebSocketDisconnect:
+                channel.offer({"type": "pong", "server_time": iso_ms(utcnow())})
+    except (WebSocketDisconnect, RuntimeError):
+        # RuntimeError: the sender closed a broken socket while receive() was waiting.
         pass
     finally:
         hub.unregister(channel)
@@ -2117,14 +2376,42 @@ def _mount_spa() -> None:
     if not index.is_file():
         return
 
+    assets_dir = (root / "assets").resolve()
+
     @app.get("/{full_path:path}", include_in_schema=False)
-    async def spa(full_path: str) -> FileResponse:
+    async def spa(full_path: str, request: Request) -> Response:
         candidate = (root / full_path).resolve()
         if candidate.is_file() and candidate.is_relative_to(root):
             if candidate.name == "index.html" or candidate.suffix in {".html", ".htm"}:
                 return FileResponse(candidate, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
-            return FileResponse(candidate)
+            # R1-25: Vite assets carry a content hash in their name, so they never change: cache them
+            # for a year and send text assets gzip-compressed (the main bundle is ~2.8 MB raw).
+            headers: dict[str, str] = {}
+            if candidate.is_relative_to(assets_dir):
+                headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            if candidate.suffix in _GZIP_SUFFIXES and "gzip" in request.headers.get("accept-encoding", "").lower():
+                body = _gzipped(str(candidate), candidate.stat().st_mtime_ns)
+                if body is not None:
+                    media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+                    if media_type.startswith("text/") or media_type.endswith("javascript"):
+                        media_type += "; charset=utf-8"
+                    headers.update({"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+                    return Response(content=body, media_type=media_type, headers=headers)
+            return FileResponse(candidate, headers=headers or None)
         return FileResponse(index, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
+_GZIP_SUFFIXES = {".js", ".mjs", ".css", ".svg", ".json", ".map", ".txt"}
+
+
+@functools.lru_cache(maxsize=64)
+def _gzipped(path: str, mtime_ns: int) -> bytes | None:
+    """Gzip a static text asset once per (path, mtime); None for tiny files not worth compressing."""
+    del mtime_ns  # part of the cache key only
+    data = Path(path).read_bytes()
+    if len(data) < 1024:
+        return None
+    return gzip.compress(data, compresslevel=6)
 
 
 app.include_router(data_models_api.build_router(admin, db_session))

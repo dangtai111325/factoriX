@@ -322,12 +322,19 @@ class StorageBindingService:
         search: str | None,
         limit: int,
     ) -> dict[str, Any]:
-        """Output groups (Data Models) and their rule / formula output fields."""
+        """Data Models (groups) with their bindable **field leaves** and Factory Model context.
+
+        Every leaf carries ``kind='model_field'``, ``model_id`` and ``field_path`` (JSON-pointer path
+        without the leading ``/``), the declared value type and the last value of the latest body,
+        so the subtable wizard binds a field, never a whole model (P0-1 / G-02 / G-04). Each group
+        carries the machine it belongs to and that machine's ancestors (line, zone, ...) so tag
+        values such as ``machine_ref`` / ``line_ref`` / ``zone_ref`` are picked, not pasted.
+        """
         rows = await fetch_all(
             session,
             """
-            SELECT m.id, m.display_name, m.status, m.spec_json,
-                   s.sampled_at, s.errors_json
+            SELECT m.id, m.display_name, m.key, m.status, m.state, m.kind, m.version, m.sample_ms,
+                   m.spec_json, m.resource_id, s.sampled_at, s.error_count, s.body_text
             FROM output_groups m
             LEFT JOIN model_state s ON s.group_id = m.id
             WHERE m.tenant_id = :tenant_id AND m.status = 'ACTIVE'
@@ -335,82 +342,102 @@ class StorageBindingService:
             """,
             {"tenant_id": tenant_id},
         )
-
+        resources = await load_resource_index(session, tenant_id)
+        bound = await bound_model_fields(session, tenant_id)
         now = utcnow()
+        needle = (search or "").strip().lower()
         flat_leaves: list[dict[str, Any]] = []
         models: list[dict[str, Any]] = []
         for r in rows:
             mid = str(r["id"])
             dname = str(r["display_name"])
             sample_t = r.get("sampled_at")
-            errs = r.get("errors_json") or []
             if sample_t is not None:
                 diff_s = (now - sample_t).total_seconds()
-                m_fresh = "FRESH" if diff_s <= 30.0 else "STALE"
-                m_qual = "BAD" if errs else "GOOD"
+                m_fresh = "FRESH" if diff_s <= max(3.0 * (r.get("sample_ms") or 1000) / 1000.0, 15.0) else "STALE"
+                m_qual = "BAD" if int(r.get("error_count") or 0) else "GOOD"
             else:
                 m_fresh = "UNKNOWN"
                 m_qual = "UNKNOWN"
-            spec = r["spec_json"]
-            if isinstance(spec, str):
+            body: Any = None
+            if r.get("body_text"):
                 try:
-                    spec = json.loads(spec)
-                except Exception:
-                    spec = {}
-            elif not isinstance(spec, dict):
-                spec = {}
-
-            fields = spec.get("fields") or (spec.get("root", {}).get("children", []) if isinstance(spec.get("root"), dict) else [])
+                    body = json.loads(str(r["body_text"]))
+                except ValueError:
+                    body = None
+            context = resource_context(resources, r.get("resource_id"))
+            machine = context["resource"]
             field_items = []
-            for f in fields:
-                if not isinstance(f, dict):
-                    continue
-                f_path = f.get("key") or f.get("path") or f.get("name") or "output"
-                f_type = f.get("value_type") or f.get("type", "float64")
+            for leaf in model_leaf_fields(r.get("spec_json")):
+                f_path = leaf["path"]
+                found, last_value = extract_field(body, f_path) if body is not None else (False, None)
                 can_id = f"mod:{mid}:{f_path}"
+                owner = bound.get((mid, f_path))
                 leaf_item = {
                     "kind": "model_field",
+                    "source_kind": "model_field",
                     "id": can_id,
                     "canonical_id": can_id,
                     "model_id": mid,
                     "model_name": dname,
-                    "model_revision": 1,
+                    "model_kind": str(r.get("kind") or "STATE"),
+                    "model_revision": int(r.get("version") or 1),
                     "field_path": f_path,
-                    "key": f_path,
-                    "name": f"{dname} -> {f_path}",
-                    "display_name": f"{dname} -> {f_path}",
-                    "display_path": f"Models / {dname} / {f_path}",
-                    "path": f"Models / {dname} / {f_path}",
-                    "data_type": f_type,
-                    "unit": f.get("unit"),
+                    "key": leaf["key"],
+                    "name": f_path,
+                    "display_name": f"{dname} \u00b7 {f_path}",
+                    "display_path": f"Data Models / {dname} / {f_path}",
+                    "path": f"Data Models / {dname} / {f_path}",
+                    "data_type": leaf["data_type"],
+                    "value_type": leaf["value_type"],
+                    "field_mode": leaf["mode"],
+                    "is_timestamp": leaf["is_timestamp"],
+                    "unit": None,
                     "status": "ACTIVE",
                     "quality": m_qual,
                     "freshness": m_fresh,
-                    "calculation_cycle": spec.get("calculation_cycle_ms", 5000),
+                    "last_value": last_value if found else None,
+                    "has_last_value": bool(found),
+                    "resource_id": machine["id"] if machine else None,
+                    "resource_name": machine["name"] if machine else None,
+                    "resource_code": machine["code"] if machine else None,
+                    "bound_to": owner,
                 }
-                if not search or search.lower() in f_path.lower() or search.lower() in dname.lower():
+                hay = f"{f_path} {dname} {machine['code'] if machine else ''}".lower()
+                if not needle or needle in hay:
                     field_items.append(leaf_item)
                     flat_leaves.append(leaf_item)
 
-            if not search or field_items or search.lower() in dname.lower():
+            if not needle or field_items or needle in dname.lower():
                 models.append({
                     "id": mid,
+                    "kind": "model",
+                    "selectable": False,
                     "name": dname,
                     "display_name": dname,
+                    "key": str(r.get("key") or ""),
+                    "model_kind": str(r.get("kind") or "STATE"),
                     "status": str(r["status"]),
+                    "state": str(r.get("state") or ""),
+                    "model_revision": int(r.get("version") or 1),
+                    "resource": machine,
+                    "ancestors": context["ancestors"],
                     "fields": field_items,
                     "signals": field_items,
                     "fields_count": len(field_items),
                     "signals_count": len(field_items),
+                    "freshness": m_fresh,
+                    "quality": m_qual,
                 })
 
         return {
             "view": "models",
             "items": models[:limit],
             "groups": models[:limit],
-            "sources": flat_leaves[:limit * 10],
-            "leaves": flat_leaves[:limit * 10],
+            "sources": flat_leaves,
+            "leaves": flat_leaves,
             "total": len(models),
+            "leaf_total": len(flat_leaves),
         }
 
     # ------------------------------------------------------------------
@@ -453,3 +480,188 @@ class StorageBindingService:
                 return False, "TIME_BUCKET requires a positive time_bucket_seconds setting (e.g. 1, 5, 10, 30, 60)"
 
         return True, None
+
+
+# ----------------------------------------------------------------------
+# Model field leaves, body extraction and Factory Model context (shared with the writer)
+# ----------------------------------------------------------------------
+
+_VALUE_TYPE_TO_DATA_TYPE = {
+    "float": "float64", "int": "int64", "string": "string", "bool": "bool",
+    "timestamp": "timestamp", "json": "json", "auto": "auto",
+}
+_TIMESTAMP_KEYS = frozenset({"source_timestamp", "publish_timestamp"})
+
+
+def _spec_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _path_text(parts: list[Any]) -> str:
+    return "/".join(str(p).replace("~", "~0").replace("/", "~1") for p in parts)
+
+
+def split_field_path(path: str) -> list[str]:
+    """``"electrical/voltage_1"`` (or ``"/electrical/voltage_1"``) -> ``["electrical", "voltage_1"]``."""
+    text = str(path or "").strip()
+    if text.startswith("/"):
+        text = text[1:]
+    if not text:
+        return []
+    return [p.replace("~1", "/").replace("~0", "~") for p in text.split("/")]
+
+
+def normalize_field_path(path: Any) -> str:
+    return _path_text(split_field_path(str(path or "")))
+
+
+def model_leaf_fields(spec_raw: Any) -> list[dict[str, Any]]:
+    """Every field leaf of a Data Model v2 spec (objects/arrays are containers, never bindable)."""
+    from factorix.domain.body import iter_fields
+
+    spec = _spec_dict(spec_raw)
+    out: list[dict[str, Any]] = []
+    if isinstance(spec.get("root"), dict):
+        for parts, node in iter_fields(spec):
+            vtype = str(node.get("value_type") or "auto")
+            path = _path_text(list(parts))
+            key = str(parts[-1]) if parts else path
+            out.append({
+                "path": path,
+                "key": key,
+                "value_type": vtype,
+                "data_type": _VALUE_TYPE_TO_DATA_TYPE.get(vtype, "auto"),
+                "mode": str(node.get("mode") or ""),
+                "is_timestamp": vtype == "timestamp" or (len(parts) == 1 and key in _TIMESTAMP_KEYS),
+            })
+        return out
+    for f in spec.get("fields") or []:  # legacy flat spec
+        if isinstance(f, dict):
+            path = normalize_field_path(f.get("key") or f.get("path") or f.get("name") or "")
+            if path:
+                vtype = str(f.get("value_type") or f.get("type") or "auto")
+                out.append({"path": path, "key": path.split("/")[-1], "value_type": vtype,
+                            "data_type": _VALUE_TYPE_TO_DATA_TYPE.get(vtype, vtype), "mode": "",
+                            "is_timestamp": path in _TIMESTAMP_KEYS})
+    return out
+
+
+def extract_field(body: Any, path: str) -> tuple[bool, Any]:
+    """``(found, value)`` of a field in an evaluated body. Missing (not sampled) is not null."""
+    node: Any = body
+    for part in split_field_path(path):
+        if isinstance(node, dict):
+            if part not in node:
+                return False, None
+            node = node[part]
+        elif isinstance(node, list):
+            try:
+                idx = int(part)
+            except ValueError:
+                return False, None
+            if idx < 0 or idx >= len(node):
+                return False, None
+            node = node[idx]
+        else:
+            return False, None
+    return True, node
+
+
+async def load_resource_index(session: AsyncSession, tenant_id: UUID) -> dict[str, dict[str, Any]]:
+    rows = await fetch_all(
+        session,
+        """
+        SELECT r.id, r.parent_id, r.name, r.code, rt.key AS type_key
+        FROM resources r JOIN resource_types rt ON rt.id = r.type_id
+        WHERE r.tenant_id = :tenant_id
+        """,
+        {"tenant_id": tenant_id},
+    )
+    return {
+        str(r["id"]): {
+            "id": str(r["id"]),
+            "parent_id": str(r["parent_id"]) if r.get("parent_id") else None,
+            "name": str(r.get("name") or ""),
+            "code": str(r.get("code") or ""),
+            "type_key": str(r.get("type_key") or ""),
+        }
+        for r in rows
+    }
+
+
+def resource_context(index: dict[str, dict[str, Any]], resource_id: Any) -> dict[str, Any]:
+    """The resource a model belongs to and its ancestors (nearest first), for tag pickers."""
+    rid = str(resource_id) if resource_id else None
+    res = index.get(rid) if rid else None
+    ancestors: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    cur = index.get(res["parent_id"]) if res and res.get("parent_id") else None
+    while cur is not None and cur["id"] not in seen and len(ancestors) < 16:
+        seen.add(cur["id"])
+        ancestors.append({k: cur[k] for k in ("id", "name", "code", "type_key")})
+        cur = index.get(cur["parent_id"]) if cur.get("parent_id") else None
+    resource = {k: res[k] for k in ("id", "name", "code", "type_key")} if res else None
+    return {"resource": resource, "ancestors": ancestors}
+
+
+async def bound_model_fields(session: AsyncSession, tenant_id: UUID) -> dict[tuple[str, str], dict[str, Any]]:
+    """Active owners of model fields: ``(model_id, field_path) -> {database, subtable, column}``."""
+    rows = await fetch_all(
+        session,
+        """
+        SELECT model_id, model_field_path, physical_db, physical_subtable, target_column
+        FROM storage_bindings
+        WHERE tenant_id = :tenant_id AND status = 'ACTIVE' AND source_kind = 'model_field'
+          AND model_id IS NOT NULL
+        """,
+        {"tenant_id": tenant_id},
+    )
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        out[(str(r["model_id"]), normalize_field_path(r.get("model_field_path")))] = {
+            "database": r["physical_db"],
+            "subtable": r["physical_subtable"],
+            "column": r["target_column"],
+        }
+    return out
+
+
+#: Data Model value type -> TDengine column base types it can be written to without loss.
+MODEL_TYPE_COMPATIBILITY: dict[str, set[str]] = {
+    "float": {"DOUBLE", "FLOAT"},
+    "int": {"BIGINT", "INT", "SMALLINT", "TINYINT", "DOUBLE"},
+    "bool": {"BOOL", "TINYINT", "INT", "BIGINT"},
+    "string": {"VARCHAR", "NCHAR", "BINARY"},
+    "timestamp": {"TIMESTAMP", "VARCHAR", "NCHAR"},
+    "json": {"VARCHAR", "NCHAR"},
+    # "auto" fields (rules without an explicit type) produce whatever the rule returns: allow the
+    # usual value columns; the writer rejects a value that does not fit at write time (visible error).
+    "auto": {"DOUBLE", "FLOAT", "BIGINT", "INT", "SMALLINT", "TINYINT", "BOOL", "VARCHAR", "NCHAR", "BINARY"},
+}
+
+
+def model_type_compatible(value_type: str, column_type: str) -> bool:
+    base = str(column_type or "").upper().split("(")[0].strip()
+    return base in MODEL_TYPE_COMPATIBILITY.get(str(value_type or "auto").lower(), set())
+
+
+def suggest_value_column(value_type: str, columns: list[str]) -> str | None:
+    """Typed value column suggestion (guide F3): float->value_f64, int->value_i64, string->value_text."""
+    prefs = {
+        "float": ["value_f64", "value_double", "value"],
+        "int": ["value_i64", "value_int", "value_f64", "value"],
+        "bool": ["value_bool", "value_i64", "value"],
+        "string": ["value_text", "value_str", "value"],
+        "timestamp": ["value_text"],
+        "json": ["value_text", "value_json"],
+        "auto": ["value_f64", "value_i64", "value_text", "value"],
+    }.get(str(value_type or "auto").lower(), [])
+    for cand in prefs:
+        if cand in columns:
+            return cand
+    return None

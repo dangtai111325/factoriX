@@ -1,9 +1,14 @@
 """Bounded SQLite WAL outage spool for Acquisition.
 
-Normal operation publishes directly to RabbitMQ without hitting SQLite. When RabbitMQ is
-unreachable or rejects under backpressure, confirmed-failed observations spill here for
-at-least-once replay with latest-per-signal prioritization, byte-size and count caps,
-and data_epoch fencing so reset-fenced old data never replays into a new epoch.
+Normal operation publishes directly to RabbitMQ without hitting SQLite. Only when RabbitMQ is
+genuinely unreachable (connection/confirm failure, not slowness or queue-full backpressure) do
+unconfirmed observations spill here for at-least-once replay with latest-per-signal
+prioritization and data_epoch fencing so reset-fenced old data never replays into a new epoch.
+
+Budgets (count and bytes) are enforced by *refusing new spills* (the publisher records an
+explicit acquisition gap); pending rows are never evicted to make room. The optional TTL
+(``FACTORIX_SPOOL_TTL_HOURS``, default 24 h, 0 disables) is an explicit, counted and logged
+retention policy, not a silent drop.
 """
 
 from __future__ import annotations
@@ -18,6 +23,10 @@ from typing import Iterable
 logger = logging.getLogger(__name__)
 
 TERMINAL_STATES = frozenset({"ACKED", "QUARANTINED", "DEAD"})
+# Full VACUUM copies every live page while holding the spool lock; only allow it when cheap.
+VACUUM_MAX_LIVE_BYTES = 64 * 1024 * 1024
+# Approximate per-row overhead (columns + 5 indexes) on top of the payload for the occupancy estimate.
+ROW_OVERHEAD_BYTES = 320
 
 # (event_uid, tenant_id, data_epoch, observed_at, payload, config_revision, created_at, signal_id)
 SpoolRow = tuple[str, str, int, str, bytes, int, str, str | None]
@@ -61,9 +70,14 @@ class AcquisitionSpool:
         )
         self.connection.commit()
         self._pending = 0
-        self.overflow_dropped_count = 0
+        self.overflow_dropped_count = 0  # kept for metrics compatibility; pending rows are never evicted
+        self.expired_count = 0
+        self._count_alarm = False
+        self._bytes_alarm = False
+        self._occupied_estimate = 0
         self._newest: dict[str, int] = {}
         self._rebuild_counters()
+        self.refresh_occupancy()
         self.expire_stale()
         self._compact_if_bloated()
 
@@ -90,7 +104,15 @@ class AcquisitionSpool:
                 expired = max(0, cur.rowcount)
             if expired:
                 self._rebuild_counters()
-                logger.info("Expired %d stale pending spool rows older than %s", expired, cutoff)
+                self.expired_count += expired
+                logger.warning(
+                    "Spool retention policy: %d pending rows spilled before %s (TTL %.1f h) marked DEAD; "
+                    "this is an acquisition gap for the replay history (total expired: %d)",
+                    expired,
+                    cutoff,
+                    max_age_hours,
+                    self.expired_count,
+                )
             return expired
 
     def _rebuild_counters(self) -> None:
@@ -108,7 +130,9 @@ class AcquisitionSpool:
             try:
                 page_count = int(self.connection.execute("PRAGMA page_count").fetchone()[0])
                 freelist_count = int(self.connection.execute("PRAGMA freelist_count").fetchone()[0])
-                if page_count > 10_000 and freelist_count > page_count // 2:
+                page_size = int(self.connection.execute("PRAGMA page_size").fetchone()[0])
+                live_bytes = (page_count - freelist_count) * page_size
+                if page_count > 10_000 and freelist_count > page_count // 2 and live_bytes <= VACUUM_MAX_LIVE_BYTES:
                     self.connection.execute("VACUUM")
                     self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except sqlite3.Error as exc:
@@ -154,6 +178,8 @@ class AcquisitionSpool:
                 if seq > prev:
                     self._newest[sig_id] = seq
             self._pending += added
+            if added:
+                self._occupied_estimate += sum(len(row[4]) for row in items) + ROW_OVERHEAD_BYTES * added
             return added
 
     def pending(self, limit: int, exclude: set[int] | None = None) -> list[sqlite3.Row]:
@@ -313,29 +339,24 @@ class AcquisitionSpool:
             return max(0, cursor.rowcount), more
 
     def enforce_cap(self, max_pending: int) -> int:
+        """Report (never evict) pending rows above the count budget.
+
+        Pending rows are unconfirmed source data: they are never marked DEAD or deleted to make
+        room. The publisher consults :meth:`is_full` and rejects *new* spills with an explicit,
+        counted acquisition gap instead (plan §4.1(6) "reject and alert, never silently drop").
+        Returns the number of pending rows dropped, which is always 0.
+        """
         with self._lock:
             count = self.pending_count()
-            if count <= max_pending:
-                return 0
-            excess = count - max_pending
-            with self.connection:
-                cursor = self.connection.execute(
-                    """
-                    UPDATE spool SET state = 'DEAD' WHERE seq IN (
-                        SELECT seq FROM spool WHERE state = 'PENDING' ORDER BY seq LIMIT ?
-                    )
-                    """,
-                    (excess,),
+            over = count > max_pending
+            if over and not self._count_alarm:
+                logger.error(
+                    "Spool holds %d pending rows (> budget %d); new outage spills are rejected until it drains",
+                    count,
+                    max_pending,
                 )
-            dropped = max(0, cursor.rowcount)
-            self._pending = max(0, self._pending - dropped)
-            self.overflow_dropped_count += dropped
-            if dropped > 0:
-                logger.warning(
-                    "Spool capacity exceeded (pending=%d > max=%d): %d pending rows transitioned to DEAD state (overflow). Total overflow dropped: %d",
-                    count, max_pending, dropped, self.overflow_dropped_count
-                )
-            return dropped
+            self._count_alarm = over
+            return 0
 
     def db_bytes(self) -> int:
         total = 0
@@ -349,20 +370,24 @@ class AcquisitionSpool:
         return total
 
     def enforce_byte_cap(self, max_bytes: int) -> int:
-        """Reclaim space before evicting pending observations that exceed the spool budget."""
+        """Reclaim space from terminal rows; never evict pending observations.
+
+        Terminal rows (ACKED/QUARANTINED/DEAD) are deleted in bounded chunks and the WAL is
+        checkpointed. The file is only VACUUMed when the live data is small, so the spool lock
+        is never held for a long full-database copy while emit/flush wait on it. Freed pages are
+        reused by SQLite, so an un-vacuumed file does not grow further. Returns the number of
+        (terminal) rows removed.
+        """
         if max_bytes <= 0:
             return 0
         with self._lock:
             if self.db_bytes() <= max_bytes:
+                self.refresh_occupancy()
                 return 0
-            # Once WAL is checkpointed, the shared-memory sidecar should not
-            # trigger compaction when the database itself fits the budget.
-            if not self._reclaim_for_byte_cap(compact=False) or self.path.stat().st_size <= max_bytes:
-                return 0
-
+            self._checkpoint()
             terminal_removed = 0
             for _ in range(10):
-                if self._occupied_bytes() <= max_bytes:
+                if self._occupied_bytes() <= max_bytes and self.path.stat().st_size <= max_bytes:
                     break
                 with self.connection:
                     cur = self.connection.execute(
@@ -373,46 +398,36 @@ class AcquisitionSpool:
                         )
                         """
                     )
-                terminal_removed += cur.rowcount
+                terminal_removed += max(0, cur.rowcount)
                 if cur.rowcount == 0:
                     break
-
-            # DELETE can leave freed pages allocated to the file. Compact before
-            # deciding whether pending observations themselves exceed the budget.
-            if not self._reclaim_for_byte_cap(compact=True):
-                return terminal_removed
-
-            pending_removed = 0
-            for _ in range(10):
-                occupied = self._occupied_bytes()
-                if occupied <= max_bytes or self._pending == 0:
-                    break
-                excess = occupied - max_bytes
-                # Estimate an eviction batch from the excess, then remeasure.
-                limit = min(5000, max(1, (self._pending * excess + occupied - 1) // occupied))
-                with self.connection:
-                    cur = self.connection.execute(
-                        """
-                        DELETE FROM spool WHERE seq IN (
-                            SELECT seq FROM spool WHERE state = 'PENDING' ORDER BY seq LIMIT ?
-                        )
-                        """,
-                        (limit,),
-                    )
-                if cur.rowcount == 0:
-                    break
-                self._pending -= cur.rowcount
-                pending_removed += cur.rowcount
-
-            if pending_removed:
-                self.overflow_dropped_count += pending_removed
-                self._rebuild_counters()
-                self._reclaim_for_byte_cap(compact=True)
-                logger.warning(
-                    "Spool byte cap %d: removed %d pending and %d terminal rows. Total overflow dropped: %d",
-                    max_bytes, pending_removed, terminal_removed, self.overflow_dropped_count,
+            occupied = self._occupied_bytes()
+            if self.path.stat().st_size > max_bytes and occupied <= VACUUM_MAX_LIVE_BYTES:
+                try:
+                    self.connection.execute("VACUUM")
+                except sqlite3.Error:
+                    logger.warning("Spool VACUUM skipped during byte cap maintenance", exc_info=True)
+            self._checkpoint()
+            self.refresh_occupancy()
+            over = self._occupied_estimate > max_bytes
+            if over and not self._bytes_alarm:
+                logger.error(
+                    "Spool pending data occupies %d bytes (> budget %d); new outage spills are rejected until it drains",
+                    self._occupied_estimate,
+                    max_bytes,
                 )
-            return terminal_removed + pending_removed
+            self._bytes_alarm = over
+            if terminal_removed:
+                logger.info("Spool byte cap maintenance removed %d terminal rows", terminal_removed)
+            return terminal_removed
+
+    def _checkpoint(self) -> bool:
+        try:
+            busy = self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        except sqlite3.Error:
+            logger.warning("Spool WAL checkpoint failed", exc_info=True)
+            return False
+        return not busy
 
     def _occupied_bytes(self) -> int:
         page_size = int(self.connection.execute("PRAGMA page_size").fetchone()[0])
@@ -420,19 +435,26 @@ class AcquisitionSpool:
         free_pages = int(self.connection.execute("PRAGMA freelist_count").fetchone()[0])
         return page_size * (page_count - free_pages)
 
-    def _reclaim_for_byte_cap(self, *, compact: bool) -> bool:
-        try:
-            if compact:
-                self.connection.execute("VACUUM")
-            busy = self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
-        except sqlite3.Error:
-            logger.warning("Spool space reclamation failed during byte cap maintenance", exc_info=True)
-            return False
-        return not busy
+    def refresh_occupancy(self) -> int:
+        """Re-measure bytes used by live pages (pending + not yet pruned terminal rows)."""
+        with self._lock:
+            try:
+                self._occupied_estimate = self._occupied_bytes()
+            except sqlite3.Error:
+                pass
+            return self._occupied_estimate
+
+    def occupied_bytes(self) -> int:
+        return self._occupied_estimate
+
+    def is_full(self, max_pending: int, max_bytes: int) -> bool:
+        """True when a new spill would exceed the count or byte budget (cheap; uses cached occupancy)."""
+        if max_pending > 0 and self._pending >= max_pending:
+            return True
+        return max_bytes > 0 and self._occupied_estimate >= max_bytes
 
     def pending_count(self) -> int:
         return self._pending
-
     def count_by_state(self) -> dict[str, int]:
         with self._lock:
             return {row[0]: int(row[1]) for row in self.connection.execute("SELECT state, count(*) FROM spool GROUP BY state")}

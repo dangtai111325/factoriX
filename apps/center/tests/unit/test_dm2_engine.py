@@ -223,13 +223,16 @@ async def test_a_failing_model_does_not_stop_the_others(world: World, monkeypatc
     assert [str(r["group_id"]) for r in world.writes[0]] == [good]
 
 
-def test_sample_from_latest_does_not_substitute_unavailable_values() -> None:
+def test_sample_from_latest_holds_last_value_with_its_quality() -> None:
+    # R1-02 / v6 contract Q3: a stale or paused source keeps its last value (flagged by quality),
+    # a BAD source publishes its last GOOD value flagged BAD; nothing is blanked to null.
     fresh = {"quality": "GOOD", "value_json": {"v": 5}, "source_time": T0, "received_time": T0}
     assert E.sample_from_latest(fresh, now=T0) == (R.Sample(5, "GOOD", T0, T0), "GOOD")
-    assert E.sample_from_latest(fresh, now=T0 + timedelta(minutes=1)) == (None, "STALE")
-    assert E.sample_from_latest({**fresh, "connection_status": "PAUSED"}, now=T0) == (None, "PAUSED")
+    assert E.sample_from_latest(fresh, now=T0 + timedelta(minutes=1)) == (R.Sample(5, "STALE", T0, T0), "STALE")
+    assert E.sample_from_latest({**fresh, "connection_status": "PAUSED"}, now=T0) == (R.Sample(5, "PAUSED", T0, T0), "PAUSED")
     bad = {**fresh, "quality": "BAD", "last_good_value_json": {"v": 4}, "last_good_event_time": T0}
-    assert E.sample_from_latest(bad, now=T0) == (None, "BAD")
+    assert E.sample_from_latest(bad, now=T0) == (R.Sample(4, "BAD", T0, T0), "BAD")
+    assert E.sample_from_latest({**fresh, "quality": "BAD"}, now=T0) == (None, "BAD")
 
 
 async def test_load_samples_keeps_quality_without_fetching_old_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -247,7 +250,8 @@ async def test_load_samples_keeps_quality_without_fetching_old_values(monkeypatc
     monkeypatch.setattr(E, "utcnow", lambda: T0)
     samples, qualities = await E.load_samples(object(), TENANT, [a, b])
     assert samples[a] == R.Sample(1, "GOOD", T0, T0)
-    assert samples[b] is None and qualities[b] == "BAD"
+    # BAD publishes the last GOOD value flagged BAD (R1-02), not a blanked null.
+    assert samples[b] == R.Sample(7, "BAD", None, None) and qualities[b] == "BAD"
     assert len(queries) == 1
     assert "FROM latest_signal_state" in queries[0]
 

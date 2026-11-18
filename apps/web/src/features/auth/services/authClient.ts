@@ -28,6 +28,11 @@ export type AuthStatus = {
   bootstrap_enabled: boolean
   setup_code_required: boolean
   appliance: boolean
+  /**
+   * R1-25 / R1-45: the signed-in user when the session cookie is valid, null otherwise. Absent on
+   * older servers (then /auth/me is asked).
+   */
+  user?: AuthUser | null
 }
 
 async function authFetch<T>(path: string, init: RequestInit = {}): Promise<T> {

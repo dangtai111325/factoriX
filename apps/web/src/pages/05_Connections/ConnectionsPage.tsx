@@ -16,8 +16,11 @@ import {
   Trash2,
   PlusCircle,
   X,
+  Loader2,
+  CheckCircle2,
+  XCircle,
 } from 'lucide-react';
-import { useApp } from '../../store/AppContext';
+import { connectionDisplayState, useApp } from '../../store/AppContext';
 import { ConnectionItem, ProtocolType } from '../../types';
 import { ConnectionDetailDrawer } from './ConnectionDetailDrawer';
 import { ConnectionFormModal } from './ConnectionFormModal';
@@ -32,6 +35,11 @@ import { LoadStateNotice } from '../../components/common/LoadStateNotice';
 import { useSubmit } from '../../lib/useSubmit';
 import { translateApiError } from '../../utils/apiErrors';
 import { PauseConnectionDialog } from './PauseConnectionDialog';
+import { collectorSiteLabel } from './collectorName';
+import { notifyModelChanged } from '../../components/shell/modelSync';
+
+/** Lifecycle answered by the server for a pause / resume, applied until the lists catch up (R1-19). */
+type LifecycleOverride = { lifecycleStatus: string; health: string; effectiveHealth: string; version: number };
 
 type KpiFilter = 'all' | 'connected' | 'idle' | 'degraded' | 'paused';
 
@@ -50,9 +58,75 @@ export const getProtocolIcon = (proto: ProtocolType) => {
   }
 };
 
+/** R1-41: per-row state of a connection test (queued by "Test all", running, or its result). */
+const RowTestState: React.FC<{ queued: boolean; running: boolean; result?: CommissionResult; onOpen: () => void }> = ({
+  queued,
+  running,
+  result,
+  onOpen,
+}) => {
+  if (running) {
+    return (
+      <div className="mt-1 inline-flex items-center gap-1 text-[10px] font-semibold text-[#134074]" role="status">
+        <Loader2 className="w-3 h-3 animate-spin" aria-hidden="true" />
+        Testing…
+      </div>
+    );
+  }
+  if (queued) return <div className="mt-1 text-[10px] font-semibold text-[#94A3B8]">Test queued</div>;
+  if (!result) return null;
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        onOpen();
+      }}
+      className={`mt-1 flex items-center gap-1 text-[10px] font-semibold hover:underline ${result.passed ? 'text-emerald-700' : 'text-red-700'}`}
+      title="Show the test result"
+    >
+      {result.passed ? <CheckCircle2 className="w-3 h-3" aria-hidden="true" /> : <XCircle className="w-3 h-3" aria-hidden="true" />}
+      {result.passed ? 'Test passed' : 'Test failed'}
+    </button>
+  );
+};
 
 export const ConnectionsPage: React.FC = () => {
-  const { connections, signals, scopedResources, edges, refresh, loadState } = useApp();
+  const { connections: listedConnections, signals, scopedResources, edges, refresh, loadState } = useApp();
+
+  // R1-19: after Pause / Resume the row, its menu and the drawer follow the server's answer at once,
+  // not the next metadata reload (seconds on a busy appliance, during which the menu still offered
+  // the old action). The override is dropped once the reloaded list has caught up.
+  const [lifecycleOverride, setLifecycleOverride] = useState<Record<string, LifecycleOverride>>({});
+  const [lifecyclePending, setLifecyclePending] = useState<Record<string, 'pause' | 'resume'>>({});
+  const [notice, setNotice] = useState<string | null>(null);
+  const connections = useMemo(
+    () =>
+      listedConnections.map((conn) => {
+        const ov = lifecycleOverride[conn.id];
+        if (!ov || conn.noConnection) return conn;
+        const next = { ...conn, lifecycleStatus: ov.lifecycleStatus, health: ov.health, effectiveHealth: ov.effectiveHealth };
+        next.status = connectionDisplayState(next);
+        return next;
+      }),
+    [listedConnections, lifecycleOverride],
+  );
+  useEffect(() => {
+    setLifecycleOverride((prev) => {
+      const ids = Object.keys(prev);
+      if (!ids.length) return prev;
+      let changed = false;
+      const next = { ...prev };
+      for (const id of ids) {
+        const listed = listedConnections.find((conn) => conn.id === id);
+        if (!listed || ((listed.version ?? 0) >= prev[id].version && listed.lifecycleStatus === prev[id].lifecycleStatus)) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [listedConnections]);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -71,8 +145,11 @@ export const ConnectionsPage: React.FC = () => {
   const [pausingConn, setPausingConn] = useState<ConnectionItem | null>(null);
   const [dialogError, setDialogError] = useState<string | null>(null);
 
-  // Real Edge test results, per connection.
+  // Real collector test results, per connection.
   const [testing, setTesting] = useState<Record<string, boolean>>({});
+  // R1-41: "Test all" shows its progress on every row (queued / testing / result).
+  const [testQueued, setTestQueued] = useState<Record<string, boolean>>({});
+  const [testAllProgress, setTestAllProgress] = useState<{ done: number; total: number } | null>(null);
   const [testResults, setTestResults] = useState<Record<string, CommissionResult>>({});
   const [testPanelId, setTestPanelId] = useState<string | null>(null);
 
@@ -140,40 +217,87 @@ export const ConnectionsPage: React.FC = () => {
   const testAll = useSubmit(async (ids: string[]) => {
     const queue = ids.filter((id) => !testing[id]);
     setTestPanelId(null);
-    setTesting((prev) => ({ ...prev, ...Object.fromEntries(queue.map((id) => [id, true])) }));
+    // Earlier results of the tested rows are cleared so each row shows this run's outcome.
+    setTestResults((prev) => {
+      const next = { ...prev };
+      queue.forEach((id) => delete next[id]);
+      return next;
+    });
+    setTestQueued((prev) => ({ ...prev, ...Object.fromEntries(queue.map((id) => [id, true])) }));
+    setTestAllProgress({ done: 0, total: queue.length });
     let next = 0;
+    let done = 0;
     const worker = async () => {
       while (next < queue.length) {
         const id = queue[next++];
+        setTestQueued((prev) => ({ ...prev, [id]: false }));
+        setTesting((prev) => ({ ...prev, [id]: true }));
         try {
           const result = await runConnectionTest(id, { mode: 'CONNECTIVITY' });
           setTestResults((prev) => ({ ...prev, [id]: result }));
         } finally {
+          done += 1;
+          setTestAllProgress({ done, total: queue.length });
           setTesting((prev) => ({ ...prev, [id]: false }));
         }
       }
     };
-    await Promise.all([worker(), worker()]);
+    try {
+      // Three tests at a time: each waits on its own source; the rows show which one runs.
+      await Promise.all([worker(), worker(), worker()]);
+    } finally {
+      setTestQueued({});
+      setTestAllProgress(null);
+    }
   });
   const testedShown = filteredConnections.filter((c) => testResults[c.id] && !testing[c.id]);
   const failedShown = testedShown.filter((c) => !testResults[c.id].passed);
 
-  /** Pause / resume, guarded so a double click sends one request. */
+  /**
+   * Pause / resume, one request at a time (a double click sends one request). The server's answer
+   * updates the row at once; the lists reload behind it.
+   */
   const lifecycle = useSubmit(async (conn: ConnectionItem, action: 'pause' | 'resume'): Promise<boolean> => {
+    setLifecyclePending((prev) => ({ ...prev, [conn.id]: action }));
     try {
-      await api(`/api/v1/connections/${encodeURIComponent(conn.id)}/${action}`, { method: 'POST' });
-      await refresh().catch((error) => console.warn(`Refresh after ${action} failed`, error));
+      const row = await api<Record<string, unknown>>(`/api/v1/connections/${encodeURIComponent(conn.id)}/${action}`, { method: 'POST' });
+      const status = String(row?.status || (action === 'pause' ? 'PAUSED' : 'ACTIVE')).toUpperCase();
+      const health = String(row?.health || (action === 'pause' ? 'PAUSED' : 'UNKNOWN')).toUpperCase();
+      setLifecycleOverride((prev) => ({
+        ...prev,
+        [conn.id]: {
+          lifecycleStatus: status,
+          health,
+          effectiveHealth: String(row?.effective_health || health).toUpperCase(),
+          version: Number(row?.version || (conn.version ?? 0) + 1),
+        },
+      }));
+      setNotice(
+        action === 'pause'
+          ? `Paused "${conn.name}". Use Resume in its menu ⋮ or in its details to collect again.`
+          : `Resumed "${conn.name}". It shows Connected again once the first new data arrives.`,
+      );
+      notifyModelChanged('connection');
+      void refresh().catch((error) => console.warn(`Refresh after ${action} failed`, error));
       return true;
     } catch (error) {
       const message = `Could not ${action} "${conn.name}": ${translateApiError(error)}`;
       if (action === 'pause') setDialogError(message);
       else setActionError(message);
       return false;
+    } finally {
+      setLifecyclePending((prev) => {
+        const next = { ...prev };
+        delete next[conn.id];
+        return next;
+      });
     }
   });
 
   const handlePauseResume = (conn: ConnectionItem) => {
     setActionError(null);
+    setNotice(null);
+    if (lifecyclePending[conn.id] || lifecycle.isRunning()) return;
     if (conn.lifecycleStatus === 'PAUSED') {
       void lifecycle.run(conn, 'resume');
       return;
@@ -197,6 +321,7 @@ export const ConnectionsPage: React.FC = () => {
       }
       await api(`/api/v1/connections/${encodeURIComponent(conn.id)}`, { method: 'DELETE' });
       setArchivingConn(null);
+      notifyModelChanged('connection');
       if (selectedConnId === conn.id) {
         setSelectedConnId(null);
         setSearchParams({});
@@ -222,7 +347,7 @@ export const ConnectionsPage: React.FC = () => {
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-xl md:text-2xl font-black text-[#0B2545] tracking-tight">Data Connections</h1>
-          <p className="text-xs text-[#64748B]">PLCs, OPC UA servers, MQTT brokers, REST APIs and WebSocket streams read by the Edge collector.</p>
+          <p className="text-xs text-[#64748B]">PLCs, OPC UA servers, MQTT brokers, REST APIs and WebSocket streams read by the FactoriX collector.</p>
         </div>
         <button
           type="button"
@@ -236,6 +361,15 @@ export const ConnectionsPage: React.FC = () => {
           <span>New Connection</span>
         </button>
       </div>
+
+      {notice && !actionError && (
+        <div role="status" className="p-3 rounded-xl bg-[#EFF6FF] border border-[#BFDBFE] text-xs text-[#134074] flex items-center justify-between gap-2">
+          <span>{notice}</span>
+          <button type="button" aria-label="Dismiss" onClick={() => setNotice(null)} className="text-[#134074]/70 hover:text-[#134074]">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {actionError && (
         <div role="alert" className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 flex items-center justify-between gap-2">
@@ -292,7 +426,11 @@ export const ConnectionsPage: React.FC = () => {
           className="sm:order-last sm:ml-auto py-1.5 px-3 rounded-xl border border-[#CBD5E1] bg-white text-xs font-bold text-[#134074] flex items-center justify-center gap-1.5 shadow-sm hover:border-[#134074] disabled:opacity-50"
         >
           <Activity className="w-3.5 h-3.5" />
-          {testAll.pending ? 'Testing…' : `Test all shown (${filteredConnections.length})`}
+          {testAll.pending
+            ? testAllProgress
+              ? `Testing… ${testAllProgress.done} of ${testAllProgress.total} done`
+              : 'Testing…'
+            : `Test all shown (${filteredConnections.length})`}
         </button>
         <div className="flex items-center gap-1 bg-[#F1F5F9] p-1 rounded-xl border border-[#E2E8F0] text-xs flex-wrap">
           {(['all', 'mqtt', 'modbus', 'opcua', 'http', 'websocket'] as const).map((proto) => (
@@ -342,9 +480,9 @@ export const ConnectionsPage: React.FC = () => {
           </div>
           <TestResultPanel
             running={testing[panelConn.id]}
-            runningLabel="The Edge collector is testing reachability and authentication…"
+            runningLabel="The collector is testing reachability and authentication…"
             result={testResults[panelConn.id] || null}
-            successLabel="The Edge collector reached the endpoint"
+            successLabel="The collector reached the endpoint"
           />
         </div>
       )}
@@ -369,7 +507,7 @@ export const ConnectionsPage: React.FC = () => {
                 <tr className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-[11px] font-bold text-[#475569] uppercase tracking-wider">
                   <th className="py-3 px-4">Name & Protocol</th>
                   <th className="py-3 px-4">Endpoint</th>
-                  <th className="py-3 px-4">Edge</th>
+                  <th className="py-3 px-4" title="Site whose built-in collector reads this connection">Collector site</th>
                   <th className="py-3 px-4">Signals</th>
                   <th className="py-3 px-4">Last data</th>
                   <th className="py-3 px-4">Status</th>
@@ -398,13 +536,26 @@ export const ConnectionsPage: React.FC = () => {
                     <td className="py-3.5 px-4 font-mono text-xs text-[#475569] truncate max-w-[220px]" title={conn.endpoint}>
                       {conn.endpoint}
                     </td>
-                    <td className="py-3.5 px-4 text-xs font-semibold text-[#0B2545]">{edgeName(conn)}</td>
+                    <td className="py-3.5 px-4 text-xs font-semibold text-[#0B2545]" title={edgeName(conn)}>{collectorSiteLabel(edgeName(conn))}</td>
                     <td className="py-3.5 px-4 font-mono font-bold text-xs text-[#0B2545]">{conn.signalsCount}</td>
                     <td className="py-3.5 px-4 text-xs text-[#64748B]" title={conn.lastSuccessAt || ''}>
                       {conn.lastSuccessAt ? timeAgo(conn.lastSuccessAt) : '—'}
                     </td>
                     <td className="py-3.5 px-4">
-                      <ConnectionStatusCell conn={conn} compact />
+                      {lifecyclePending[conn.id] ? (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#475569]" role="status">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                          {lifecyclePending[conn.id] === 'pause' ? 'Pausing…' : 'Resuming…'}
+                        </span>
+                      ) : (
+                        <ConnectionStatusCell conn={conn} compact />
+                      )}
+                      <RowTestState
+                        queued={Boolean(testQueued[conn.id])}
+                        running={Boolean(testing[conn.id])}
+                        result={testResults[conn.id]}
+                        onOpen={() => setTestPanelId(conn.id)}
+                      />
                     </td>
                     <td className="py-3.5 px-4 text-right" onClick={(e) => e.stopPropagation()}>
                       <div className="relative inline-block">
@@ -437,7 +588,11 @@ export const ConnectionsPage: React.FC = () => {
                             </button>
                             <button type="button" role="menuitem" disabled={lifecycle.pending} onClick={() => { setActiveMenuId(null); handlePauseResume(conn); }} className="w-full px-3 py-1.5 rounded-lg hover:bg-[#F1F5F9] text-[#0B2545] flex items-center gap-2 disabled:opacity-50">
                               {conn.lifecycleStatus === 'PAUSED' ? <Play className="w-3.5 h-3.5 text-[#10B981]" /> : <Pause className="w-3.5 h-3.5 text-[#64748B]" />}
-                              <span>{conn.lifecycleStatus === 'PAUSED' ? 'Resume' : 'Pause…'}</span>
+                              <span>
+                                {lifecyclePending[conn.id]
+                                  ? lifecyclePending[conn.id] === 'pause' ? 'Pausing…' : 'Resuming…'
+                                  : conn.lifecycleStatus === 'PAUSED' ? 'Resume' : 'Pause…'}
+                              </span>
                             </button>
                             <div className="h-px bg-[#F1F5F9] my-1" />
                             <button type="button" role="menuitem" onClick={() => { setActiveMenuId(null); setArchivingConn(conn); }} className="w-full px-3 py-1.5 rounded-lg hover:bg-red-50 text-red-600 flex items-center gap-2">
@@ -479,7 +634,10 @@ export const ConnectionsPage: React.FC = () => {
         isOpen={isFormOpen}
         onClose={() => setIsFormOpen(false)}
         connectionToEdit={editingConn}
-        onSuccess={() => void refresh()}
+        onSuccess={() => {
+          notifyModelChanged('connection');
+          void refresh();
+        }}
         edges={edges}
       />
 

@@ -176,7 +176,7 @@ export const FieldTable: React.FC<FieldTableProps> = ({ protocol, rows, onChange
             <th className={cell}>Type</th>
             <th className={cell}>Unit</th>
             <th className={cell} title="A null value from a successful read is Good">Nullable</th>
-            <th className={cell} title="Round numeric values on the edge (decimal digits)">Round</th>
+            <th className={cell} title="Round numeric values when they are collected (decimal digits)">Round</th>
             <th className={cell}>Sample / test value</th>
             <th className={cell} />
           </tr>

@@ -1,41 +1,35 @@
-import React, { useState, useEffect, useMemo } from 'react';
+/**
+ * Subtable wizard steps (WS-H v6).
+ *
+ * - Bind Sources picks a Data Model FIELD (leaf), never a whole model; the binding carries
+ *   source_kind=model_field + model_id + field_path (review P0-1, guide G-02/G-04).
+ * - Tag values are picked from the Factory Model context of the bound model (machine / line /
+ *   zone), never typed from invented examples (P1-6).
+ * - Recording is off until the user starts it; "On new event" writes one atomic row per event (G-06).
+ * - The Review step shows the DDL and binding resolution computed by the backend (P1-4).
+ * - No simulated rows are shown anywhere (G-09).
+ */
+import React, { useEffect, useMemo, useState } from 'react';
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Info, Link2, Loader2, Search, Unlink } from 'lucide-react';
 import {
-  Table,
-  Layers,
-  Search,
-  Check,
-  Copy,
-  Info,
-  AlertTriangle,
-  FolderTree,
-  Radio,
-  Boxes,
-  Link2,
-  Unlink,
-  Eye,
-  Sliders,
-  CheckCircle2,
-  Clock,
-  Activity,
-  HardDrive,
-} from 'lucide-react';
-import {
-  RowAssemblyPolicy,
-  RecordingMode,
-  TagValueAssignment,
   FieldBindingIntent,
-  TDStable,
-  TDColumn,
-  TDTag,
-  listStables,
-  getStable,
-  getSources,
+  FactoryRef,
+  ModelSourceGroup,
+  RecordingMode,
+  RowAssemblyPolicy,
   SourceRef,
-  SourceView,
+  StoragePlan,
+  TDColumn,
+  TDStable,
+  TagValueAssignment,
+  getSources,
+  isSystemStorageName,
+  listStables,
+  planStorageObject,
 } from '../../../lib/storagePhysicalApi';
 
 // ============================================================================
-// Types
+// Types & helpers
 // ============================================================================
 
 export interface SubtableWizardData {
@@ -52,6 +46,8 @@ export interface SubtableWizardData {
   max_age_seconds?: number | null;
   time_bucket_seconds?: number | null;
   start_recording?: boolean;
+  no_binding?: boolean;
+  identity_paths?: string[];
   confirmed?: boolean;
 }
 
@@ -63,997 +59,579 @@ export interface SubtableStepProps {
   onSelectStable?: (stable: TDStable) => void;
 }
 
+/** Columns the recorder fills itself (guide E1); never a binding target. */
+export const WRITER_COLUMNS = new Set([
+  'event_key', 'source_timestamp', 'publish_timestamp', 'field_source_timestamp', 'quality', 'quality_reason',
+  'is_null', 'model_ref', 'model_field_path', 'model_revision', 'data_epoch', 'source_event_uid', 'time_basis',
+]);
+
+export function valueColumns(stable: TDStable | null | undefined): TDColumn[] {
+  if (!stable) return [];
+  return stable.columns.filter((c, i) => i > 0 && !c.primary_key && !WRITER_COLUMNS.has(c.name));
+}
+
+const TYPE_COMPAT: Record<string, string[]> = {
+  float: ['DOUBLE', 'FLOAT'],
+  int: ['BIGINT', 'INT', 'SMALLINT', 'TINYINT', 'DOUBLE'],
+  bool: ['BOOL', 'TINYINT', 'INT', 'BIGINT'],
+  string: ['VARCHAR', 'NCHAR', 'BINARY'],
+  timestamp: ['TIMESTAMP', 'VARCHAR', 'NCHAR'],
+  json: ['VARCHAR', 'NCHAR'],
+  auto: ['DOUBLE', 'FLOAT', 'BIGINT', 'INT', 'SMALLINT', 'TINYINT', 'BOOL', 'VARCHAR', 'NCHAR', 'BINARY'],
+};
+
+export function baseType(tdType: string): string {
+  return String(tdType || '').toUpperCase().split('(')[0].trim();
+}
+
+export function typeCompatible(valueType: string | null | undefined, column: TDColumn): boolean {
+  return (TYPE_COMPAT[String(valueType || 'auto').toLowerCase()] || []).includes(baseType(column.td_type));
+}
+
+/** Guide F3: float -> value_f64, int -> value_i64, string -> value_text. */
+export function suggestColumn(valueType: string | null | undefined, cols: TDColumn[]): string | null {
+  const prefs: Record<string, string[]> = {
+    float: ['value_f64', 'value_double', 'value'],
+    int: ['value_i64', 'value_int', 'value_f64', 'value'],
+    bool: ['value_bool', 'value_i64', 'value'],
+    string: ['value_text', 'value_str', 'value'],
+    timestamp: ['value_text'],
+    json: ['value_text'],
+    auto: ['value_f64', 'value_i64', 'value_text', 'value'],
+  };
+  const names = cols.map((c) => c.name);
+  for (const cand of prefs[String(valueType || 'auto').toLowerCase()] || []) {
+    if (names.includes(cand)) return cand;
+  }
+  const compatible = cols.find((c) => typeCompatible(valueType, c));
+  return compatible ? compatible.name : null;
+}
+
+/**
+ * Tag values derived from the Factory Model context of a bound model field:
+ * `machine*` -> the model's resource, `line*` / `zone*` / `area*` / `site*` -> the nearest ancestor
+ * of that type, `field_key` -> the field key. Only empty tags are filled.
+ */
+export function autoTagValues(
+  tags: { name: string }[],
+  current: TagValueAssignment[],
+  group: ModelSourceGroup | null | undefined,
+  leaf: SourceRef | null | undefined,
+): TagValueAssignment[] {
+  const byName = new Map(current.map((t) => [t.tag_name, t.value]));
+  const ancestorOf = (needle: string): FactoryRef | undefined =>
+    group?.ancestors.find((a) => a.type_key.toLowerCase().includes(needle));
+  return tags.map((t) => {
+    const existing = byName.get(t.name) || '';
+    if (existing.trim()) return { tag_name: t.name, value: existing };
+    const n = t.name.toLowerCase();
+    let value = '';
+    if (n.startsWith('machine') && group?.resource) value = group.resource.id;
+    else if (n.startsWith('resource') && group?.resource) value = group.resource.id;
+    else if (n.startsWith('line')) value = ancestorOf('line')?.id || '';
+    else if (n.startsWith('zone')) value = ancestorOf('zone')?.id || '';
+    else if (n.startsWith('area')) value = ancestorOf('area')?.id || '';
+    else if (n.startsWith('site')) value = ancestorOf('site')?.id || '';
+    else if (n === 'field_key' && leaf) value = String(leaf.key || leaf.field_path || '').split('/').pop() || '';
+    return { tag_name: t.name, value };
+  });
+}
+
+/** Request body for plan / create (same shape for both). */
+export function buildSubtableSpec(data: SubtableWizardData): Record<string, unknown> {
+  const [db, st] = data.stable_id.includes('.') ? data.stable_id.split('.', 2) : [data.database_name || '', data.stable_id];
+  const atomic = data.recording_mode === 'ON_NEW_EVENT';
+  return {
+    database: db,
+    stable: st,
+    name: data.physical_name,
+    physical_name: data.physical_name,
+    display_name: data.display_name || undefined,
+    description: data.description || undefined,
+    tag_values: data.tag_values.map((t) => ({ name: t.tag_name, value: t.value })),
+    bindings: data.bindings.map((b) => ({
+      source_kind: b.source_kind,
+      source_id: b.source_id,
+      model_id: b.model_id ?? undefined,
+      field_path: b.field_path ?? undefined,
+      signal_id: b.signal_id ?? undefined,
+      column_name: b.column_name,
+    })),
+    no_binding: data.bindings.length === 0 && !!data.no_binding,
+    recording: {
+      mode: data.recording_mode,
+      row_assembly: atomic ? 'ATOMIC_EVENT' : 'INDEPENDENT_EVENTS',
+      start_recording: !!data.start_recording,
+      identity_paths: data.identity_paths || [],
+    },
+  };
+}
+
+const inputCls =
+  'w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] focus:outline-none focus:border-[#EF1B24] focus:ring-2 focus:ring-[#EF1B24]/10 bg-white';
+
+const Field: React.FC<{ label: string; required?: boolean; error?: string; hint?: string; children: React.ReactNode }> = ({
+  label, required, error, hint, children,
+}) => (
+  <div>
+    <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
+      {label} {required && <span className="text-[#EF1B24]">*</span>}
+    </label>
+    {children}
+    {error ? (
+      <p className="text-[12px] text-[#F2343B] mt-1 flex items-center gap-1"><AlertTriangle className="w-3.5 h-3.5" />{error}</p>
+    ) : hint ? (
+      <p className="text-[11px] text-[#657794] mt-1">{hint}</p>
+    ) : null}
+  </div>
+);
+
+const StepHeader: React.FC<{ title: string; subtitle: string }> = ({ title, subtitle }) => (
+  <div>
+    <h2 className="text-[16px] font-bold text-[#111B37]">{title}</h2>
+    <p className="text-[13px] text-[#657794] mt-1">{subtitle}</p>
+  </div>
+);
+
 // ============================================================================
-// Step 1: SubtableIdentityStep
+// Step 1: Identity
 // ============================================================================
 
-export const SubtableIdentityStep: React.FC<SubtableStepProps> = ({
-  data,
-  onChange,
-  errors = {},
-  parentStable,
-  onSelectStable,
-}) => {
+export const SubtableIdentityStep: React.FC<SubtableStepProps> = ({ data, onChange, errors = {}, onSelectStable }) => {
   const [stables, setStables] = useState<TDStable[]>([]);
-  const [loadingStables, setLoadingStables] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
     listStables()
       .then((res) => {
-        if (active) {
-          setStables(res.items || []);
-          setLoadingStables(false);
-        }
+        if (!active) return;
+        // FactoriX system supertables (operational history) are never a parent (P1-5 / R1-16).
+        setStables((res.items || []).filter((s) => !isSystemStorageName(s.physical_name) && !(s as { is_system?: boolean }).is_system));
       })
-      .catch(() => {
-        if (active) setLoadingStables(false);
-      });
-    return () => {
-      active = false;
-    };
+      .catch((err: Error) => active && setLoadError(err.message || 'Supertables could not be loaded.'))
+      .finally(() => active && setLoading(false));
+    return () => { active = false; };
   }, []);
 
-  const handleStableChange = (stId: string) => {
-    const selected = stables.find((s) => s.id === stId);
-    if (selected) {
-      onChange({
-        stable_id: selected.id,
-        stable_name: selected.physical_name,
-        database_name: selected.database_name,
-      });
-      onSelectStable?.(selected);
-    }
+  const select = (id: string) => {
+    const st = stables.find((s) => s.id === id);
+    if (!st) return;
+    onChange({ stable_id: st.id, stable_name: st.physical_name, database_name: st.database_name });
+    onSelectStable?.(st);
   };
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-[16px] font-bold text-[#111B37]">Subtable Identity & Archetype</h2>
-        <p className="text-[13px] text-[#657794] mt-1">
-          Select the parent Supertable template and specify the physical table identifier.
-        </p>
-      </div>
-
+      <StepHeader title="Identity" subtitle="Choose the parent supertable and name the subtable." />
       <div className="space-y-4 max-w-xl">
-        {/* Parent STable selector */}
-        <div>
-          <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
-            Parent Supertable (STable) <span className="text-[#EF1B24]">*</span>
-          </label>
-          <div className="relative">
-            <select
-              value={data.stable_id}
-              onChange={(e) => handleStableChange(e.target.value)}
-              className={`w-full h-9 px-3 rounded-lg border text-[13px] transition-colors focus:outline-none focus:ring-2 bg-white ${
-                errors.stable_id
-                  ? 'border-[#EF1B24] focus:ring-[#EF1B24]/20'
-                  : 'border-[#D4DFEC] focus:border-[#EF1B24] focus:ring-[#EF1B24]/10'
-              }`}
-            >
-              <option value="" disabled>
-                {loadingStables ? 'Loading Supertables...' : 'Select a Supertable...'}
+        <Field label="Parent supertable" required error={errors.stable_id || loadError || undefined}
+          hint="Only your own supertables are listed; FactoriX system supertables are read-only.">
+          <select value={data.stable_id} onChange={(e) => select(e.target.value)} className={inputCls}>
+            <option value="" disabled>{loading ? 'Loading supertables…' : stables.length ? 'Select a supertable…' : 'No user supertable yet — create one first'}</option>
+            {stables.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.physical_name} · {s.database_name} ({s.subtable_count} subtables)
               </option>
-              {stables.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.physical_name} ({s.database_name}) — {s.columns?.length || 0} cols,{' '}
-                  {s.tags?.length || 0} tags
-                </option>
-              ))}
-            </select>
-          </div>
-          {errors.stable_id ? (
-            <p className="text-[12px] text-[#EF1B24] mt-1">{errors.stable_id}</p>
-          ) : (
-            <p className="text-[11px] text-[#8C9BAE] mt-1">
-              The subtable inherits all columns and tags from this Supertable.
-            </p>
-          )}
-        </div>
-
-        {/* Physical Name */}
-        <div>
-          <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
-            Subtable Name <span className="text-[#EF1B24]">*</span>
-          </label>
-          <input
-            type="text"
-            value={data.physical_name}
+            ))}
+          </select>
+        </Field>
+        <Field label="Subtable name" required error={errors.physical_name}
+          hint="Physical name in TDengine: lowercase letters, digits and underscores, at most 63 characters.">
+          <input type="text" maxLength={63} value={data.physical_name}
             onChange={(e) => onChange({ physical_name: e.target.value.toLowerCase().trim() })}
-            placeholder="e.g. sub_cnc_mill_01"
-            className={`w-full h-9 px-3 rounded-lg border text-[13px] font-mono transition-colors focus:outline-none focus:ring-2 ${
-              errors.physical_name
-                ? 'border-[#EF1B24] focus:ring-[#EF1B24]/20'
-                : 'border-[#D4DFEC] focus:border-[#EF1B24] focus:ring-[#EF1B24]/10'
-            }`}
-          />
-          {errors.physical_name ? (
-            <p className="text-[12px] text-[#EF1B24] mt-1 flex items-center gap-1">
-              <AlertTriangle className="w-3.5 h-3.5" />
-              <span>{errors.physical_name}</span>
-            </p>
-          ) : (
-            <p className="text-[11px] text-[#8C9BAE] mt-1">
-              Physical table name in TDengine. Lowercase letters, numbers, and underscores only.
-            </p>
-          )}
-        </div>
-
-        {/* Display Name */}
-        <div>
-          <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
-            Display Name
-          </label>
-          <input
-            type="text"
-            value={data.display_name}
-            onChange={(e) => onChange({ display_name: e.target.value })}
-            placeholder="e.g. CNC Milling Machine #1"
-            className="w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] transition-colors focus:outline-none focus:border-[#EF1B24] focus:ring-2 focus:ring-[#EF1B24]/10"
-          />
-        </div>
-
-        {/* Description */}
-        <div>
-          <label className="block text-[13px] font-semibold text-[#111B37] mb-1">
-            Description
-          </label>
-          <textarea
-            value={data.description}
-            onChange={(e) => onChange({ description: e.target.value })}
-            rows={2}
-            placeholder="Describe machine serial number, installation area, or telemetry context..."
-            className="w-full p-3 rounded-lg border border-[#D4DFEC] text-[13px] transition-colors focus:outline-none focus:border-[#EF1B24] focus:ring-2 focus:ring-[#EF1B24]/10 resize-none"
-          />
-        </div>
-      </div>
-
-      {/* Parent STable Schema Preview */}
-      {parentStable && (
-        <div className="p-4 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl space-y-3 max-w-xl">
-          <div className="flex items-center justify-between">
-            <span className="text-[12px] font-bold text-[#111B37] flex items-center gap-1.5">
-              <Layers className="w-4 h-4 text-[#0284C7]" />
-              <span>Inherited Schema from "{parentStable.physical_name}"</span>
-            </span>
-            <span className="text-[11px] text-[#657794]">
-              DB: <span className="font-mono font-semibold">{parentStable.database_name}</span>
-            </span>
-          </div>
-
-          <div className="space-y-1.5 text-[12px]">
-            <div>
-              <span className="font-medium text-[#657794]">Columns ({parentStable.columns?.length || 0}): </span>
-              <span className="font-mono text-[#334568]">
-                {parentStable.columns?.map((c) => c.name).join(', ') || 'None'}
-              </span>
-            </div>
-            <div>
-              <span className="font-medium text-[#657794]">Tags ({parentStable.tags?.length || 0}): </span>
-              <span className="font-mono text-[#334568]">
-                {parentStable.tags?.map((t) => `${t.name} [${t.td_type}]`).join(', ') || 'None'}
-              </span>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-// ============================================================================
-// Step 2: SubtableTagValuesStep
-// ============================================================================
-
-export const SubtableTagValuesStep: React.FC<SubtableStepProps> = ({
-  data,
-  onChange,
-  errors = {},
-  parentStable,
-}) => {
-  const tags: TDTag[] = parentStable?.tags || [];
-
-  // Helper to update specific tag value
-  const setTagValue = (tagName: string, value: string) => {
-    const existing = [...data.tag_values];
-    const idx = existing.findIndex((t) => t.tag_name === tagName);
-    if (idx >= 0) {
-      existing[idx] = { tag_name: tagName, value };
-    } else {
-      existing.push({ tag_name: tagName, value });
-    }
-    onChange({ tag_values: existing });
-  };
-
-  const getTagValue = (tagName: string): string => {
-    return data.tag_values.find((t) => t.tag_name === tagName)?.value || '';
-  };
-
-  return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-[16px] font-bold text-[#111B37]">Static Tag Values</h2>
-        <p className="text-[13px] text-[#657794] mt-1">
-          Assign constant metadata values for each tag inherited from the parent Supertable.
-        </p>
-      </div>
-
-      <div className="p-4 bg-[#F0FDF4] border border-[#DCFCE7] rounded-xl flex items-start gap-3 max-w-xl">
-        <Info className="w-5 h-5 text-[#0DBA67] flex-shrink-0 mt-0.5" />
-        <div className="text-[12px] text-[#166534] space-y-1">
-          <div className="font-semibold text-[#14532D]">Subtable Tag Assignment</div>
-          <div>
-            Tags distinguish this subtable from other instances of the same Supertable. They are
-            indexed in memory by TDengine for instant aggregation.
-          </div>
-        </div>
-      </div>
-
-      {errors.tag_values && (
-        <div className="p-3 bg-[#FEF2F2] border border-[#FAC6C9] rounded-lg text-[13px] text-[#EF1B24] flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-          <span>{errors.tag_values}</span>
-        </div>
-      )}
-
-      {/* Tag fields */}
-      <div className="space-y-4 max-w-xl">
-        {tags.length === 0 ? (
-          <div className="p-6 text-center text-[#8C9BAE] text-[13px] border border-dashed rounded-xl">
-            The selected Supertable does not define any tags.
-          </div>
-        ) : (
-          tags.map((tag) => {
-            const isResourceId =
-              tag.name.toLowerCase().includes('resource') ||
-              tag.name.toLowerCase().includes('machine') ||
-              tag.name.toLowerCase().includes('asset');
-            const val = getTagValue(tag.name);
-
-            return (
-              <div key={tag.name} className="p-4 bg-white border border-[#E3EAF3] rounded-xl space-y-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono font-bold text-[13px] text-[#111B37]">
-                      {tag.name}
-                    </span>
-                    <span className="text-[11px] font-mono text-[#0284C7] bg-[#E0F2FE] px-1.5 py-0.5 rounded">
-                      {tag.td_type}
-                    </span>
-                  </div>
-                  {isResourceId && (
-                    <span className="text-[10px] font-semibold text-[#0DBA67] bg-[#E8FAF0] px-1.5 py-0.5 rounded">
-                      Resource Identifier
-                    </span>
-                  )}
-                </div>
-
-                <div className="space-y-1.5">
-                  <input
-                    type="text"
-                    value={val}
-                    onChange={(e) => setTagValue(tag.name, e.target.value)}
-                    placeholder={`Enter value for ${tag.name}...`}
-                    className="w-full h-9 px-3 rounded-lg border border-[#D4DFEC] text-[13px] font-mono focus:outline-none focus:border-[#EF1B24]"
-                  />
-
-                  {/* Quick suggestion pills if resource_id */}
-                  {isResourceId && !val && (
-                    <div className="flex items-center gap-1.5 pt-1 text-[11px] text-[#657794]">
-                      <span>Suggestions:</span>
-                      {['cnc-mill-01', 'robot-arm-02', 'press-line-03'].map((sug) => (
-                        <button
-                          key={sug}
-                          type="button"
-                          onClick={() => setTagValue(tag.name, sug)}
-                          className="px-2 py-0.5 rounded bg-[#EEF2F6] hover:bg-[#E2E8F0] font-mono text-[10px] text-[#334568]"
-                        >
-                          {sug}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })
-        )}
+            className={`${inputCls} font-mono`} />
+        </Field>
+        <Field label="Display name">
+          <input type="text" maxLength={200} value={data.display_name} onChange={(e) => onChange({ display_name: e.target.value })} className={inputCls} />
+        </Field>
+        <Field label="Description" hint={`${(data.description || '').length}/1000`}>
+          <textarea maxLength={1000} rows={3} value={data.description} onChange={(e) => onChange({ description: e.target.value })}
+            className="w-full px-3 py-2 rounded-lg border border-[#D4DFEC] text-[13px] focus:outline-none focus:border-[#EF1B24]" />
+        </Field>
       </div>
     </div>
   );
 };
 
 // ============================================================================
-// Step 3: SubtableBindSourcesStep
+// Factory Model resource choices (machine / line / zone) from the models view
 // ============================================================================
 
-export const SubtableBindSourcesStep: React.FC<SubtableStepProps> = ({
-  data,
-  onChange,
-  parentStable,
-}) => {
-  const [activeTab, setActiveTab] = useState<SourceView>('hierarchy');
-  const [sources, setSources] = useState<SourceRef[]>([]);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [loadingSources, setLoadingSources] = useState(false);
-  const [selectedColumn, setSelectedColumn] = useState<string>(
-    parentStable?.columns?.find((c) => c.name !== 'ts')?.name || ''
-  );
-  const [selectedSource, setSelectedSource] = useState<SourceRef | null>(null);
-
+function useModelGroups(): { groups: ModelSourceGroup[]; loading: boolean; error: string | null } {
+  const [groups, setGroups] = useState<ModelSourceGroup[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
-    setLoadingSources(true);
-    getSources({ view: activeTab, search: searchQuery || undefined })
-      .then((res) => {
-        if (active) {
-          setSources(res.items || []);
-          setLoadingSources(false);
-          if (res.items && res.items.length > 0 && !selectedSource) {
-            setSelectedSource(res.items[0]);
-          }
-        }
-      })
-      .catch(() => {
-        if (active) setLoadingSources(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [activeTab, searchQuery]);
+    getSources({ view: 'models' })
+      .then((res) => active && setGroups(((res.groups || res.items || []) as unknown) as ModelSourceGroup[]))
+      .catch((err: Error) => active && setError(err.message || 'Data Models could not be loaded.'))
+      .finally(() => active && setLoading(false));
+    return () => { active = false; };
+  }, []);
+  return { groups, loading, error };
+}
 
-  const metricCols = (parentStable?.columns || []).filter((c) => c.name !== 'ts');
-
-  const bindSourceToColumn = (colName: string, src: SourceRef) => {
-    const existing = data.bindings.filter((b) => b.column_name !== colName);
-    const newBinding: FieldBindingIntent = {
-      column_name: colName,
-      source_id: src.id,
-      source_kind: src.kind,
-      source_path: src.path,
-    };
-    onChange({ bindings: [...existing, newBinding] });
-  };
-
-  const unbindColumn = (colName: string) => {
-    const filtered = data.bindings.filter((b) => b.column_name !== colName);
-    onChange({ bindings: filtered });
-  };
-
-  // Inspect currently selected binding or column
-  const currentBinding = data.bindings.find((b) => b.column_name === selectedColumn);
-  const boundSource = sources.find((s) => s.id === currentBinding?.source_id);
-
-  return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-[16px] font-bold text-[#111B37]">Bind Signals to Columns</h2>
-        <p className="text-[13px] text-[#657794] mt-1">
-          Map incoming operational signals to target Supertable columns.
-        </p>
-      </div>
-
-      {/* 3-Panel Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-        {/* Left: 3-tab Source Picker (4 cols) */}
-        <div className="lg:col-span-4 border border-[#E3EAF3] rounded-xl overflow-hidden flex flex-col bg-white">
-          <div className="flex border-b border-[#E3EAF3] bg-[#F8FAFC] p-1 gap-1">
-            {[
-              { id: 'hierarchy', label: 'Hierarchy', icon: FolderTree },
-              { id: 'collector', label: 'Collector', icon: Radio },
-              { id: 'models', label: 'Models', icon: Boxes },
-            ].map((t) => {
-              const Icon = t.icon;
-              const active = activeTab === t.id;
-              return (
-                <button
-                  key={t.id}
-                  type="button"
-                  onClick={() => setActiveTab(t.id as SourceView)}
-                  className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-[11px] font-semibold transition-all ${
-                    active
-                      ? 'bg-white text-[#111B37] shadow-xs'
-                      : 'text-[#657794] hover:text-[#111B37]'
-                  }`}
-                >
-                  <Icon className="w-3.5 h-3.5" />
-                  <span>{t.label}</span>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="p-2 border-b border-[#E3EAF3]">
-            <div className="relative">
-              <Search className="w-3.5 h-3.5 text-[#8C9BAE] absolute left-2.5 top-2.5" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search signals..."
-                className="w-full h-8 pl-8 pr-2.5 rounded-lg border border-[#D4DFEC] text-[11px] focus:outline-none focus:border-[#EF1B24]"
-              />
-            </div>
-          </div>
-
-          <div className="p-2 overflow-y-auto max-h-80 divide-y divide-[#F1F5FA]">
-            {loadingSources ? (
-              <div className="py-8 text-center text-[#8C9BAE] text-[12px]">Loading sources...</div>
-            ) : sources.length === 0 ? (
-              <div className="py-8 text-center text-[#8C9BAE] text-[12px]">No signals found.</div>
-            ) : (
-              sources.map((src) => {
-                const isSelected = selectedSource?.id === src.id;
-                return (
-                  <div
-                    key={src.id}
-                    onClick={() => setSelectedSource(src)}
-                    className={`p-2 rounded-lg cursor-pointer transition-colors ${
-                      isSelected ? 'bg-[#EEF2F6]' : 'hover:bg-[#F8FAFC]'
-                    }`}
-                  >
-                    <div className="text-[12px] font-semibold text-[#111B37] truncate">
-                      {src.display_name}
-                    </div>
-                    <div className="text-[10px] font-mono text-[#657794] truncate">{src.path}</div>
-                    <div className="flex items-center gap-2 mt-0.5 text-[10px] text-[#8C9BAE]">
-                      <span>{src.data_type || 'number'}</span>
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-        </div>
-
-        {/* Center: Columns List (4 cols) */}
-        <div className="lg:col-span-4 border border-[#E3EAF3] rounded-xl overflow-hidden flex flex-col bg-white">
-          <div className="bg-[#F8FAFC] px-3.5 py-2.5 border-b border-[#E3EAF3] text-[12px] font-bold text-[#334568]">
-            Target Columns
-          </div>
-
-          <div className="p-2 overflow-y-auto max-h-96 space-y-2">
-            {metricCols.map((col) => {
-              const binding = data.bindings.find((b) => b.column_name === col.name);
-              const isSelected = selectedColumn === col.name;
-
-              return (
-                <div
-                  key={col.name}
-                  onClick={() => setSelectedColumn(col.name)}
-                  className={`p-2.5 rounded-xl border transition-all cursor-pointer ${
-                    isSelected
-                      ? 'border-[#EF1B24] bg-[#FFFBFB] ring-1 ring-[#EF1B24]/30'
-                      : 'border-[#E3EAF3] bg-white hover:border-[#D4DFEC]'
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono font-bold text-[12px] text-[#111B37]">
-                        {col.name}
-                      </span>
-                      <span className="text-[10px] font-mono text-[#0284C7] bg-[#E0F2FE] px-1 py-0.5 rounded">
-                        {col.td_type}
-                      </span>
-                    </div>
-
-                    {binding && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          unbindColumn(col.name);
-                        }}
-                        className="text-[#EF1B24] hover:text-[#D9141D] p-0.5"
-                        title="Unbind"
-                      >
-                        <Unlink className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-
-                  {binding ? (
-                    <div className="mt-1.5 p-1.5 bg-[#F6F8FC] rounded text-[11px] text-[#111B37] truncate">
-                      {binding.source_path}
-                    </div>
-                  ) : (
-                    <div className="mt-1 text-[11px] text-[#8C9BAE] italic">Unassigned</div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Right: Binding Inspector (4 cols) */}
-        <div className="lg:col-span-4 border border-[#E3EAF3] rounded-xl overflow-hidden flex flex-col bg-white">
-          <div className="bg-[#F8FAFC] px-3.5 py-2.5 border-b border-[#E3EAF3] text-[12px] font-bold text-[#334568]">
-            Binding Inspector
-          </div>
-
-          <div className="p-4 space-y-4 text-[12px]">
-            <div>
-              <span className="text-[#657794] block mb-1">Target Column:</span>
-              <span className="font-mono font-bold text-[13px] text-[#111B37]">
-                {selectedColumn || 'None selected'}
-              </span>
-            </div>
-
-            {selectedSource && (
-              <div className="p-3 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl space-y-2">
-                <div className="font-semibold text-[#111B37]">Active Selected Source:</div>
-                <div className="text-[11px] font-mono text-[#334568] break-all">
-                  {selectedSource.path}
-                </div>
-                <div className="grid grid-cols-2 gap-2 text-[11px] pt-1">
-                  <div>
-                    <span className="text-[#657794]">Kind: </span>
-                    <span className="font-medium text-[#111B37]">{selectedSource.kind}</span>
-                  </div>
-                  <div>
-                    <span className="text-[#657794]">Quality: </span>
-                    <span className="font-semibold text-[#0DBA67]">
-                      {selectedSource.quality || '—'}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-[#657794]">Sample: </span>
-                    <span className="font-mono text-[#111B37]">
-                      {selectedSource.last_value !== undefined && selectedSource.last_value !== null
-                        ? String(selectedSource.last_value)
-                        : '—'}
-                    </span>
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (selectedColumn && selectedSource) {
-                      bindSourceToColumn(selectedColumn, selectedSource);
-                    }
-                  }}
-                  disabled={!selectedColumn}
-                  className="w-full mt-2 py-1.5 bg-[#EF1B24] hover:bg-[#D9141D] text-white font-semibold text-[12px] rounded-lg transition-colors flex items-center justify-center gap-1.5 shadow-2xs disabled:opacity-50"
-                >
-                  <Link2 className="w-3.5 h-3.5" />
-                  <span>Bind to {selectedColumn}</span>
-                </button>
-              </div>
-            )}
-
-            {currentBinding && (
-              <div className="p-3 bg-[#E8FAF0] border border-[#DCFCE7] rounded-xl">
-                <div className="flex items-center gap-1.5 text-[#0DBA67] font-semibold">
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>Active Mapping Established</span>
-                </div>
-                <div className="mt-1 text-[11px] font-mono text-[#166534] break-all">
-                  {currentBinding.source_path}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-// ============================================================================
-// Step 4: SubtableRowAssemblyStep
-// ============================================================================
-
-export const SubtableRowAssemblyStep: React.FC<SubtableStepProps> = ({ data, onChange }) => {
-  const policies: {
-    id: RowAssemblyPolicy;
-    title: string;
-    desc: string;
-    warning?: string;
-  }[] = [
-    {
-      id: 'INDEPENDENT_EVENTS',
-      title: 'Independent Events (Safe Default)',
-      desc: 'Each signal packet creates a row immediately in TDengine. Non-updated columns carry forward their previous values or remain null.',
-    },
-    {
-      id: 'LATEST_AS_OF_TRIGGER',
-      title: 'Latest-As-Of Trigger Signal',
-      desc: 'A designated trigger signal produces the row, snapshotting the most recent values of other signals within a specified maximum age window.',
-    },
-    {
-      id: 'TIME_BUCKET',
-      title: 'Fixed Time Bucket Alignment',
-      desc: 'Aligns and resamples asynchronous data streams into regular time intervals (e.g. 1s, 5s, 10s).',
-    },
-    {
-      id: 'EXACT_TIMESTAMP',
-      title: 'Strict Exact Timestamp Match',
-      desc: 'Requires all bound signals to carry identical timestamps.',
-      warning:
-        'Packets with misaligned timestamps will be dropped or written as partial rows.',
-    },
-  ];
-
-  return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-[16px] font-bold text-[#111B37]">Row Assembly & Ingestion Policy</h2>
-        <p className="text-[13px] text-[#657794] mt-1">
-          Specify how multi-signal asynchronous streams are combined into single TDengine rows.
-        </p>
-      </div>
-
-      {/* Policy Radio Cards */}
-      <div className="space-y-3 max-w-2xl">
-        <label className="block text-[13px] font-semibold text-[#111B37]">
-          Row Assembly Policy <span className="text-[#EF1B24]">*</span>
-        </label>
-        <div className="space-y-2.5">
-          {policies.map((p) => {
-            const selected = data.row_assembly_policy === p.id;
-            return (
-              <div
-                key={p.id}
-                onClick={() => onChange({ row_assembly_policy: p.id })}
-                className={`p-3.5 rounded-xl border-2 cursor-pointer transition-all ${
-                  selected
-                    ? 'border-[#EF1B24] bg-[#FFF5F5]'
-                    : 'border-[#E3EAF3] bg-white hover:border-[#D4DFEC]'
-                }`}
-              >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[13px] font-bold text-[#111B37]">{p.title}</span>
-                  <input
-                    type="radio"
-                    checked={selected}
-                    onChange={() => {}}
-                    className="text-[#EF1B24] focus:ring-[#EF1B24]"
-                  />
-                </div>
-                <p className="text-[11px] text-[#657794]">{p.desc}</p>
-                {p.warning && (
-                  <div className="mt-2 p-2 bg-[#FEF2F2] border border-[#FAC6C9] rounded text-[11px] text-[#EF1B24] flex items-center gap-1.5">
-                    <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-                    <span>{p.warning}</span>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Policy-specific config parameters */}
-        {data.row_assembly_policy === 'LATEST_AS_OF_TRIGGER' && (
-          <div className="p-4 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl">
-            <label className="block text-[12px] font-semibold text-[#334568] mb-1">
-              Max Age Tolerance (Seconds)
-            </label>
-            <input
-              type="number"
-              min="1"
-              max="3600"
-              value={data.max_age_seconds ?? 5}
-              onChange={(e) =>
-                onChange({ max_age_seconds: parseInt(e.target.value, 10) || 5 })
-              }
-              className="w-48 h-8 px-2.5 rounded-lg border border-[#D4DFEC] bg-white text-[12px] focus:outline-none focus:border-[#EF1B24]"
-            />
-            <p className="text-[10px] text-[#8C9BAE] mt-1">
-              Historical samples older than this window will not be carried into the triggered row.
-            </p>
-          </div>
-        )}
-
-        {data.row_assembly_policy === 'TIME_BUCKET' && (
-          <div className="p-4 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl">
-            <label className="block text-[12px] font-semibold text-[#334568] mb-1">
-              Bucket Duration
-            </label>
-            <select
-              value={data.time_bucket_seconds ?? 5}
-              onChange={(e) =>
-                onChange({ time_bucket_seconds: parseInt(e.target.value, 10) || 5 })
-              }
-              className="w-48 h-8 px-2 rounded-lg border border-[#D4DFEC] bg-white text-[12px] focus:outline-none focus:border-[#EF1B24]"
-            >
-              <option value="1">1 second</option>
-              <option value="5">5 seconds</option>
-              <option value="10">10 seconds</option>
-              <option value="30">30 seconds</option>
-              <option value="60">60 seconds</option>
-            </select>
-          </div>
-        )}
-      </div>
-
-      {/* Recording Mode */}
-      <div className="max-w-2xl pt-2">
-        <label className="block text-[13px] font-semibold text-[#111B37] mb-2">
-          Recording Mode
-        </label>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          {[
-            { id: 'ON_CHANGE' as RecordingMode, label: 'ON_CHANGE' },
-            { id: 'EVERY_ACQUISITION' as RecordingMode, label: 'EVERY_ACQUISITION' },
-            { id: 'INTERVAL' as RecordingMode, label: 'INTERVAL' },
-          ].map((m) => (
-            <button
-              key={m.id}
-              type="button"
-              onClick={() => onChange({ recording_mode: m.id })}
-              className={`py-2 px-3 rounded-lg border text-[12px] font-semibold transition-all ${
-                data.recording_mode === m.id
-                  ? 'border-[#EF1B24] bg-[#FFF5F5] text-[#EF1B24]'
-                  : 'border-[#E3EAF3] bg-white text-[#334568] hover:border-[#D4DFEC]'
-              }`}
-            >
-              {m.label}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* 5-row preview simulation */}
-      <div className="max-w-3xl pt-2">
-        <div className="flex items-center justify-between mb-2">
-          <span className="text-[12px] font-bold text-[#111B37] uppercase tracking-wider flex items-center gap-1.5">
-            <Eye className="w-3.5 h-3.5 text-[#0284C7]" />
-            <span>Simulated Row Ingestion Preview (5 Rows)</span>
-          </span>
-          <span className="text-[11px] text-[#657794]">
-            Policy: <span className="font-semibold text-[#111B37]">{data.row_assembly_policy}</span>
-          </span>
-        </div>
-
-        <div className="border border-[#E3EAF3] rounded-xl overflow-hidden shadow-xs">
-          <table className="w-full text-left border-collapse text-[12px]">
-            <thead className="bg-[#F8FAFC] border-b border-[#E3EAF3] text-[11px] font-bold text-[#657794]">
-              <tr>
-                <th className="py-2 px-3">Timestamp (ts)</th>
-                <th className="py-2 px-3">Column 1</th>
-                <th className="py-2 px-3">Column 2</th>
-                <th className="py-2 px-3">Quality</th>
-                <th className="py-2 px-3">Assembly Event</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#E3EAF3] font-mono text-[11px]">
-              {[
-                {
-                  ts: '2026-11-12 16:30:00.000',
-                  col1: '142.5',
-                  col2: '2400',
-                  q: 'GOOD',
-                  event: 'Direct Packet',
-                },
-                {
-                  ts: '2026-11-12 16:30:01.200',
-                  col1: '143.1',
-                  col2: '2402',
-                  q: 'GOOD',
-                  event:
-                    data.row_assembly_policy === 'TIME_BUCKET'
-                      ? 'Bucket Aggregated'
-                      : 'Carried Forward',
-                },
-                {
-                  ts: '2026-11-12 16:30:02.500',
-                  col1: '142.9',
-                  col2: '2398',
-                  q: 'GOOD',
-                  event: 'Trigger Sync',
-                },
-                {
-                  ts: '2026-11-12 16:30:03.800',
-                  col1: '144.0',
-                  col2: '2410',
-                  q: 'GOOD',
-                  event: 'Direct Packet',
-                },
-                {
-                  ts: '2026-11-12 16:30:05.000',
-                  col1: '143.8',
-                  col2: '2405',
-                  q: 'GOOD',
-                  event: 'Checkpoint Flush',
-                },
-              ].map((row, idx) => (
-                <tr key={idx} className="bg-white hover:bg-[#F9FAFD]">
-                  <td className="py-2 px-3 text-[#111B37]">{row.ts}</td>
-                  <td className="py-2 px-3 text-[#0284C7]">{row.col1}</td>
-                  <td className="py-2 px-3 text-[#0284C7]">{row.col2}</td>
-                  <td className="py-2 px-3 text-[#0DBA67]">{row.q}</td>
-                  <td className="py-2 px-3 text-[#657794]">{row.event}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Start Recording Checkbox */}
-      <div className="pt-2">
-        <label className="flex items-center gap-2.5 text-[13px] font-semibold text-[#111B37] cursor-pointer">
-          <input
-            type="checkbox"
-            checked={data.start_recording !== false}
-            onChange={(e) => onChange({ start_recording: e.target.checked })}
-            className="rounded border-[#D4DFEC] text-[#EF1B24] focus:ring-[#EF1B24]"
-          />
-          <span>Start recording immediately upon creation</span>
-        </label>
-      </div>
-    </div>
-  );
-};
-
-// ============================================================================
-// DDL Helper for Subtable
-// ============================================================================
-
-export function generateSubtableDDL(data: SubtableWizardData): string {
-  const db = data.database_name ? `${data.database_name}.` : '';
-  const name = data.physical_name || 'unnamed_subtable';
-  const parent = data.stable_name ? `${db}${data.stable_name}` : 'parent_stable';
-
-  const tagValuesFormatted = data.tag_values.map((tv) => `'${tv.value}'`).join(', ');
-
-  return `CREATE TABLE ${db}${name} USING ${parent} TAGS (${tagValuesFormatted || ''});`;
+function factoryChoices(groups: ModelSourceGroup[]): FactoryRef[] {
+  const seen = new Map<string, FactoryRef>();
+  for (const g of groups) {
+    if (g.resource) seen.set(g.resource.id, g.resource);
+    for (const a of g.ancestors || []) seen.set(a.id, a);
+  }
+  return [...seen.values()].sort((a, b) => a.type_key.localeCompare(b.type_key) || a.name.localeCompare(b.name));
 }
 
 // ============================================================================
-// Step 5: SubtableReviewStep
+// Step 2: Tag values
 // ============================================================================
 
-export const SubtableReviewStep: React.FC<SubtableStepProps> = ({
-  data,
-  onChange,
-  errors = {},
-}) => {
-  const [copied, setCopied] = useState(false);
-  const ddl = generateSubtableDDL(data);
+export const SubtableTagValuesStep: React.FC<SubtableStepProps> = ({ data, onChange, errors = {}, parentStable }) => {
+  const { groups, loading } = useModelGroups();
+  const choices = useMemo(() => factoryChoices(groups), [groups]);
+  const tags = parentStable?.tags || [];
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(ddl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const setValue = (name: string, value: string) => {
+    const next = tags.map((t) => ({
+      tag_name: t.name,
+      value: t.name === name ? value : data.tag_values.find((tv) => tv.tag_name === t.name)?.value || '',
+    }));
+    onChange({ tag_values: next });
   };
 
+  if (!parentStable) {
+    return <p className="text-[13px] text-[#657794]">Select a parent supertable first.</p>;
+  }
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-[16px] font-bold text-[#111B37]">Review Subtable Configuration</h2>
-        <p className="text-[13px] text-[#657794] mt-1">
-          Review TDengine DDL, tag values, and signal bindings before instantiating the subtable.
-        </p>
+      <StepHeader title="Tag values"
+        subtitle="Static identity of this subtable. Reference tags (machine, line, zone) store the Factory Model id; pick it instead of typing it." />
+      {errors.tag_values && <p className="text-[12px] text-[#F2343B]">{errors.tag_values}</p>}
+      <div className="space-y-4 max-w-2xl">
+        {tags.map((t) => {
+          const value = data.tag_values.find((tv) => tv.tag_name === t.name)?.value || '';
+          const isRef = /(_ref|_id)$/.test(t.name);
+          const picked = choices.find((c) => c.id === value);
+          return (
+            <Field key={t.name} label={`${t.name} (${t.td_type}${t.length ? `(${t.length})` : ''})`}
+              hint={picked ? `${picked.name} · ${picked.type_key}${picked.code ? ` · ${picked.code}` : ''}` : isRef ? 'Pick a Factory Model resource or paste its id.' : undefined}>
+              <div className="flex gap-2">
+                <input type="text" value={value} onChange={(e) => setValue(t.name, e.target.value)} className={`${inputCls} font-mono`} />
+                {isRef && (
+                  <select aria-label={`Pick ${t.name} from Factory Model`} value="" onChange={(e) => e.target.value && setValue(t.name, e.target.value)}
+                    className="h-9 px-2 rounded-lg border border-[#D4DFEC] text-[12px] bg-white max-w-[240px]">
+                    <option value="">{loading ? 'Loading…' : 'Pick from Factory Model…'}</option>
+                    {choices.map((c) => (
+                      <option key={c.id} value={c.id}>{c.type_key} · {c.name}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </Field>
+          );
+        })}
       </div>
+      <p className="text-[12px] text-[#657794] flex items-center gap-1.5"><Info className="w-3.5 h-3.5" />
+        Binding a Data Model field in the next step fills empty machine / line / zone / field_key tags from that model.
+      </p>
+    </div>
+  );
+};
 
-      {/* Summary Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        <div className="p-3.5 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl">
-          <div className="text-[11px] font-semibold text-[#657794] uppercase tracking-wider">
-            Parent Supertable
-          </div>
-          <div className="text-[14px] font-bold text-[#111B37] mt-0.5">
-            {data.stable_name || '—'}
-          </div>
-        </div>
+// ============================================================================
+// Step 3: Bind sources (Data Model field leaves)
+// ============================================================================
 
-        <div className="p-3.5 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl">
-          <div className="text-[11px] font-semibold text-[#657794] uppercase tracking-wider">
-            Row Assembly Policy
-          </div>
-          <div className="text-[14px] font-bold text-[#111B37] mt-0.5">
-            {data.row_assembly_policy}
-          </div>
-        </div>
+export const SubtableBindSourcesStep: React.FC<SubtableStepProps> = ({ data, onChange, errors = {}, parentStable }) => {
+  const { groups, loading, error } = useModelGroups();
+  const [search, setSearch] = useState('');
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [pending, setPending] = useState<{ group: ModelSourceGroup; leaf: SourceRef } | null>(null);
+  const [column, setColumn] = useState('');
+  const cols = valueColumns(parentStable);
+  const atomic = data.recording_mode === 'ON_NEW_EVENT';
 
-        <div className="p-3.5 bg-[#F8FAFC] border border-[#E3EAF3] rounded-xl">
-          <div className="text-[11px] font-semibold text-[#657794] uppercase tracking-wider">
-            Active Bindings
-          </div>
-          <div className="text-[14px] font-bold text-[#111B37] mt-0.5">
-            {data.bindings.length} signals bound
-          </div>
-        </div>
-      </div>
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return groups;
+    return groups
+      .map((g) => ({ ...g, fields: g.fields.filter((f) => `${g.display_name} ${f.field_path} ${g.resource?.code || ''}`.toLowerCase().includes(q)) }))
+      .filter((g) => g.fields.length > 0 || g.display_name.toLowerCase().includes(q));
+  }, [groups, search]);
 
-      {/* DDL Preview Box */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <span className="text-[12px] font-bold text-[#111B37] uppercase tracking-wider">
-            Generated Physical DDL
-          </span>
-          <button
-            type="button"
-            onClick={handleCopy}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[12px] font-semibold text-[#334568] hover:bg-[#EEF2F6] transition-colors"
-          >
-            {copied ? (
-              <>
-                <Check className="w-3.5 h-3.5 text-[#0DBA67]" />
-                <span className="text-[#0DBA67]">Copied!</span>
-              </>
-            ) : (
-              <>
-                <Copy className="w-3.5 h-3.5" />
-                <span>Copy SQL</span>
-              </>
-            )}
-          </button>
-        </div>
+  const choose = (group: ModelSourceGroup, leaf: SourceRef) => {
+    setPending({ group, leaf });
+    setColumn(suggestColumn(leaf.value_type, cols.filter((c) => !data.bindings.some((b) => b.column_name === c.name))) || '');
+  };
 
-        <pre className="p-4 bg-[#111B37] text-[#38BDF8] rounded-xl font-mono text-[12px] overflow-x-auto leading-relaxed selection:bg-[#EF1B24] selection:text-white">
-          {ddl}
-        </pre>
-      </div>
+  const bind = () => {
+    if (!pending || !column) return;
+    const { group, leaf } = pending;
+    const binding: FieldBindingIntent = {
+      column_name: column,
+      source_kind: 'model_field',
+      source_id: `mod:${group.id}:${leaf.field_path}`,
+      source_path: String(leaf.field_path || ''),
+      model_id: group.id,
+      field_path: leaf.field_path || null,
+    };
+    const others = atomic ? data.bindings.filter((b) => b.column_name !== column) : [];
+    const sameModel = others.filter((b) => b.model_id === group.id);
+    onChange({
+      bindings: [...sameModel, binding],
+      no_binding: false,
+      tag_values: autoTagValues(parentStable?.tags || [], data.tag_values, group, leaf),
+    });
+    setPending(null);
+  };
 
-      {/* Tag values and Bindings Summary */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {/* Tag values */}
-        <div className="border border-[#E3EAF3] rounded-xl overflow-hidden">
-          <div className="bg-[#F8FAFC] px-3.5 py-2 border-b border-[#E3EAF3] text-[12px] font-bold text-[#334568]">
-            Assigned Tag Values
+  const remove = (col: string) => onChange({ bindings: data.bindings.filter((b) => b.column_name !== col) });
+
+  return (
+    <div className="space-y-5">
+      <StepHeader title="Bind sources"
+        subtitle={atomic
+          ? 'On new event: bind each business field of ONE Data Model to its column; one row is written per new event.'
+          : 'Pick one Data Model field and the typed value column it is written to.'} />
+      {errors.bindings && <p className="text-[12px] text-[#F2343B]">{errors.bindings}</p>}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="border border-[#E3EAF3] rounded-xl bg-white flex flex-col max-h-[480px]">
+          <div className="p-3 border-b border-[#E3EAF3]">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-[#94A3B8] absolute left-2.5 top-1/2 -translate-y-1/2" />
+              <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search model, machine or field"
+                className="w-full pl-8 pr-2 h-8 rounded-lg border border-[#D4DFEC] text-[12px] focus:outline-none focus:border-[#EF1B24]" />
+            </div>
           </div>
-          <div className="p-3 text-[12px] divide-y divide-[#F1F5FA]">
-            {data.tag_values.length === 0 ? (
-              <p className="text-[#8C9BAE]">No tag values assigned.</p>
-            ) : (
-              data.tag_values.map((t) => (
-                <div key={t.tag_name} className="py-1.5 flex justify-between">
-                  <span className="font-mono text-[#657794]">{t.tag_name}:</span>
-                  <span className="font-mono font-semibold text-[#111B37]">{t.value}</span>
+          <div className="flex-1 overflow-y-auto p-2 space-y-1">
+            {loading && <p className="p-4 text-[12px] text-[#657794] flex items-center gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" />Loading Data Models…</p>}
+            {error && <p className="p-4 text-[12px] text-[#F2343B]">{error}</p>}
+            {!loading && !error && filtered.length === 0 && <p className="p-4 text-[12px] text-[#657794]">No Data Model matches.</p>}
+            {filtered.map((g) => {
+              const open = expanded.has(g.id) || !!search;
+              return (
+                <div key={g.id} className="rounded-lg">
+                  <button type="button" onClick={() => setExpanded((prev) => { const n = new Set(prev); if (n.has(g.id)) n.delete(g.id); else n.add(g.id); return n; })}
+                    className="w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded-md hover:bg-[#F6F8FC] text-left">
+                    <span className="flex items-center gap-1.5 min-w-0">
+                      {open ? <ChevronDown className="w-3.5 h-3.5 text-[#657794]" /> : <ChevronRight className="w-3.5 h-3.5 text-[#657794]" />}
+                      <span className="text-[12px] font-semibold text-[#111B37] truncate">{g.display_name}</span>
+                      {g.resource && <span className="text-[11px] text-[#657794] truncate">· {g.resource.name}</span>}
+                    </span>
+                    <span className="text-[11px] text-[#657794] shrink-0">{g.fields_count} fields</span>
+                  </button>
+                  {open && (
+                    <div className="pl-6 pb-1 space-y-0.5">
+                      {g.fields.map((f) => {
+                        const taken = f.bound_to && !(f.bound_to.subtable === data.physical_name);
+                        const isPending = pending?.leaf.id === f.id;
+                        const isBound = data.bindings.some((b) => b.model_id === g.id && b.field_path === f.field_path);
+                        return (
+                          <button key={f.id} type="button" disabled={!!taken} onClick={() => choose(g, f)}
+                            title={taken ? `Already recorded in ${f.bound_to?.database}.${f.bound_to?.subtable}` : f.display_name}
+                            className={`w-full flex items-center justify-between gap-2 px-2 py-1 rounded-md text-left text-[12px] ${
+                              isPending ? 'bg-[#FFF0F1] text-[#111B37]' : 'hover:bg-[#F6F8FC]'} disabled:opacity-50 disabled:cursor-not-allowed`}>
+                            <span className="font-mono truncate">{f.field_path}</span>
+                            <span className="flex items-center gap-2 shrink-0 text-[11px] text-[#657794]">
+                              <span>{f.value_type}</span>
+                              <span className="max-w-[90px] truncate" title="Last value">{f.has_last_value ? String(f.last_value ?? 'null') : '—'}</span>
+                              {isBound && <Check className="w-3.5 h-3.5 text-[#0DBA67]" />}
+                              {taken && <span>recorded</span>}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
-              ))
-            )}
+              );
+            })}
           </div>
         </div>
 
-        {/* Bound signals */}
-        <div className="border border-[#E3EAF3] rounded-xl overflow-hidden">
-          <div className="bg-[#F8FAFC] px-3.5 py-2 border-b border-[#E3EAF3] text-[12px] font-bold text-[#334568]">
-            Bound Signals
+        <div className="space-y-4">
+          <div className="border border-[#E3EAF3] rounded-xl bg-white p-4 space-y-3">
+            <div className="text-[12px] font-semibold text-[#657794] uppercase tracking-wide">Selected field</div>
+            {pending ? (
+              <>
+                <div className="text-[13px] text-[#111B37]">
+                  <span className="font-semibold">{pending.group.display_name}</span> · <span className="font-mono">{pending.leaf.field_path}</span>
+                  <span className="text-[#657794]"> ({pending.leaf.value_type})</span>
+                </div>
+                <Field label="Target column" required hint="Typed value column of the supertable; audit columns are filled by the recorder.">
+                  <select value={column} onChange={(e) => setColumn(e.target.value)} className={inputCls}>
+                    <option value="">Choose a column…</option>
+                    {cols.map((c) => (
+                      <option key={c.name} value={c.name} disabled={!typeCompatible(pending.leaf.value_type, c)}>
+                        {c.name} ({c.td_type}){!typeCompatible(pending.leaf.value_type, c) ? ' — incompatible' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <button type="button" onClick={bind} disabled={!column}
+                  className="inline-flex items-center gap-1.5 h-9 px-4 rounded-lg bg-[#EF1B24] text-white text-[13px] font-semibold disabled:bg-[#E3EAF3] disabled:text-[#94A3B8]">
+                  <Link2 className="w-4 h-4" />Bind
+                </button>
+              </>
+            ) : (
+              <p className="text-[12px] text-[#657794]">Expand a Data Model and click one of its fields.</p>
+            )}
           </div>
-          <div className="p-3 text-[12px] divide-y divide-[#F1F5FA]">
+
+          <div className="border border-[#E3EAF3] rounded-xl bg-white p-4">
+            <div className="text-[12px] font-semibold text-[#657794] uppercase tracking-wide mb-2">Bindings ({data.bindings.length})</div>
             {data.bindings.length === 0 ? (
-              <p className="text-[#8C9BAE]">No signals bound.</p>
+              <label className="flex items-start gap-2 text-[12px] text-[#334568]">
+                <input type="checkbox" checked={!!data.no_binding} onChange={(e) => onChange({ no_binding: e.target.checked })} className="mt-0.5" />
+                <span>Create this subtable without a binding (nothing will be recorded until a binding exists).</span>
+              </label>
             ) : (
-              data.bindings.map((b) => (
-                <div key={b.column_name} className="py-1.5 flex justify-between">
-                  <span className="font-mono font-bold text-[#111B37]">{b.column_name}:</span>
-                  <span className="font-mono text-[#657794] truncate max-w-[180px]">
-                    {b.source_path}
-                  </span>
-                </div>
-              ))
+              <table className="w-full text-[12px]">
+                <thead><tr className="text-[#657794] text-left"><th className="py-1">Source field</th><th>Column</th><th /></tr></thead>
+                <tbody>
+                  {data.bindings.map((b) => {
+                    const g = groups.find((x) => x.id === b.model_id);
+                    return (
+                      <tr key={b.column_name} className="border-t border-[#E3EAF3]">
+                        <td className="py-1.5"><span className="font-semibold">{g?.display_name || b.model_id}</span> · <span className="font-mono">{b.field_path}</span>
+                          <div className="text-[11px] text-[#657794]">model_field</div></td>
+                        <td className="font-mono">{b.column_name}</td>
+                        <td className="text-right"><button type="button" onClick={() => remove(b.column_name)} className="text-[#657794] hover:text-[#F2343B]" aria-label="Remove binding"><Unlink className="w-3.5 h-3.5" /></button></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             )}
           </div>
         </div>
       </div>
+    </div>
+  );
+};
 
-      {/* Confirmation Checkbox */}
-      <div className="pt-2">
-        <label className="flex items-start gap-3 p-3.5 bg-[#FFF5F5] border border-[#FAC6C9] rounded-xl cursor-pointer">
-          <input
-            type="checkbox"
-            checked={!!data.confirmed}
-            onChange={(e) => onChange({ confirmed: e.target.checked })}
-            className="mt-0.5 rounded border-[#D4DFEC] text-[#EF1B24] focus:ring-[#EF1B24]"
-          />
-          <div className="text-[12px] text-[#334568] leading-relaxed">
-            <span className="font-semibold text-[#111B37]">
-              I confirm the creation of Subtable "{data.physical_name || '...'}"
-            </span>{' '}
-            using template "{data.stable_name}". Ingestion will be initialized with policy {data.row_assembly_policy}.
-          </div>
-        </label>
-        {errors.confirmed && (
-          <p className="text-[12px] text-[#EF1B24] mt-1.5 flex items-center gap-1">
-            <AlertTriangle className="w-3.5 h-3.5" />
-            <span>{errors.confirmed}</span>
-          </p>
-        )}
+// ============================================================================
+// Step 4: Recording
+// ============================================================================
+
+const MODES: { id: RecordingMode; label: string; detail: string }[] = [
+  { id: 'ON_CHANGE', label: 'On change', detail: 'First value is the baseline; afterwards a row only when the value, null-state or quality changes. Re-publishing the same value writes nothing.' },
+  { id: 'ON_NEW_EVENT', label: 'On new event', detail: 'One row holding all bound fields per new event (for example a completion). A repeated identical event is not written again.' },
+  { id: 'EVERY_ACQUISITION', label: 'Every model sample', detail: 'A row for every model sample, even when nothing changed. Use only when every sample is needed.' },
+];
+
+export const SubtableRowAssemblyStep: React.FC<SubtableStepProps> = ({ data, onChange, parentStable }) => {
+  const cols = parentStable?.columns || [];
+  return (
+    <div className="space-y-6">
+      <StepHeader title="Recording" subtitle="How changes of the bound field(s) are written to this subtable." />
+      <div className="space-y-2 max-w-2xl">
+        {MODES.map((m) => (
+          <label key={m.id} className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer ${data.recording_mode === m.id ? 'border-[#EF1B24] bg-[#FFF7F8]' : 'border-[#E3EAF3] bg-white'}`}>
+            <input type="radio" name="recording_mode" checked={data.recording_mode === m.id}
+              onChange={() => onChange({ recording_mode: m.id, row_assembly_policy: m.id === 'ON_NEW_EVENT' ? 'ATOMIC_EVENT' : 'INDEPENDENT_EVENTS' })} className="mt-1" />
+            <span><span className="text-[13px] font-semibold text-[#111B37]">{m.label}</span><span className="block text-[12px] text-[#657794]">{m.detail}</span></span>
+          </label>
+        ))}
       </div>
+      {data.recording_mode === 'ON_NEW_EVENT' && (
+        <div className="max-w-2xl p-3 rounded-xl border border-[#FFE2B3] bg-[#FFF6E5] text-[12px] text-[#334568]">
+          The event identity is the bound fields plus the model body <span className="font-mono">source_timestamp</span>.
+          The source is the sampled Data Model body: two events between two model samples cannot be told apart.
+        </div>
+      )}
+      <label className="flex items-start gap-2 max-w-2xl text-[13px] text-[#334568]">
+        <input type="checkbox" checked={!!data.start_recording} onChange={(e) => onChange({ start_recording: e.target.checked })} className="mt-1" />
+        <span><span className="font-semibold">Start recording after creation</span>
+          <span className="block text-[12px] text-[#657794]">Off by default. You can start or pause recording later from the object page.</span></span>
+      </label>
+      {cols.length > 0 && (
+        <div className="max-w-2xl">
+          <div className="text-[12px] font-semibold text-[#657794] uppercase tracking-wide mb-1">Columns written per row</div>
+          <div className="flex flex-wrap gap-1.5">
+            {cols.map((c, i) => {
+              const bound = data.bindings.some((b) => b.column_name === c.name);
+              const writer = i === 0 || c.primary_key || WRITER_COLUMNS.has(c.name);
+              return (
+                <span key={c.name} className={`px-2 py-0.5 rounded-md text-[11px] font-mono border ${bound ? 'border-[#EF1B24] text-[#111B37]' : writer ? 'border-[#D4DFEC] text-[#334568]' : 'border-[#E3EAF3] text-[#94A3B8]'}`}
+                  title={bound ? 'Bound value' : writer ? 'Filled by the recorder' : 'Left empty'}>{c.name}</span>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ============================================================================
+// Step 5: Review (backend plan)
+// ============================================================================
+
+/** Kept for compatibility; the Review step shows the backend plan instead. */
+export function generateSubtableDDL(data: SubtableWizardData): string {
+  return `-- Generated by the backend on Review (${data.physical_name})`;
+}
+
+export const SubtableReviewStep: React.FC<SubtableStepProps> = ({ data, onChange, errors = {} }) => {
+  const [plan, setPlan] = useState<StoragePlan | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const specKey = JSON.stringify(buildSubtableSpec(data));
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    planStorageObject('subtable', JSON.parse(specKey))
+      .then((p) => active && setPlan(p))
+      .catch((err: Error) => active && setPlanError(err.message || 'The plan could not be computed.'))
+      .finally(() => active && setLoading(false));
+    return () => { active = false; };
+  }, [specKey]);
+
+  return (
+    <div className="space-y-5">
+      <StepHeader title="Review" subtitle="Exactly what the backend will execute and register." />
+      {loading && <p className="text-[12px] text-[#657794] flex items-center gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" />Computing the plan…</p>}
+      {planError && <p className="text-[12px] text-[#F2343B]">{planError}</p>}
+      {plan && (
+        <>
+          {plan.errors.length > 0 && (
+            <div className="p-3 rounded-xl border border-[#FAC6C9] bg-[#FFF0F1] text-[12px] text-[#334568] space-y-1">
+              {plan.errors.map((e, i) => <div key={i}><span className="font-semibold">{e.field || 'spec'}:</span> {e.message}</div>)}
+            </div>
+          )}
+          {plan.warnings.length > 0 && (
+            <div className="p-3 rounded-xl border border-[#FFE2B3] bg-[#FFF6E5] text-[12px] text-[#334568] space-y-1">
+              {plan.warnings.map((e, i) => <div key={i}>{e.message}</div>)}
+            </div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-[12px]">
+            <div className="p-3 rounded-xl border border-[#E3EAF3] bg-white"><div className="text-[#657794]">Target</div><div className="font-mono text-[#111B37]">{data.stable_id} → {data.physical_name}</div></div>
+            <div className="p-3 rounded-xl border border-[#E3EAF3] bg-white"><div className="text-[#657794]">Recording</div><div className="text-[#111B37]">{plan.recording?.mode || data.recording_mode} · {plan.recording?.start_recording ? 'starts after creation' : 'off until started'}</div></div>
+            <div className="p-3 rounded-xl border border-[#E3EAF3] bg-white"><div className="text-[#657794]">Bindings</div><div className="text-[#111B37]">{(plan.bindings || []).length || (data.no_binding ? 'none (explicit)' : '0')}</div></div>
+          </div>
+          {(plan.bindings || []).length > 0 && (
+            <table className="w-full text-[12px] border border-[#E3EAF3] rounded-xl bg-white">
+              <thead><tr className="text-left text-[#657794] bg-[#F6F8FC]"><th className="p-2">Kind</th><th>Model</th><th>Field path</th><th>Column</th></tr></thead>
+              <tbody>{(plan.bindings || []).map((b) => (
+                <tr key={b.target_column} className="border-t border-[#E3EAF3]"><td className="p-2">{b.source_kind}</td><td>{b.model_name || b.model_id}</td><td className="font-mono">{b.model_field_path}</td><td className="font-mono">{b.target_column}</td></tr>
+              ))}</tbody>
+            </table>
+          )}
+          <div>
+            <div className="text-[12px] font-semibold text-[#657794] uppercase tracking-wide mb-1">Physical DDL (from the backend)</div>
+            <pre className="p-3 rounded-xl bg-[#111B37] text-[#E3EAF3] text-[12px] font-mono whitespace-pre-wrap break-all">{plan.ddl.join(';\n') || '—'}</pre>
+          </div>
+        </>
+      )}
+      <label className="flex items-start gap-2 text-[13px] text-[#334568]">
+        <input type="checkbox" checked={!!data.confirmed} disabled={!plan || !plan.valid} onChange={(e) => onChange({ confirmed: e.target.checked })} className="mt-1" />
+        <span>I reviewed the DDL and bindings and want to create this subtable.</span>
+      </label>
+      {errors.confirmed && <p className="text-[12px] text-[#F2343B]">{errors.confirmed}</p>}
     </div>
   );
 };

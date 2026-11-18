@@ -23,6 +23,7 @@ import { SignalsCatalogPage } from './pages/08_SignalsCatalog/SignalsCatalogPage
 import { StorageManagementPage } from './pages/storage-management/StorageManagementPage';
 import { CreateStorageObjectWizard } from './pages/storage-management/wizards/CreateStorageObjectWizard';
 import { EditStorageObjectWizard } from './pages/storage-management/wizards/EditStorageObjectWizard';
+import { BulkSubtablesWizard } from './pages/storage-management/wizards/BulkSubtablesWizard';
 import { StorageObjectDetailPage } from './pages/storage-management/StorageObjectDetailPage';
 import { HistorianExplorerPage } from './pages/historian/HistorianExplorerPage';
 import { DataModelsPage } from './pages/13_DataModels/DataModelsPage';
@@ -112,6 +113,7 @@ const ProtectedAppShell: React.FC = () => (
               {/* Storage & Historian Routes */}
               <Route path="/historian/storage" element={<StorageManagementPage />} />
               <Route path="/historian/storage/create" element={<CreateStorageObjectWizard />} />
+              <Route path="/historian/storage/bulk" element={<BulkSubtablesWizard />} />
               <Route path="/historian/storage/edit/:objectId" element={<EditStorageObjectWizard />} />
               <Route path="/historian/storage/object/:objectId" element={<StorageObjectDetailPage />} />
               <Route path="/historian/historian" element={<HistorianExplorerPage />} />
@@ -123,6 +125,9 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/historian/catalog/:id" element={<LegacyCatalogRedirect />} />
               <Route path="/historian" element={<RedirectWithQuery to="/historian/storage" />} />
               <Route path="/storage" element={<RedirectWithQuery to="/historian/storage" />} />
+              <Route path="/historian/explorer" element={<RedirectWithQuery to="/historian/historian" />} />
+              <Route path="/historian/policies" element={<RedirectWithQuery to="/historian/storage" extraParams={{ tab: 'objects' }} />} />
+              <Route path="/historian/retention" element={<RedirectWithQuery to="/historian/storage" extraParams={{ tab: 'objects' }} />} />
 
               {/* Coming soon routes */}
               <Route path="/dashboards/*" element={<ComingSoonPage />} />

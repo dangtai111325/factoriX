@@ -53,6 +53,61 @@ PRUNE_PAUSE_S = 0.05
 PRUNE_INTERVAL_S = 15.0
 MAX_PRUNE_STEPS_PER_PASS = 40
 ACKED_RETENTION = timedelta(minutes=2)
+# Connection health hysteresis: a job is "failing" only when it has had no successful read for
+# max(DEGRADE_INTERVALS x interval, MIN_DEGRADE_S). One failed read never reports DOWN.
+DEGRADE_INTERVALS = 3
+MIN_DEGRADE_S = 10.0
+HEARTBEAT_WRITE_TIMEOUT_S = 4.0
+COMMISSION_BUDGET_S = 25.0
+REPORT_WRITE_TIMEOUT_S = 6.0
+
+
+def degrade_window_s(interval_s: float, min_degrade_s: float) -> float:
+    """Seconds without a successful read before a job counts as failing (0 disables the hysteresis)."""
+    if min_degrade_s <= 0:
+        return 0.0
+    return max(DEGRADE_INTERVALS * max(0.0, float(interval_s)), float(min_degrade_s))
+
+
+class JobHealth:
+    """Per-job acquisition evidence. Connection health is aggregated from these, never last-writer-wins."""
+
+    __slots__ = (
+        "job_id",
+        "connection_id",
+        "interval_s",
+        "push",
+        "started_mono",
+        "last_ok_mono",
+        "last_ok_at",
+        "consecutive_failures",
+        "last_error_code",
+        "last_error",
+        "last_error_mono",
+        "reads_ok",
+        "reads_failed",
+        "read_ms",
+        "samples",
+        "stall_s",
+    )
+
+    def __init__(self, job_id: str, connection_id: str, interval_s: float, push: bool, stall_s: float = 0.0) -> None:
+        self.job_id = job_id
+        self.connection_id = connection_id
+        self.interval_s = interval_s
+        self.push = push
+        self.started_mono = time.monotonic()
+        self.last_ok_mono: float | None = None
+        self.last_ok_at: str | None = None
+        self.consecutive_failures = 0
+        self.last_error_code: str | None = None
+        self.last_error: str | None = None
+        self.last_error_mono: float | None = None
+        self.reads_ok = 0
+        self.reads_failed = 0
+        self.read_ms: int | None = None
+        self.samples = 0
+        self.stall_s = stall_s
 
 
 class LeaderLockProtocol(Protocol):
@@ -79,6 +134,7 @@ class AcquisitionRuntime:
         config_s: float = 10.0,
         commands_s: float = 2.0,
         leader_probe_s: float = 2.0,
+        min_degrade_s: float = MIN_DEGRADE_S,
     ) -> None:
         self.config_provider = config_provider
         self.control_plane = control_plane
@@ -92,6 +148,10 @@ class AcquisitionRuntime:
         self.config_s = config_s
         self.commands_s = commands_s
         self.leader_probe_s = leader_probe_s
+        self.min_degrade_s = float(min_degrade_s)
+        self.started_at = now_iso()
+        self.leader_since: str | None = None
+        self.job_health: dict[str, JobHealth] = {}
 
         self.revision = 0
         self.snapshot_checksum = ""
@@ -180,7 +240,9 @@ class AcquisitionRuntime:
                 username=str(config.get("username") or "") or None,
                 password=password,
                 keepalive=int(config.get("keepalive") or 60),
-                clean_session=bool(config.get("clean_session", True)),
+                # Persistent session by default (QoS 1 messages are queued by the broker while the
+                # client reconnects). An explicit clean_session=true in the connection keeps the old way.
+                clean_session=bool(config.get("clean_session", False)),
                 tls=bool(config.get("tls", False)),
                 ca_pem=config.get("ca_pem"),
                 tls_insecure=not bool(config.get("tls_verify", True)),
@@ -229,42 +291,157 @@ class AcquisitionRuntime:
             {"state": None, "last_ok_at": None, "last_error_code": None, "last_error": None, "read_ms": None, "samples": 0},
         )
 
-    def record_ok(self, connection_id: str, read_ms: int | None, samples: int, at: str | None = None) -> None:
+    def _job_health(self, connection_id: str, job_id: str | None) -> JobHealth:
+        key = job_id or f"{connection_id}:*"
+        health = self.job_health.get(key)
+        if health is None or health.connection_id != connection_id:
+            spec = self.specs.get(job_id) if job_id else None
+            interval_s = (spec.interval_ms / 1000) if spec else 1.0
+            push = bool(spec.subscribe) if spec else False
+            stall_s = 0.0
+            if spec is not None and not push:
+                from factorix_acquisition.jobs import poll_watchdog_s
+
+                stall_s = poll_watchdog_s(spec) + 2 * interval_s
+            health = self.job_health[key] = JobHealth(key, connection_id, interval_s, push, stall_s)
+        return health
+
+    def record_ok(self, connection_id: str, read_ms: int | None, samples: int, at: str | None = None, *, job_id: str | None = None) -> None:
         state = self._state(connection_id)
-        state.update(state="UP", last_ok_at=at or now_iso(), last_error_code=None, last_error=None)
+        ok_at = at or now_iso()
+        if (state["last_ok_at"] or "") < ok_at:
+            state["last_ok_at"] = ok_at
+        state.update(state="UP", last_error_code=None, last_error=None)
         if read_ms is not None:
             state["read_ms"] = read_ms
         state["samples"] += samples
+        health = self._job_health(connection_id, job_id)
+        health.last_ok_mono = time.monotonic()
+        if (health.last_ok_at or "") < ok_at:
+            health.last_ok_at = ok_at
+        health.consecutive_failures = 0
+        health.reads_ok += 1
+        health.samples += samples
+        if read_ms is not None:
+            health.read_ms = read_ms
 
-    def record_failure(self, connection_id: str, error: ConnectorError) -> None:
+    def record_failure(self, connection_id: str, error: ConnectorError, *, job_id: str | None = None) -> None:
         state = self._state(connection_id)
         state.update(state=STATE_BY_CODE.get(error.code, "DOWN"), last_error_code=error.code, last_error=str(error)[:500])
+        health = self._job_health(connection_id, job_id)
+        health.consecutive_failures += 1
+        health.reads_failed += 1
+        health.last_error_code = error.code
+        health.last_error = str(error)[:500]
+        health.last_error_mono = time.monotonic()
+
+    def _job_verdict(self, health: JobHealth, connector: Any, now: float) -> tuple[str | None, str | None, str | None]:
+        """(state, error_code, error) for one job with hysteresis.
+
+        state None = no evidence yet; UP = acquiring; RATE_LIMITED = acquiring slowly; DOWN /
+        AUTH_FAILED = no successful read for the degrade window and the reads fail; SILENT = the
+        transport is up but the source sent nothing for the window (push) or no read completed (poll).
+        """
+        window = degrade_window_s(health.interval_s, self.min_degrade_s)
+        silent_window = window or max(5.0, 2 * health.interval_s)
+        reference = health.last_ok_mono if health.last_ok_mono is not None else health.started_mono
+        quiet_s = now - reference
+        if health.push and connector is not None and hasattr(connector, "state"):
+            transport = str(getattr(connector, "state", "UP") or "UP")
+            if transport != "UP":
+                down_since = getattr(connector, "down_since", None)
+                if down_since is None or now - float(down_since) >= window:
+                    code = getattr(connector, "last_error_code", None) or "NETWORK"
+                    text = getattr(connector, "last_error", None) or "Disconnected."
+                    return STATE_BY_CODE.get(code, "DOWN"), code, text
+            elif quiet_s >= silent_window and health.consecutive_failures == 0:
+                return "SILENT", "NO_DATA", f"Connected, but the source sent no data for {int(quiet_s)} s."
+        if health.consecutive_failures > 0 and quiet_s >= window:
+            code = health.last_error_code or "INTERNAL"
+            state = STATE_BY_CODE.get(code, "DOWN")
+            return state, code, health.last_error
+        if health.consecutive_failures == 0 and not health.push and health.stall_s > 0 and quiet_s >= max(silent_window, health.stall_s):
+            return "SILENT", "STALLED", f"No read completed for {int(quiet_s)} s."
+        if health.last_error_code == "RATE_LIMITED" and health.last_error_mono is not None and now - health.last_error_mono <= max(window, 2 * health.interval_s, 5.0):
+            # The source answered (429): reachable, only slowed down.
+            return "RATE_LIMITED", "RATE_LIMITED", health.last_error
+        if health.last_ok_mono is None:
+            return None, None, None
+        return "UP", None, None
 
     def connection_report(self, *, reset: bool = False) -> dict[str, dict[str, Any]]:
         report: dict[str, dict[str, Any]] = {}
         if not self.snapshot:
             return report
-        active = {spec.connection_id for spec in self.specs.values()}
+        jobs_by_conn: dict[str, list[JobSpec]] = {}
+        for spec in self.specs.values():
+            jobs_by_conn.setdefault(spec.connection_id, []).append(spec)
+        now = time.monotonic()
+        severity = {"AUTH_FAILED": 4, "DOWN": 3, "SILENT": 2, "RATE_LIMITED": 1, "UP": 0}
         for connection in self.snapshot.get("connections") or []:
             cid = str(connection["id"])
-            if cid not in active:
+            specs = jobs_by_conn.get(cid)
+            if not specs:
                 report[cid] = {"state": "IDLE", "last_ok_at": None, "last_error_code": None, "last_error": None, "read_ms": None, "samples": 0}
                 continue
-            state = dict(self._state(cid))
             connector = self.connectors.get(cid, (None, None))[1]
-            if isinstance(connector, (MqttConnector, WebSocketConnector)):
-                if connector.state != "UP":
-                    state.update(state=connector.state, last_error_code=connector.last_error_code, last_error=connector.last_error)
-                elif state["state"] in {None, "DOWN"}:
-                    state.update(state="UP", last_error_code=None, last_error=None)
-                if connector.last_message_at and (state["last_ok_at"] or "") < connector.last_message_at:
-                    state["last_ok_at"] = connector.last_message_at
-            if state["state"] is None:
+            verdicts: list[tuple[str, str | None, str | None]] = []
+            healths: list[JobHealth] = []
+            for spec in specs:
+                health = self._job_health(cid, spec.job_id)
+                healths.append(health)
+                state, code, text = self._job_verdict(health, connector, now)
+                if state is not None:
+                    verdicts.append((state, code, text))
+            legacy = self.job_health.get(f"{cid}:*")
+            if legacy is not None and legacy.last_error_mono is not None and legacy.consecutive_failures:
+                healths.append(legacy)
+            last_ok_at = max((h.last_ok_at for h in healths if h.last_ok_at), default=None)
+            last_message_at = getattr(connector, "last_message_at", None) if connector is not None else None
+            if last_message_at and (last_ok_at or "") < last_message_at:
+                last_ok_at = last_message_at
+            failing = [v for v in verdicts if v[0] in {"DOWN", "AUTH_FAILED", "SILENT"}]
+            if not verdicts:
                 continue
-            report[cid] = state
+            worst = max(verdicts, key=lambda item: severity.get(item[0], 3))
+            entry: dict[str, Any] = {
+                "state": worst[0],
+                "last_ok_at": last_ok_at,
+                "last_error_code": worst[1],
+                "last_error": worst[2],
+                "read_ms": max((h.read_ms for h in healths if h.read_ms is not None), default=None),
+                "samples": sum(h.samples for h in healths),
+                "window_s": max(degrade_window_s(h.interval_s, self.min_degrade_s) for h in healths),
+                "reads_ok": sum(h.reads_ok for h in healths),
+                "reads_failed": sum(h.reads_failed for h in healths),
+                "jobs_total": len(specs),
+                "jobs_failing": len(failing),
+            }
+            if failing and len(specs) > 1:
+                entry["last_error"] = f"{len(failing)} of {len(specs)} jobs failing: {worst[2] or worst[1]}"[:500]
+            recent = [h for h in healths if h.last_error_mono is not None and now - h.last_error_mono <= entry["window_s"]]
+            if not failing and recent:
+                last = max(recent, key=lambda h: h.last_error_mono or 0.0)
+                entry["warning"] = f"Intermittent errors: {last.last_error_code}: {last.last_error}"[:500]
+            report[cid] = entry
             if reset:
                 self._state(cid)["samples"] = 0
+                for health in healths:
+                    health.samples = 0
+                    health.reads_ok = 0
+                    health.reads_failed = 0
         return report
+
+    def runtime_info(self) -> dict[str, Any]:
+        """Facts Center needs to judge evidence: when acquisition started / became leader, which connections run jobs."""
+        running = {spec.connection_id for spec in self.specs.values() if (task := self.job_tasks.get(spec.job_id)) is not None and not task.done()}
+        return {
+            "started_at": self.started_at,
+            "leader_since": self.leader_since,
+            "jobs_expected": len(self.specs),
+            "jobs_running": sum(1 for task in self.job_tasks.values() if not task.done()),
+            "connections_running": sorted(running),
+        }
 
     # ------------------------------------------------------------------ config sync
 
@@ -342,6 +519,10 @@ class AcquisitionRuntime:
         for connection_id in list(self.conn_states):
             if connection_id not in wanted_connections:
                 del self.conn_states[connection_id]
+        for key in list(self.job_health):
+            health = self.job_health[key]
+            if health.connection_id not in wanted_connections or (not key.endswith(":*") and key not in specs):
+                del self.job_health[key]
 
         old = self.specs
         self.specs = specs
@@ -371,19 +552,48 @@ class AcquisitionRuntime:
         return rotated
 
     def _start_job(self, spec: JobSpec) -> None:
+        old = self.job_tasks.get(spec.job_id)
+        if old is not None and not old.done():
+            old.cancel()
+        # A (re)started job gets a fresh evidence window: its new configuration has not failed yet.
+        self.job_health.pop(spec.job_id, None)
+        self._job_health(spec.connection_id, spec.job_id)
         runner = JobRunner(spec, self)
         self.job_tasks[spec.job_id] = asyncio.create_task(self._job_main(runner), name=f"job:{spec.job_id}")
+
+    def ensure_jobs_running(self) -> int:
+        """Start every configured job whose task is missing or has ended. Leader only. Returns jobs started.
+
+        Called on promotion and on every config tick, so the running set always converges to the
+        configured set no matter how a task was lost (demotion, crash, cancellation).
+        """
+        if not self._is_leader:
+            return 0
+        started = 0
+        for job_id, spec in self.specs.items():
+            task = self.job_tasks.get(job_id)
+            if task is None or task.done():
+                if task is not None and not task.cancelled() and task.exception() is not None:
+                    logger.warning("Job %s ended with %r; restarting", job_id, task.exception())
+                self._start_job(spec)
+                started += 1
+        return started
 
     async def _job_main(self, runner: JobRunner) -> None:
         while True:
             try:
                 await runner.run()
-                return
+                logger.warning("Job %s returned unexpectedly; restarting in 1 s", runner.spec.job_id)
+                await asyncio.sleep(1)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
                 logger.exception("Job %s crashed; restarting in 5 s", runner.spec.job_id)
-                self.record_failure(runner.spec.connection_id, ConnectorError("INTERNAL", "Acquisition task crashed; restarting."))
+                self.record_failure(
+                    runner.spec.connection_id,
+                    ConnectorError("INTERNAL", "Acquisition task crashed; restarting."),
+                    job_id=runner.spec.job_id,
+                )
                 await asyncio.sleep(5)
 
     async def _stop_job(self, job_id: str) -> None:
@@ -418,27 +628,58 @@ class AcquisitionRuntime:
             return
         pending = self.publisher.spool.pending_count()
         queues: dict[str, Any] = {
-            cid: {"pending": connector.queue_length, "dropped": connector.dropped}
+            cid: {
+                "pending": connector.queue_length,
+                "dropped": connector.dropped,
+                "connects": connector.connects,
+                "disconnects": connector.disconnects,
+                "session_present": connector.session_present,
+            }
             for cid, (_, connector) in self.connectors.items()
             if isinstance(connector, MqttConnector)
         }
         queues["publisher"] = self.publisher.publish_metrics()
-        degraded = not self.config_ok or self.activation_error is not None or self.publisher.storage_error is not None or not self.publisher.broker_ok
-        diag = self.activation_error or self.publisher.storage_error or ("RabbitMQ broker unavailable." if not self.publisher.broker_ok else None)
-        reports = self.connection_report(reset=True)
-        if reports:
-            await self.control_plane.flush_connection_reports(reports)
-        await self.control_plane.record_heartbeat(
-            health="DEGRADED" if degraded else "HEALTHY",
-            software_version=SOFTWARE_VERSION,
-            spool_pending=pending,
-            fast_buffered=self.publisher.fast_buffered,
-            queues=queues,
-            revision=self.revision,
-            broker_ok=self.publisher.broker_ok,
-            config_in_sync=self.config_ok and self.activation_error is None,
-            diagnostic=diag,
+        runtime = self.runtime_info()
+        queues["runtime"] = runtime
+        missing_jobs = runtime["jobs_expected"] - runtime["jobs_running"]
+        degraded = (
+            not self.config_ok
+            or self.activation_error is not None
+            or self.publisher.storage_error is not None
+            or not self.publisher.broker_ok
+            or missing_jobs > 0
         )
+        diag = (
+            self.activation_error
+            or self.publisher.storage_error
+            or ("RabbitMQ broker unavailable." if not self.publisher.broker_ok else None)
+            or (f"{missing_jobs} of {runtime['jobs_expected']} acquisition jobs are not running." if missing_jobs > 0 else None)
+        )
+        reports = self.connection_report(reset=True)
+        # The liveness heartbeat goes first and is bounded on its own: a slow or failing health flush
+        # (row locks, PG hiccup) must never make Center believe the collector is offline.
+        heartbeat_error: BaseException | None = None
+        try:
+            await bounded(
+                self.control_plane.record_heartbeat(
+                    health="DEGRADED" if degraded else "HEALTHY",
+                    software_version=SOFTWARE_VERSION,
+                    spool_pending=pending,
+                    fast_buffered=self.publisher.fast_buffered,
+                    queues=queues,
+                    revision=self.revision,
+                    broker_ok=self.publisher.broker_ok,
+                    config_in_sync=self.config_ok and self.activation_error is None,
+                    diagnostic=diag,
+                ),
+                timeout=HEARTBEAT_WRITE_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - still try to flush connection evidence
+            heartbeat_error = exc
+        if reports:
+            await bounded(self.control_plane.flush_connection_reports(reports), timeout=REPORT_WRITE_TIMEOUT_S)
+        if heartbeat_error is not None:
+            raise heartbeat_error
 
     def _write_health(self, ok: bool) -> None:
         if self.health_path is None:
@@ -468,9 +709,31 @@ class AcquisitionRuntime:
 
     async def _run_command(self, job: dict[str, Any]) -> None:
         try:
-            await self.commissioner.run(job)
+            # Center reaps a RUNNING command after 30 s with a bare "timed out". Finish earlier with
+            # a real diagnostic so the operator sees what was slow.
+            await bounded(self.commissioner.run(job), timeout=COMMISSION_BUDGET_S)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            logger.warning("Commissioning command %s did not finish within %.0f s", job.get("id"), COMMISSION_BUDGET_S)
+            try:
+                await bounded(
+                    self.control_plane.finish_commissioning(
+                        str(job.get("id")),
+                        {
+                            "status": "FAILED",
+                            "error_code": "TIMEOUT",
+                            "diagnostic": (
+                                f"The source did not answer within {int(COMMISSION_BUDGET_S)} s. "
+                                "Check that the device is reachable and the address is correct, then test again."
+                            ),
+                            "stages": [],
+                        },
+                    ),
+                    timeout=5.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info("Could not report commissioning timeout for %s: %r", job.get("id"), exc)
         except Exception:  # noqa: BLE001
             logger.exception("Commissioning command %s failed", job.get("id"))
 
@@ -497,22 +760,45 @@ class AcquisitionRuntime:
             acquired = await self.leader_lock.probe()
             if acquired and not self._is_leader:
                 logger.info("Acquired PostgreSQL advisory leader lock; starting acquisition jobs")
-                self._is_leader = True
-                if self.notify_listener is not None:
-                    self.notify_listener.config_event.set()
-                    self.notify_listener.commissioning_event.set()
+                await self._promote()
             elif not acquired and self._is_leader:
                 logger.warning("Lost PostgreSQL advisory leader lock; demoting to standby and stopping jobs")
-                self._is_leader = False
-                await self._stop_all_jobs_and_connectors()
+                await self._demote()
             if not self._is_leader:
                 self._write_health(True)
             await asyncio.sleep(self.leader_probe_s)
+
+    async def _promote(self) -> None:
+        """Become leader and run every configured job now (P0: never sit as leader with zero jobs).
+
+        The last applied snapshot is still in memory, and ``fetch_if_changed`` reports "unchanged" for
+        it, so jobs are started from that snapshot directly; a config sync is also requested so a
+        revision published while this instance was standby is applied right after.
+        """
+        self._is_leader = True
+        self.leader_since = now_iso()
+        self.conn_states.clear()
+        self.job_health.clear()
+        if self.snapshot is not None:
+            started = self.ensure_jobs_running()
+            logger.info("Leader promotion started %d acquisition job(s) from revision %s", started, self.revision)
+        if self.notify_listener is not None:
+            self.notify_listener.config_event.set()
+            self.notify_listener.commissioning_event.set()
+
+    async def _demote(self) -> None:
+        self._is_leader = False
+        self.leader_since = None
+        await self._stop_all_jobs_and_connectors()
+        # Evidence gathered as leader must not be reported after a later promotion.
+        self.conn_states.clear()
+        self.job_health.clear()
 
     async def _config_loop(self) -> None:
         while not self._stopping:
             if self._is_leader:
                 await self.sync_config()
+                self.ensure_jobs_running()
             if self.notify_listener is not None:
                 try:
                     await bounded(self.notify_listener.config_event.wait(), timeout=self.config_s)
@@ -642,6 +928,7 @@ class AcquisitionRuntime:
             await self.leader_lock.probe()
             self._is_leader = self.leader_lock.is_leader
         if self._is_leader:
+            self.leader_since = now_iso()
             await self.sync_config(start_jobs=False)
         try:
             async with asyncio.TaskGroup() as group:

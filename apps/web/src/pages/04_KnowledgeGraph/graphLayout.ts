@@ -1,7 +1,19 @@
-import ELK from 'elkjs/lib/elk.bundled.js';
-import { Node, Edge } from '@xyflow/react';
+import type { Node, Edge } from '@xyflow/react';
 
-const elk = new ELK();
+// R1-25: ELK (~1.4 MB) is loaded on first use instead of in the main bundle every page downloads.
+type ElkLayout = InstanceType<typeof import('elkjs/lib/elk.bundled.js').default>;
+let elkPromise: Promise<ElkLayout> | null = null;
+function getElk(): Promise<ElkLayout> {
+  if (!elkPromise) {
+    elkPromise = import('elkjs/lib/elk.bundled.js')
+      .then((mod) => new mod.default() as ElkLayout)
+      .catch((error) => {
+        elkPromise = null;
+        throw error;
+      });
+  }
+  return elkPromise;
+}
 
 export async function layoutGraph(
   nodes: Node[],
@@ -56,6 +68,7 @@ export async function layoutGraph(
     })),
   };
 
+  const elk = await getElk();
   const layouted = await elk.layout(graph);
 
   const nodePositions = new Map<string, { x: number; y: number }>();

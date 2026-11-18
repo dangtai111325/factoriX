@@ -493,7 +493,10 @@ class TDengineHistoryRepository:
         limit: int,
         active_epoch: int,
         cursor_tuple: tuple[int, str] | None = None,
+        newest: bool = False,
     ) -> list[HistoricalPoint]:
+        """Rows of the window in ascending order. ``newest=True`` (no cursor) returns the most recent
+        ``limit`` rows instead of the oldest ones (R1-A P1-10: a sparkline must end at "now")."""
         db = tenant_database_name(tenant_id, prefix=self._client.config.db_prefix)
         subtable = op_subtable_name(signal_id, value_type)
         fq = quote_fq_table(db, subtable)
@@ -507,7 +510,7 @@ class TDengineHistoryRepository:
             rows = await self._client.query_rows(
                 f"SELECT `ts`, `val`, `acquired_at`, `source_time`, `raw_quality`, `reason_code`, "
                 f"`origin`, `unit`, `event_uid`, `config_rev`, `data_epoch`, `record_kind` "
-                f"FROM {fq} WHERE {where} ORDER BY `ts` ASC LIMIT {fetch_cap}"
+                f"FROM {fq} WHERE {where} ORDER BY `ts` {'DESC' if newest and cursor_tuple is None else 'ASC'} LIMIT {fetch_cap}"
             )
         except TDEngineError as exc:
             if _is_missing_td_object(exc):
@@ -549,6 +552,8 @@ class TDengineHistoryRepository:
                 )
             )
         points.sort(key=lambda p: (to_td_timestamp_us(p.event_time), p.id))
+        if newest and cursor_tuple is None:
+            return points[-limit:]
         return points[:limit]
 
     async def _query_managed_rows(
@@ -693,7 +698,11 @@ class TDengineHistoryRepository:
         session: AsyncSession | None = None,
         value_type: str | None = None,
         active_epoch: int | None = None,
+        order: Literal["oldest", "newest"] = "oldest",
     ) -> HistoricalPage:
+        """``order="newest"`` (operational, first page) returns the most recent ``limit`` rows of the
+        window instead of the oldest ones (R1-A P1-10); the default keeps the paging contract of
+        ``/api/v1/observations/history`` (ascending pages with ``next_cursor``)."""
         start_utc = _utc(start)
         end_utc = _utc(end)
         if start_utc is None or end_utc is None or end_utc <= start_utc:
@@ -723,13 +732,21 @@ class TDengineHistoryRepository:
                 limit=bounded_limit + 1,
                 active_epoch=eff_epoch,
                 cursor_tuple=cursor_tuple,
+                newest=order == "newest" and cursor_tuple is None,
             )
             next_cur = None
+            notes: list[str] = []
             if len(pts) > bounded_limit:
-                last_pt = pts[bounded_limit - 1]
-                next_cur = _format_cursor(last_pt.event_time, last_pt.id)
-                pts = pts[:bounded_limit]
-            return HistoricalPage(items=pts, next_cursor=next_cur, downsampled=False, fidelity="operational_full")
+                if order == "newest" and cursor_tuple is None:
+                    # First page = the most recent rows of the window (never the oldest minutes).
+                    pts = pts[-bounded_limit:]
+                    notes.append(f"Showing the most recent {bounded_limit} rows of the window.")
+                else:
+                    last_pt = pts[bounded_limit - 1]
+                    next_cur = _format_cursor(last_pt.event_time, last_pt.id)
+                    pts = pts[:bounded_limit]
+            return HistoricalPage(items=pts, next_cursor=next_cur, downsampled=False, fidelity="operational_full",
+                                  coverage_notes=notes)
 
         binding = await self._managed_binding(session, tenant_id, signal_id, dataset_id=dataset_id)
         if mode == "recorded":

@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import threading
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -97,25 +98,27 @@ async def test_partial_failure_spills_unconfirmed_items_and_keeps_unattempted_ra
     pub = ObservationPublisher(broker, spool)
     field_id = spec.fields[0]["id"]
 
-    # Emit 600 samples (> BATCH_ROWS=500) so second batch of 100 remains in RAM when first batch partially fails
-    for i in range(600):
+    # Emit 2600 samples: one pipelined broker call takes BATCH_ROWS * PIPELINE_BATCHES = 2000,
+    # the remaining 600 stay in RAM when that call partially fails.
+    for i in range(2600):
         await pub.emit(spec, [Sample(field_id, float(i), "GOOD")])
     sent, failed = await pub.flush_once()
 
     assert sent == 2 and failed is True
     assert pub.broker_ok is True
-    assert pub.fast_buffered == 100
-    assert spool.pending_count() == 498
+    assert pub.fast_buffered == 600
+    assert spool.pending_count() == 1998
 
     broker.down = False
     broker.fail_after = None
     sent2, failed2 = await pub.flush_once(budget_s=5.0)
     assert failed2 is False
-    assert sent2 == 598
+    assert sent2 == 2598
     assert spool.pending_count() == 0
     seqs = [o.source_sequence for o in broker.published]
-    assert seqs[:102] == [1, 2, *range(501, 601)]
-    assert sorted(seqs) == list(range(1, 601))
+    # Live RAM data leaves before any spooled replay.
+    assert seqs[:602] == [1, 2, *range(2001, 2601)]
+    assert sorted(seqs) == list(range(1, 2601))
     spool.close()
 
 
@@ -384,7 +387,7 @@ async def test_fair_flushing_interleaves_ram_and_spool(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_replay_uses_a_smaller_slice_while_ram_stays_busy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_live_ram_drains_before_replay_and_replay_is_rate_limited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("factorix_acquisition.publisher.BATCH_ROWS", 4)
     monkeypatch.setattr("factorix_acquisition.publisher.CONTENDED_REPLAY_ROWS", 1)
     spool = AcquisitionSpool(tmp_path / "spool.sqlite")
@@ -398,10 +401,49 @@ async def test_replay_uses_a_smaller_slice_while_ram_stays_busy(tmp_path: Path, 
         spec, _, _ = _spec()
         await publisher.emit(spec, [Sample(spec.fields[0]["id"], float(i + 10), "GOOD") for i in range(9)])
 
+        # Replay tokens exhausted: live RAM still flows completely, replay waits without failing.
+        publisher._replay_tokens = 0.0
+        publisher._replay_refill_at = time.monotonic() + 3600.0
         assert await publisher.flush_once(budget_s=0) == (9, False)
-        assert publisher.fast_buffered == 1
-        assert spool.pending_count() == 2
-        assert await publisher.flush_once(budget_s=0) == (3, False)
+        assert publisher.fast_buffered == 0 and spool.pending_count() == 3
+        assert [o.value for o in broker.published] == [float(i + 10) for i in range(9)]
+
+        # Tokens refill: replay resumes, newest-per-signal first.
+        publisher._replay_tokens = 2.0
+        assert await publisher.flush_once(budget_s=0) == (2, False)
+        assert spool.pending_count() == 1
+        publisher._replay_refill_at = 0.0  # long elapsed: bucket refills to capacity
+        assert await publisher.flush_once(budget_s=0) == (1, False)
         assert spool.pending_count() == 0
+    finally:
+        spool.close()
+
+
+@pytest.mark.asyncio
+async def test_emit_applies_bounded_backpressure_instead_of_spilling(tmp_path: Path) -> None:
+    spec, _, _ = _spec()
+    field_id = spec.fields[0]["id"]
+    spool = AcquisitionSpool(tmp_path / "spool.sqlite")
+    pub = ObservationPublisher(RecordingBroker(), spool, max_memory_queue=100, admission_wait_s=0.5)
+    try:
+        await pub.emit(spec, [Sample(field_id, float(i), "GOOD") for i in range(100)])
+        assert pub.fast_buffered == 100
+
+        # A flusher frees space while the job is waiting: the job resumes, nothing is spooled.
+        waiting = asyncio.create_task(pub.emit(spec, [Sample(field_id, 1000.0, "GOOD")]))
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
+        await pub.flush_once()
+        assert await asyncio.wait_for(waiting, 1) == 1
+        assert spool.pending_count() == 0 and pub.spilled == 0
+        assert pub.admission_waits == 1
+
+        # Nobody drains: after the bounded wait the samples are rejected as an explicit gap.
+        await pub.emit(spec, [Sample(field_id, float(i), "GOOD") for i in range(99)])
+        assert pub.fast_buffered == 100
+        pub.admission_wait_s = 0.05
+        assert await pub.emit(spec, [Sample(field_id, 5.0, "GOOD"), Sample(field_id, 6.0, "GOOD")]) == 0
+        assert pub.gap_rejected == 2 and spool.pending_count() == 0
+        assert "acquisition gap" in (pub.storage_error or "")
     finally:
         spool.close()

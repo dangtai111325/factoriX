@@ -226,7 +226,9 @@ class Commissioner:
         except NetworkPolicyError as exc:
             stages.set("REACH", "FAILED", str(exc))
             return False, {}
+        # Interactive "Test read": priority lane of the endpoint scheduler, never behind a poll cycle.
         connector = ModbusConnector(host, port, timeout_s=timeout_s)
+        connector.priority = True
         try:
             try:
                 await connector.connect()

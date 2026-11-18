@@ -193,6 +193,7 @@ def _runtime(
         config_s=0.2,
         commands_s=0.2,
         leader_probe_s=0.1,
+        min_degrade_s=0.5,
     )
 
     async def create(spec):  # noqa: ANN001
@@ -225,7 +226,12 @@ async def _run_for(
 
 
 @pytest.mark.asyncio
-async def test_failing_and_hanging_jobs_do_not_stop_other_jobs_or_heartbeat(tmp_path: Path) -> None:
+async def test_failing_and_hanging_jobs_do_not_stop_other_jobs_or_heartbeat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import factorix_acquisition.jobs as jobs_mod
+
+    # Real Modbus requests are bounded per request inside ModbusConnector (after the endpoint
+    # queue); the fake device bypasses that, so shrink the cycle watchdog to see it fire.
+    monkeypatch.setattr(jobs_mod, "MODBUS_MAX_CYCLE_S", 1.0)
     snap = _snapshot(
         [
             {"name": "good"},
