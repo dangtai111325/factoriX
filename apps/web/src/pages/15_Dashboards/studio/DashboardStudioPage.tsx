@@ -8,7 +8,7 @@
  * asks first. The Studio covers the main navigation (it needs the width) and requires ≥ 1024 px.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   Archive,
   ArchiveRestore,
@@ -81,6 +81,7 @@ import {
 } from '../../../features/dashboard/document';
 import { useThemePresets, useWidgetRegistry } from '../../../features/dashboard/registry';
 import { DashboardRuntimeProvider, useRuntimeStatus } from '../../../features/dashboard/runtime/RuntimeProvider';
+import { isUuid } from '../../../features/dashboard/nav';
 import { useSourceCatalog } from '../../../features/dashboard/sources';
 import { resolveTheme } from '../../../features/dashboard/theme';
 import type {
@@ -138,6 +139,10 @@ export const DashboardStudioPage: React.FC = () => {
   );
   useEffect(() => {
     const ctrl = new AbortController();
+    if (!isUuid(dashboardId)) {
+      setState({ kind: 'not_found' });
+      return () => ctrl.abort();
+    }
     setState({ kind: 'loading' });
     void load(ctrl.signal);
     return () => ctrl.abort();
@@ -256,6 +261,14 @@ const StudioEditor: React.FC<{ initial: DashboardDetail; reloadPage: () => void 
   const [meta, setMeta] = useState<Meta>(() => metaOf(initial));
   const [upgradeNotes, setUpgradeNotes] = useState<string[]>(() => (Array.isArray(initial.upgrade_notes) ? initial.upgrade_notes : []));
   const { toast, show, dismiss } = useActionToast();
+  const location = useLocation();
+  useEffect(() => {
+    const w = (location.state as { createdWarnings?: string[] } | null)?.createdWarnings;
+    if (!w?.length) return;
+    show({ message: `Created “${initial.name}”. ${w.length} item${w.length === 1 ? '' : 's'} need attention: ${w[0]}${w.length > 1 ? ' Use Validate to see all.' : ''}`, tone: 'info', durationMs: 12000 });
+    window.history.replaceState({ ...window.history.state, usr: null }, '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [leftTab, setLeftTab] = useState<LeftTab>('widgets');

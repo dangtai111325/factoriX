@@ -1,6 +1,7 @@
 /**
  * Dashboards (/dashboards): every dashboard of the tenant as cards with search, status filter and sort;
- * New dashboard (blank or template), Import, and per-card Open / Edit / Duplicate / Export / Archive.
+ * New dashboard (blank or template), Import, and per-card Open / Edit / Duplicate / Export / Archive;
+ * archived cards offer Unarchive and Delete permanently (typed-name confirmation).
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -16,6 +17,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Trash2,
   Upload,
 } from 'lucide-react';
 import { Button } from '../../components/common/Button';
@@ -23,7 +25,7 @@ import { ConfirmDialog } from '../../components/common/ConfirmDialog';
 import { ActionToast, useActionToast } from '../../components/common/ActionToast';
 import { Dialog, IconMenu, Skeleton, timeAgo, useNow } from '../13_DataModels/ui';
 import { ErrorBanner, FilterBar, PageHeader, SearchInput, selectCls } from '../historian/hsUi';
-import { archiveDashboard, downloadJson, duplicateDashboard, errorLine, exportDashboard, listDashboards, safeFileName, unarchiveDashboard } from '../../features/dashboard/api';
+import { archiveDashboard, deleteDashboard, downloadJson, duplicateDashboard, errorLine, exportDashboard, listDashboards, safeFileName, unarchiveDashboard } from '../../features/dashboard/api';
 import { DashboardStatusChip } from '../../features/dashboard/components/controls';
 import { THEME_PRESET_LABEL } from '../../features/dashboard/theme';
 import type { DashboardSummary, ThemePresetId } from '../../features/dashboard/types';
@@ -47,6 +49,9 @@ export const DashboardListPage: React.FC = () => {
   const [dup, setDup] = useState<DashboardSummary | null>(null);
   const [toArchive, setToArchive] = useState<DashboardSummary | null>(null);
   const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [toDelete, setToDelete] = useState<DashboardSummary | null>(null);
+  const [deleteTyped, setDeleteTyped] = useState('');
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const { toast, show, dismiss } = useActionToast();
   const now = useNow(30000);
 
@@ -189,6 +194,11 @@ export const DashboardListPage: React.FC = () => {
                 setToArchive(d);
               }}
               onUnarchive={() => void doUnarchive(d)}
+              onDelete={() => {
+                setDeleteError(null);
+                setDeleteTyped('');
+                setToDelete(d);
+              }}
             />
           ))}
         </div>
@@ -199,8 +209,8 @@ export const DashboardListPage: React.FC = () => {
         onClose={() => setNewOpen(false)}
         onCreated={(d, warnings) => {
           setNewOpen(false);
-          if (warnings.length) show({ message: `Created “${d.name}”. ${warnings.length} item${warnings.length === 1 ? '' : 's'} need attention: ${warnings[0]}`, tone: 'info' });
-          navigate(`/dashboards/${d.id}/edit`);
+          // The list unmounts on navigation: the Studio shows the creation notes.
+          navigate(`/dashboards/${d.id}/edit`, { state: warnings.length ? { createdWarnings: warnings } : undefined });
         }}
       />
       <ImportDashboardDialog
@@ -244,6 +254,42 @@ export const DashboardListPage: React.FC = () => {
           }
         }}
       />
+      <ConfirmDialog
+        isOpen={!!toDelete}
+        title={`Delete “${toDelete?.name ?? ''}” permanently?`}
+        message="The dashboard, its draft and every published revision are deleted. This cannot be undone. Links to it from other dashboards stop working."
+        confirmLabel="Delete permanently"
+        busyLabel="Deleting…"
+        variant="danger"
+        confirmDisabled={!toDelete || deleteTyped.trim() !== toDelete.name.trim()}
+        error={deleteError}
+        onCancel={() => setToDelete(null)}
+        onConfirm={async () => {
+          if (!toDelete || deleteTyped.trim() !== toDelete.name.trim()) return;
+          try {
+            await deleteDashboard(toDelete.id);
+            const { id, name } = toDelete;
+            setItems((prev) => prev.filter((x) => x.id !== id));
+            setToDelete(null);
+            show({ message: `Deleted “${name}” permanently.`, tone: 'success' });
+          } catch (e) {
+            setDeleteError(errorLine(e, 'Could not delete the dashboard.'));
+          }
+        }}
+      >
+        <label htmlFor="dash-delete-name" className="block text-[12px] font-semibold text-[#334568] mb-1">
+          Type the dashboard name to confirm
+        </label>
+        <input
+          id="dash-delete-name"
+          className="fx-input"
+          value={deleteTyped}
+          autoComplete="off"
+          spellCheck={false}
+          placeholder={toDelete?.name}
+          onChange={(e) => setDeleteTyped(e.target.value)}
+        />
+      </ConfirmDialog>
       <ActionToast toast={toast} onDismiss={dismiss} />
     </div>
   );
@@ -287,16 +333,20 @@ const DashboardCard: React.FC<{
   onExport: () => void;
   onArchive: () => void;
   onUnarchive: () => void;
-}> = ({ d, now, onOpen, onEdit, onDuplicate, onExport, onArchive, onUnarchive }) => {
+  onDelete: () => void;
+}> = ({ d, now, onOpen, onEdit, onDuplicate, onExport, onArchive, onUnarchive, onDelete }) => {
   const archived = !!d.archived_at;
   const items = [
     { key: 'open', label: 'Open', icon: <Eye className="w-3.5 h-3.5" />, onSelect: onOpen, disabled: archived },
     { key: 'edit', label: 'Edit', icon: <Pencil className="w-3.5 h-3.5" />, onSelect: onEdit, disabled: archived },
     { key: 'dup', label: 'Duplicate…', icon: <Copy className="w-3.5 h-3.5" />, onSelect: onDuplicate, separator: true },
     { key: 'export', label: 'Export JSON', icon: <Download className="w-3.5 h-3.5" />, onSelect: onExport },
-    archived
-      ? { key: 'unarchive', label: 'Unarchive', icon: <ArchiveRestore className="w-3.5 h-3.5" />, onSelect: onUnarchive, separator: true }
-      : { key: 'archive', label: 'Archive…', icon: <Archive className="w-3.5 h-3.5" />, onSelect: onArchive, separator: true },
+    ...(archived
+      ? [
+          { key: 'unarchive', label: 'Unarchive', icon: <ArchiveRestore className="w-3.5 h-3.5" />, onSelect: onUnarchive, separator: true },
+          { key: 'delete', label: 'Delete permanently…', icon: <Trash2 className="w-3.5 h-3.5" />, onSelect: onDelete, danger: true },
+        ]
+      : [{ key: 'archive', label: 'Archive…', icon: <Archive className="w-3.5 h-3.5" />, onSelect: onArchive, separator: true }]),
   ];
   const themeLabel = THEME_PRESET_LABEL[d.theme_preset as ThemePresetId] || d.theme_preset || '—';
   return (
@@ -305,14 +355,26 @@ const DashboardCard: React.FC<{
         <span className="mt-0.5 w-8 h-8 rounded-lg bg-[#EEF5FF] text-[#134074] flex items-center justify-center shrink-0" aria-hidden="true">
           <LayoutDashboard className="w-4 h-4" />
         </span>
-        <button type="button" onClick={archived ? onUnarchive : d.published_revision ? onOpen : onEdit} className="min-w-0 flex-1 text-left outline-none" aria-label={`${archived ? 'Unarchive' : d.published_revision ? 'Open' : 'Edit'} ${d.name}`}>
-          <h3 className="text-[14px] font-bold text-[#111B37] truncate group-hover:text-[#134074]" title={d.name}>
-            {d.name}
-          </h3>
-          <p className="text-[12px] text-[#657794] line-clamp-2 min-h-[32px]" title={d.description}>
-            {d.description || <span className="text-[#94A3B8]">No description</span>}
-          </p>
-        </button>
+        {/* The title opens (or edits) an active dashboard; on an archived card it is plain text: a click must never mutate. */}
+        {archived ? (
+          <div className="min-w-0 flex-1">
+            <h3 className="text-[14px] font-bold text-[#111B37] truncate" title={d.name}>
+              {d.name}
+            </h3>
+            <p className="text-[12px] text-[#657794] line-clamp-2 min-h-[32px]" title={d.description}>
+              {d.description || <span className="text-[#94A3B8]">No description</span>}
+            </p>
+          </div>
+        ) : (
+          <button type="button" onClick={d.published_revision ? onOpen : onEdit} className="min-w-0 flex-1 text-left outline-none" aria-label={`${d.published_revision ? 'Open' : 'Edit'} ${d.name}`}>
+            <h3 className="text-[14px] font-bold text-[#111B37] truncate group-hover:text-[#134074]" title={d.name}>
+              {d.name}
+            </h3>
+            <p className="text-[12px] text-[#657794] line-clamp-2 min-h-[32px]" title={d.description}>
+              {d.description || <span className="text-[#94A3B8]">No description</span>}
+            </p>
+          </button>
+        )}
         <IconMenu label={`Actions for ${d.name}`} icon={<EllipsisVertical className="w-4 h-4" />} items={items} />
       </div>
       <div className="px-4 mt-2">
@@ -331,9 +393,14 @@ const DashboardCard: React.FC<{
       </div>
       <div className="mt-auto flex items-center gap-2 px-4 py-3 border-t border-[#F1F5F9] mt-3">
         {archived ? (
-          <Button size="sm" variant="outline" icon={<ArchiveRestore className="w-3.5 h-3.5" />} onClick={onUnarchive}>
-            Unarchive
-          </Button>
+          <>
+            <Button size="sm" variant="outline" icon={<ArchiveRestore className="w-3.5 h-3.5" />} onClick={onUnarchive}>
+              Unarchive
+            </Button>
+            <Button size="sm" variant="danger" className="ml-auto" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={onDelete}>
+              Delete permanently
+            </Button>
+          </>
         ) : (
           <>
             <Button size="sm" variant="outline" icon={<Eye className="w-3.5 h-3.5" />} onClick={onOpen} disabled={!d.published_revision} title={d.published_revision ? undefined : 'Publish the dashboard first'}>

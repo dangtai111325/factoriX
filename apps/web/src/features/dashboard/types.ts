@@ -118,6 +118,7 @@ export interface PublishedDashboard {
   description: string;
   revision: number;
   published_at: string;
+  archived_at?: string | null;
   document: DashboardDocument;
 }
 

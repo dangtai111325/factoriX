@@ -74,7 +74,7 @@ export function errorLine(error: unknown, fallback?: string): string {
 export function listDashboards(params: { includeArchived?: boolean; q?: string } = {}, signal?: AbortSignal): Promise<DashboardListResponse> {
   const qs = new URLSearchParams({ include_archived: params.includeArchived ? 'true' : 'false' });
   if (params.q) qs.set('q', params.q);
-  return api<DashboardListResponse>(`${BASE}/?${qs}`, { signal });
+  return api<DashboardListResponse>(`${BASE}?${qs}`, { signal });
 }
 
 export interface CreateDashboardBody {
@@ -86,7 +86,7 @@ export interface CreateDashboardBody {
 }
 
 export function createDashboard(body: CreateDashboardBody): Promise<DashboardDetail & { warnings?: DashboardImportResult['warnings'] }> {
-  return api(`${BASE}/`, { method: 'POST', body: json(body) });
+  return api(`${BASE}`, { method: 'POST', body: json(body) });
 }
 
 export function getDashboard(id: string, signal?: AbortSignal): Promise<DashboardDetail> {
@@ -134,6 +134,11 @@ export function archiveDashboard(id: string, version: number): Promise<Dashboard
 
 export function unarchiveDashboard(id: string, version: number): Promise<DashboardDetail> {
   return api<DashboardDetail>(`${BASE}/${enc(id)}/unarchive`, { method: 'POST', body: json({ version }) });
+}
+
+/** Permanently delete an archived dashboard and all its revisions (409 NOT_ARCHIVED for an active one). */
+export function deleteDashboard(id: string): Promise<void> {
+  return api<void>(`${BASE}/${enc(id)}`, { method: 'DELETE' });
 }
 
 export function exportDashboard(id: string): Promise<DashboardExport> {

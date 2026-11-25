@@ -6,7 +6,7 @@
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { ArrowLeft, LayoutDashboard, Maximize, Minimize, Pencil } from 'lucide-react';
+import { Archive, ArrowLeft, LayoutDashboard, Maximize, Minimize, Pencil } from 'lucide-react';
 import { Button } from '../../components/common/Button';
 import { ActionToast, useActionToast } from '../../components/common/ActionToast';
 import { useNow } from '../13_DataModels/ui';
@@ -28,6 +28,7 @@ type LoadState =
   | { kind: 'loading' }
   | { kind: 'ready'; dash: PublishedDashboard; doc: DashboardDocument }
   | { kind: 'not_published'; name: string; description: string }
+  | { kind: 'archived'; name: string }
   | { kind: 'not_found' }
   | { kind: 'error'; error: unknown };
 
@@ -56,9 +57,17 @@ export const DashboardViewPage: React.FC = () => {
 
   useEffect(() => {
     const ctrl = new AbortController();
+    if (!isUuid(dashboardId)) {
+      // A malformed id (e.g. /dashboards/templates) is simply not a dashboard: no request, no retry banner.
+      setState({ kind: 'not_found' });
+      return () => ctrl.abort();
+    }
     setState({ kind: 'loading' });
     getPublished(dashboardId, ctrl.signal)
-      .then((dash) => setState({ kind: 'ready', dash, doc: normalizeDocument(dash.document) }))
+      .then((dash) =>
+        // Archived dashboards stop opening for viewers (the archive dialog promises it); the Studio offers unarchive.
+        setState(dash.archived_at ? { kind: 'archived', name: dash.name } : { kind: 'ready', dash, doc: normalizeDocument(dash.document) }),
+      )
       .catch(async (e) => {
         if (ctrl.signal.aborted) return;
         const info = errorInfo(e);
@@ -94,7 +103,16 @@ export const DashboardViewPage: React.FC = () => {
       <div className="space-y-4">
         <BackLink />
         <EmptyState icon={<LayoutDashboard className="w-6 h-6" />} title="Dashboard not found" action={<Link to="/dashboards" className="fx-btn fx-btn-secondary">All dashboards</Link>}>
-          It may have been archived, or the link is wrong.
+          It may have been archived or deleted, or the link is wrong.
+        </EmptyState>
+      </div>
+    );
+  if (state.kind === 'archived')
+    return (
+      <div className="space-y-4">
+        <BackLink />
+        <EmptyState icon={<Archive className="w-6 h-6" />} title={`“${state.name}” is archived`} action={<Link to="/dashboards" className="fx-btn fx-btn-secondary">All dashboards</Link>}>
+          Archived dashboards do not open. An editor can unarchive it from the Archived filter of the dashboard list.
         </EmptyState>
       </div>
     );
