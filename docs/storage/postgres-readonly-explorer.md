@@ -24,7 +24,7 @@ The **PostgreSQL Read-Only Explorer** provides this visibility directly within `
 To ensure that internal secrets and sensitive user credentials are never exposed, the PostgreSQL Explorer enforces three layers of defense:
 
 ### Layer 1: Table & Schema Denylist (Server-Side)
-The following tables (`SENSITIVE_TABLES` in `apps/center/src/factorix/modules/postgres_explorer.py`) are hidden from the table list and refused for preview and count:
+The following tables (`SENSITIVE_TABLES` in `apps/center/src/factorix/platform/pg_explorer_role.py`, used by the explorer and by the read-only role grants) are hidden from the table list and refused for preview and count:
 - `admin_accounts`, `sessions`, `password_reset_codes`, `login_throttle` (credentials and sign-in state)
 - `secret_store`, `edge_enrollment_tokens` (connection credentials and enrollment tokens)
 - `audit_events`
@@ -38,11 +38,16 @@ For tables that are visible (e.g., `connections`, `signal_definitions`), columns
 - Masked values appear in data preview as `********`.
 
 ### Layer 3: Database Role Privileges (Least Privilege)
-The backend connection pool for PostgreSQL Explorer queries uses a dedicated read-only role or explicitly enforces read-only transactions:
+Every explorer request runs in one transaction that starts with:
 ```sql
 SET TRANSACTION READ ONLY;
+SET LOCAL ROLE factorix_explorer_ro;   -- when the application login may use the role
 ```
-Direct DDL (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`) or DML (`INSERT`, `UPDATE`, `DELETE`) executed through explorer endpoints is impossible and will raise an immediate database error.
+- `factorix_explorer_ro` (migration `0015_explorer_ro_role`, `apps/center/src/factorix/platform/pg_explorer_role.py`) is a `NOLOGIN` role with `USAGE` on the application schemas and `SELECT` on every table / view **except** the Layer 1 tables (the same `SENSITIVE_TABLES` list) and views that read one of them. The application login is granted the role.
+- PostgreSQL therefore refuses a sensitive table by itself (`42501`, answered `403 EXPLORER_NOT_GRANTED`) even if the Layer 1 check were bypassed, and refuses every write twice (read-only transaction, and the role has no INSERT / UPDATE / DELETE / DDL privilege).
+- No default privileges: a table created by a later migration is not readable through the explorer until that migration calls `provision_explorer_role` again (opt-in, never by accident).
+- Fallback: where the database user can neither create the role (no `SUPERUSER` / `CREATEROLE`, e.g. the single-container appliance) nor use an existing one, the migration logs a warning and succeeds, the explorer keeps the read-only transaction, and `GET /api/v1/storage/pg/status` answers `privilege_isolation: false` (the explorer banner says so).
+- Downgrade revokes the grants of this database and drops the role (kept with a warning if another database of the same cluster still grants it something).
 
 ---
 
@@ -77,6 +82,7 @@ All endpoints require a signed-in administrator session (`apps/center/src/factor
 
 | Method | Endpoint | Description |
 |---|---|---|
+| `GET` | `/api/v1/storage/pg/status` | `read_only_transaction`, `privilege_isolation` (queries run as `factorix_explorer_ro`), `role`, `detail` |
 | `GET` | `/api/v1/storage/pg/schemas` | List all visible schemas in the control plane database |
 | `GET` | `/api/v1/storage/pg/tables?schema=public` | List visible tables with approximate row counts |
 | `GET` | `/api/v1/storage/pg/tables/{schema}/{table}` | Column definitions, types, nullability, PK/FK flags |

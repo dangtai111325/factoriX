@@ -23,6 +23,16 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
 
     # --- PostgreSQL Read-Only Explorer ---
 
+    @router.get("/api/v1/storage/pg/status", tags=["storage"])
+    async def get_pg_explorer_status(
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """How the explorer is confined (B-14 / OP-19): read-only transaction, and whether it runs as the
+        read-only role ``factorix_explorer_ro`` (``privilege_isolation``) or, where the role could not be
+        provisioned, under the application role."""
+        return await pg_explorer.status(session)
+
     @router.get("/api/v1/storage/pg/schemas", tags=["storage"])
     async def list_pg_schemas(
         principal: dict[str, Any] = Depends(admin_dep),

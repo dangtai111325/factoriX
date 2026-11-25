@@ -9,20 +9,21 @@ Provides:
 
 Zero write operations: the explorer never accepts SQL text. Every statement is a SELECT generated
 here from identifiers validated against the catalog and is refused for credential/session/audit
-tables (P1-14). Enforcement (B-14 / OP-19), in this order:
+tables (P1-14). Enforcement (B-14 / OP-19), in this order, once per request transaction:
 
-1. ``SET TRANSACTION READ ONLY`` before the first explorer statement of the request transaction, so
-   PostgreSQL itself rejects any INSERT / UPDATE / DELETE / DDL (``25006 read_only_sql_transaction``)
-   even if a statement were ever built wrongly. (Switching a transaction to read-only is allowed at any
-   point; the request's earlier auth bookkeeping is unaffected.)
-2. A statement allowlist: only ``SELECT`` / ``WITH`` text without ``;`` reaches the driver.
-3. ``SET LOCAL statement_timeout`` for previews and exact counts.
-
-A dedicated ``NOLOGIN`` read-only role (``SET LOCAL ROLE``) was not added: provisioning it needs
-``CREATEROLE`` on the appliance database, a grant of the role to the application login and default
-privileges for every future table, i.e. a change to database credentials / authorisation that is the
-owner's decision. The read-only transaction gives the same guarantee for writes; table-level
-visibility stays enforced by ``SENSITIVE_TABLES`` (403) and tenant scoping.
+1. ``SET TRANSACTION READ ONLY`` before the first explorer statement, so PostgreSQL itself rejects any
+   INSERT / UPDATE / DELETE / DDL (``25006 read_only_sql_transaction``) even if a statement were ever built
+   wrongly. (Switching a transaction to read-only is allowed at any point; the request's earlier auth
+   bookkeeping is unaffected.)
+2. ``SET LOCAL ROLE factorix_explorer_ro`` when the application login may use that role (migration
+   ``0015_explorer_ro_role``, ``factorix.platform.pg_explorer_role``): the role has ``SELECT`` on the
+   non-sensitive tables only, so a sensitive or not-granted table is refused by PostgreSQL (``42501``, answered
+   403) even if the 403 list check below were bypassed, and it has no write privilege at all. Where the role
+   could not be provisioned (database user without ``CREATEROLE``) the explorer keeps step 1 alone and
+   ``GET /storage/pg/status`` reports ``privilege_isolation: false``.
+3. A statement allowlist: only ``SELECT`` / ``WITH`` text without ``;`` reaches the driver.
+4. ``SET LOCAL statement_timeout`` for previews and exact counts.
+5. ``SENSITIVE_TABLES`` (403 before any data is read) and tenant scoping.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules.common import execute, fetch_all, fetch_one
 from factorix.platform.errors import AppError
+from factorix.platform.pg_explorer_role import EXPLORER_ROLE, ROLE_USABLE_SQL, SENSITIVE_TABLES
 
 # Schemas to ignore
 SYSTEM_SCHEMAS = frozenset({
@@ -45,22 +47,15 @@ SYSTEM_SCHEMAS = frozenset({
     "pg_toast_temp_1",
 })
 
-# Tables to block from previewing entirely for security
-SENSITIVE_TABLES = frozenset({
-    "alembic_version",
-    "admin_accounts",
-    "secret_store",
-    "sessions",
-    "password_reset_codes",
-    "edge_enrollment_tokens",
-    "login_throttle",
-    "audit_events",
-})
+# Tables blocked entirely (hidden, 403): ``SENSITIVE_TABLES`` (imported above), defined next to the read-only role
+# that is never granted them, so the 403 list and the PostgreSQL grants come from one list.
 PREVIEW_TIMEOUT_MS = 5000
 COUNT_TIMEOUT_MS = 10000
 
 _READ_STATEMENT = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
 _RO_FLAG = "fx_pg_explorer_read_only"
+_ROLE_FLAG = "fx_pg_explorer_role"
+INSUFFICIENT_PRIVILEGE = "42501"
 
 
 def assert_read_statement(sql: str) -> None:
@@ -69,26 +64,68 @@ def assert_read_statement(sql: str) -> None:
         raise AppError(500, "EXPLORER_STATEMENT_REFUSED", "The explorer only runs single SELECT statements.")
 
 
-async def enter_read_only(session: AsyncSession) -> None:
-    """``SET TRANSACTION READ ONLY`` once per request transaction (PostgreSQL then refuses every write)."""
+async def enter_read_only(session: AsyncSession) -> bool:
+    """Once per request transaction: ``SET TRANSACTION READ ONLY``, then ``SET LOCAL ROLE factorix_explorer_ro``
+    when the login may use it. Returns whether the privilege isolation (the role) is in force."""
     info = getattr(session, "info", None)
     if isinstance(info, dict) and info.get(_RO_FLAG):
-        return
+        return bool(info.get(_ROLE_FLAG))
     await execute(session, "SET TRANSACTION READ ONLY", {})
+    row = await fetch_one(session, ROLE_USABLE_SQL, {"role": EXPLORER_ROLE})
+    isolated = bool(row and row.get("usable"))
+    if isolated:
+        await execute(session, f"SET LOCAL ROLE {EXPLORER_ROLE}", {})
     if isinstance(info, dict):
         info[_RO_FLAG] = True
+        info[_ROLE_FLAG] = isolated
+    return isolated
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    """SQLSTATE of a driver error, whether wrapped by SQLAlchemy (``.orig``) and its asyncpg adapter or not."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        code = getattr(cur, "sqlstate", None) or getattr(cur, "pgcode", None)
+        if isinstance(code, str) and code:
+            return code
+        cur = getattr(cur, "orig", None) or cur.__cause__
+    return None
+
+
+def _privilege_denied(exc: BaseException) -> AppError | None:
+    if _sqlstate(exc) != INSUFFICIENT_PRIVILEGE:
+        return None
+    return AppError(
+        403,
+        "EXPLORER_NOT_GRANTED",
+        f"PostgreSQL refused this read: the table is not granted to the explorer's read-only role {EXPLORER_ROLE}.",
+    )
 
 
 async def _ro_fetch_all(session: AsyncSession, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     await enter_read_only(session)
     assert_read_statement(sql)
-    return await fetch_all(session, sql, params)
+    try:
+        return await fetch_all(session, sql, params)
+    except Exception as exc:
+        denied = _privilege_denied(exc)
+        if denied is not None:
+            raise denied from exc
+        raise
 
 
 async def _ro_fetch_one(session: AsyncSession, sql: str, params: dict[str, Any]) -> dict[str, Any] | None:
     await enter_read_only(session)
     assert_read_statement(sql)
-    return await fetch_one(session, sql, params)
+    try:
+        return await fetch_one(session, sql, params)
+    except Exception as exc:
+        denied = _privilege_denied(exc)
+        if denied is not None:
+            raise denied from exc
+        raise
 
 
 def _assert_not_sensitive(table: str, action: str) -> None:
@@ -127,6 +164,23 @@ def _validate_ident(name: str, kind: str = "identifier") -> str:
 
 class PostgresExplorerService:
     """Read-only introspection and data preview for PostgreSQL."""
+
+    async def status(self, session: AsyncSession) -> dict[str, Any]:
+        """How the explorer is confined (shown by the explorer banner); never fails for a missing role."""
+        isolated = await enter_read_only(session)
+        return {
+            "read_only_transaction": True,
+            "privilege_isolation": isolated,
+            "role": EXPLORER_ROLE if isolated else None,
+            "detail": (
+                f"Queries run as the read-only role {EXPLORER_ROLE} (SELECT on non-sensitive tables only) "
+                "inside a read-only transaction."
+                if isolated
+                else f"The read-only role {EXPLORER_ROLE} is not available to the application database user "
+                "(it needs CREATEROLE to provision it); queries run in a read-only transaction under the "
+                "application role, and sensitive tables are refused by the explorer."
+            ),
+        }
 
     async def list_schemas(self, session: AsyncSession) -> list[dict[str, Any]]:
         """Return non-system schemas."""

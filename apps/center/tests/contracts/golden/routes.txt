@@ -185,6 +185,7 @@ GET /api/v1/storage/pg/preview
 GET /api/v1/storage/pg/preview/{schema}/{table}
 GET /api/v1/storage/pg/relationships
 GET /api/v1/storage/pg/schemas
+GET /api/v1/storage/pg/status
 GET /api/v1/storage/pg/tables
 GET /api/v1/storage/pg/tables/{schema}/{table}
 GET /api/v1/storage/recording/failures
