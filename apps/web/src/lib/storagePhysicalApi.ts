@@ -611,7 +611,8 @@ export async function createSubtable(intent: CreateSubtableIntent, idempotencyKe
 export interface StoragePlan {
   valid: boolean;
   exists: boolean;
-  errors: { field?: string; code?: string; message: string }[];
+  /** `expected` (TAG_MACHINE_MISMATCH, R2-09): the machine id the bound field belongs to. */
+  errors: { field?: string; code?: string; message: string; expected?: string }[];
   warnings: { field?: string; code?: string; message: string }[];
   ddl: string[];
   steps: { action: string; sql: string; description?: string }[];
@@ -636,7 +637,7 @@ export interface BulkRowResult {
   replay?: boolean;
   code?: string;
   message?: string;
-  errors?: { field?: string; code?: string; message: string }[];
+  errors?: { field?: string; code?: string; message: string; expected?: string }[];
   ddl?: string[];
 }
 

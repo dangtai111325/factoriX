@@ -665,6 +665,7 @@ export const BulkSubtablesWizard: React.FC = () => {
                           {resultOf(r)!.status === 'CREATED' && <CheckCircle2 className="w-3.5 h-3.5 inline mr-1" />}
                           {(resultOf(r)!.status === 'FAILED' || resultOf(r)!.status === 'INVALID') && <AlertTriangle className="w-3.5 h-3.5 inline mr-1" />}
                           {STATUS_TEXT[resultOf(r)!.status] || resultOf(r)!.status}
+                          {resultOf(r)!.errors?.some((e) => e.code === 'TAG_MACHINE_MISMATCH') && ': machine tag mismatch'}
                           {(resultOf(r)!.message || resultOf(r)!.errors?.length) && (
                             <div className="font-normal text-[11px] text-[#657794] max-w-[280px]">
                               {resultOf(r)!.code ? `${resultOf(r)!.code}: ` : ''}
