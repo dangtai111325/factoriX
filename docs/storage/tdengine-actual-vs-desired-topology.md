@@ -1,5 +1,7 @@
 # TDengine Actual vs Desired Topology
 
+> **Name corrections (2026-11-25):** the tables `storage_object_specs`, `storage_object_revisions` and `storage_topology_snapshots` named below do not exist. The desired state is read from `storage_objects` (with `storage_physical_registry` and `storage_bindings`); see `apps/center/src/factorix/modules/storage_topology.py` and migration `0009_storage_drafts_lifecycle`.
+
 **Branch:** TDengine-RabbitMQ-Stoorage-Historian  
 **Source baseline:** 400dba192eb13be30806dbacb1568ffff23ae26b  
 **Last updated:** 2026-11-12
@@ -142,9 +144,9 @@ For >100k subtables: graph shows aggregated counts at STable level; drill-down o
 
 | Setting | Location | Default | Impact |
 |---------|----------|---------|--------|
-| `FACTORIX_RECORD_OPERATIONAL` | docker-compose.yml env | `false` (Compose override); code default `true` if no env | Controls auto-creation of operational history STables |
+| `FACTORIX_RECORD_OPERATIONAL` | docker-compose.yml env | `true` (set in Compose); code default `true` when unset, forced `true` when `FACTORIX_ENVIRONMENT=test` | Controls auto-creation of operational history STables |
 | Reconcile interval | storage_topology.py | On-demand only | Scheduled reconcile not enabled by default |
 | Snapshot retention | storage_topology_snapshots | Last 10 per object | Configurable |
 
 > [!WARNING]
-> `FACTORIX_RECORD_OPERATIONAL=false` in Compose overrides the code default of `true` introduced in commit `316976108529d4d`. The effective value must be verified at runtime: `docker exec factorix-appliance env | grep FACTORIX_RECORD_OPERATIONAL`. Changing this setting on a running system without capacity planning may cause unexpected TDengine write amplification.
+> `docker-compose.yml` sets `FACTORIX_RECORD_OPERATIONAL=true`; only `false`, `0` or `no` turn operational history off (`modules/recording_policy.py`). The effective value must be verified at runtime: `docker exec factorix-appliance env | grep FACTORIX_RECORD_OPERATIONAL`. Changing this setting on a running system without capacity planning may cause unexpected TDengine write amplification.

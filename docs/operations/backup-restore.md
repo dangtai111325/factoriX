@@ -20,14 +20,15 @@ Example operator backup path: `C:\Users\Ave-T14-001\Desktop\FactoriX\backup\`
 ### Capture (Read-Only on Running Appliance)
 ```powershell
 $ts = Get-Date -Format "yyyyMMdd_HHmmss"
-docker exec factorix-appliance su - postgres -c "pg_dump -Fc -d factorix --exclude-table-data='observations*' --exclude-table-data='ingest_dedup' > /tmp/config_$ts.dump"
-docker cp "factorix-appliance:/tmp/config_$ts.dump" "C:\Users\Ave-T14-001\Desktop\FactoriX\backup\config_$ts.dump"
-docker exec factorix-appliance rm -f "/tmp/config_$ts.dump"
+# PostgreSQL runs in the factorix-postgres container (docker-compose.yml); adjust -U / -d if .env differs.
+docker exec factorix-postgres pg_dump -U factorix -Fc -d factorix --exclude-table-data='observations*' --exclude-table-data='ingest_dedup' -f "/tmp/config_$ts.dump"
+docker cp "factorix-postgres:/tmp/config_$ts.dump" "C:\Users\Ave-T14-001\Desktop\FactoriX\backup\config_$ts.dump"
+docker exec factorix-postgres rm -f "/tmp/config_$ts.dump"
 ```
 
 ### Independent Restore Verification (Mandatory Before Gate Pass)
 ```powershell
-docker run -d --name pg-restore-check -e POSTGRES_PASSWORD=verify_tmp -e POSTGRES_DB=factorix_verify postgres:17-alpine
+docker run -d --name pg-restore-check -e POSTGRES_PASSWORD=<throwaway-password> -e POSTGRES_DB=factorix_verify postgres:17-alpine
 # Wait until pg_isready succeeds, create role 'factorix', then:
 Get-Content "C:\Users\Ave-T14-001\Desktop\FactoriX\backup\config_$ts.dump" -Encoding Byte -ReadCount 0 |
   docker exec -i pg-restore-check pg_restore -U postgres -d factorix_verify --no-owner
@@ -39,6 +40,6 @@ docker rm -f -v pg-restore-check
 
 ## 3. TDengine & RabbitMQ Backup Notes (Expanded in S05 / S14)
 
-- **TDengine 3.3.6.13 Community Edition (AGPL-3.0):** Does **not** rely on Enterprise-only backup daemons. Physical subtables are tenant-scoped (`db_t_<short_tenant>` / stable supertables). S05/S14 will implement and verify logical/export chunk snapshots + PG `storage_physical_registry` consistency check + clean restore into an ephemeral `tdengine/tdengine:3.3.6.13` instance.
-- **RabbitMQ 4.0:** Quorum definitions (`definitions.json`) exported via Management API (`:15672`) without embedding plaintext broker passwords in version control. Broker messages are **transient in-flight transport**; historical persistence lives in TDengine after ACK.
+- **TDengine 3.4.3.9 (`tdengine/tsdb:3.4.3.9`, AGPL-3.0):** Does **not** rely on Enterprise-only backup daemons. Physical subtables are tenant-scoped (`db_t_<short_tenant>` / stable supertables). S05/S14 will implement and verify logical/export chunk snapshots + PG `storage_physical_registry` consistency check + clean restore into an ephemeral `tdengine/tsdb:3.4.3.9` instance.
+- **RabbitMQ 4.4 (`rabbitmq:4.4-management-alpine`):** Quorum definitions (`definitions.json`) exported via Management API (`:15672`) without embedding plaintext broker passwords in version control. Broker messages are **transient in-flight transport**; historical persistence lives in TDengine after ACK.
 - **Emergency Rollback Before Cutover Removal:** Until S17 completes, keep PG `observations*` untouched so rollback can re-enable legacy PG readers if staged validation uncovers a discrepancy.

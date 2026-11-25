@@ -8,7 +8,7 @@
 
 ## 1. Test Suite Summary
 
-The testing framework covers **264 test scenarios** categorized across 14 distinct functional domains as specified in Master Plan §10. All scenarios are tracked programmatically in `reports/test-results.json` with execution evidence, source commits, and pass/fail statuses.
+The testing framework covers **264 test scenarios** categorized across 14 distinct functional domains as specified in Master Plan §10. This matrix is a test plan: the scenario registry `reports/test-results.json` it refers to is not part of the repository (generated evidence was removed on 2026-11-25, see `RELEASE_READINESS.md`), and execution results are delivered with each handover.
 
 | Domain Category | Prefix | Total Scenarios | Focus Area |
 |---|---|---|---|
@@ -41,7 +41,7 @@ flowchart LR
     FAIL --> PATCH["Implement Targeted Fix"]
     PATCH --> RETEST["Regression Run"]
     RETEST --> VERIFY
-    PASS --> JSON["Update reports/test-results.json"]
+    PASS --> JSON["Record result in the handover report"]
 ```
 
 ---
@@ -59,7 +59,7 @@ flowchart LR
 
 ## 4. Test Reporting Contract
 
-All 264 scenarios are registered in `reports/test-results.json` adhering to the following schema:
+Scenario results reported in a handover follow this schema:
 ```json
 {
   "test_id": "NAV-001",

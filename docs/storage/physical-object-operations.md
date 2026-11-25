@@ -72,7 +72,7 @@ DDL: `DROP DATABASE <name>` — only after approval and writer quiesce.
 **B1:** Select existing Database, STable name, write semantics.  
 **B2:** Column editor — `ts TIMESTAMP` pre-filled (immutable); add value columns with TDengine types.  
 **B3:** Tag editor — static subtable identity fields; not per-sample values.  
-**B4:** Source Mapping — three-perspective picker (Hierarchy / Collector / Models); bindings stored in `storage_source_bindings_v2`.  
+**B4:** Source Mapping — three-perspective picker (Hierarchy / Collector / Models); bindings stored in `storage_bindings`.  
 **B5:** Recording Policy — `ON_CHANGE`, `EVERY_ACQUISITION`, `INTERVAL`; row assembly for mixed-cadence sources.  
 **B6:** Review & Publish — DDL preview, impact, quota, `Validate & Dry-run` → `Publish` → saga.
 
@@ -107,17 +107,16 @@ Inherited columns: cannot be edited on subtable; requires STable edit.
 
 ### Pause / Resume Recording
 
-`PATCH /api/v1/storage/td/objects/{id}/pause` — writer binding disabled; physical schema preserved; existing data retained.  
-`PATCH /api/v1/storage/td/objects/{id}/resume` — validates current config and source; activates writer.
+`POST /api/v1/storage/td/objects/{id}/pause` — stops recording (status `PAUSED`); physical schema and existing data are kept.  
+`POST /api/v1/storage/td/objects/{id}/resume` — starts / resumes recording (status `ACTIVE`).
 
 ### Archive / Retire
 
-Stops recording; locks new writes; retains historical data and DDL under retention/legal-hold policy.
+`POST /api/v1/storage/td/objects/{id}/retire` (status `RETIRED`) — stops recording; locks new writes; retains historical data and DDL under retention/legal-hold policy.
 
 ### Purge
 
-`POST /api/v1/storage/td/objects/{id}/purge-preview` — returns impact manifest (data estimate, dependencies, backup status).  
-`POST /api/v1/storage/td/objects/{id}/purge` — requires: approval token, backup verified hash, typed confirmation, `PURGE_STORAGE` permission, writer quiesced.  
+`DELETE /api/v1/storage/td/objects/{id}?confirm_name=<exact object name>` — permanent DROP of a user-created object; without the exact typed name it answers 400 `CONFIRMATION_REQUIRED`; system objects are refused (403); a supertable that still has subtables not `PURGED`/`RETIRED` answers 409 `DEPENDENCY_EXISTS` unless `force=true`. There is no separate purge-preview endpoint (`apps/center/src/factorix/transport/http/routers/storage/td_objects.py`).  
 DDL: `DROP TABLE <name>` — after all guards pass.
 
 **Warning:** Purge of a Subtable with an active writer will quiesce the writer first. If the writer is restarted without the subtable, it will NOT auto-recreate the table.
@@ -126,15 +125,9 @@ DDL: `DROP TABLE <name>` — after all guards pass.
 
 ## Security and Authorization
 
-| Action | Required Permission |
-|--------|-------------------|
-| View topology | `VIEW_STORAGE` |
-| Create Database/STable | `EDIT_STORAGE` |
-| Publish DDL | `PUBLISH_STORAGE` |
-| Purge objects | `PURGE_STORAGE` |
-| View PG metadata | `VIEW_PG_METADATA` |
+Every storage route requires a signed-in administrator session (`admin_dep`); there are no finer-grained storage permissions in the code.
 
-All mutations: tenant check, optimistic locking (`If-Match` revision header), idempotency key, audit actor/timestamp.
+All mutations: tenant check and audit actor/timestamp; metadata edits (`PATCH /api/v1/storage/td/objects/{id}`) take the revision in the `If-Match` header.
 
 ---
 

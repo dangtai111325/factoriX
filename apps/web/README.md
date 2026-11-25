@@ -1,83 +1,66 @@
-# FactoriX Industrial IoT (IIoT) Platform — Modern Frontend
+# FactoriX Web Console (`apps/web`)
 
-Welcome to the **FactoriX IIoT Platform** frontend repository. This application delivers a high-density, mission-critical operations console for factory asset hierarchy, industrial multi-protocol data acquisition, real-time telemetry streaming, and Unified Namespace (UNS) northbound publishing.
+Single-page application for the FactoriX appliance. In production it is built inside the `Dockerfile` (`npm run build`)
+and served by the Center API from `FACTORIX_WEB_DIST` on the same port as the API (`:8080`), so the browser talks to
+`/api/v1/*` and the live WebSocket `/stream` same-origin. Architecture and pages: see the root [`README.md`](../../README.md).
 
----
+## Stack
 
-## 1. Architectural Highlights
+React 18, TypeScript 5, Vite 5, TailwindCSS 3, React Router 6, ECharts 5 (charts), `@xyflow/react` + `elkjs`
+(Knowledge Graph), `react-grid-layout` (Dashboard Studio canvas), `lucide-react` (icons). Versions: `package.json`.
 
-- **Visual Theme**: Light Industrial Design System (`#F6F8FC` application canvas, crisp `#FFFFFF` cards, `#0F172A` high-contrast terminal insets, and signature FactoriX Red `#EF1B24` brand accent).
-- **Domain Scope**: Built around ISA-95 hierarchical levels (`Enterprise` $\rightarrow$ `Site` $\rightarrow$ `Plant` $\rightarrow$ `Line` $\rightarrow$ `Machine` $\rightarrow$ `Sensor`).
-- **Interactive Multi-Plant Switcher**: Real-time switching between operational sites (`Plant 01 CNC`, `Plant 02 Welding`, `Plant 03 Coating`, `Plant 04 Assembly`) across all dashboard screens.
-- **Deterministic Demo Mode**: Built-in state machine simulator with 5 selectable scenarios (`healthy`, `degraded_modbus`, `timeout_opcua`, `auth_fail_mqtt`, `offline`) allowing comprehensive operational validation before backend integration.
-- **Real-Time Telemetry & Micro-Sparklines**: 60-second vector wave sparklines embedded in table rows, high-frequency waveform charts, and live collector daemon health monitoring.
+## Scripts (`package.json`)
 
----
+| Command | What it does |
+|---|---|
+| `npm ci` | Install the locked dependencies (`package-lock.json`) |
+| `npm run dev` | Vite dev server on port 3000 (`--host`) |
+| `npm run check` | Type check only (`tsc --noEmit`) — CI job `web-build` |
+| `npm run build` | `tsc && vite build` into `dist/` — CI job `web-build` |
+| `npm run preview` | Serve the built `dist/` on port 3000 |
 
-## 2. 15 Screen Core Navigation Map
+## Dev server proxy (`vite.config.ts`)
 
-| # | Route | Screen Name | Key Operational Capabilities |
-|---|---|---|---|
-| **01** | `/` | **Operations Overview** | Global factory telemetry KPIs, gateway connectivity donut chart, buffer status, and live event log. |
-| **02** | `/factory/structure` | **Factory Structure** | ISA-95 asset hierarchy explorer, add resource modal, and move resource workflow with cycle validation and undo. |
-| **03** | `/factory/layout` | **Layout Designer** | 2D visual CAD plant floor blueprint with snap-to-grid, pan/zoom, object placement, and power telemetry. |
-| **04** | `/factory/graph` | **Knowledge Graph** | Contextual asset dependency graph, upstream sources, downstream telemetry consumers, and hop-depth filtering. |
-| **05** | `/acquisition/connections` | **Industrial Connections** | Protocol gateways (Modbus TCP, OPC UA, MQTT, HTTP REST) with multi-stage diagnostics and latency ping tests. |
-| **06** | `/acquisition/add-data` | **Add Data Wizard** | 4-step data acquisition setup: protocol selection, endpoint configuration, register mapping, and live sample read. |
-| **07** | `/acquisition/studio/opcua` | **OPC UA Studio** | Server endpoint explorer, hierarchical node browsing, monitored item subscriptions, and security policy selection. |
-| **08** | `/signals` | **Signals Catalog** | Central tag inventory with inline 60s micro-sparklines, slide-out inspector drawer, and floating sticky bulk action bar. |
-| **09** | `/signals/calculated` | **Calculated Signals** | Deterministic mathematical AST formula evaluator, live test sliders, division-by-zero protection, and rule saver. |
-| **10** | `/live/monitor` | **Live Monitor** | Dual-view operational console: high-frequency streaming matrix cards, telemetry waveform trendline, and parameter chips. |
-| **11** | `/live/diagnostics` | **Diagnostics Center** | Root-cause troubleshooting workbench: dropped packet analysis, stage execution status, and raw trace logging. |
-| **12** | `/live/activity` | **Activity Log** | Auditable security & operations event stream with severity filters and JSON event copy functionality. |
-| **13** | `/signals/output-groups` | **Output Groups** | Unified Namespace (UNS) topic template builder, signal payload bundling, and live JSON projection preview. |
-| **14** | `/acquisition/studio/mqtt` | **MQTT Mapping Studio** | 3-pane JSONPath telemetry mapper: raw broker payload, JSONPath extractor rules, and target signal schema. |
-| **15** | `/acquisition/studio/http` | **HTTP REST Studio** | REST poll/push endpoint editor, bearer token authentication, request parameters, and response preview. |
+| Path | Target | Override |
+|---|---|---|
+| `/api` | `http://127.0.0.1:8080` | `FACTORIX_BACKEND_TARGET` |
+| `/ws` | `ws://127.0.0.1:8080` | `FACTORIX_WS_TARGET` |
 
----
+The live stream client (`src/lib/liveStream.ts`) connects to `/stream` on the page's own host, and that path is not in
+the proxy list, so in `npm run dev` live push does not reach the backend; the UI then falls back to REST polling
+(`src/lib/connectivity.ts`). Use the appliance on `:8080` to check live behaviour.
 
-## 3. Quick Start & Local Execution
+## Layout (`src/`)
 
-### Prerequisites
-- Node.js (v18+ recommended)
-- npm or yarn
-- Docker (optional, for standalone containerized deployment)
+| Folder | Content |
+|---|---|
+| `App.tsx`, `main.tsx` | Routes (every page except Overview is lazy-loaded), auth guards, app shell |
+| `api/` | Shared HTTP client |
+| `components/` | `shell/` (Sidebar, Topbar, search), `modals/`, `charts/`, `tree/`, `common/` |
+| `features/auth/` | Login, first-run setup (`/register`), password reset, auth context |
+| `features/dashboard/` | Dashboard Studio: document model, widget registry and widgets, canvas, source picker, runtime |
+| `lib/` | Live stream client, connectivity state, protocol and commissioning helpers, formatting |
+| `pages/` | One folder per screen (below) |
+| `store/AppContext.tsx` | App-wide state and live subscriptions |
+| `types/`, `utils/` | Shared types and helpers |
 
-### Development Server
-```bash
-# Install dependencies
-npm install
+## Pages (`src/pages/`)
 
-# Run type check
-npm run check
+| Folder | Route(s) |
+|---|---|
+| `01_Overview` | `/overview` |
+| `02_FactoryStructure` | `/factory/structure` |
+| `04_KnowledgeGraph` | `/factory/graph` |
+| `05_Connections` | `/collector/connections` |
+| `06_AddDataWizard` | `/collector/add-data` |
+| `08_SignalsCatalog` | `/collector/signals` |
+| `13_DataModels` | `/models` |
+| `storage-management` | `/historian/storage`, `/historian/storage/create`, `/historian/storage/bulk`, `/historian/storage/edit/:objectId`, `/historian/storage/object/:objectId` |
+| `historian` | `/historian/historian` |
+| `15_Dashboards` | `/dashboards`, `/dashboards/:dashboardId`, `/dashboards/:dashboardId/edit` |
+| `FutureModules` | "Coming soon" for `/alarms`, `/analytics`, `/reports`, `/administration` |
+| `NotFound` | Any unknown route |
 
-# Start development server on port 3000
-npm run dev
-```
-Open [http://localhost:3000](http://localhost:3000) in your browser.
-
-### Production Build
-```bash
-# Compile TypeScript & generate production bundle
-npm run build
-
-# Preview production build locally
-npm run preview
-```
-
-### Docker (appliance)
-Use the repo root one-container package (web + Postgres + Center + Edge):
-```bash
-# from repo root
-.\run-appliance.ps1
-# or: docker compose up -d --build
-```
-Access the application on [http://127.0.0.1:8080](http://127.0.0.1:8080).
-
----
-
-## 4. Quality Assurance & Screenshot Evidence
-
-Full-resolution desktop screenshots (1672×941 and 1366×768) covering all 15 screens, modal dialogs, and interactive states are archived in:
-- `artifacts/visual_qa_v2/`
-- Interactive visual gallery: `artifacts/visual_qa_v2/gallery_v2.html`
+Older URLs (`/signals`, `/acquisition/*`, `/historian/explorer`, …) redirect to the routes above with their query string
+kept (`App.tsx`). The widget types, limits and themes of the Dashboard Studio come from the backend
+(`GET /api/v1/dashboards/widget-types`, contract `docs/architecture/contracts/dashboard.md`).

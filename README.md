@@ -1,6 +1,6 @@
 # FactoriX IIoT Platform - Technical Documentation & System Wiki
 
-Tài liệu kỹ thuật tổng hợp toàn diện về kiến trúc nền tảng, cấu trúc mã nguồn, hạ tầng dữ liệu thực tế (Data Sources, Signals, Asset Hierarchy) và hệ thống 36 Data Models v2 đang vận hành trong FactoriX Appliance. Tài liệu này được thiết kế như một **System Wiki** phục vụ bàn giao dự án, vận hành, bảo trì và phát triển mở rộng.
+Tài liệu kỹ thuật tổng hợp về kiến trúc nền tảng, cấu trúc mã nguồn, hạ tầng dữ liệu thực tế (Data Sources, Signals, Asset Hierarchy) và hệ thống 36 Data Models v2 đang vận hành trong FactoriX Appliance. Tài liệu này là **System Wiki** phục vụ bàn giao, vận hành, bảo trì và phát triển mở rộng. Các quyết định kiến trúc chi tiết nằm trong [`docs/architecture/`](docs/architecture/) (ADR-001 đến ADR-019) và các hợp đồng giữa module trong [`docs/architecture/contracts/`](docs/architecture/contracts/README.md).
 
 ---
 
@@ -10,105 +10,123 @@ Tài liệu kỹ thuật tổng hợp toàn diện về kiến trúc nền tản
 3. [Nguồn Dữ liệu Thực tế (Live OT Data Sources)](#3-nguồn-dữ-liệu-thực-tế)
 4. [Cây Phân cấp Tài sản (Asset Topology Hierarchy)](#4-cây-phân-cấp-tài-sản)
 5. [Hệ thống 36 Data Models v2 (Data Models Specification)](#5-hệ-thống-36-data-models-v2)
-6. [Kiến trúc Lưu trữ & Hai Cơ sở Dữ liệu (Database Architecture)](#6-kiến-trúc-lưu-trữ--hai-cơ-sở-dữ-liệu)
-7. [Vận hành, Giám sát & Khắc phục Sự cố (Runbook & Operations)](#7-vận-hành-giám-sát--khắc-phục-sự-cố)
-8. [Lịch sử Nghiệm thu & Tối ưu Hiệu năng (Release Acceptance)](#8-lịch-sử-nghiệm-thu--tối-ưu-hiệu-năng)
+6. [Kiến trúc Lưu trữ & Truyền tải Dữ liệu (Storage & Transport)](#6-kiến-trúc-lưu-trữ--truyền-tải-dữ-liệu)
+7. [Giao diện Web & Dashboard Studio (Web Console)](#7-giao-diện-web--dashboard-studio)
+8. [Vận hành, Giám sát & Khắc phục Sự cố (Runbook & Operations)](#8-vận-hành-giám-sát--khắc-phục-sự-cố)
+9. [Nghiệm thu & Phát hành (Release Readiness)](#9-nghiệm-thu--phát-hành)
 
 ---
 
 ## 1. Tổng quan Kiến trúc Hệ thống
 
-FactoriX là nền tảng IIoT (Industrial Internet of Things) cấp doanh nghiệp, được thiết kế theo mô hình **Edge-to-Cloud/Center Appliance** chịu lỗi cao (Fault-tolerant), hỗ trợ kết nối đa giao thức công nghiệp, chuẩn hóa dữ liệu vi mô thời gian thực và tổng hợp mô hình dữ liệu (Data Model v2 Engine).
+FactoriX là nền tảng IIoT triển khai dưới dạng **một appliance tại nhà máy** (Docker Compose project `factoriX`, 4 container). Bộ thu thập cục bộ (`apps/acquisition`) đọc thiết bị OT qua 5 giao thức và gửi dữ liệu qua RabbitMQ; Center (`apps/center`) ghi lịch sử vào TDengine, cập nhật trạng thái mới nhất trong PostgreSQL, tính Data Model v2 và đẩy dữ liệu trực tiếp tới Web Console qua WebSocket.
+
+| Container | Image (`docker-compose.yml`) | Vai trò |
+|---|---|---|
+| `factorix-appliance` | `factorix:latest` (build từ `Dockerfile`), cổng `8080` | Center API + Web UI (`uvicorn factorix.transport.app:app`), ingestion worker (`python -m factorix.ingestion`), acquisition runtime (`python -m factorix_acquisition`) — cả ba do `infrastructure/docker/entrypoint.sh` giám sát |
+| `factorix-postgres` | `postgres:17-alpine`, `127.0.0.1:5432` | Control plane: định danh, Factory Model, Connections, Signals, Data Models, Storage, Dashboards, `latest_signal_state`, audit (ADR-008) |
+| `factorix-rabbitmq` | `rabbitmq:4.4-management-alpine`, `127.0.0.1:5672` / `15672` | Truyền tải bền vững: quorum queues, hai lane live/ingest, DLQ (ADR-001) |
+| `factorix-tdengine` | `tdengine/tsdb:3.4.3.9`, `127.0.0.1:6041` | Lịch sử chuỗi thời gian: operational history, Storage objects, model snapshots (ADR-002, ADR-003) |
 
 ```mermaid
-flowchart TD
-    subgraph OT_Lab ["Mạng OT / Thiết bị Nguồn (PC03: 192.168.2.108)"]
-        MB["Modbus TCP (:502)"]
-        OPC["OPC UA (:4840)"]
-        MQTT_B["MQTT Broker (:1883)"]
-        HTTP_S["HTTP REST (:443)"]
-        WS_S["WebSocket Live (:80)"]
+flowchart LR
+    subgraph OT["Nguồn OT (PC03)"]
+        MB["Modbus TCP"]
+        OPC["OPC UA"]
+        MQ["MQTT"]
+        HT["HTTP"]
+        WSS["WebSocket"]
     end
 
-    subgraph Edge_Collector ["FactoriX Edge Daemon (apps/edge)"]
-        Connectors["Protocol Connectors\n(Async HTTP/Modbus/OPC UA/MQTT/WS)"]
-        StoreOutbox["Transactional Outbox (SQLite WAL)\n- Store-and-Forward\n- History Lane & Latest Lane"]
-        Forwarder["Edge Sync Forwarder\n(POST /api/v1/edge-sync/observations)"]
-        Connectors -->|Raw Samples| StoreOutbox
-        StoreOutbox --> Forwarder
+    subgraph APP["factorix-appliance (:8080)"]
+        ACQ["Acquisition runtime<br/>apps/acquisition"]
+        SPOOL[("Spool SQLite<br/>chỉ dùng khi mất RabbitMQ")]
+        ING["Ingestion worker<br/>factorix.ingestion"]
+        API["Center API + Web UI<br/>REST /api/v1 · WS /stream<br/>Data Model engine"]
     end
 
-    subgraph Center_Appliance ["FactoriX Center Core (apps/center - Docker :8080)"]
-        Ingest["Ingestion & Deduplication Engine\n(ingest_dedup Index B-Tree)"]
-        PG_DB[("PostgreSQL 16\n- observations (Monthly Partitioned)\n- latest_signal_state (In-memory/Cache)\n- output_groups & model_state")]
-        DM_Engine["Data Model v2 Engine\n(Real-time State Recomposition)"]
-        WebSockets["Real-time WebSocket & SSE Fanout"]
-        API_GW["FastAPI Core & Security RBAC"]
+    RMQ[["factorix-rabbitmq<br/>exchange factorix.telemetry.ingress<br/>live.q · ingest.q · dlq"]]
+    TD[("factorix-tdengine<br/>lịch sử chuỗi thời gian")]
+    PG[("factorix-postgres<br/>control plane + latest_signal_state")]
+    WEB["Trình duyệt<br/>Web Console (apps/web)"]
 
-        Forwarder --> Ingest
-        Ingest --> PG_DB
-        PG_DB --> DM_Engine
-        DM_Engine --> WebSockets
-        PG_DB --> API_GW
-    end
-
-    subgraph Frontend_App ["FactoriX Web Console (apps/web)"]
-        UI_Dash["Overview & Real-time KPI"]
-        UI_Tree["Hierarchy & Resource Explorer"]
-        UI_Sig["Signals Catalog (336 Live Signals)"]
-        UI_DM["Data Model Builder v2"]
-        UI_Conn["Connections & Commissioning"]
-
-        API_GW --> Frontend_App
-        WebSockets --> Frontend_App
-    end
-
-    OT_Lab --> Connectors
+    MB --> ACQ
+    OPC --> ACQ
+    MQ --> ACQ
+    HT --> ACQ
+    WSS --> ACQ
+    PG -->|"cấu hình + LISTEN/NOTIFY"| ACQ
+    ACQ -->|"publish + confirm"| RMQ
+    ACQ -.->|"RabbitMQ không truy cập được"| SPOOL
+    SPOOL -.->|"replay"| RMQ
+    ACQ -->|"health, commissioning"| PG
+    RMQ -->|"live lane + ingest lane"| ING
+    ING -->|"ghi lịch sử"| TD
+    ING -->|"latest state + NOTIFY"| PG
+    PG -->|"NOTIFY bridge"| API
+    API -->|"Historian query"| TD
+    API -->|"REST + /stream"| WEB
 ```
 
-### Các nguyên tắc thiết kế cốt lõi:
-1. **Không mất dữ liệu (Store-and-Forward)**: Khi mạng giữa Edge và Center bị ngắt, Edge lưu cục bộ vào SQLite WAL Outbox và tự động phát lại (replay) theo đúng thứ tự khi kết nối hồi phục mà không làm trễ luồng trực tiếp (dual-lane: History Lane & Latest Lane).
-2. **Bảo toàn dữ liệu tốt cuối cùng (Last Good Value)**: Khi một tín hiệu bị gián đoạn hoặc lỗi, hệ thống không xóa giá trị hợp lệ cuối cùng mà chuyển cờ sang `BAD` hoặc `STALE`, giữ nguyên `last_good_value_json` và `last_good_event_time`.
-3. **Thứ tự thời gian bất biến (Monotonic Ingest Ordering)**: Trạng thái mới nhất được sắp xếp dựa trên thời gian thu nhận thực tế của hệ thống `(received_time, observation_id)`, ngăn chặn hiện tượng clock skew (lệch giờ đồng hồ thiết bị nguồn) làm đảo lộn thứ tự dữ liệu.
+### Luồng dữ liệu
+1. **Acquisition** (`apps/acquisition`) đọc cấu hình trực tiếp từ PostgreSQL (`config_provider.py`, `LISTEN/NOTIFY` + snapshot LKG), giữ một advisory lock để không bao giờ có hai bộ thu cùng poll thiết bị (ADR-006), và publish lô quan sát tới exchange `factorix.telemetry.ingress` với publisher confirms. Lane live (`factorix.telemetry.live.q`) nhận quan sát không quá 12 s tuổi khi publish; dữ liệu cũ hơn (replay) đi lane ingest (`factorix.telemetry.ingest.q`) (ADR-001, `contracts/obs-batch.md`).
+2. **Ingestion worker** (Center) tiêu thụ hai lane, áp epoch fence + idempotency theo `event_uid` (ADR-005, ADR-007), ghi TDengine, **chỉ ACK sau khi TDengine commit bền vững**, rồi cập nhật `latest_signal_state` và gửi NOTIFY. Message lỗi lặp lại quá `x-delivery-limit` (mặc định 5) đi vào `factorix.telemetry.dlq`.
+3. **Center API** nhận NOTIFY, đẩy giá trị mới nhất, health và `model_body` tới trình duyệt qua `WS /stream` (`contracts/live-stream.md`). Data Model engine (`modules/models_engine.py`) chạy trong tiến trình API, lấy mẫu mỗi model theo `sample_ms` và ghi `model_state` / `model_snapshots`.
+4. **Historian & Dashboard** đọc lịch sử từ TDengine qua `POST /api/v1/historian/query`.
+
+### Các nguyên tắc thiết kế cốt lõi
+1. **Không mất dữ liệu một cách âm thầm**: publisher confirms + ACK sau commit TDengine + DLQ `at-least-once`; hàng đợi đầy thì từ chối publish (`reject-publish`) và tạo backpressure thay vì bỏ message. Khi RabbitMQ không truy cập được, acquisition ghi tạm vào spool SQLite và phát lại khi broker hồi phục; nếu spool chạm giới hạn, quan sát mới bị từ chối và được ghi nhận thành khoảng trống (gap) rõ ràng (`apps/acquisition/src/factorix_acquisition/spool.py`).
+2. **Bảo toàn giá trị tốt cuối cùng (Last Good Value)**: khi tín hiệu lỗi, `latest_signal_state` lưu chất lượng `BAD` nhưng giữ `last_good_value_json` và `last_good_event_time`. `STALE` không được lưu trong bảng mà được tính khi phục vụ dữ liệu (`domain/quality.py`, `contracts/freshness.md`).
+3. **Thứ tự & idempotency chuẩn tắc**: mỗi quan sát có `event_uid` xác định và `data_epoch`; dữ liệu replay hoặc dữ liệu thuộc epoch cũ (sau Clear Telemetry) không thể ghi đè trạng thái mới (ADR-005, ADR-007, ADR-011).
 
 ---
 
 ## 2. Cấu trúc Thư mục & Mã Nguồn
 
 ```
-iiot-platform/
+.
 ├── apps/
-│   ├── center/               # Backend Core API & Pipeline Engine (Python 3.12, FastAPI, SQLAlchemy, asyncpg)
+│   ├── center/                    # Center: Python 3.12, FastAPI, asyncpg, aio-pika, taos-ws-py
 │   │   ├── src/factorix/
-│   │   │   ├── api/          # Định nghĩa Route REST API và WebSocket endpoints
-│   │   │   ├── domain/       # Nghiệp vụ: signal_state, body, datamodel_v2, formula
-│   │   │   ├── modules/      # Logic xử lý: telemetry, collect, data_models, resources, edge_sync
-│   │   │   ├── platform/     # Config Pydantic, database engine, logging, security
-│   │   │   └── transport/    # HTTP app setup, WebSocket hub, SSE, middleware
-│   │   └── tests/            # Test suite: unit tests (498 tests), integration tests
-│   ├── edge/                 # Edge Collector Daemon (Python 3.12 Asyncio)
-│   │   ├── src/factorix_edge/
-│   │   │   ├── connectors/   # Connector: modbus, opcua, mqtt, http_pull, websocket_live
-│   │   │   ├── store/        # Outbox SQLite WAL: outbox.py, compaction, pruning
-│   │   │   ├── jobs.py       # Job runner, schedule concurrent polling
-│   │   │   ├── runtime.py    # Edge runtime lifecycle, heartbeat, forward loop
-│   │   │   └── mapping.py    # Type coercion, sample decoding
-│   │   └── tests/            # Edge pytest suite (99 tests)
-│   └── web/                  # Frontend SPA (React 18, TypeScript, Vite, TailwindCSS)
-│       ├── src/
-│       │   ├── assets/       # Logo, static branding (factorix_brand_logo.png)
-│       │   ├── components/   # UI kit, layout, shell, modals, forms
-│       │   ├── pages/        # 14 màn hình chức năng (00_Login -> 13_DataModels)
-│       │   ├── store/        # Zustand state & AppContext WebSocket manager
-│       │   └── test/         # Playwright E2E browser tests
-├── docs/                     # Tài liệu kiến trúc & Release Gates
-├── infrastructure/           # Docker, docker-compose, entrypoint.sh, PostgreSQL conf
-└── package.json / pyproject.toml
+│   │   │   ├── application/       # Use case theo bounded context: collector, dashboards, health, history,
+│   │   │   │                      #   ingestion (worker RabbitMQ -> TDengine/PG), live, reset, legacy_edge
+│   │   │   ├── domain/            # Logic thuần: quality, signal_state, body, formula, canonical, health
+│   │   │   ├── modules/           # Dịch vụ: identity, collect, data_models, models_engine, historian_*, storage_*
+│   │   │   ├── platform/          # settings, db, broker (RabbitMQ), tdengine, security, mail
+│   │   │   ├── transport/         # FastAPI app, routers HTTP, WebSocket /stream (hub), phục vụ SPA
+│   │   │   ├── adapters/          # legacy_pg_telemetry (đường ghi PostgreSQL cũ)
+│   │   │   └── ingestion/         # Entry point `python -m factorix.ingestion`
+│   │   ├── migrations/versions/   # Alembic 0001 -> 0014 (0001 áp dụng infrastructure/postgres/001_schema.sql)
+│   │   └── tests/                 # unit/, contracts/, integration/
+│   ├── acquisition/               # Bộ thu thập cục bộ `factorix_acquisition`
+│   │   ├── src/factorix_acquisition/  # connectors/ (modbus, opcua, mqtt, http_pull, ws), jobs, mapping,
+│   │   │                              #   config_provider, pg_control, publisher, spool, replay, runtime
+│   │   └── tests/                 # unit/, integration/
+│   ├── edge/                      # Edge daemon cũ (`factorix_edge`), chỉ chạy khi FACTORIX_COLLECTOR_MODE=edge
+│   ├── shared/src/factorix_core/  # Dùng chung: contracts (notify, runtime_status), quy tắc đặt tên TDengine, time
+│   └── web/                       # Web Console: React 18, TypeScript, Vite 5, TailwindCSS, ECharts, @xyflow/react
+│       └── src/                   # api/, components/ (shell, modals), features/ (auth, dashboard), lib/,
+│                                  #   pages/, store/ (AppContext), types/, utils/
+├── docs/                          # architecture/ (ADR + contracts), baseline/, benchmark/, operations/, storage/, testing/
+├── infrastructure/
+│   ├── docker/                    # entrypoint.sh, bootstrap_db.py, backup.sh, requirements.txt
+│   └── postgres/001_schema.sql    # Schema gốc (migration 0001)
+├── tests/                         # load/ (bench_pipeline.py), safety/, simulators/ (5 giao thức OT giả lập)
+├── .github/workflows/ci.yml       # CI: python-unit, web-build, storage-integration
+├── Dockerfile                     # Image appliance (web build + Center + acquisition + edge)
+├── docker-compose.yml             # Stack vận hành factoriX (4 container)
+├── docker-compose.test.yml        # Stack thử nghiệm cô lập factorix-storage-e2e
+├── run-appliance.ps1              # Build + khởi động stack, chờ /health/live
+├── .env.example / .env.test.example
+├── pytest.ini / pyproject.toml / conftest.py
+└── RELEASE_READINESS.md
 ```
+
+Ghi chú: `apps/edge` vẫn được đóng gói vào image để rollback có chủ đích (`FACTORIX_COLLECTOR_MODE=edge`). Ở chế độ mặc định `acquisition`, API `/api/v1/edge-sync/*` trả về **410 Gone** (`transport/http/routers/edge_legacy.py`, ADR-006).
 
 ---
 
-## 3. Nguồn Dữ liệu Thực tế (Live OT Data Sources)
+## 3. Nguồn Dữ liệu Thực tế
 
 Toàn bộ dữ liệu thực tế tại hiện trường đang được thu thập từ trạm thiết bị mô phỏng **PC03** tại địa chỉ IP nội bộ: **`192.168.2.108`**.
 
@@ -124,7 +142,7 @@ Hệ thống kết nối song song qua **5 giao thức công nghiệp**, tất c
 
 ---
 
-## 4. Cây Phân cấp Tài sản (Asset Topology Hierarchy)
+## 4. Cây Phân cấp Tài sản
 
 Hệ thống tài sản được tổ chức theo tiêu chuẩn phân cấp ISA-95:
 
@@ -314,114 +332,136 @@ Mỗi máy trong 6 máy sở hữu **6 Data Models** độc lập chạy ở chu
 
 ---
 
-## 6. Kiến trúc Lưu trữ & Hai Cơ sở Dữ liệu
+## 6. Kiến trúc Lưu trữ & Truyền tải Dữ liệu
 
-Hệ thống FactoriX sử dụng **2 cơ sở dữ liệu chuyên biệt**:
+Phiên bản image lấy từ `docker-compose.yml`; container DB/broker chỉ mở cổng trên `127.0.0.1`. Mọi thông tin đăng nhập (PostgreSQL, RabbitMQ, TDengine) được cấu hình trong `.env` (mẫu: `.env.example`) và **không** được ghi vào tài liệu hay git.
 
-### 1. Cơ sở dữ liệu Edge: SQLite Outbox (`/data/outbox.sqlite`)
-- **Vị trí**: Nằm trên Edge (hoặc container appliance tại `/data/outbox.sqlite`).
-- **Nhiệm vụ**: Vùng đệm Store-and-Forward đảm bảo at-least-once delivery.
-- **Dung lượng hiện tại**:
-  - File chính: `42.32 MB`
-  - File WAL: `5.72 MB`
-  - File SHM: `0.06 MB`
-  - **Tổng cộng: ~48 MB**.
-- **Cơ chế tự xóa sau khi Forward (Auto-pruning)**:
-  - Khi forward thành công sang Center, bản ghi chuyển sang `ACKED`.
-  - Giữ lại đệm trong **2 phút** (`ACKED_RETENTION = timedelta(minutes=2)`).
-  - Vòng lặp bảo trì (`_maintenance_loop`) chạy định kỳ **mỗi 15 giây** (`PRUNE_INTERVAL_S = 15s`) sẽ xóa vĩnh viễn (`DELETE FROM outbox`) các bản ghi `ACKED`, `QUARANTINED`, `DEAD` thành từng lô nhỏ 500 dòng chạy trên luồng ngầm (`asyncio.to_thread`).
-  - Tự động chạy `VACUUM` và `wal_checkpoint(TRUNCATE)` khi phát hiện trang trống phình to.
-  - **Tốc độ tăng dung lượng dài hạn**: **~0 MB/s** (dung lượng giữ ổn định quanh mốc 40 - 50 MB, không bị phình vô tận).
+### 1. PostgreSQL 17 — Control Plane (`factorix-postgres`, volume `factorix-pg-data`)
+- **Nhiệm vụ**: định danh & phiên (`admin_accounts`, `sessions`), Factory Model (`resources`, ...), Connections (`connections`, `acquisition_jobs`, `secret_store` mã hóa bằng `FACTORIX_DATA_KEY`), Signals (`signal_definitions`, `signal_bindings`), Data Models (`output_groups`, `model_state`, `model_snapshots`), Storage (`storage_*`), Dashboards (`dashboards`, `dashboard_revisions`, `dashboard_templates`), `telemetry_generations` (epoch), `collector_runtime_status`, `audit_events` (ADR-008, ADR-017).
+- **Trạng thái mới nhất**: `latest_signal_state` (một hàng / tín hiệu) do ingestion worker cập nhật.
+- **Schema**: chỉ thay đổi qua Alembic (`apps/center/migrations/versions/`, head hiện tại `0014_bulk_jobs_failed_idx`); container appliance chạy `alembic upgrade head` khi khởi động.
+- **Lưu ý**: ở chế độ `acquisition`, lịch sử **không** còn ghi vào bảng `observations` / `ingest_dedup` của PostgreSQL (chỉ ghi khi bật `FACTORIX_INGESTION_SHADOW_PG=true`, mặc định `false`). Các bảng này là di sản của Edge daemon.
 
-### 2. Cơ sở dữ liệu Center: PostgreSQL 17 (`factorix` DB, Port 5432)
-- **Vị trí**: Container `factorix-postgres` thuộc Docker Compose group `factoriX` (`postgresql://factorix:***@127.0.0.1:5432/factorix`).
-- **Nhiệm vụ**: Lưu trữ toàn bộ siêu dữ liệu nền tảng, chuỗi thời gian phân vùng, trạng thái tức thời và kiểm toán.
-- **Dung lượng hiện tại**: **18 GB** (Dung lượng volume `factorix-pg-data`).
-- **Phân bổ bảng dung lượng lớn nhất**:
-  - `observations_2026_11` (Bảng chuỗi thời gian tháng 11/2026): **15 GB** (16,55 GB).
-  - `ingest_dedup` (Bảng chống trùng lặp quan sát): **2.44 GB**.
-  - `latest_signal_state` (Trạng thái tức thời 344 tín hiệu): **14 MB**.
-  - `model_snapshots` / `output_groups` / `model_state`: **~12 MB**.
-- **Tốc độ nạp & Tăng trưởng đo đạc thực tế**:
-  - **Tần suất nạp**: **~298 - 300 observations/giây** (Khớp với 336 tín hiệu chu kỳ 1s).
-  - **Tốc độ tăng dung lượng**: **~0.268 MB/giây** (~281 KB/s).
-  - **Tốc độ tăng tích lũy**: Khoảng **16 MB/phút**, tương đương **~965 MB/giờ** (~**22.6 GB/ngày** trước khi chạy chính sách nén/retention).
+### 2. TDengine 3.4.3.9 — Time-Series Data Plane (`factorix-tdengine`, volume `factorix-td-data`)
+- **Nhiệm vụ**: lịch sử chuỗi thời gian. Mỗi tenant có database riêng `fx_t_<tenant uuid hex>` (`FACTORIX_TDENGINE_DB_PREFIX`, mặc định `fx_t_`; ADR-002).
+- **Operational history**: ghi tự động mọi quan sát khi `FACTORIX_RECORD_OPERATIONAL=true` (đặt sẵn trong `docker-compose.yml`), phục vụ sparkline 15 phút, `value_at()` và Historian (ADR-003).
+- **Storage objects**: database / supertable / subtable do người dùng tạo trong Storage Management, đăng ký trong PostgreSQL (`storage_objects`, `storage_physical_registry`; ADR-012, ADR-016).
+- **Kết nối**: WebSocket qua taosAdapter `:6041` (`FACTORIX_TDENGINE_DSN`).
 
-### 3. Time-Series Engine: TDengine 3.4.3.9 (Port 6041)
-- **Vị trí**: Container `factorix-tdengine` thuộc Docker Compose group `factoriX` (`ws://root:taosdata@127.0.0.1:6041`).
-- **Nhiệm vụ**: Lưu trữ và truy vấn chuỗi thời gian tốc độ cao (Historian, Storage Engine, Super-tables và Sub-tables).
+### 3. RabbitMQ 4.4 — Reliable Transport (`factorix-rabbitmq`, volume `factorix-rmq-data`)
+- **Topology** (`apps/center/src/factorix/platform/broker.py`): topic exchange `factorix.telemetry.ingress`; quorum queue `factorix.telemetry.live.q` (binding `telemetry.live.v1.*`, quan sát không quá 12 s tuổi khi publish) và `factorix.telemetry.ingest.q` (binding `telemetry.v1.*`, dữ liệu replay); dead-letter exchange `factorix.telemetry.dlx` → `factorix.telemetry.dlq`.
+- **Đảm bảo**: publisher confirms, `x-overflow: reject-publish`, `x-delivery-limit` (`FACTORIX_RABBITMQ_DELIVERY_LIMIT`, mặc định 5), ACK thủ công sau khi TDengine commit. RabbitMQ chỉ là tầng truyền tải, không bao giờ là đích lưu trữ trên UI (ADR-001).
 
-### 4. Message Broker: RabbitMQ 4.4 Management (Ports 5672, 15672)
-- **Vị trí**: Container `factorix-rabbitmq` thuộc Docker Compose group `factoriX` (`amqp://factorix_mq:***@127.0.0.1:5672/`).
-- **Nhiệm vụ**: Phân phối message ingestion, quorum queues, telemetry streaming giữa collector và engine.
+### 4. Spool cục bộ của Acquisition (SQLite WAL, trong volume `factorix-data`)
+- **Vị trí**: `/data/acquisition/spool.sqlite` (`FACTORIX_SPOOL_PATH`; mặc định `<FACTORIX_ACQUISITION_DIR>/spool.sqlite`, image đặt `FACTORIX_ACQUISITION_DIR=/data/acquisition`).
+- **Khi nào dùng**: bình thường acquisition publish thẳng lên RabbitMQ, **không** đi qua SQLite. Chỉ khi RabbitMQ thực sự không truy cập được (lỗi kết nối/confirm, không phải chậm hay hàng đợi đầy) thì quan sát chưa được xác nhận mới tràn vào spool để replay `at-least-once`, ưu tiên giá trị mới nhất mỗi tín hiệu và loại bỏ dữ liệu thuộc epoch cũ.
+- **Giới hạn** (`apps/acquisition/src/factorix_acquisition/__main__.py`): `FACTORIX_SPOOL_MAX_BYTES` (mặc định 512 MiB), `FACTORIX_SPOOL_MAX_PENDING` (mặc định 1.000.000 hàng), `FACTORIX_SPOOL_MAX_ATTEMPTS` (mặc định 10). Khi vượt giới hạn, spool từ chối nhận thêm (ghi nhận gap) chứ không xóa hàng đang chờ. `FACTORIX_SPOOL_TTL_HOURS` mặc định `0` (tắt, backlog không bị hết hạn).
+
+### 5. Volume dữ liệu appliance (`factorix-data` → `/data`)
+Chứa spool acquisition (`/data/acquisition`); `entrypoint.sh` cũng tạo thư mục `/data/exports` (`FACTORIX_STORAGE_EXPORT_DIR`).
 
 ---
 
-## 7. Vận hành, Giám sát & Khắc phục Sự cố (Runbook & Operations)
+## 7. Giao diện Web & Dashboard Studio
 
-### Thông tin đăng nhập mặc định:
-- **URL Web Console**: `http://localhost:8080`
-- **Username**: `dangtai`
-- **Password**: `Avenue-net@2026`
+Web Console (`apps/web`) được build vào image và phục vụ cùng cổng `8080` với API. Lần khởi động đầu (chưa có quản trị viên) trình duyệt được chuyển tới `/register`; sau đó là `/login`.
 
-### Các lệnh vận hành nhanh (CLI):
+### Menu điều hướng (`apps/web/src/components/shell/Sidebar.tsx`, routes trong `apps/web/src/App.tsx`)
 
-#### 1. Kiểm tra trạng thái Container & Dịch vụ (Stack factoriX):
+| Mục menu | Trang con / Route | Chức năng |
+|---|---|---|
+| **Overview** | `/overview` | KPI tổng quan, trạng thái kết nối & thu thập, giá trị mới nhất |
+| **Factory Model** | Hierarchy Structure `/factory/structure` · Knowledge Graph `/factory/graph` | Cây tài sản ISA-95 và đồ thị quan hệ |
+| **Data Collector** | Connections `/collector/connections` · Signals `/collector/signals` | Kết nối OT, commissioning, danh mục tín hiệu; trình hướng dẫn Add Data tại `/collector/add-data` |
+| **Data Models** | `/models` (một mục duy nhất) | Danh mục và trình dựng Data Model v2 |
+| **Historian & Storage** | Storage Management `/historian/storage` · Historian `/historian/historian` | Quản lý đối tượng lưu trữ TDengine (wizard tạo/sửa/bulk) và truy vấn lịch sử (ADR-009) |
+| **Dashboard** | `/dashboards` · xem `/dashboards/:id` · soạn `/dashboards/:id/edit` | Dashboard Studio (xem bên dưới) |
+| *Coming soon* | `/alarms`, `/analytics`, `/reports`, `/administration` | Chưa phát hành, hiển thị trang "Coming soon" |
+
+Các URL cũ (`/signals`, `/historian/explorer`, `/acquisition/*`, ...) được chuyển hướng về route mới, giữ nguyên query string; route không tồn tại hiển thị trang Not Found.
+
+### Dashboard Studio (ADR-019, hợp đồng `docs/architecture/contracts/dashboard.md`)
+- **Bản chất**: dashboard là **view chỉ đọc**. Backend chỉ lưu metadata (`dashboards`, `dashboard_revisions`, `dashboard_templates`, migration `0013_dashboard_studio`) và phân giải nguồn dữ liệu; trình duyệt tự lấy lịch sử qua Historian và giá trị trực tiếp qua `/stream`. Không có lệnh ghi xuống thiết bị.
+- **Nguồn dữ liệu**: chỉ **signal** (`signal`), **trường Data Model** (`model_field`: model + đường dẫn trường) và `signal_key` (tín hiệu có key tương ứng trên tài nguyên chọn qua biến dashboard). Không có nguồn URL, SQL hay script.
+- **Loại widget** (registry backend `apps/center/src/factorix/application/dashboards/registry.py`, `GET /api/v1/dashboards/widget-types`): Value (`kpi`), Gauge, Progress, Status, Time series, State timeline, Bar chart, Pie chart, Histogram, XY scatter, Latest values, History table, Equipment, Text, Image, Divider, Link. Giới hạn: tối đa 40 widget / dashboard, 20 series / truy vấn Historian.
+- **Vòng đời**: bản nháp lưu với khóa lạc quan theo `version`; **Publish** kiểm tra đầy đủ (mọi binding phải phân giải được và phù hợp widget) rồi tạo revision bất biến; có xem/khôi phục revision, duplicate, archive/unarchive, **export** (`format: factorix.dashboard`) và **import**, template (4 template dựng sẵn + template của tenant), 3 theme preset.
+
+---
+
+## 8. Vận hành, Giám sát & Khắc phục Sự cố
+
+### Khởi động & tài khoản quản trị đầu tiên
+1. Sao chép `.env.example` thành `.env` và thay mọi giá trị `change-me...` / `example...` bằng bí mật riêng của nhà máy (mật khẩu PostgreSQL, RabbitMQ, TDengine DSN, `FACTORIX_DATA_KEY`, `FACTORIX_BOOTSTRAP_TOKEN`). Không commit `.env`.
+2. Chạy `./run-appliance.ps1` (hoặc `docker compose up -d --build`). Script chờ `/health/live` rồi in kết quả `GET /api/v1/auth/status` (`admin_exists`, `bootstrap_enabled`, `setup_code_required`).
+3. Mở `http://127.0.0.1:8080`. Khi chưa có quản trị viên, trang **Initial setup** (`/register`) cho phép tạo tài khoản quản trị đầu tiên (`POST /api/v1/auth/bootstrap`, `modules/identity.py`):
+   - Nếu `FACTORIX_BOOTSTRAP_TOKEN` được đặt, form yêu cầu **Setup code** bằng đúng giá trị đó.
+   - Nếu không đặt token: chỉ mở khi `FACTORIX_ENVIRONMENT=development`; ở `production` (mặc định) bootstrap bị tắt (`403 BOOTSTRAP_DISABLED`).
+   - Bootstrap chỉ chạy một lần; khi đã có quản trị viên sẽ trả `409 ADMIN_EXISTS`.
+   - Mật khẩu: 12–128 ký tự, ít nhất 3 nhóm ký tự (`domain/passwords.py`).
+4. Quên mật khẩu: trang `/forgot-password` gửi mã đặt lại (hiệu lực 10 phút) qua SMTP, cần cấu hình `FACTORIX_SMTP_*`.
+
+### Các lệnh vận hành nhanh (CLI)
+
+#### 1. Trạng thái container & sức khỏe ứng dụng
 ```powershell
 docker compose ps
 docker logs -f --tail 100 factorix-appliance
+Invoke-RestMethod http://127.0.0.1:8080/health/live
+Invoke-RestMethod http://127.0.0.1:8080/health/ready
 ```
 
-#### 2. Kiểm tra chất lượng Tín hiệu trực tiếp trong PostgreSQL 17:
+#### 2. Chất lượng tín hiệu trong PostgreSQL
 ```powershell
 docker exec factorix-postgres psql -U factorix -d factorix -c "SELECT quality, count(*) FROM latest_signal_state GROUP BY quality;"
 ```
-*(Kết quả chuẩn: `GOOD | 344` hoặc `GOOD | 336`, `0 BAD`, `0 STALE`)*
+*(Bảng chỉ lưu `GOOD` / `UNCERTAIN` / `BAD`; `STALE` được tính khi phục vụ và xem trên UI/API. Khi mọi nguồn khỏe, các hàng đều là `GOOD`.)*
 
-#### 3. Kiểm tra sức khỏe Kết nối OT:
+#### 3. Sức khỏe kết nối OT và bộ thu thập
 ```powershell
-docker exec factorix-postgres psql -U factorix -d factorix -c "SELECT name, protocol, status, health FROM connections;"
+docker exec factorix-postgres psql -U factorix -d factorix -c "SELECT name, protocol, status, health FROM connections WHERE status <> 'ARCHIVED';"
+docker exec factorix-postgres psql -U factorix -d factorix -c "SELECT instance_id, role, health, broker_ok, spool_pending, last_heartbeat FROM collector_runtime_status;"
 ```
-*(Kết quả chuẩn: 5 kết nối PC03 đều `ACTIVE` và `HEALTHY`)*
+*(`status`: `DRAFT` / `ACTIVE` / `PAUSED` / `ARCHIVED`; `health` bình thường là `HEALTHY`. `spool_pending > 0` nghĩa là acquisition đang giữ dữ liệu chờ phát lại vì RabbitMQ gián đoạn.)*
 
-#### 4. Kiểm tra TDengine và RabbitMQ:
+#### 4. TDengine và RabbitMQ
 ```powershell
-# TDengine 3.4.3
-docker exec factorix-tdengine taos -s "SHOW DATABASES;"
+# TDengine: ping taosAdapter, liệt kê database (-p hỏi mật khẩu root đã cấu hình)
+docker exec factorix-tdengine curl -fsS http://127.0.0.1:6041/-/ping
+docker exec -it factorix-tdengine taos -p -s "SHOW DATABASES;"
 
-# RabbitMQ 4.4 ping
-docker exec factorix-rabbitmq rabbitmq-diagnostics -q ping
+# RabbitMQ: ping và độ sâu hàng đợi
+docker exec factorix-rabbitmq su-exec rabbitmq rabbitmq-diagnostics -q ping
+docker exec factorix-rabbitmq su-exec rabbitmq rabbitmqctl list_queues name type messages
 ```
+*(Lệnh `psql` giả định `POSTGRES_USER` / `POSTGRES_DB` mặc định là `factorix`; đổi `-U` / `-d` nếu `.env` khác.)*
 
-#### 5. Chạy Test Suite toàn diện:
+#### 5. Sao lưu
+Xem [`docs/operations/backup-restore.md`](docs/operations/backup-restore.md). Luôn sao lưu PostgreSQL (`pg_dump`) và TDengine trước khi nâng cấp hoặc chạy Clear Telemetry ([`docs/operations/storage-reset-preservation.md`](docs/operations/storage-reset-preservation.md)).
+
+#### 6. Chạy test (giống CI `.github/workflows/ci.yml`)
 ```powershell
-# Chạy Chaotic safety tests
-python -m pytest tests/chaotic/test_chaotic_tester_scenarios.py -v
+# Job python-unit: unit, safety, contract & simulator (không cần DB thật).
+# Đặt FACTORIX_ENVIRONMENT=test, FACTORIX_DATABASE_URL (driver postgresql+asyncpg, DB tên *_test)
+# và FACTORIX_DATA_KEY (khóa base64 32 byte dùng riêng cho test) như trong ci.yml.
+$env:PYTHONPATH = ".;apps/center/src;apps/acquisition/src;apps/edge/src;apps/shared/src"
+python -m pytest apps/center/tests/unit apps/acquisition/tests/unit apps/edge/tests tests/safety tests/simulators -q
 
-# Chạy 100x Scale Load Benchmark (TDengine 3.4.3 & RabbitMQ 4.4)
-python -m pytest tests/scale/test_100x_scale_load.py -v
+# Job web-build
+Push-Location apps/web; npm ci; npm run check; npm run build; Pop-Location
+
+# Job storage-integration: cần PostgreSQL 17 + RabbitMQ 4.4 + TDengine 3.4.3.9 riêng cho test
+# (vd. docker compose -f docker-compose.test.yml up -d, xem docs/testing/test-environment.md),
+# FACTORIX_ENABLE_DESTRUCTIVE_TESTS=YES_I_USE_EPHEMERAL_DB và các biến kết nối như ci.yml.
+Push-Location apps/center; python -m alembic upgrade head; Pop-Location
+python -m pytest apps/center/tests/integration apps/acquisition/tests/integration -v --tb=short
 ```
-```
+**Không bao giờ** chạy test integration vào stack vận hành (`factorix-appliance`, `:8080`) — test destructive được chặn bởi `tests/safety/test_destructive_guard.py`.
 
 ---
 
-## 8. Lịch sử Nghiệm thu & Tối ưu Hiệu năng
+## 9. Nghiệm thu & Phát hành
 
-Bản dựng hiện tại đã giải quyết triệt để 100% các vấn đề phát hiện trong đợt kiểm thử độc lập **Round 5**:
-
-| Mã lỗi | Mô tả sự cố gốc | Giải pháp triệt để đã triển khai | Kết quả nghiệm thu |
-|---|---|---|---|
-| **R5-ENV-01** | Collector mất kết nối định kỳ (15 lần/78 phút), outbox khóa vòng lặp chính tới 67 s | Bổ sung partial index `outbox_terminal_created_idx`, chuyển dọn dẹp sang `asyncio.to_thread` với chunks có giới hạn. | **Triệt để (0 lần mất kết nối)** |
-| **BOTTLENECK-DB** | Bảng `ingest_dedup` 17 triệu dòng quét full table làm đơ database 25s | Đánh index B-tree `ingest_dedup(first_seen_at)`, rút ngắn thời gian dọn dẹp từ 25.000 ms xuống **15 ms**. Giảm thời gian lưu dedup xuống 2 giờ. | **Triệt để (15 ms prune)** |
-| **BOTTLENECK-HTTP**| Thu thập HTTP tuần tự 6 máy mất 4,2 s / chu kỳ 5,0 s | Chuyển sang thu thập đồng thời `asyncio.gather`, rút ngắn còn **~600 ms**. Tăng pool kết nối lên 16 và thêm cơ chế retry ngắt socket keep-alive. | **Triệt để (Nhanh gấp 7 lần)** |
-| **R5-SG-03** | Lỗi React #310 làm trắng trang khi bấm "Edit source address…" | Di chuyển React Hook `useRef` lên trước lệnh early return trong modal. | **Đạt 100%** |
-| **R5-SG-02** | Khóa ô "Round digits" khi sửa thuộc tính hàng loạt | Mở khóa ô làm tròn số cho tất cả kiểu số (`float32`, `float64`, `analog`, `int16-64`). | **Đạt 100%** |
-| **R5-SG-01** | Shift-click không chọn dải hàng trong bảng Signals | Bổ sung ref theo dõi danh sách hiển thị và xử lý click range chuẩn xác. | **Đạt 100%** |
-| **R5-DM-01** | Checkbox nhận body sự kiện trong Paste JSON bị tắt mặc định | Tự động kích hoạt khi phát hiện JSON chứa định dạng sự kiện. | **Đạt 100%** |
-| **R5-DM-02** | Thông báo lỗi khi xóa signal bị hiển thị trùng lặp | Loại bỏ trùng lặp thông báo theo từng dòng trường dữ liệu. | **Đạt 100%** |
-| **R5-DM-03/04** | Pause/Resume hàng loạt và lưu model 350 trường bị chậm | Song song hóa Promise.all và tối ưu hóa câu lệnh SQL scalar subquery. | **Đạt 100%** |
-| **BRANDING** | Logo công ty bị sai trên màn hình Đăng nhập và Sidebar | Cập nhật hình ảnh logo `factorix_brand_logo.png` (độ phân giải cao 6184×1588). | **Đạt 100%** |
-| **UI-OVERVIEW** | Bảng "Latest values" bị nhảy kích thước cột khi dữ liệu đổi độ dài | Khóa cố định cấu trúc bảng `table-layout: fixed` với độ rộng px cụ thể. | **Đạt 100% (0px drift)** |
+Quy trình xác minh một commit và quyết định phát hành nằm trong [`RELEASE_READINESS.md`](RELEASE_READINESS.md): các gate CI (`python-unit`, `web-build`, `storage-integration`), kiểm tra migration, nghiệm thu trên appliance với dữ liệu thật, và nguồn mã sạch. Bản dựng không tự nghiệm thu: chỉ chủ sở hữu nền tảng quyết định phát hành. Kết quả test, ảnh chụp và báo cáo nghiệm thu được bàn giao kèm từng commit, không lưu trong repository.
 
 ---
-*Tài liệu này được biên soạn và cập nhật tự động vào tháng 11/2026 dựa trên toàn bộ phân tích mã nguồn thực tế và dữ liệu runtime của dự án FactoriX.*
+*Tài liệu cập nhật ngày 2026-11-25 theo mã nguồn nhánh hiện tại; các số liệu runtime ở mục 3–5 do chủ dự án ghi nhận trên hệ thống thật (2026-11-10/12).*

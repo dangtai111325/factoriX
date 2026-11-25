@@ -1,5 +1,7 @@
 # FactoriX commercial gate
 
+> **Historical document (state as of 2026-11-06).** Current behaviour: see [`README.md`](../../README.md) and [`docs/architecture/ADR-*`](./).
+
 Scored against section 12.2 of the architecture review. This build is the running appliance. It is not Commercial GA and it is not RELEASE-READY.
 
 | Condition | Result | Evidence |

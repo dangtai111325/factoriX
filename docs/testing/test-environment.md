@@ -12,9 +12,9 @@
 | HTTP Web / API Port | `127.0.0.1:8080` | `127.0.0.1:8081` |
 | Database Name | `factorix` | `factorix_test` |
 | Destructive Test Flag | Unset / disallowed | `FACTORIX_ENABLE_DESTRUCTIVE_TESTS=YES_I_USE_EPHEMERAL_DB` |
-| PostgreSQL Volume | `factorix-data` | Disposable volume `factorix_e2e_pg_data` (project-scoped) |
-| RabbitMQ Service | — *(until S16 cutover)* | `rabbitmq:4.0-management-alpine` (internal net, ports exposed to test runner only) |
-| TDengine Service | — *(until S16 cutover)* | `tdengine/tdengine:3.3.6.13` (internal net + WebSocket `:6041`) |
+| PostgreSQL Volume | `factorix-pg-data` | Disposable volume `e2e_pg_data` (project-scoped) |
+| RabbitMQ Service | `factorix-rabbitmq` (`rabbitmq:4.4-management-alpine`) | `rabbitmq-test` (`rabbitmq:4.4-management-alpine`, AMQP `127.0.0.1:15673`) |
+| TDengine Service | `factorix-tdengine` (`tdengine/tsdb:3.4.3.9`) | `tdengine-test` (`tdengine/tsdb:3.4.3.9`, WebSocket `127.0.0.1:16041`) |
 | OT Sources | Live `pc03` (`192.168.2.108`) | Isolated mock simulators in `tests/simulators/` (Modbus TCP, OPC UA, MQTT, HTTP REST, WebSocket) |
 
 ---
@@ -33,8 +33,8 @@ Any test or script that resets data, truncates tables, or purges broker/TSDB sta
 | Service | Pinned Image Tag | Verified Digest / ID | Purpose |
 |---|---|---|---|
 | PostgreSQL | `postgres:17-alpine` | `b0f9560a2de0` | Control plane & staging clone verification |
-| RabbitMQ | `rabbitmq:4.0-management-alpine` | `6202aafa4a1b` | Quorum Queue ingress broker + management HTTP API (`:15672`) |
-| TDengine | `tdengine/tdengine:3.3.6.13` | `79d32ce8a42f` | TSDB engine + `taosadapter` REST/WebSocket (`:6041`) |
+| RabbitMQ | `rabbitmq:4.4-management-alpine` | — | Quorum Queue ingress broker + management HTTP API (`:15672`) — same image as `docker-compose.yml` |
+| TDengine | `tdengine/tsdb:3.4.3.9` | — | TSDB engine + `taosadapter` REST/WebSocket (`:6041`) — same image as `docker-compose.yml` |
 
 ---
 

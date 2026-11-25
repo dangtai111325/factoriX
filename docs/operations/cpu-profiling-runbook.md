@@ -36,10 +36,11 @@ Inside the appliance container, multiple Python workloads run concurrently:
 docker exec -it factorix-appliance ps aux --sort=-%cpu
 ```
 Typical processes:
-1. `factorix.ingestion`: RabbitMQ consumer, policy routing, TDengine batch assembly
-2. `factorix_acquisition.runtime`: Protocol pollers, local SQLite spool, publisher
-3. `uvicorn factorix.main:app`: FastAPI web and REST API server
-4. `factorix.modules.models_engine`: Periodic model rule evaluation
+1. `python -m factorix.ingestion`: RabbitMQ consumer, policy routing, TDengine batch assembly
+2. `python -m factorix_acquisition`: Protocol pollers, local SQLite spool, publisher
+3. `uvicorn factorix.transport.app:app`: FastAPI web and REST API server; the Data Model engine (`factorix.modules.models_engine`) runs inside this process
+
+(Processes started by `infrastructure/docker/entrypoint.sh` in the default `acquisition` mode.)
 
 ### 2.3 Python Hotspot Profiling (cProfile / Py-Spy)
 To record a 30-second flamegraph of the ingestion worker without stopping the container:
@@ -87,4 +88,4 @@ py-spy record -o /tmp/ingestion_flamegraph.svg --pid <INGESTION_PID> --duration 
 1. **No Silent Data Loss:** Optimization must never drop RabbitMQ messages or bypass consumer ACK before durable write.
 2. **Regression Parity:** All 5 existing navigations (Overview, Factory Model, Data Collector, Data Models, Coming Soon) must pass contract tests after each optimization.
 3. **Operational History Invariant:** Never reduce CPU by disabling operational history or dropping `ON_CHANGE` fidelity unless explicitly commanded.
-4. **Before/After Metrics:** Every optimization must be committed independently with documented before/after CPU, memory, and p99 latency recorded in `reports/cpu-before-after.csv`.
+4. **Before/After Metrics:** Every optimization must be committed independently with documented before/after CPU, memory, and p99 latency recorded in the handover report of that change (evidence is kept outside the repository, see `RELEASE_READINESS.md`).

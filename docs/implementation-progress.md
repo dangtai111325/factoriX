@@ -1,5 +1,7 @@
 # FactoriX — TDengine + RabbitMQ + Historian & Storage Implementation Progress
 
+> **Historical document (state as of 2026-11-11).** Current behaviour: see [`README.md`](../README.md) and [`docs/architecture/ADR-*`](architecture/).
+
 **Branch:** `TDengine-RabbitMQ-Stoorage-Historian`  
 **Base Commit (`main`):** `1cd21f384cd50ea8613dfcca26be6b93a86b5207`  
 **Master Spec:** `C:\Users\Ave-T14-001\Downloads\plan.md`  
