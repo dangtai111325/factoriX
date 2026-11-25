@@ -9,6 +9,7 @@ import { StorageObjectGraph } from './StorageObjectGraph';
 import { ObjectTypeFilter, StorageObjectsTable } from './StorageObjectsTable';
 import { StorageObjectDrawer } from './StorageObjectDrawer';
 import { PostgresExplorerView } from './PostgresExplorerView';
+import { RecordingFailuresDrawer } from './RecordingFailuresDrawer';
 import { Dialog, EmptyState, ErrorBanner, LoadingBlock, PageHeader, Segmented, TimeCell } from '../historian/hsUi';
 import { StorageObjectData, kindOfId, KIND_LABEL } from './objectViews';
 import {
@@ -224,6 +225,7 @@ export const StorageManagementPage: React.FC = () => {
   const activeTab = searchParams.get('tab') === 'objects' ? 'objects' : 'topology';
   const typeFilter = (['database', 'stable', 'subtable'].includes(searchParams.get('type') || '') ? searchParams.get('type') : 'all') as ObjectTypeFilter;
   const [statusFilter, setStatusFilter] = useState('all');
+  const [errorsOpen, setErrorsOpen] = useState(false);
 
   const patchParams = useCallback(
     (patch: Record<string, string | null>) => {
@@ -406,6 +408,7 @@ export const StorageManagementPage: React.FC = () => {
                 loadDrafts();
                 setDraftsOpen(true);
               }}
+              onOpenErrors={() => setErrorsOpen(true)}
             />
           )}
 
@@ -482,6 +485,16 @@ export const StorageManagementPage: React.FC = () => {
           )}
         </div>
       )}
+
+      <RecordingFailuresDrawer
+        open={errorsOpen}
+        onClose={() => setErrorsOpen(false)}
+        onShowInTable={() => {
+          setErrorsOpen(false);
+          setStatusFilter('ERROR');
+          patchParams({ tab: 'objects', type: null });
+        }}
+      />
 
       <DraftsDialog
         open={draftsOpen}

@@ -13,7 +13,7 @@ import {
   Loader2,
   Info,
 } from 'lucide-react';
-import { StorageWizardLayout, useWizardDraft, useStorageBackTarget, PendingDraftBanner } from './WizardShared';
+import { StorageWizardLayout, useWizardDraft, useStorageBackTarget, useStepHistory, PendingDraftBanner } from './WizardShared';
 import { Button } from '../../../components/common/Button';
 import { DraftChip, EmptyState, LoadingBlock, WizardHeader } from '../../historian/hsUi';
 import {
@@ -25,11 +25,6 @@ import {
 } from './DatabaseWizardSteps';
 import {
   StableTargetStep,
-  StableColumnsStep,
-  StableTagsStep,
-  StableSourceMappingStep,
-  StableRecordingStep,
-  StableReviewStep,
   StableWizardData,
 } from './StableWizardSteps';
 import {
@@ -52,6 +47,7 @@ import {
 } from '../../../lib/storagePhysicalApi';
 import { api } from '../../../api/client';
 import { isSystemStorageName } from '../../../lib/storagePhysicalApi';
+import { StableSchemaEditor } from './StableSchemaEditor';
 
 // ============================================================================
 // Type guards
@@ -94,6 +90,8 @@ export const EditStorageObjectWizard: React.FC = () => {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [versionConflict, setVersionConflict] = useState(false);
   const [activeOperation, setActiveOperation] = useState<StorageOperation | null>(null);
+  // Steps live in the browser history: Back = previous step, not out of the wizard (R1-28).
+  useStepHistory(currentStep, setCurrentStep, !loading && !!objectKind);
 
   // Subtable parent STable ref
   const [parentStable, setParentStable] = useState<TDStable | null>(null);
@@ -495,12 +493,13 @@ export const EditStorageObjectWizard: React.FC = () => {
     };
 
     const handleSubmit = () => {
+      // PATCH changes display name / description; a retention change is sent only when it changed, so an
+      // unchanged retention never turns a metadata edit into SCHEMA_CHANGE_NOT_SUPPORTED.
+      const retentionChanged = ((originalObject as TDDatabase).retention_days ?? null) !== (dbDraft.data.retention_days ?? null);
       handleSave({
         display_name: dbDraft.data.display_name,
         description: dbDraft.data.description,
-        retention_days: dbDraft.data.retention_days,
-        vgroups: dbDraft.data.vgroups,
-        cache_mb: dbDraft.data.cache_mb,
+        ...(retentionChanged ? { retention_days: dbDraft.data.retention_days } : {}),
       });
     };
 
@@ -575,14 +574,9 @@ export const EditStorageObjectWizard: React.FC = () => {
   // ==========================================================================
 
   if (objectKind === 'stable') {
-    const STABLE_STEPS = [
-      'Target',
-      'Columns',
-      'Tags',
-      'Mapping',
-      'Recording',
-      'Review & Diff',
-    ];
+    // B-08: columns / tags change through POST …/alter (additive, dry run first) on the "Edit schema" step;
+    // "Save" stores the display name and description (PATCH accepts metadata only).
+    const STABLE_STEPS = ['Name', 'Edit schema', 'Review & save'];
 
     const handleNext = () => {
       setCurrentStep((p) => Math.min(p + 1, STABLE_STEPS.length - 1));
@@ -592,11 +586,6 @@ export const EditStorageObjectWizard: React.FC = () => {
       handleSave({
         display_name: stableDraft.data.display_name,
         description: stableDraft.data.description,
-        columns: stableDraft.data.columns,
-        tags: stableDraft.data.tags,
-        default_recording_mode: stableDraft.data.default_recording_mode,
-        retention_days: stableDraft.data.retention_days,
-        source_mapping_template: stableDraft.data.source_mapping_template,
       });
     };
 
@@ -646,43 +635,20 @@ export const EditStorageObjectWizard: React.FC = () => {
           />
         )}
         {currentStep === 1 && (
-          <StableColumnsStep
-            data={stableDraft.data}
-            onChange={stableDraft.updateData}
-            errors={errors}
+          <StableSchemaEditor
+            objectId={objectId?.startsWith('stable:') ? objectId : `stable:${(originalObject as TDStable).database_name}.${originalObject.physical_name}`}
+            columns={(originalObject as TDStable).columns || []}
+            tags={(originalObject as TDStable).tags || []}
+            subtableCount={(originalObject as TDStable).subtable_count}
+            onApplied={() => {
+              // Reload the supertable (new columns / tags); unsaved name / description edits stay in the draft.
+              getStorageObject(objectId as string)
+                .then((obj) => setOriginalObject(obj))
+                .catch(() => undefined);
+            }}
           />
         )}
-        {currentStep === 2 && (
-          <StableTagsStep
-            data={stableDraft.data}
-            onChange={stableDraft.updateData}
-            errors={errors}
-          />
-        )}
-        {currentStep === 3 && (
-          <StableSourceMappingStep
-            data={stableDraft.data}
-            onChange={stableDraft.updateData}
-            errors={errors}
-          />
-        )}
-        {currentStep === 4 && (
-          <StableRecordingStep
-            data={stableDraft.data}
-            onChange={stableDraft.updateData}
-            errors={errors}
-          />
-        )}
-        {currentStep === 5 && (
-          <>
-            <StableReviewStep
-              data={stableDraft.data}
-              onChange={stableDraft.updateData}
-              errors={errors}
-            />
-            {renderDiffPanel()}
-          </>
-        )}
+        {currentStep === 2 && renderDiffPanel()}
       </StorageWizardLayout>
     );
   }
@@ -698,11 +664,18 @@ export const EditStorageObjectWizard: React.FC = () => {
   };
 
   const handleSubtableSubmit = () => {
+    const sub = originalObject as TDSubtable;
+    const tagsBefore = JSON.stringify((sub.tag_values || []).map((t) => [t.name, t.value || '']));
+    const tagsNow = JSON.stringify(subtableDraft.data.tag_values.map((t) => [t.tag_name, t.value || '']));
+    const bindingsBefore = JSON.stringify((sub.bindings || []).map((b) => [b.destination_column, b.source_kind, b.source_id]));
+    const bindingsNow = JSON.stringify(subtableDraft.data.bindings.map((b) => [b.column_name, b.source_kind, b.source_id]));
+    // PATCH changes display name / description; tag values and bindings are sent only when they changed
+    // (the server then explains that they need a corrected copy) instead of failing every metadata edit.
     handleSave({
       display_name: subtableDraft.data.display_name,
       description: subtableDraft.data.description,
-      tag_values: subtableDraft.data.tag_values,
-      bindings: subtableDraft.data.bindings,
+      ...(tagsNow !== tagsBefore ? { tag_values: subtableDraft.data.tag_values } : {}),
+      ...(bindingsNow !== bindingsBefore ? { bindings: subtableDraft.data.bindings } : {}),
       row_assembly_policy: subtableDraft.data.row_assembly_policy,
       recording_mode: subtableDraft.data.recording_mode,
       start_recording: subtableDraft.data.start_recording,

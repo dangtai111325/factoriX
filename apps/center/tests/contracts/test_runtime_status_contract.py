@@ -33,7 +33,7 @@ def _function(path: Path, name: str) -> ast.AST:
 
 
 def test_acquisition_queues_json_top_level_keys() -> None:
-    """CT-18: besides ``publisher`` and ``runtime`` the top level holds MQTT counters keyed by connection UUID."""
+    """CT-18 fixed (B-11): ``schema_version`` 1; MQTT counters under ``connectors`` (no UUID keys at the top level)."""
     fn = _function(ACQ / "runtime.py", "send_heartbeat")
     subscripts = {
         node.slice.value
@@ -41,7 +41,30 @@ def test_acquisition_queues_json_top_level_keys() -> None:
         if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store)
         and isinstance(node.value, ast.Name) and node.value.id == "queues" and isinstance(node.slice, ast.Constant)
     }
-    assert subscripts == {"publisher", "runtime"}
+    assert subscripts == {"schema_version", "connectors", "publisher", "runtime"}
+
+
+def test_queues_json_readers_accept_v1_and_the_legacy_shape() -> None:
+    """ADR-018: a reader accepts N and N-1 — ``connectors`` (v1) and top-level UUID keys (unversioned)."""
+    from factorix_core.contracts.runtime_status import QUEUES_SCHEMA_VERSION, connector_counters, queues_schema_version
+
+    cid = "c0000000-0000-0000-0000-000000000001"
+    counters = {"pending": 0, "dropped": 0, "connects": 1, "disconnects": 0, "session_present": True}
+    v1 = {"schema_version": QUEUES_SCHEMA_VERSION, "connectors": {cid: counters}, "publisher": {}, "runtime": {}}
+    legacy = {cid: counters, "publisher": {"published_fast": 3}, "runtime": {"jobs_expected": 1}}
+    assert QUEUES_SCHEMA_VERSION == 1
+    assert connector_counters(v1) == connector_counters(json.dumps(legacy)) == {cid: counters}
+    assert (queues_schema_version(v1), queues_schema_version(legacy), queues_schema_version("not json")) == (1, 0, 0)
+    assert connector_counters({"publisher": {}, "runtime": {}}) == {}
+
+
+def test_ingestion_heartbeat_is_versioned() -> None:
+    fn = _function(CENTER / "application" / "ingestion" / "worker.py", "_heartbeat_loop")
+    keys: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "queues_json" for t in node.targets) and isinstance(node.value, ast.Dict):
+            keys = {k.value for k in node.value.keys if isinstance(k, ast.Constant)}
+    assert "schema_version" in keys
 
 
 def test_acquisition_runtime_block_round_trips_to_the_center_sweep() -> None:

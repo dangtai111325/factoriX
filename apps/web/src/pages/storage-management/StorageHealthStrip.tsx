@@ -12,6 +12,8 @@ interface StorageHealthStripProps {
   activeType?: 'all' | 'database' | 'stable' | 'subtable';
   onFilterType?: (type: 'database' | 'stable' | 'subtable') => void;
   onOpenDrafts?: () => void;
+  /** Opens the list of subtables with write errors (R2-07). */
+  onOpenErrors?: () => void;
   /** Totals not loaded yet: skeleton tiles, never a 0 or "nothing is recorded yet" (R2-18). */
   loading?: boolean;
 }
@@ -33,6 +35,7 @@ export const StorageHealthStrip: React.FC<StorageHealthStripProps> = ({
   activeType,
   onFilterType,
   onOpenDrafts,
+  onOpenErrors,
   loading,
 }) => {
   if (loading) {
@@ -54,7 +57,20 @@ export const StorageHealthStrip: React.FC<StorageHealthStripProps> = ({
       <>
         {recordingPaused ? `${recordingPaused} paused` : ''}
         {recordingPaused && recordingError ? ' · ' : ''}
-        {recordingError ? <span className="text-[#DB2028] font-semibold">{recordingError} with write errors</span> : null}
+        {recordingError ? (
+          onOpenErrors ? (
+            <button
+              type="button"
+              onClick={onOpenErrors}
+              className="text-[#DB2028] font-semibold underline decoration-dotted underline-offset-2 hover:decoration-solid focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#DB2028] rounded"
+              title="Show which subtables could not be written, and why"
+            >
+              {recordingError} with write errors
+            </button>
+          ) : (
+            <span className="text-[#DB2028] font-semibold">{recordingError} with write errors</span>
+          )
+        ) : null}
       </>
     ) : null;
   return (

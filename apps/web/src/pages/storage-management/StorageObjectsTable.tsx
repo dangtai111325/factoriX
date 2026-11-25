@@ -278,9 +278,11 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
         <select aria-label="Filter by status" value={statusFilter} onChange={(e) => onStatusFilter(e.target.value)} className={selectCls}>
           <option value="all">All statuses</option>
           <option value="ACTIVE">Active</option>
+          <option value="PAUSED">Paused</option>
+          <option value="RETIRED">Retired</option>
           <option value="DRAFT">Draft</option>
           <option value="OUT_OF_SYNC">Out of sync</option>
-          <option value="ERROR">Error</option>
+          <option value="ERROR">Error (write errors)</option>
         </select>
         {filtersActive && (
           <Button
@@ -407,6 +409,11 @@ export const StorageObjectsTable: React.FC<StorageObjectsTableProps> = ({
                       <td className="text-right tabular-nums">{obj.binding_count ?? '—'}</td>
                       <td className="whitespace-nowrap">
                         <StorageStatusBadge status={obj.status} />
+                        {obj.recording_error && (
+                          <span className="ml-1.5 text-[11px] font-semibold text-[#DB2028]" title="The writer could not store some rows into this subtable">
+                            Write errors
+                          </span>
+                        )}
                       </td>
                       <td className="text-[12px] text-[#657794]">
                         <TimeCell iso={obj.last_verified_at} />

@@ -97,7 +97,8 @@ class Settings(BrokerSettings):
     # Read the legacy PostgreSQL ``observations`` table as a history fallback (R2-E C3). Unset = only in
     # Edge mode (which still writes it); the appliance (acquisition mode) no longer writes that table.
     pg_telemetry_fallback: bool | None = None
-    collector_mode: str = "edge"
+    # CT-14: the appliance default (Dockerfile / compose / entrypoint agree); FACTORIX_COLLECTOR_MODE=edge overrides.
+    collector_mode: str = "acquisition"
     ot_allowlist: str = ""
     acquisition_spool_path: str = ""
     acquisition_spool_max_bytes: int = Field(default=128 * 1024 * 1024, ge=1_048_576)

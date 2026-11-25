@@ -13,13 +13,47 @@ import {
   getPgTableDetail,
   getPgErd,
   getPgTablePreview,
+  countPgRows,
 } from '../../lib/storagePhysicalApi';
+import { errorText } from '../historian/hsUi';
 
 const SENSITIVE_COL_REGEX = /password|secret|token|hash|salt|credential|private_key|auth_key/i;
 
 function isSensitiveColumn(colName: string): boolean {
   return SENSITIVE_COL_REGEX.test(colName);
 }
+
+/** "Count exactly" next to the estimate (R1-35): the server counts with a 10 s timeout. */
+const ExactCount: React.FC<{ schema: string; table: string; estimate: number | null | undefined }> = ({ schema, table, estimate }) => {
+  const [state, setState] = useState<{ busy: boolean; rows?: number; scoped?: boolean; error?: string }>({ busy: false });
+  useEffect(() => setState({ busy: false }), [schema, table]);
+  const run = () => {
+    setState({ busy: true });
+    countPgRows(schema, table)
+      .then((r) => setState({ busy: false, rows: r.exact_rows, scoped: r.tenant_scoped }))
+      .catch((e: unknown) => setState({ busy: false, error: errorText(e) }));
+  };
+  const estText = estimate == null || estimate < 0 ? 'unknown, never analyzed' : `~${estimate.toLocaleString()} (estimate)`;
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-[12px] text-[#657794]" data-testid="pg-exact-count">
+      <span>
+        Rows:{' '}
+        {state.rows != null ? (
+          <span className="font-mono font-semibold text-[#111B37]">
+            {state.rows.toLocaleString()}
+            {state.scoped ? ' (your tenant)' : ''}
+          </span>
+        ) : (
+          <span className="font-mono">{estText}</span>
+        )}
+      </span>
+      <Button type="button" size="sm" variant="outline" onClick={run} disabled={state.busy} loading={state.busy}>
+        Count exactly
+      </Button>
+      {state.error && <span className="text-[#DB2028]">{state.error}</span>}
+    </div>
+  );
+};
 
 export const PostgresExplorerView: React.FC = () => {
   const [schemas, setSchemas] = useState<PgSchema[]>([]);
@@ -227,9 +261,10 @@ export const PostgresExplorerView: React.FC = () => {
     <div className="space-y-4">
       {/* Read-only banner: states exactly what is enforced (P1-14) */}
       <Banner tone="info">
-        <span className="font-semibold">Read-only explorer.</span> Only generated SELECT statements on catalog-validated tables run here (5 s timeout, rows
-        of your tenant only). Credential, session and audit tables are hidden and secret values are masked. It uses the application database role, not a
-        separate read-only role.
+        <span className="font-semibold">Read-only explorer.</span> Every query runs in a read-only PostgreSQL transaction (writes are refused by the
+        database) and only generated SELECT statements on catalog-validated tables run here (5 s timeout for previews, 10 s for exact counts, rows of your
+        tenant only). Credential, session and audit tables are hidden and secret values are masked. It uses the application database role, not a separate
+        read-only role.
       </Banner>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
@@ -300,6 +335,13 @@ export const PostgresExplorerView: React.FC = () => {
             <div className="font-mono text-[13px] font-bold text-[#111B37] break-all">
               {selectedSchema}.{selectedTable || '*'}
             </div>
+            {selectedTable && (
+              <ExactCount
+                schema={selectedSchema}
+                table={selectedTable}
+                estimate={tables.find((t) => t.table_name === selectedTable)?.row_count_estimate}
+              />
+            )}
             <Tabs tabs={tabs} activeTab={activeTab} onChange={(id) => setActiveTab(id as 'erd' | 'columns' | 'preview')} />
           </div>
 

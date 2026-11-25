@@ -38,7 +38,7 @@ future; a connection marked DEGRADED by the Center "no samples" sweep is not cle
 
 ## 3. Other writers of `connections.health` (for the ownership map, ADR-017)
 
-Center sweep `app.py::_evaluate_connections` (DEGRADED "No samples received for N s." for bound connections
+Center sweep `transport/background/health_loop.py::_evaluate_connections` (DEGRADED "No samples received for N s." for bound connections
 acquisition runs nothing for, predicate re-checked in the UPDATE); `collect.py` pause / resume / archive;
 `edge_sync.py` and `telemetry._mark_connections_live` (edge mode); ingestion (edge mode, recovery from the
 "No samples" state). Target: one `HealthService` writer (Phase C2).

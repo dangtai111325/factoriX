@@ -12,6 +12,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { getStorageEngines } from '../../../lib/storagePhysicalApi';
+import { DESCRIPTION_MAX_LENGTH } from './useServerNameCheck';
 
 // ============================================================================
 // Types
@@ -106,11 +107,24 @@ export const DatabaseBasicsStep: React.FC<StepProps> = ({ data, onChange, errors
           </label>
           <textarea
             value={data.description}
+            maxLength={DESCRIPTION_MAX_LENGTH}
             onChange={(e) => onChange({ description: e.target.value })}
             rows={3}
             placeholder="Document what data streams this database holds, retention expectations, and plant context..."
-            className="w-full p-3 rounded-lg border border-[#D4DFEC] text-[13px] transition-colors focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 resize-none"
+            className={`w-full p-3 rounded-lg border text-[13px] transition-colors focus:outline-none focus:ring-2 resize-none ${
+              errors.description ? 'border-[#EF1B24] focus:ring-red-100' : 'border-[#D4DFEC] focus:border-blue-500 focus:ring-blue-100'
+            }`}
           />
+          {errors.description ? (
+            <p className="text-[11px] text-red-700 mt-1 flex items-center gap-1">
+              <AlertTriangle className="w-3.5 h-3.5" />
+              <span>{errors.description}</span>
+            </p>
+          ) : (
+            <p className="text-[11px] text-[#657794] mt-1 text-right tabular-nums">
+              {(data.description || '').length}/{DESCRIPTION_MAX_LENGTH}
+            </p>
+          )}
         </div>
       </div>
 

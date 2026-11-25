@@ -30,7 +30,9 @@ Result per row: ``CREATED`` | ``EXISTS`` | ``VALID`` (dry run) | ``INVALID`` | `
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -39,7 +41,7 @@ from uuid import UUID, uuid4
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import storage_bindings as SB
-from factorix.modules.common import execute, fetch_all, iso_ms, jsonb, utcnow
+from factorix.modules.common import execute, fetch_all, fetch_one, iso_ms, jsonb, utcnow
 from factorix.modules.storage_objects import StorageObjectError, generate_create_subtable_ddl, validate_subtable_spec
 from factorix.modules.storage_revisions import (
     IN_PROGRESS,
@@ -412,8 +414,11 @@ class BulkSubtableCreator:
 # Background jobs (WS-P P6 / R2-05): bulk creation never runs inside the API request nor on the shared
 # TDengine pool. ``POST .../bulk`` answers 202 with a job id; the job uses its OWN one-connection
 # TDengine client, one job at a time, in chunks of ``MAX_ROWS``, a fresh PostgreSQL session per chunk.
-# Job state is in memory (single API process); every row is durable in ``storage_operations`` anyway,
-# so after an API restart re-validating the same rows reports them as EXISTS.
+# The live job state is in memory (single API process) and is mirrored to ``storage_bulk_jobs``
+# (migration 0014) when it starts, after every chunk and when it ends (B-12 / OP-14). A job the current
+# process does not know but the table shows QUEUED / RUNNING ran in a process that is gone: it is reported
+# INTERRUPTED with the rows it finished. Every row is idempotent in ``storage_operations``, so validating
+# the same rows again reports the created ones as EXISTS.
 # ------------------------------------------------------------------------------------------------
 
 MAX_JOB_ROWS = 1000
@@ -421,6 +426,14 @@ JOB_KEEP_S = 3600.0
 _JOBS: dict[str, dict[str, Any]] = {}
 _JOB_TASKS: set[Any] = set()
 _RUN_ONE_AT_A_TIME: Any = None  # asyncio.Semaphore, created lazily in the running loop
+# Identifies this API process in storage_bulk_jobs.process_id (diagnostics: which boot ran the job).
+PROCESS_ID = f"{os.getpid()}-{uuid4().hex[:8]}"
+JOB_ACTIVE_STATES = ("QUEUED", "RUNNING")
+INTERRUPTED_MESSAGE = (
+    "The Center restarted while this job was running; {done} of {total} rows were processed. "
+    "Validate the same rows again: the ones already created show as Exists, the rest can be created."
+)
+_persist_warned = False
 
 ResolveFactory = Callable[[AsyncSession], Callable[[str | None], Awaitable[str]]]
 
@@ -489,8 +502,10 @@ async def _run_job(
     job: dict[str, Any], tenant_id: UUID, actor_id: UUID | None, rows: list[dict[str, Any]],
     resolve_factory: ResolveFactory, sessions: Any, td_factory: Callable[[], Any],
 ) -> None:
+    await _persist_job(sessions, job)  # QUEUED is visible (and recoverable) before the job may start
     async with _RUN_ONE_AT_A_TIME:
         job.update(status="RUNNING", started_at=iso_ms(utcnow()))
+        await _persist_job(sessions, job)
         td = None
         try:
             td = td_factory()
@@ -506,6 +521,7 @@ async def _run_job(
                     job["summary"][k] = job["summary"].get(k, 0) + v
                 for k, v in res["timing_ms"].items():
                     job["timing_ms"][k] = round(job["timing_ms"].get(k, 0.0) + v, 1)
+                await _persist_job(sessions, job)
             job["status"] = "DONE"
         except Exception as exc:  # noqa: BLE001 - reported on the job; rows already done stay done
             logger.exception("Bulk subtable job %s failed", job["job_id"])
@@ -517,6 +533,110 @@ async def _run_job(
                 except Exception:  # noqa: BLE001 - closing a dedicated client is best effort
                     logger.warning("Closing the bulk job TDengine client failed", exc_info=True)
             job.update(finished_at=iso_ms(utcnow()), _finished_mono=time.monotonic())
+            await _persist_job(sessions, job)
+
+
+_UPSERT_JOB = """
+INSERT INTO storage_bulk_jobs (id, tenant_id, status, total, done, summary_json, items_json, timing_json, error,
+                               process_id, created_at, started_at, finished_at, updated_at)
+VALUES (:id, :tenant_id, :status, :total, :done, CAST(:summary AS jsonb), CAST(:items AS jsonb), CAST(:timing AS jsonb),
+        :error, :process_id, :created_at, :started_at, :finished_at, now())
+ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, done = EXCLUDED.done, summary_json = EXCLUDED.summary_json,
+    items_json = EXCLUDED.items_json, timing_json = EXCLUDED.timing_json, error = EXCLUDED.error,
+    started_at = EXCLUDED.started_at, finished_at = EXCLUDED.finished_at, updated_at = now()
+"""
+
+
+def _ts(value: str | None) -> Any:
+    from datetime import datetime
+
+    return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+
+
+async def _persist_job(sessions: Any, job: dict[str, Any]) -> None:
+    """Mirror the job to storage_bulk_jobs; never fails the job (e.g. before migration 0014 ran)."""
+    global _persist_warned
+    try:
+        async with sessions() as session:
+            await execute(session, _UPSERT_JOB, {
+                "id": UUID(job["job_id"]), "tenant_id": UUID(job["tenant_id"]), "status": job["status"],
+                "total": job["total"], "done": job["done"], "summary": json.dumps(job["summary"]),
+                "items": json.dumps(job["items"], default=str), "timing": json.dumps(job["timing_ms"]),
+                "error": job.get("error"), "process_id": PROCESS_ID, "created_at": _ts(job["created_at"]),
+                "started_at": _ts(job.get("started_at")), "finished_at": _ts(job.get("finished_at")),
+            })
+            await session.commit()
+    except Exception:  # noqa: BLE001 - durability is best effort; the in-memory job is the source of truth here
+        if not _persist_warned:
+            _persist_warned = True
+            logger.warning("Could not persist bulk job %s (storage_bulk_jobs missing?)", job["job_id"], exc_info=True)
+
+
+def _job_from_row(row: dict[str, Any], *, with_items: bool) -> dict[str, Any]:
+    """A stored job; QUEUED / RUNNING without a live task in this process = INTERRUPTED."""
+
+    def _json(value: Any, default: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                return default
+        return default if value is None else value
+
+    status = str(row.get("status") or "FAILED")
+    total, done = int(row.get("total") or 0), int(row.get("done") or 0)
+    error = row.get("error")
+    if status in JOB_ACTIVE_STATES:
+        status = "INTERRUPTED"
+        error = INTERRUPTED_MESSAGE.format(done=done, total=total)
+    job = {
+        "job_id": str(row["id"]), "tenant_id": str(row["tenant_id"]), "status": status, "total": total, "done": done,
+        "summary": _json(row.get("summary_json"), {}), "items": _json(row.get("items_json"), []),
+        "timing_ms": _json(row.get("timing_json"), {}), "error": error,
+        "created_at": iso_ms(row["created_at"]) if row.get("created_at") else None,
+        "started_at": iso_ms(row["started_at"]) if row.get("started_at") else None,
+        "finished_at": iso_ms(row["finished_at"]) if row.get("finished_at") else None,
+        "interrupted": status == "INTERRUPTED",
+    }
+    return _job_public(job, with_items=with_items)
+
+
+async def load_job(session: AsyncSession, tenant_id: UUID, job_id: str, *, with_items: bool = True) -> dict[str, Any] | None:
+    """In-memory job of this process, else the stored one (survives an API restart)."""
+    live = get_job(tenant_id, job_id, with_items=with_items)
+    if live is not None:
+        return live
+    try:
+        jid = UUID(str(job_id))
+    except ValueError:
+        return None
+    try:
+        row = await fetch_one(
+            session,
+            "SELECT id, tenant_id, status, total, done, summary_json, items_json, timing_json, error, created_at, "
+            "started_at, finished_at FROM storage_bulk_jobs WHERE id = :id AND tenant_id = :tenant_id",
+            {"id": jid, "tenant_id": tenant_id},
+        )
+    except Exception:  # noqa: BLE001 - table missing before migration 0014: same answer as before (404)
+        return None
+    return _job_from_row(dict(row), with_items=with_items) if row else None
+
+
+async def load_jobs(session: AsyncSession, tenant_id: UUID, *, limit: int = 20) -> list[dict[str, Any]]:
+    """Recent jobs: this process's live ones plus stored ones (newest first, no per-row items)."""
+    live = {j["job_id"]: j for j in list_jobs(tenant_id)}
+    try:
+        rows = await fetch_all(
+            session,
+            "SELECT id, tenant_id, status, total, done, summary_json, '[]'::jsonb AS items_json, timing_json, error, "
+            "created_at, started_at, finished_at FROM storage_bulk_jobs WHERE tenant_id = :tenant_id "
+            "ORDER BY created_at DESC LIMIT :limit",
+            {"tenant_id": tenant_id, "limit": int(limit)},
+        )
+    except Exception:  # noqa: BLE001 - before migration 0014
+        rows = []
+    stored = [_job_from_row(dict(r), with_items=False) for r in rows if str(r["id"]) not in live]
+    return sorted([*live.values(), *stored], key=lambda j: j.get("created_at") or "", reverse=True)
 
 
 def get_job(tenant_id: UUID, job_id: str, *, with_items: bool = True) -> dict[str, Any] | None:

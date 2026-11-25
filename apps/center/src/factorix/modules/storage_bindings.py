@@ -11,7 +11,7 @@ Row Assembly Policies (INDEPENDENT_EVENTS, LATEST_AS_OF_TRIGGER, TIME_BUCKET, EX
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import json
 import logging
 from typing import Any, Literal

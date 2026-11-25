@@ -16,7 +16,7 @@
 
 | type | Shape | Notes |
 |---|---|---|
-| `latest` | `type, signal_id, value, quality, effective_status, reason_code, received_time, source_time` + optional `evaluated_at, stale_after_ms, freshness, delivery_lag_ms, connection_id, data_epoch, last_acquired_at, last_value_changed_at, source_health, connection_health, broker_health, storage_health` (`app.py::_latest_message`) | re-evaluated at dispatch and on the 5 s sweep (`refresh_live_message` adds `age_ms`); only transitions are pushed by the sweep |
+| `latest` | `type, signal_id, value, quality, effective_status, reason_code, received_time, source_time` + optional `evaluated_at, stale_after_ms, freshness, delivery_lag_ms, connection_id, data_epoch, last_acquired_at, last_value_changed_at, source_health, connection_health, broker_health, storage_health` (`transport/ws/stream.py::_latest_message`) | re-evaluated at dispatch and on the 5 s sweep (`refresh_live_message` adds `age_ms`); only transitions are pushed by the sweep |
 | `batch` | `{"type":"batch","messages":[…]}` | several pending frames flushed together |
 | `health` | `{type:"health",entity:"connection",id,health,effective_health,last_error,last_success_at}` | coalesced per (entity, id) |
 | `heartbeat` | `{type:"heartbeat",seq,server_time,pipeline?:{connection_id:{source_ok_at,delivered_at,delivery_lag_ms}}}` every 5 s | client treats > 15 s without any frame as "push not live" and polls REST |

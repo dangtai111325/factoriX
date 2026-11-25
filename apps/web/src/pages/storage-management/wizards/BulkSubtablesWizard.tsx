@@ -14,6 +14,7 @@ import {
   ModelSourceGroup,
   RecordingMode,
   SourceRef,
+  TDColumn,
   TDStable,
   BulkJob,
   bulkCreateSubtables,
@@ -84,6 +85,28 @@ function defaultPrefix(stableName: string): string {
   const s = stableName.replace(/^st_/, '').replace(/^machine_/, '');
   return s.split('_')[0] || s;
 }
+
+/** Name prefix: the server's `suggested_prefix` (R2-14, e.g. `order_`), else the local guess (older Center). */
+function prefixFor(stable: Pick<TDStable, 'physical_name' | 'suggested_prefix'>): string {
+  return slug(stable.suggested_prefix || '') || defaultPrefix(stable.physical_name);
+}
+
+/** The type a field is checked and suggested with: declared, else the server's `inferred_type` for `auto`. */
+function effectiveType(f: Pick<SourceRef, 'value_type' | 'inferred_type'>): string | null | undefined {
+  const declared = String(f.value_type || 'auto').toLowerCase();
+  return declared === 'auto' && f.inferred_type ? f.inferred_type : f.value_type;
+}
+
+/** Target column of a field: the server's `suggested_column` when this supertable has it, else by type (guide F3). */
+function columnSuggestion(f: Pick<SourceRef, 'value_type' | 'inferred_type' | 'suggested_column'>, cols: TDColumn[]): string | null {
+  if (f.suggested_column) {
+    const col = cols.find((c) => c.name === f.suggested_column);
+    if (col && typeCompatible(f.value_type, col)) return col.name;
+  }
+  return suggestColumn(effectiveType(f), cols);
+}
+
+const TYPE_SOURCE_TEXT: Record<string, string> = { signal: 'from signal', live_value: 'from live value' };
 
 function download(name: string, mime: string, text: string) {
   const blob = new Blob([text], { type: mime });
@@ -156,7 +179,7 @@ export const BulkSubtablesWizard: React.FC = () => {
   const cols = valueColumns(stable);
   const atomic = mode === 'ON_NEW_EVENT';
   useEffect(() => {
-    if (stable && !prefix) setPrefix(defaultPrefix(stable.physical_name));
+    if (stable && !prefix) setPrefix(prefixFor(stable));
     if (stable && stable.columns.some((c) => ['so', 'wo', 'qty', 'lot_serial'].includes(c.name)) && !cols.some((c) => c.name.startsWith('value_'))) setMode('ON_NEW_EVENT');
   }, [stable]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -180,7 +203,7 @@ export const BulkSubtablesWizard: React.FC = () => {
       for (const f of fieldUnion) {
         const path = f.field_path as string;
         if (!next[path]) {
-          const v = atomic && cols.some((c) => c.name === f.key) ? String(f.key) : suggestColumn(f.value_type, cols) || '';
+          const v = atomic && cols.some((c) => c.name === f.key) ? String(f.key) : columnSuggestion(f, cols) || '';
           if (v) {
             next[path] = v;
             changed = true;
@@ -330,7 +353,7 @@ export const BulkSubtablesWizard: React.FC = () => {
             writeStoredJob(null);
             setJob(null);
             setJobGone(
-              'The Center no longer knows this bulk job (jobs are kept 1 hour after they finish and are lost when the Center restarts). Every row it created is kept: press Validate to see which subtables already exist.',
+              'The Center no longer knows this bulk job. Every row it created is kept: press Validate to see which subtables already exist.',
             );
             return;
           }
@@ -345,10 +368,12 @@ export const BulkSubtablesWizard: React.FC = () => {
           });
           return next;
         });
-        if (j.status === 'DONE' || j.status === 'FAILED') {
+        if (j.status === 'DONE' || j.status === 'FAILED' || j.status === 'INTERRUPTED') {
           const sm = j.summary || {};
           setSummary({ dryRun: false, created: sm.CREATED || 0, exists: sm.EXISTS || 0, failed: sm.FAILED || 0, invalid: sm.INVALID || 0, valid: 0, at: new Date(j.finished_at || Date.now()).toLocaleTimeString() });
           if (j.status === 'FAILED') setRunError(`The bulk job stopped: ${j.error || 'unknown error'}. Rows already created are kept; press Create again for the rest.`);
+          // B-12: the Center restarted mid-job; the stored job says how far it got (job lost -> re-validate).
+          if (j.status === 'INTERRUPTED') setJobGone(j.error || 'The Center restarted while this job was running. Press Validate: subtables already created show as Exists.');
           writeStoredJob(null);
           if ((sm.CREATED || 0) + (sm.EXISTS || 0) > 0) {
             setReloading(true);
@@ -534,7 +559,17 @@ export const BulkSubtablesWizard: React.FC = () => {
                           setSelectedFields(n);
                         }} /></td>
                         <td className="font-mono">{path}</td>
-                        <td className="text-[#657794]">{f.value_type}</td>
+                        <td className="text-[#657794]">
+                          {f.value_type}
+                          {String(f.value_type || 'auto').toLowerCase() === 'auto' && f.inferred_type && (
+                            <span
+                              className="ml-1.5 inline-flex px-1.5 py-0.5 rounded bg-[#EEF5FF] text-[#134074] text-[10px] font-semibold whitespace-nowrap"
+                              title="Suggested by the server for this auto-typed field"
+                            >
+                              type: {f.inferred_type}{f.type_source && TYPE_SOURCE_TEXT[f.type_source] ? ` (${TYPE_SOURCE_TEXT[f.type_source]})` : ''}
+                            </span>
+                          )}
+                        </td>
                         <td>
                           <select aria-label={`Column for ${path}`} value={columnFor[path] || ''} onChange={(e) => setColumnFor({ ...columnFor, [path]: e.target.value })}
                             className="h-7 px-1 rounded border border-[#D4DFEC] bg-white text-[12px] font-mono">
@@ -632,6 +667,7 @@ export const BulkSubtablesWizard: React.FC = () => {
                           {resultOf(r)!.status === 'CREATED' && <CheckCircle2 className="w-3.5 h-3.5 inline mr-1" />}
                           {(resultOf(r)!.status === 'FAILED' || resultOf(r)!.status === 'INVALID') && <AlertTriangle className="w-3.5 h-3.5 inline mr-1" />}
                           {STATUS_TEXT[resultOf(r)!.status] || resultOf(r)!.status}
+                          {resultOf(r)!.errors?.some((e) => e.code === 'TAG_MACHINE_MISMATCH') && ': machine tag mismatch'}
                           {(resultOf(r)!.message || resultOf(r)!.errors?.length) && (
                             <div className="font-normal text-[11px] text-[#657794] max-w-[280px]">
                               {resultOf(r)!.code ? `${resultOf(r)!.code}: ` : ''}

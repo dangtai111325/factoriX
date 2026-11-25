@@ -10,6 +10,7 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import collect
+from factorix.application.health import broker_depth
 from factorix.application.health.health_service import collector_report_state
 from factorix.application.live.freshness_service import FreshnessService
 from factorix.modules.live_state import get_pipeline_evidence
@@ -127,6 +128,8 @@ async def edges(principal: dict[str, Any] = Depends(admin), session: AsyncSessio
                     "outbox_pending": int(r.get("spool_pending") or 0),
                     "queues": {},
                     "config_state": "IN_SYNC",
+                    # CT-20 (additive): last RabbitMQ live/ingest queue depth + DLQ probed by the API health loop.
+                    "broker": broker_depth.latest(),
                 })
             return {"items": items}
     items = await fetch_all(session, "SELECT id, name, site_id, enrollment_status, desired_revision, active_revision, last_heartbeat, health, software_version, outbox_pending, queues_json FROM edge_nodes WHERE tenant_id = :tenant_id ORDER BY name", {"tenant_id": tenant_id})

@@ -87,7 +87,8 @@ supervise_process() {
 
 # Supervise strictly one acquisition path (never edge + acquisition simultaneously to prevent double polling).
 WORKERS=()
-MODE="${FACTORIX_COLLECTOR_MODE:-edge}"
+# Default = the appliance path (CT-14); FACTORIX_COLLECTOR_MODE=edge stays available for a deliberate rollback.
+MODE="${FACTORIX_COLLECTOR_MODE:-acquisition}"
 if [ "$MODE" = "acquisition" ]; then
   if [ -z "${FACTORIX_RABBITMQ_URL:-}" ] || [ -z "${FACTORIX_TDENGINE_DSN:-}" ]; then
     echo "FACTORIX_COLLECTOR_MODE=acquisition requires FACTORIX_RABBITMQ_URL and FACTORIX_TDENGINE_DSN; refusing unsafe startup." >&2

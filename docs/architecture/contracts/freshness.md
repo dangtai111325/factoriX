@@ -67,7 +67,7 @@ A STALE / PAUSED / DELAYED signal keeps its last value (Q3, H1); only BAD / NO_D
 | Models engine PG fallback, `data_models.signal_states` without provider, `telemetry.latest_states` without provider | `evaluate_signal_state` | none | signal → 1000 | `models_engine_pg_fallback` ✘ |
 | Historian source catalog badge | `historian_catalog._freshness` (WS-H) | none, no DELAYED | signal → 1000 | `historian_catalog` ✘ |
 | Historian quality segments | `historian_service` gap threshold `canonical_stale_after_ms(1000)` (12 s constant) | none | constant | not in matrix (WS-H) |
-| Browser safety net | `AppContext.tsx:570`, `SignalInspector.tsx:58` use `stale_after_ms` from the server, else `max(2 × (expectedIntervalMs ‖ 1000), 12000)`; `historian/types.ts:237` default 15 s | — | 1000 | not in matrix (TS) |
+| Browser safety net | `apps/web/src/lib/format.ts::serverStaleAfterMs` (used by `store/AppContext.tsx` and `pages/08_SignalsCatalog/SignalInspector.tsx`): the server's `stale_after_ms`, else the server minimum `SERVER_MIN_STALE_AFTER_MS = 12000`; the browser never derives it from the interval | — | 1000 | not in matrix (TS) |
 
 ✘ = disagrees with the reference for at least one scenario (`xfail(strict)` cells, CT-10). Target: one
 `FreshnessService.evaluate(record, evidence, now)` for every surface (Phase C1).

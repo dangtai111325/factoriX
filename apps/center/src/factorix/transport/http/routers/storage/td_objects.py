@@ -15,9 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from factorix.modules import storage_model_recorder as SMR
 from factorix.modules import storage_bulk as SBULK
 from factorix.modules import storage_topology as ST
-from factorix.modules.storage_objects import StorageObjectError, is_system_stable, is_system_subtable, validate_identifier
+from factorix.modules.storage_objects import (
+    MAX_DESCRIPTION_LEN,
+    StorageObjectError,
+    is_system_stable,
+    is_system_subtable,
+    validate_identifier,
+)
 from factorix.modules.common import execute, fetch_all, fetch_one, iso_ms, utcnow
 from factorix.platform.errors import AppError
+from factorix_core.contracts.notify import Channel, ConfigChanged
 from factorix.platform.tdengine import is_missing_object_error, quote_str
 
 from factorix.transport.http.routers.storage.common import _assert_tenant_database_access, _bindings_of, _require_db, _storage_error, tenant_db
@@ -307,7 +314,7 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
     @router.get("/api/v1/storage/td/catalog", tags=["storage"])
     async def get_td_catalog(
         object_type: Literal["database", "stable", "subtable"] | None = None,
-        status: Literal["ACTIVE", "DRAFT", "OUT_OF_SYNC", "ERROR"] | None = None,
+        status: Literal["ACTIVE", "PAUSED", "RETIRED", "DRAFT", "OUT_OF_SYNC", "ERROR"] | None = None,
         search: str = Query("", max_length=200),
         page: int = Query(1, ge=1),
         page_size: int = Query(15, ge=1, le=100),
@@ -355,18 +362,7 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
         active_cnt = status_map.get("ACTIVE", 0)
         paused_cnt = status_map.get("PAUSED", 0)
         # R2-07: only objects that still exist count, and the KPI says which ones they are.
-        err_rows = await fetch_all(
-            session,
-            """
-            SELECT DISTINCT x.physical_db, x.physical_subtable
-            FROM storage_record_outbox x
-            JOIN storage_objects o ON o.tenant_id = x.tenant_id AND o.object_type = 'subtable'
-             AND o.physical_db = x.physical_db AND o.physical_name = x.physical_subtable AND o.status <> 'PURGED'
-            WHERE x.tenant_id = :tenant_id AND x.status = 'FAILED'
-            ORDER BY 1, 2 LIMIT 200
-            """,
-            {"tenant_id": tenant_id},
-        )
+        err_rows = await ST.recording_error_subtables(session, tenant_id, limit=200)
         error_cnt = len(err_rows)
 
         return {
@@ -376,7 +372,7 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
             "recording_active": active_cnt,
             "recording_paused": paused_cnt,
             "recording_error": error_cnt,
-            "recording_error_objects": [f"{r['physical_db']}.{r['physical_subtable']}" for r in err_rows[:50]],
+            "recording_error_objects": [f"{db}.{sub}" for db, sub in err_rows[:50]],
             "observed_at": iso_ms(utcnow()),
         }
 
@@ -789,20 +785,28 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
         return {**job, "status_url": f"/api/v1/storage/td/bulk-jobs/{job['job_id']}", "poll_after_ms": 1000}
 
     @router.get("/api/v1/storage/td/bulk-jobs", tags=["storage"])
-    async def list_bulk_jobs(principal: dict[str, Any] = Depends(admin_dep)) -> dict[str, Any]:
-        """Recent bulk jobs of the tenant (kept 1 h after they finish; no per-row items)."""
+    async def list_bulk_jobs(
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Recent bulk jobs of the tenant, live and stored (no per-row items)."""
         tenant_id, _actor = ids(principal)
-        items = SBULK.list_jobs(tenant_id)
+        items = await SBULK.load_jobs(session, tenant_id)
         return {"items": items, "total": len(items)}
 
     @router.get("/api/v1/storage/td/bulk-jobs/{job_id}", tags=["storage"])
-    async def get_bulk_job(job_id: str, principal: dict[str, Any] = Depends(admin_dep)) -> dict[str, Any]:
-        """Progress + per-row results of a bulk job: ``status`` QUEUED | RUNNING | DONE | FAILED,
+    async def get_bulk_job(
+        job_id: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Progress + per-row results of a bulk job: ``status`` QUEUED | RUNNING | DONE | FAILED |
+        INTERRUPTED (the API restarted while it ran; ``error`` says how many rows were processed),
         ``total``, ``done``, ``progress_pct``, ``summary``, ``items`` (rows finished so far), ``error``."""
         tenant_id, _actor = ids(principal)
-        job = SBULK.get_job(tenant_id, job_id)
+        job = await SBULK.load_job(session, tenant_id, job_id)
         if job is None:
-            raise AppError(404, "NOT_FOUND", f"Bulk job '{job_id}' not found (jobs are kept 1 h after they finish).")
+            raise AppError(404, "NOT_FOUND", f"Bulk job '{job_id}' not found.")
         return job
 
     @router.get("/api/v1/storage/td/summary", tags=["storage"])
@@ -988,6 +992,13 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
         if is_metadata_only and existing_obj:
             new_disp = body.get("display_name", existing_obj.get("display_name") or "")
             new_desc = body.get("description", existing_obj.get("description") or "")
+            # Same limit as create (validate_*_spec): a long description must not be accepted silently.
+            if len(str(new_desc or "")) > MAX_DESCRIPTION_LEN:
+                raise AppError(
+                    422, "DESCRIPTION_TOO_LONG", f"Description is limited to {MAX_DESCRIPTION_LEN} characters.",
+                    field_errors=[{"field": "description", "code": "DESCRIPTION_TOO_LONG",
+                                   "message": f"Description is limited to {MAX_DESCRIPTION_LEN} characters."}],
+                )
             new_rev = current_rev + 1
             await execute(
                 session,
@@ -1084,6 +1095,13 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
              "object_key": f"{db_name}.{name}" if name and obj_kind != "database" else db_name},
         )
         SMR.invalidate_bindings(tenant_id)
+        # H7: the ingestion worker (another process) caches signal-binding targets; tell it to reload now
+        # instead of on its 30 s catalog TTL. Delivered on commit, so a rolled-back change is not announced.
+        await execute(
+            session,
+            "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
+            {"channel": Channel.CONFIG_CHANGED.value, "payload": ConfigChanged(str(tenant_id)).to_payload()},
+        )
         return {
             "id": object_id,
             "operation_id": str(op_id),

@@ -28,7 +28,7 @@ services:
       retries: 20
 
   rabbitmq-test:
-    image: rabbitmq:4.0-management-alpine
+    image: rabbitmq:4.4-management-alpine  # same image as docker-compose.yml (CT-15)
     hostname: factorix-rmq-test
     environment:
       RABBITMQ_DEFAULT_USER: ${TEST_RABBITMQ_USER:-factorix_mq_test}
@@ -47,7 +47,7 @@ services:
       retries: 15
 
   tdengine-test:
-    image: tdengine/tdengine:3.3.6.13
+    image: tdengine/tsdb:3.4.3.9  # same image as docker-compose.yml (CT-15)
     hostname: factorix-td-test
     ports:
       - "127.0.0.1:16041:6041"

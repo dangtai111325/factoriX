@@ -108,7 +108,7 @@ async def test_collector_status_shape_in_acquisition_mode(api: Any, monkeypatch:
     (item,) = response.json()["items"]
     assert set(item) == {"id", "name", "site_id", "enrollment_status", "desired_revision", "active_revision", "last_heartbeat", "health",
                          "effective_health", "health_raw", "diagnostic", "delivery_lag_ms", "delayed_connections", "software_version",
-                         "outbox_pending", "queues", "config_state", "report_state"}  # additive: delayed_connections (R2-02), report_state (P6)
+                         "outbox_pending", "queues", "config_state", "report_state", "broker"}  # additive: delayed_connections (R2-02), report_state (P6), broker (CT-20)
     assert (item["health"], item["effective_health"], item["desired_revision"]) == ("ONLINE", "ONLINE", 7)
 
 

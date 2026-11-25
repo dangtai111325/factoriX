@@ -179,6 +179,7 @@ GET /api/v1/storage/ingestion-health
 GET /api/v1/storage/operations
 GET /api/v1/storage/operations/{op_id}
 GET /api/v1/storage/overview
+GET /api/v1/storage/pg/count/{schema}/{table}
 GET /api/v1/storage/pg/preview
 GET /api/v1/storage/pg/preview/{schema}/{table}
 GET /api/v1/storage/pg/relationships

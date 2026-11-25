@@ -854,8 +854,17 @@ async def test_s11_health_operations_and_retention_preview() -> None:
 # S12 Historian Service Unit Tests
 # ==============================================================================
 
+@pytest.fixture()
+def edge_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The test reads the legacy PostgreSQL ``observations`` fallback, which only the Edge collector mode
+    enables; the default mode is ``acquisition`` (CT-14 / B-10), so the test selects Edge explicitly."""
+    from factorix.platform.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "collector_mode", "edge")
+
+
 @pytest.mark.asyncio
-async def test_s12_historian_latest_query_and_events() -> None:
+async def test_s12_historian_latest_query_and_events(edge_mode: None) -> None:
     session = FakeStorageAndHistorianSession()
     now = datetime.now(timezone.utc)
 
@@ -969,7 +978,7 @@ async def test_s12_saved_views_crud() -> None:
 
 
 @pytest.mark.asyncio
-async def test_s12_csv_exports_and_formula_injection_safety() -> None:
+async def test_s12_csv_exports_and_formula_injection_safety(edge_mode: None) -> None:
     session = FakeStorageAndHistorianSession()
     now = datetime.now(timezone.utc)
 

@@ -11,7 +11,7 @@ listens to it — CT-17, ADR corrected.)
 
 | Channel | Producers (module) | Listeners | Payload | Listener semantics |
 |---|---|---|---|---|
-| `factorix_config_changed` | `collect._notify_config_changed`; `storage_designs` (×4); `telemetry_reset` (R1, R5); `transport/app.py` `POST /api/v1/jobs` (×2) | acquisition `PgNotifyListener` (wake-up only, payload ignored); ingestion `_on_pg_notify` | `{"tenant_id": "<uuid>"}`; storage designs add `kind, design_id, version`; reset sends the epoch payload below | acquisition: re-read the whole snapshot (`config-revision.md`); ingestion: invalidate that tenant's catalog (payload without a valid `tenant_id` → invalidate all tenants) |
+| `factorix_config_changed` | `application/legacy_edge/fleet.py::_notify_config_changed` (collector connections / signals / formulas); `storage_designs` (×4); storage object pause / resume / retire (`transport/http/routers/storage/td_objects.py::_lifecycle`, H7); `application/reset/telemetry_reset.py` (R1, R5); `transport/http/routers/connections.py` `POST /api/v1/jobs` (×2) | acquisition `PgNotifyListener` (wake-up only, payload ignored); ingestion `_on_pg_notify` | `{"tenant_id": "<uuid>"}`; storage designs add `kind, design_id, version`; reset sends the epoch payload below | acquisition: re-read the whole snapshot (`config-revision.md`); ingestion: invalidate that tenant's catalog (payload without a valid `tenant_id` → invalidate all tenants) |
 | `factorix_epoch_changed` | `telemetry_reset` (R1 `RESETTING`, R5 `ACTIVE`) | acquisition (wake-up epoch + config loops); ingestion (invalidate catalog + recording state + dedup LRU of the tenant); API bridge (fence the live cache) | `{"tenant_id","previous_epoch","active_epoch","new_epoch","lifecycle_state","operation_id","kind"}` — `active_epoch == new_epoch` (two names, both kept for compatibility) | API reads `active_epoch` (falls back to `new_epoch`). Ingestion ignores the number and fences its own live provider at `cached_epoch + 1` (CT-06); its catalog reload (≤ 2 s) restores the real epoch |
 | `factorix_stream_events` | ingestion `commit_batch_metadata` | API `_pg_notify_bridge_loop` | **v1** (default): `{"events":[event,…]}`; **v2** (`FACTORIX_NOTIFY_FORMAT=v2`): `{"v":2,"kind":"latest_ids",…}` | see §1 / §2 |
 | `factorix_health_changed` | acquisition `pg_control.flush_connection_reports` (only when `health` or `last_error` changed); ingestion (edge mode only, connection recovered) | API bridge | `{"tenant_id","event":{type:"health",entity:"connection",id,health,effective_health,last_error,last_success_at}}` | parsed to `{kind:"health",tenant_id,payload:event}`; `last_success_at` also feeds `PipelineEvidence.note_source` |
@@ -27,7 +27,7 @@ listens to it — CT-17, ADR corrected.)
                        "last_acquired_at","last_value_changed_at"}}, …]}
 ```
 
-* Packed by `ingestion_worker._emit_chunked_notify`: ≤ 64 events and ≤ 7800 bytes per NOTIFY, order kept.
+* Packed by `application/ingestion/notify.py::_emit_chunked_notify`: ≤ 64 events and ≤ 7800 bytes per NOTIFY, order kept.
   An event whose encoding alone exceeds 7900 bytes is sent without `payload.value` (the value stays
   readable through REST).
 * Only signals whose `latest_signal_state` row actually advanced in the committed transaction are sent.
@@ -42,7 +42,7 @@ listens to it — CT-17, ADR corrected.)
 {"v":2,"kind":"latest_ids","tenant_id":"<uuid>","max_acquired_at":"<iso ms>","connection_ids":[≤32],"signal_ids":[…]}
 ```
 
-* Built by `ingestion_worker._latest_ids_payloads`, each payload < 7800 bytes (~190 ids), as many NOTIFYs
+* Built by `application/ingestion/notify.py::_latest_ids_payloads`, each payload < 7800 bytes (~190 ids), as many NOTIFYs
   as needed; `connection_ids` is capped at 32 per payload; `max_acquired_at` / `connection_ids` are optional.
 * The bridge recognises v2 by its `v`/`kind` markers (`factorix_core.contracts.notify.parse_stream_events`,
   CT-04 fixed), notes delivery evidence for the listed connections, coalesces bursts per tenant and reads the

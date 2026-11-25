@@ -65,6 +65,18 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
             "observed_at": iso_ms(utcnow()),
         }
 
+    @router.get("/api/v1/storage/pg/count/{schema}/{table}", tags=["storage"])
+    async def count_pg_rows(
+        schema: str,
+        table: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """"Count exactly" (R1-35): ``count(*)`` in a read-only transaction, 10 s timeout (504 COUNT_TIMEOUT),
+        tenant-scoped like the preview; credential / session / audit tables answer 403."""
+        tenant_id, _actor = ids(principal)
+        return await pg_explorer.count_rows(session, table=table, schema=schema, tenant_id=tenant_id)
+
     @router.get("/api/v1/storage/pg/preview/{schema}/{table}", tags=["storage"])
     @router.get("/api/v1/storage/pg/preview", tags=["storage"])
     async def get_pg_preview(

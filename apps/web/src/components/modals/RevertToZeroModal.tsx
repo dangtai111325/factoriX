@@ -38,20 +38,61 @@ export interface TelemetryResetPreview {
     exportJobs: Count;
     commissioningJobs: Count;
     tdengineSubtables: Count;
+    /** Subtables of the user's own (Storage Management) supertables whose rows are deleted (R2-08). */
+    tdengineUserSubtables: Count;
+    /** Rows recorded in the user's supertables that the reset deletes (R2-08). */
+    tdengineUserRows: Count;
   };
   preserved: {
     connections: Count;
     signalsActive: Count;
     signalsArchived: Count;
     dataModels: Count;
+    dataModelsArchived: Count;
     storageDesigns: Count;
+    storageUserDatabases: Count;
+    storageUserStables: Count;
+    storageUserSubtables: Count;
+    storageRecordingBindings: Count;
     resources: Count;
+    resourcesArchived: Count;
     adminAccounts: Count;
     sessions: Count;
     secretStore: Count;
     formulas: Count;
   };
+  /** Server warnings, e.g. USER_RECORDED_HISTORY_CLEARED (R2-08). */
+  warnings: ResetWarning[];
   raw: Record<string, unknown>;
+}
+
+export interface ResetWarning {
+  code: string;
+  severity?: string;
+  message?: string;
+  rowsTotal: Count;
+  stables: { database: string; stable: string; rows: Count }[];
+}
+
+export const USER_HISTORY_WARNING = 'USER_RECORDED_HISTORY_CLEARED';
+
+function parseWarnings(raw: unknown): ResetWarning[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((w): w is Record<string, unknown> => !!w && typeof w === 'object' && typeof (w as Record<string, unknown>).code === 'string')
+    .map((w) => ({
+      code: String(w.code),
+      severity: typeof w.severity === 'string' ? w.severity : undefined,
+      message: typeof w.message === 'string' ? w.message : undefined,
+      rowsTotal: count(w.rows_total),
+      stables: Array.isArray(w.stables)
+        ? (w.stables as Record<string, unknown>[]).map((s) => ({
+            database: String(s?.database ?? ''),
+            stable: String(s?.stable ?? ''),
+            rows: count(s?.rows),
+          }))
+        : [],
+    }));
 }
 
 export interface TelemetryResetResult {
@@ -124,19 +165,28 @@ function normalizePreview(
       tdengineSubtables: count(
         clearedObj.tdengine_subtables ?? clearedObj.tdengine_series ?? clearedObj.tdengine_tables ?? clearedObj.tdengine,
       ),
+      tdengineUserSubtables: count(clearedObj.tdengine_user_subtables),
+      tdengineUserRows: count(clearedObj.tdengine_user_rows),
     },
     preserved: {
       connections: count(preservedObj.connections) ?? fallbacks.connections,
       signalsActive: count(preservedObj.signals_active ?? preservedObj.signalsActive ?? preservedObj.active_signals) ?? fallbacks.signals,
       signalsArchived: count(preservedObj.signals_archived ?? preservedObj.signalsArchived ?? preservedObj.archived_signals),
       dataModels: count(preservedObj.data_models ?? preservedObj.dataModels ?? preservedObj.output_groups) ?? fallbacks.models,
+      dataModelsArchived: count(preservedObj.data_models_archived),
       storageDesigns: count(preservedObj.storage_designs ?? preservedObj.storageDesigns),
+      storageUserDatabases: count(preservedObj.storage_user_databases),
+      storageUserStables: count(preservedObj.storage_user_stables),
+      storageUserSubtables: count(preservedObj.storage_user_subtables),
+      storageRecordingBindings: count(preservedObj.storage_recording_bindings),
       resources: count(preservedObj.resources) ?? fallbacks.resources,
+      resourcesArchived: count(preservedObj.resources_archived),
       adminAccounts: count(preservedObj.admin_accounts ?? preservedObj.adminAccounts),
       sessions: count(preservedObj.sessions ?? preservedObj.active_sessions),
       secretStore: count(preservedObj.secret_store ?? preservedObj.secretStore),
       formulas: count(preservedObj.formulas ?? preservedObj.formula_definitions),
     },
+    warnings: parseWarnings(data.warnings),
     raw: data,
   };
 }
@@ -277,6 +327,16 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
     return unit ? `${value.toLocaleString()} ${unit}` : value.toLocaleString();
   };
   const epochText = (value: Count): string => (loadingCounts ? '…' : value === null ? '—' : `#${value}`);
+  /** "36 preserved (+2 archived)": archived items are preserved too but reported apart (R2-08). */
+  const withArchived = (active: Count, archived: Count, unit: string): string => {
+    if (loadingCounts) return 'Loading…';
+    const base = show(active, unit);
+    return archived ? `${base} (+${archived.toLocaleString()} archived)` : base;
+  };
+  const pv = effPreview.preserved;
+  const userStorageKnown = pv.storageUserStables !== null || pv.storageUserSubtables !== null || pv.storageRecordingBindings !== null;
+  const historyWarning = loadingCounts ? undefined : effPreview.warnings.find((w) => w.code === USER_HISTORY_WARNING);
+  const historyStables = historyWarning ? historyWarning.stables.length || pv.storageUserStables || 0 : 0;
 
   return (
     <ModalPortal>
@@ -464,6 +524,18 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
                           {show(effPreview.cleared.exportJobs, 'jobs')}
                         </span>
                       </li>
+                      {(loadingCounts || effPreview.cleared.tdengineUserRows !== null || effPreview.cleared.tdengineUserSubtables) && (
+                        <li className="flex items-center justify-between gap-2">
+                          <span>Rows recorded in your supertables</span>
+                          <span className="font-mono font-bold text-[#9B1C1C]" data-testid="reset-user-rows">
+                            {loadingCounts
+                              ? 'Loading…'
+                              : effPreview.cleared.tdengineUserRows === null
+                                ? 'unknown'
+                                : show(effPreview.cleared.tdengineUserRows, 'rows')}
+                          </span>
+                        </li>
+                      )}
                       <li className="flex items-center justify-between gap-2 pt-1 border-t border-[#FED7D7]/70">
                         <span>TDengine Operational &amp; Managed Time-Series</span>
                         <span className="font-mono font-bold text-[#EF1B24]">
@@ -496,20 +568,36 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
                       </li>
                       <li className="flex items-center justify-between gap-2">
                         <span>Data Models</span>
-                        <span className="font-mono font-bold text-emerald-800">
-                          {show(effPreview.preserved.dataModels, 'preserved')}
+                        <span className="font-mono font-bold text-emerald-800" data-testid="reset-data-models">
+                          {withArchived(pv.dataModels, pv.dataModelsArchived, 'preserved')}
                         </span>
                       </li>
-                      <li className="flex items-center justify-between gap-2">
-                        <span>Storage Designs &amp; Policies</span>
-                        <span className="font-mono font-bold text-emerald-800">
-                          {show(effPreview.preserved.storageDesigns, 'designs + STables')}
+                      <li className="flex items-start justify-between gap-2">
+                        <span>Storage (your supertables)</span>
+                        <span className="font-mono font-bold text-emerald-800 text-right" data-testid="reset-user-storage">
+                          {loadingCounts ? (
+                            'Loading…'
+                          ) : userStorageKnown ? (
+                            <>
+                              Supertables {show(pv.storageUserStables)} · Subtables {show(pv.storageUserSubtables)}
+                              <br />
+                              Recording bindings {show(pv.storageRecordingBindings)}
+                            </>
+                          ) : (
+                            '—'
+                          )}
                         </span>
                       </li>
+                      {!loadingCounts && !!pv.storageDesigns && (
+                        <li className="flex items-center justify-between gap-2">
+                          <span>Storage designs (legacy)</span>
+                          <span className="font-mono font-bold text-emerald-800">{show(pv.storageDesigns, 'designs')}</span>
+                        </li>
+                      )}
                       <li className="flex items-center justify-between gap-2">
                         <span>Factory Structure Resources</span>
-                        <span className="font-mono font-bold text-emerald-800">
-                          {show(effPreview.preserved.resources, 'resources')}
+                        <span className="font-mono font-bold text-emerald-800" data-testid="reset-resources">
+                          {withArchived(pv.resources, pv.resourcesArchived, 'resources')}
                         </span>
                       </li>
                       <li className="flex items-center justify-between gap-2">
@@ -523,6 +611,37 @@ export const RevertToZeroModal: React.FC<RevertToZeroModalProps> = ({ isOpen, on
                     </ul>
                   </div>
                 </div>
+
+                {historyWarning && (
+                  <div
+                    role="alert"
+                    data-testid="reset-history-warning"
+                    className="p-4 rounded-xl bg-amber-50 border-2 border-amber-300 text-[13px] text-amber-950 flex items-start gap-3"
+                  >
+                    <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <div className="font-bold">Your recorded history is deleted too</div>
+                      <p className="leading-relaxed">
+                        Revert To Zero also deletes the rows recorded in your supertables (
+                        <span className="font-mono font-semibold">
+                          {historyWarning.rowsTotal === null ? 'an unknown number of' : historyWarning.rowsTotal.toLocaleString()}
+                        </span>{' '}
+                        rows in <span className="font-mono font-semibold">{historyStables.toLocaleString()}</span> supertable
+                        {historyStables === 1 ? '' : 's'}). The tables, tags and bindings stay.
+                      </p>
+                      {historyWarning.stables.length > 0 && (
+                        <ul className="text-[12px] text-amber-900 font-mono space-y-0.5 max-h-28 overflow-y-auto">
+                          {historyWarning.stables.map((s) => (
+                            <li key={`${s.database}.${s.stable}`} className="flex justify-between gap-3">
+                              <span className="truncate" title={`${s.database}.${s.stable}`}>{s.stable}</span>
+                              <span className="tabular-nums">{s.rows === null ? 'unknown' : `${s.rows.toLocaleString()} rows`}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {/* Security Confirmation Inputs */}
                 <div className="p-4 rounded-xl bg-[#F6F8FC] border border-[#E3EAF3] space-y-3.5">

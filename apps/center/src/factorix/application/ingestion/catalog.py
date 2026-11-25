@@ -59,6 +59,25 @@ def _default_owned_check(catalog: TenantCatalog, obs: CanonicalObservation, rece
     return row
 
 
+# Storage object states that accept writes. A binding whose subtable has no ``storage_objects`` row yet
+# (legacy rows created before the object registry) keeps writing, as before.
+_WRITABLE_OBJECT_STATES = frozenset({"ACTIVE"})
+
+
+def signal_binding_write_active(row: Any) -> bool:
+    """Contract H7: a signal-bound subtable that is PAUSED / RETIRED (directly, or through its STABLE or
+    database lifecycle, which cascades into ``storage_objects.status``) must not receive new rows.
+
+    ``row`` is one ``sb_rows`` record; ``subtable_status`` / ``stable_status`` are ``NULL`` when the
+    object has no registry row (legacy binding) and then do not block writes.
+    """
+    for key in ("subtable_status", "stable_status"):
+        status = row.get(key) if hasattr(row, "get") else row[key]
+        if status is not None and str(status).upper() not in _WRITABLE_OBJECT_STATES:
+            return False
+    return True
+
+
 class _CatalogStore:
     """PgIngestionStore part: tenant epoch and catalog queries."""
 
@@ -234,6 +253,8 @@ class _CatalogStore:
                            sb.policy_config_json,
                            sb.binding_revision,
                            sb.status AS binding_status,
+                           so.status AS subtable_status,
+                           pso.status AS stable_status,
                            COALESCE(so.parent_name, pr.td_stable, '') AS td_stable,
                            s.data_type,
                            s.resource_id,
@@ -260,6 +281,8 @@ class _CatalogStore:
                     tenant_id,
                 )
                 for r in sb_rows:
+                    if not signal_binding_write_active(r):
+                        continue  # H7: the subtable (or its STABLE) is paused / retired in Storage Management
                     try:
                         target = build_managed_target_from_storage_binding(dict(r))
                     except Exception as exc:  # noqa: BLE001 - one bad binding must not poison the tenant catalog

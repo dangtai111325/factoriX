@@ -35,7 +35,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain import rules as R
 from factorix.domain.body import BodyContext, CompiledSpec, EvalResult, compile_spec, evaluate_detailed
-from factorix.domain.signal_state import evaluate_signal_state  # noqa: F401
 from factorix.modules import storage_model_recorder
 from factorix.modules.common import execute, fetch_all, queue_stream_event, utcnow
 from factorix.platform import after_commit

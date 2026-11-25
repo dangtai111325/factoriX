@@ -19,6 +19,7 @@ export type StorageObjectStatus =
   | 'VERIFYING'
   | 'OUT_OF_SYNC'
   | 'ERROR'
+  | 'PAUSED'
   | 'RETIRED'
   | 'READ_ONLY'
   | 'UNKNOWN';
@@ -137,6 +138,8 @@ export interface TDStable {
   source_mapping_template?: SourceBinding[] | null;
   default_recording_mode?: RecordingMode | null;
   retention_days?: number | null;
+  /** Bulk wizard name prefix proposed by the server (R2-14), e.g. `order_` for `st_production_order_change`. */
+  suggested_prefix?: string | null;
 }
 
 export interface TDSubtable {
@@ -221,6 +224,8 @@ export interface StorageCatalogRow {
   binding_count?: number;
   last_verified_at: string;
   status: StorageObjectStatus;
+  /** Only on `?status=ERROR` rows: the writer could not store rows into this subtable (R2-07). */
+  recording_error?: boolean;
 }
 
 export function getTDStorageCatalog(params: URLSearchParams, signal: AbortSignal): Promise<PaginatedList<StorageCatalogRow>> {
@@ -263,6 +268,12 @@ export interface SourceRef {
   freshness?: string | null;
   has_last_value?: boolean;
   bound_to?: { database: string; subtable: string; column: string } | null;
+  /** Server suggestion for `auto` fields (R2-14): the type of the mapped signal, else of the live value. */
+  inferred_type?: string | null;
+  /** Where `inferred_type` comes from: `declared`, `signal` or `live_value`. */
+  type_source?: 'declared' | 'signal' | 'live_value' | string | null;
+  /** Value column of the standard template the server proposes for this field. */
+  suggested_column?: string | null;
   resource_code?: string | null;
   is_timestamp?: boolean;
   display_name: string;
@@ -495,6 +506,60 @@ export async function getDatabase(nameOrId: string): Promise<TDDatabase> {
   return api(`/api/v1/storage/td/databases/${encodeURIComponent(nameOrId)}`);
 }
 
+// --- Additive schema change of a user supertable (H9) ---
+
+export interface StableSchemaAddition {
+  name: string;
+  td_type: string;
+  length?: number | null;
+}
+
+export interface StableAlterResult {
+  valid?: boolean;
+  status?: 'APPLIED' | string;
+  /** dry run: the statements that would run; apply: the statements that ran. */
+  ddl: string[];
+  columns?: string[];
+  tags?: string[];
+}
+
+/**
+ * `POST /storage/td/objects/stable:<db>.<name>/alter`: add columns / tags only (no drop, no retype).
+ * `dry_run: true` validates and returns the ALTER statements without executing them.
+ */
+export function alterStable(
+  objectId: string,
+  change: { add_columns?: StableSchemaAddition[]; add_tags?: StableSchemaAddition[]; dry_run?: boolean },
+): Promise<StableAlterResult> {
+  return api(`/api/v1/storage/td/objects/${encodeURIComponent(objectId)}/alter`, { method: 'POST', body: JSON.stringify(change) });
+}
+
+// --- Name check (wizard step 1, R1-17a / R1-29) ---
+
+export type StorageNameErrorCode =
+  | 'RESERVED_NAME'
+  | 'IDENTIFIER_TOO_LONG'
+  | 'INVALID_IDENTIFIER'
+  | 'RESERVED_PREFIX'
+  | 'SYSTEM_OBJECT'
+  | 'DESCRIPTION_TOO_LONG'
+  | 'NAME_CONFLICT'
+  | string;
+
+export interface StorageNameCheck {
+  valid: boolean;
+  errors: { field?: string; code: StorageNameErrorCode; message: string }[];
+  exists: boolean;
+}
+
+/** `POST /storage/td/validate-name`: the create validators for the name (+ description) only, plus NAME_CONFLICT. */
+export function validateStorageName(
+  body: { kind: TDObjectType; name: string; database?: string; stable?: string; description?: string },
+  signal?: AbortSignal,
+): Promise<StorageNameCheck> {
+  return api('/api/v1/storage/td/validate-name', { method: 'POST', body: JSON.stringify(body), signal });
+}
+
 export async function createDatabase(intent: CreateDatabaseIntent, idempotencyKey?: string): Promise<StorageOperation> {
   return api('/api/v1/storage/td/databases', {
     method: 'POST',
@@ -574,7 +639,8 @@ export async function createSubtable(intent: CreateSubtableIntent, idempotencyKe
 export interface StoragePlan {
   valid: boolean;
   exists: boolean;
-  errors: { field?: string; code?: string; message: string }[];
+  /** `expected` (TAG_MACHINE_MISMATCH, R2-09): the machine id the bound field belongs to. */
+  errors: { field?: string; code?: string; message: string; expected?: string }[];
   warnings: { field?: string; code?: string; message: string }[];
   ddl: string[];
   steps: { action: string; sql: string; description?: string }[];
@@ -599,14 +665,18 @@ export interface BulkRowResult {
   replay?: boolean;
   code?: string;
   message?: string;
-  errors?: { field?: string; code?: string; message: string }[];
+  errors?: { field?: string; code?: string; message: string; expected?: string }[];
   ddl?: string[];
 }
 
-/** A background bulk-create job (H-R4.3): progress in memory on the Center, kept 1 h, lost on an API restart (404). */
+/**
+ * A background bulk-create job (H-R4.3): runs on the Center, progress stored in `storage_bulk_jobs` (B-12).
+ * INTERRUPTED = the Center restarted while it ran; `error` says how many rows were processed.
+ */
 export interface BulkJob {
   job_id: string;
-  status: 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | string;
+  status: 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | 'INTERRUPTED' | string;
+  interrupted?: boolean;
   total: number;
   done: number;
   progress_pct?: number;
@@ -837,6 +907,14 @@ export async function getPgTablePreview(
   if (params?.sort_column) qs.set('sort_column', params.sort_column);
   if (params?.sort_dir) qs.set('sort_dir', params.sort_dir);
   return api(`/api/v1/storage/pg/preview/${encodeURIComponent(schema)}/${encodeURIComponent(table)}${qs.size ? '?' + qs : ''}`);
+}
+
+/** "Count exactly" (R1-35): `count(*)` in a read-only transaction, 10 s timeout (504 COUNT_TIMEOUT). */
+export async function countPgRows(
+  schema: string,
+  table: string,
+): Promise<{ schema: string; table: string; exact_rows: number; tenant_scoped: boolean; timeout_ms: number }> {
+  return api(`/api/v1/storage/pg/count/${encodeURIComponent(schema)}/${encodeURIComponent(table)}`);
 }
 
 // --- Historian queries ---
@@ -1225,7 +1303,27 @@ export async function getStorageStats(signal?: AbortSignal): Promise<{
   recording_active: number;
   recording_paused: number;
   recording_error: number;
+  /** `db.subtable` of (up to 50 of) the subtables counted in `recording_error`. */
+  recording_error_objects?: string[];
   observed_at: string;
 }> {
   return api('/api/v1/storage/td/stats', { signal });
+}
+
+/** One subtable whose rows the writer could not store (`GET /storage/recording/failures`, R2-07). */
+export interface RecordingFailure {
+  object_id: string;
+  database: string;
+  subtable: string;
+  display_name: string;
+  object_status: string | null;
+  failed: number;
+  attempts: number;
+  last_error: string | null;
+  first_failed_at: string | null;
+  last_failed_at: string | null;
+}
+
+export function listRecordingFailures(signal?: AbortSignal): Promise<{ items: RecordingFailure[]; total: number }> {
+  return api('/api/v1/storage/recording/failures', { signal });
 }

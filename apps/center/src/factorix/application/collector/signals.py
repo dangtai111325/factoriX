@@ -318,7 +318,19 @@ async def patch_signal(session: AsyncSession, tenant_id: UUID, actor: UUID, sign
         correlation_id=correlation_id,
     )
     if address_check is not None and source is not None:
-        await audit(session, tenant_id=tenant_id, event_type="SIGNAL_ADDRESS_UPDATE", actor_id=actor, entity_type="signal", entity_id=signal_id, before={"address": source.get("address_json") or {}}, after={"address": address_check.address}, correlation_id=correlation_id)
+        # B-16: the re-address creates a new source field (observations carry it as provenance); the audit
+        # records both ids so history can be tied to the address that produced it.
+        await audit(
+            session,
+            tenant_id=tenant_id,
+            event_type="SIGNAL_ADDRESS_UPDATE",
+            actor_id=actor,
+            entity_type="signal",
+            entity_id=signal_id,
+            before={"address": source.get("address_json") or {}, "source_field_id": str(source["source_field_id"])},
+            after={"address": address_check.address, "source_field_id": str(new_field_id) if new_field_id else None},
+            correlation_id=correlation_id,
+        )
     result = await _signal(session, tenant_id, signal_id)
     latest_source = (await _current_sources(session, tenant_id, [signal_id])).get(signal_id)
     result["source"] = _source_view(latest_source)
