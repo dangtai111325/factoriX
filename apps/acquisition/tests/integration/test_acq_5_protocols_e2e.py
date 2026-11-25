@@ -10,8 +10,10 @@ import pytest
 from aio_pika.abc import AbstractIncomingMessage
 
 from factorix.domain.canonical import CanonicalObservation
-from factorix.platform.broker import ConsumeOutcome, RabbitMQConsumer, RabbitMQPublisher
+from factorix.platform.broker import ConsumeOutcome, RabbitMQPublisher
 from acq_int_helpers import (
+    TwoLaneConsumer,
+    delivered_observations,
     assert_isolated_test_env,
     cleanup_broker_topology,
     isolated_broker_cfg,
@@ -39,15 +41,15 @@ async def test_acquisition_runtime_collects_all_5_protocols_to_rabbitmq(pg_pool,
     all_seen = asyncio.Event()
 
     async def handle(msg: AbstractIncomingMessage) -> ConsumeOutcome:
-        obs = CanonicalObservation.from_json_bytes(msg.body)
-        received.append(obs)
-        if obs.quality.value == "GOOD" and obs.value is not None:
-            good_signals_seen.add(str(obs.signal_id))
+        for obs in delivered_observations(msg):
+            received.append(obs)
+            if obs.quality.value == "GOOD" and obs.value is not None:
+                good_signals_seen.add(str(obs.signal_id))
         if expected_signal_ids <= good_signals_seen:
             all_seen.set()
         return ConsumeOutcome.ACK
 
-    consumer = RabbitMQConsumer(broker_cfg, handle)
+    consumer = TwoLaneConsumer(broker_cfg, handle)
     broker = RabbitMQPublisher(broker_cfg)
     runtime, lkg_store, _spool, _pub = make_runtime(pool, asyncpg_dsn, broker, tmp_path, data_key=data_key)
     rt_task: asyncio.Task[None] | None = None

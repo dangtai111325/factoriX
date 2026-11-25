@@ -14,6 +14,8 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from factorix.modules.storage_compiler import apply_compiled_plan, load_catalog_snapshot, reconcile_operational_registry
@@ -29,6 +31,13 @@ from factorix.platform.tdengine import (
 
 def _td_dsn() -> str:
     return os.environ["FACTORIX_TDENGINE_DSN"]
+
+
+def _alembic_script() -> ScriptDirectory:
+    center = Path(__file__).resolve().parents[3]
+    cfg = AlembicConfig(str(center / "alembic.ini"))
+    cfg.set_main_option("script_location", str(center / "migrations"))
+    return ScriptDirectory.from_config(cfg)
 
 
 def _pg_dsn_asyncpg() -> str:
@@ -400,9 +409,11 @@ async def test_pg_control_plane_and_tdengine_compiler_reconcile() -> None:
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
-        # Ensure Alembic 0008 or later schema is present
+        # The DB must be at the real Alembic head of the script directory (which includes 0008 storage schema).
         ver = await pg.fetchval("SELECT version_num FROM alembic_version LIMIT 1")
-        assert ver in ("0008_storage_and_historian", "0009_storage_drafts_lifecycle")
+        script = _alembic_script()
+        assert ver == script.get_current_head()
+        assert "0008_storage_and_historian" in {rev.revision for rev in script.iterate_revisions(ver, "base")}
 
         now = datetime.now(timezone.utc)
         await pg.execute(

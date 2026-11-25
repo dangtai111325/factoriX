@@ -80,13 +80,26 @@ class ConsumeOutcome(StrEnum):
     DEAD_LETTER = "DEAD_LETTER"
 
 
+def derive_live_queue_name(queue_name: str) -> str:
+    """Live-lane queue name of the topology whose ingest (legacy lane) queue is ``queue_name``.
+
+    ``factorix.telemetry.ingest.q`` -> ``factorix.telemetry.live.q`` (production name, unchanged);
+    ``factorix.s06.ingest.q.<suffix>`` -> ``factorix.s06.live.q.<suffix>``; any other name gets ``.live``.
+    """
+    if ".ingest.q" in queue_name:
+        return queue_name.replace(".ingest.q", ".live.q", 1)
+    return f"{queue_name}.live"
+
+
 @dataclass(frozen=True, slots=True)
 class BrokerConfig:
     amqp_url: str
     mgmt_url: str = ""
     exchange_name: str = "factorix.telemetry.ingress"
     queue_name: str = "factorix.telemetry.ingest.q"
-    live_queue_name: str = "factorix.telemetry.live.q"
+    # Empty = derived from ``queue_name`` (``*.ingest.q*`` -> ``*.live.q*``), so the live lane always belongs
+    # to the same topology as the ingest queue (production: ``factorix.telemetry.live.q``). See __post_init__.
+    live_queue_name: str = ""
     dlx_name: str = "factorix.telemetry.dlx"
     dlq_name: str = "factorix.telemetry.dlq"
     binding_pattern: str = "telemetry.v1.*"
@@ -113,6 +126,12 @@ class BrokerConfig:
     # arguments); a publisher built with ``declare_topology=False`` (acquisition) only checks passively
     # that the ingress exchange exists, so the two sides can never declare different queue arguments.
     declare_topology: bool = True
+
+    def __post_init__(self) -> None:
+        # A fixed live-queue name shared by topologies with different DLX / exchange names makes RabbitMQ
+        # refuse the redeclare (PRECONDITION_FAILED inequivalent arg 'x-dead-letter-exchange'); derive it.
+        if not self.live_queue_name:
+            object.__setattr__(self, "live_queue_name", derive_live_queue_name(self.queue_name))
 
     @classmethod
     def from_settings(cls, settings: Any, **overrides: Any) -> "BrokerConfig":

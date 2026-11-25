@@ -59,7 +59,7 @@ async def _cleanup_broker(cfg: BrokerConfig) -> None:
     conn = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
     try:
         ch = await conn.channel()
-        for qname in (cfg.queue_name, cfg.dlq_name):
+        for qname in (cfg.queue_name, cfg.live_queue_name, cfg.dlq_name):
             try:
                 await ch.queue_delete(qname, if_unused=False, if_empty=False)
             except Exception:

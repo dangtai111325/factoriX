@@ -15,7 +15,16 @@ import aio_pika
 import asyncpg
 import pytest
 
-from factorix.platform.broker import BrokerConfig
+from aio_pika.abc import AbstractIncomingMessage
+
+from factorix.domain.canonical import (
+    OBS_BATCH_CONTENT_TYPE,
+    OBS_BATCH_HEADER,
+    OBS_BATCH_HEADER_VALUE,
+    CanonicalObservation,
+    decode_observation_batch,
+)
+from factorix.platform.broker import BrokerConfig, MessageHandler, RabbitMQConsumer
 from factorix.platform.security import encrypt_secret, hash_password
 from factorix_acquisition.config_provider import (
     ConfigProvider,
@@ -68,11 +77,37 @@ def isolated_broker_cfg(amqp_url: str, mgmt_url: str) -> BrokerConfig:
     )
 
 
+def delivered_observations(msg: AbstractIncomingMessage) -> list[CanonicalObservation]:
+    """Observations carried by one AMQP delivery: a v2 ``obs-batch`` envelope (the acquisition publisher's
+    default, ``FACTORIX_PUBLISH_ENVELOPE=batch``) or a legacy v1 single observation."""
+    headers = dict(msg.headers or {})
+    if headers.get(OBS_BATCH_HEADER) == OBS_BATCH_HEADER_VALUE or msg.content_type == OBS_BATCH_CONTENT_TYPE:
+        return [CanonicalObservation.from_dict(item) for item in decode_observation_batch(bytes(msg.body)).items]
+    return [CanonicalObservation.from_json_bytes(msg.body)]
+
+
+class TwoLaneConsumer:
+    """Test consumer of both telemetry lanes, like the ingestion worker: fresh observations are routed to the
+    live queue, replayed / older ones to the ingest (legacy) queue."""
+
+    def __init__(self, cfg: BrokerConfig, handler: MessageHandler) -> None:
+        self.live = RabbitMQConsumer(cfg, handler, queue_name=cfg.live_queue_name)
+        self.legacy = RabbitMQConsumer(cfg, handler, queue_name=cfg.queue_name)
+
+    async def start(self) -> None:
+        await self.live.start()
+        await self.legacy.start()
+
+    async def stop(self, *, drain_timeout_s: float = 15.0) -> None:
+        await self.live.stop(drain_timeout_s=drain_timeout_s)
+        await self.legacy.stop(drain_timeout_s=drain_timeout_s)
+
+
 async def cleanup_broker_topology(cfg: BrokerConfig) -> None:
     conn = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
     try:
         ch = await conn.channel()
-        for qname in (cfg.queue_name, cfg.dlq_name):
+        for qname in (cfg.queue_name, cfg.live_queue_name, cfg.dlq_name):
             try:
                 await ch.queue_delete(qname, if_unused=False, if_empty=False)
             except Exception:

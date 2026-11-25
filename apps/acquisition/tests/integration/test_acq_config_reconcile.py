@@ -12,9 +12,11 @@ import pytest
 from aio_pika.abc import AbstractIncomingMessage
 
 from factorix.domain.canonical import CanonicalObservation
-from factorix.platform.broker import ConsumeOutcome, RabbitMQConsumer, RabbitMQPublisher
+from factorix.platform.broker import ConsumeOutcome, RabbitMQPublisher
 from factorix.platform.security import encrypt_secret
 from acq_int_helpers import (
+    TwoLaneConsumer,
+    delivered_observations,
     assert_isolated_test_env,
     cleanup_broker_topology,
     isolated_broker_cfg,
@@ -41,10 +43,10 @@ async def test_pg_notify_reloads_pause_resume_secret_rotation_without_touching_o
     received: list[CanonicalObservation] = []
 
     async def handle(msg: AbstractIncomingMessage) -> ConsumeOutcome:
-        received.append(CanonicalObservation.from_json_bytes(msg.body))
+        received.extend(delivered_observations(msg))
         return ConsumeOutcome.ACK
 
-    consumer = RabbitMQConsumer(broker_cfg, handle)
+    consumer = TwoLaneConsumer(broker_cfg, handle)
     broker = RabbitMQPublisher(broker_cfg)
     # Slow poll fallback (60s) proves reload is triggered by PostgreSQL LISTEN/NOTIFY, not timer polling!
     runtime, _lkg, _spool, _pub = make_runtime(pool, asyncpg_dsn, broker, tmp_path, data_key=data_key, config_s=60.0)
@@ -278,10 +280,10 @@ async def test_f26_dual_worker_advisory_lock_prevents_double_poll_and_fails_over
     received: list[CanonicalObservation] = []
 
     async def handle(msg: AbstractIncomingMessage) -> ConsumeOutcome:
-        received.append(CanonicalObservation.from_json_bytes(msg.body))
+        received.extend(delivered_observations(msg))
         return ConsumeOutcome.ACK
 
-    consumer = RabbitMQConsumer(broker_cfg, handle)
+    consumer = TwoLaneConsumer(broker_cfg, handle)
     broker_a = RabbitMQPublisher(broker_cfg)
     broker_b = RabbitMQPublisher(broker_cfg)
     lock_key = 910_000_777
