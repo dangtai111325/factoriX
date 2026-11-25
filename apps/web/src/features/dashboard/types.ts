@@ -105,6 +105,11 @@ export interface DashboardSummary {
 
 export interface DashboardDetail extends Omit<DashboardSummary, 'status' | 'widget_count' | 'theme_preset'> {
   document: DashboardDocument;
+  status?: 'DRAFT' | 'PUBLISHED';
+  site_id?: string | null;
+  created_at?: string;
+  /** Notes of a legacy draft upgraded on read. */
+  upgrade_notes?: string[];
 }
 
 export interface PublishedDashboard {
@@ -120,6 +125,7 @@ export interface RevisionSummary {
   revision: number;
   published_at: string;
   published_by: string | null;
+  published_by_name?: string | null;
   note: string;
   widget_count: number;
 }
@@ -130,9 +136,10 @@ export interface ValidationIssue {
   message: string;
   widget_id?: string;
   binding_id?: string;
+  path?: string;
 }
 
-export interface TemplateRole { id: string; label: string; value_kinds: ValueKind[]; required: boolean }
+export interface TemplateRole { id: string; label: string; value_kinds: ValueKind[]; required: boolean; description?: string }
 export interface DashboardTemplate {
   id: string;
   label: string;
@@ -205,12 +212,20 @@ export interface RegistryLimits {
   max_range_days: number;
   max_resolve_refs: number;
   max_document_bytes: number;
+  /** Server names (dash-be): the client normalises them onto the fields above. */
+  default_max_points?: number;
+  max_window_days?: number;
+  max_variables?: number;
+  max_bindings_per_document?: number;
+  max_widget_height?: number;
+  max_y?: number;
 }
 
 export interface WidgetRegistry {
   schema_version: number;
   widget_types: WidgetTypeDef[];
   limits: RegistryLimits;
+  enums?: Record<string, string[]>;
 }
 
 export interface Threshold { value: number; color: string; label?: string }
@@ -239,10 +254,14 @@ export interface ResolvedSource {
   label?: string;
   resource?: { id: string | null; name: string; code?: string } | null;
   value_type?: string | null;
+  /** number | boolean | string | json | unknown (server verdict). */
+  value_kind?: string | null;
   unit?: string | null;
   signal_id?: string;
+  key?: string;
   model_id?: string;
   field_path?: string;
+  is_timestamp?: boolean;
   capabilities?: SourceCapabilities;
   error?: { code: string; message: string };
 }
@@ -338,4 +357,126 @@ export interface WidgetRendererProps {
   mode: 'view' | 'edit';
   timeRange: { start: number; end: number };
   onNavigate: (target: NavTarget) => void;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Frontend core additions (API envelopes, source catalog). Added by the Studio/runtime layer;
+// every type above is unchanged.
+// ---------------------------------------------------------------------------------------------
+
+export interface DashboardListResponse { items: DashboardSummary[] }
+
+export interface DashboardImportResult extends DashboardDetail {
+  warnings?: Array<string | { code?: string; message: string; widget_id?: string; binding_id?: string }>;
+}
+
+export interface DashboardExport {
+  format: 'factorix.dashboard';
+  format_version: number;
+  exported_at: string;
+  name: string;
+  description: string;
+  document: DashboardDocument;
+}
+
+export interface ValidationResult { ok: boolean; issues: ValidationIssue[] }
+
+export interface RevisionDetail {
+  revision: number;
+  published_at: string;
+  note: string;
+  document: DashboardDocument;
+}
+
+/** One Factory Model resource of `GET /dashboards/sources` (`resources[]`). */
+export interface SourceResource {
+  id: string;
+  name: string;
+  code: string;
+  type_key: string;
+  path: string[] | string | null;
+  parent_id: string | null;
+}
+
+/** One selectable source of the catalog (signal or Data Model field), normalised by the client. */
+export interface SourceItem {
+  kind: 'signal' | 'model_field';
+  token: string;
+  key: string;
+  label: string;
+  value_type: string | null;
+  unit: string | null;
+  quality: string | null;
+  freshness: string | null;
+  last_value: unknown;
+  has_last_value: boolean;
+  last_at: string | null;
+  resource_id: string | null;
+  signal_id?: string;
+  model_id?: string;
+  model_name?: string;
+  field_path?: string;
+  /** The SourceRef to store verbatim in a binding (from the server). */
+  source: SourceRef | null;
+  /** number | boolean | string | json | unknown (server verdict). */
+  value_kind: string | null;
+  capabilities: SourceCapabilities | null;
+}
+
+export interface SourceCatalog {
+  items: SourceItem[];
+  resources: SourceResource[];
+}
+
+export interface ResolveResponse { items: ResolvedSource[] }
+
+/** `GET /api/v1/data-models/{id}/latest`. `body` is the exact JSON text of the last sample. */
+export interface ModelLatest {
+  body: string | null;
+  sampled_at: string | null;
+  errors: Array<{ path?: string; code?: string; message?: string }>;
+  fields?: Array<{ path: string; quality: string; reason?: string | null }>;
+}
+
+/** `POST /api/v1/historian/query` request (only the keys the dashboard runtime sends). */
+export interface HistorianQueryRequest {
+  sources: string[];
+  start: string;
+  end: string;
+  mode: 'operational' | 'recorded';
+  resolution: 'auto' | 'raw';
+  max_points: number;
+}
+
+export interface HistorianPointRaw {
+  ts: string;
+  value: unknown;
+  quality: string | null;
+  record_kind: string;
+  data_epoch?: number | null;
+}
+
+export interface HistorianSeriesRaw {
+  series_key: string;
+  status: string;
+  fidelity: string;
+  points: HistorianPointRaw[];
+  downsampled: boolean;
+  truncated: boolean;
+  bucket_ms?: number | null;
+  next_cursor?: string | null;
+  coverage_notes?: string[];
+  unit?: string | null;
+  value_type?: string | null;
+  display_name?: string;
+}
+
+export interface HistorianQueryResponseRaw {
+  series_list: HistorianSeriesRaw[];
+  downsampled?: boolean;
+  history_available?: boolean;
+  coverage_notes?: string[];
+  next_cursor?: string | null;
+  start?: string;
+  end?: string;
 }
