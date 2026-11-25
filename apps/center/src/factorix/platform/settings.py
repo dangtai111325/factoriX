@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -9,6 +11,16 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PLACEHOLDERS = {"", "change-me", "changeme", "password", "postgres", "secret"}
+
+logger = logging.getLogger(__name__)
+
+# C-05: settings that were declared here but never read by any process. Setting the variable has never had an
+# effect (the acquisition spool reads FACTORIX_SPOOL_PATH / FACTORIX_SPOOL_MAX_BYTES in
+# ``factorix_acquisition.__main__``); the field is gone and a leftover variable only logs this warning.
+REMOVED_ENV_VARS: dict[str, str] = {
+    "FACTORIX_ACQUISITION_SPOOL_PATH": "FACTORIX_SPOOL_PATH",
+    "FACTORIX_ACQUISITION_SPOOL_MAX_BYTES": "FACTORIX_SPOOL_MAX_BYTES",
+}
 
 
 class BrokerSettings(BaseSettings):
@@ -101,8 +113,6 @@ class Settings(BrokerSettings):
     # CT-14: the appliance default (Dockerfile / compose / entrypoint agree); FACTORIX_COLLECTOR_MODE=edge overrides.
     collector_mode: str = "acquisition"
     ot_allowlist: str = ""
-    acquisition_spool_path: str = ""
-    acquisition_spool_max_bytes: int = Field(default=128 * 1024 * 1024, ge=1_048_576)
     enable_destructive_tests: str = ""
 
     @field_validator("database_url")
@@ -136,6 +146,20 @@ class Settings(BrokerSettings):
         return self.environment == "production"
 
 
+def warn_removed_env_vars(environ: dict[str, str] | None = None) -> list[str]:
+    """Log one warning per removed variable that is still set (it never configured anything); returns them."""
+    env = os.environ if environ is None else environ
+    found = [name for name in REMOVED_ENV_VARS if name in env]
+    for name in found:
+        logger.warning(
+            "%s is not used by FactoriX and is ignored; the acquisition spool is configured by %s.",
+            name,
+            REMOVED_ENV_VARS[name],
+        )
+    return found
+
+
 @lru_cache
 def get_settings() -> Settings:
+    warn_removed_env_vars()
     return Settings()
