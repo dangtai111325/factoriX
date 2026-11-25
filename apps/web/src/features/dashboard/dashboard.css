@@ -86,14 +86,14 @@ html.fx-studio-open .fx-banner-stack {
   left: 0;
 }
 
-/* One-row widgets: the Studio header floats over the body and shows on hover, focus or selection. */
+/* One-row widgets: the Studio header floats over the body and shows on hover (or keyboard focus inside it),
+   so a selected link/divider still shows its content; the Inspector has the widget actions. */
 .dash-widget.dash-tiny .dash-tiny-head {
   opacity: 0;
   transition: opacity 120ms ease;
 }
 
 .dash-widget.dash-tiny:hover .dash-tiny-head,
-.dash-widget.dash-tiny:focus-within .dash-tiny-head,
-.dash-widget.dash-tiny[data-selected='true'] .dash-tiny-head {
+.dash-widget.dash-tiny .dash-tiny-head:focus-within {
   opacity: 1;
 }

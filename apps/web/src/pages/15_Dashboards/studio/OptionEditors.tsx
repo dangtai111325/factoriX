@@ -495,7 +495,27 @@ const ImageEditor: React.FC<{ id: string; value: string | null; onChange: (v: st
       setError(`The image is ${Math.round(file.size / 1024)} KB; the limit is 300 KB.`);
       return;
     }
+    // The browser derives `type` from the extension: check the file really starts like that image format
+    // (a renamed text file would otherwise be embedded as a broken image).
+    const head = new FileReader();
+    head.onload = () => {
+      const b = new Uint8Array(head.result as ArrayBuffer);
+      const is = (sig: number[], at = 0) => sig.every((x, i) => b[at + i] === x);
+      const real =
+        (file.type === 'image/png' && is([0x89, 0x50, 0x4e, 0x47])) ||
+        (file.type === 'image/jpeg' && is([0xff, 0xd8, 0xff])) ||
+        (file.type === 'image/gif' && is([0x47, 0x49, 0x46, 0x38])) ||
+        (file.type === 'image/webp' && is([0x52, 0x49, 0x46, 0x46]) && is([0x57, 0x45, 0x42, 0x50], 8));
+      if (!real) {
+        setError('This file is not a valid PNG, JPEG, WebP or GIF image.');
+        return;
+      }
+      readData();
+    };
+    head.onerror = () => setError('The file could not be read.');
+    head.readAsArrayBuffer(file.slice(0, 16));
     const reader = new FileReader();
+    const readData = () => reader.readAsDataURL(file);
     reader.onload = () => {
       const url = String(reader.result || '');
       if (!DATA_URL_RE.test(url) || url.length > 400000) {
@@ -505,7 +525,6 @@ const ImageEditor: React.FC<{ id: string; value: string | null; onChange: (v: st
       onChange(url);
     };
     reader.onerror = () => setError('The file could not be read.');
-    reader.readAsDataURL(file);
   };
   const safe = value && DATA_URL_RE.test(value) ? value : null;
   return (

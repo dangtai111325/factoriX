@@ -66,8 +66,9 @@ export function PieWidget({ options: o, data, theme, size, timeRange, mode }: Wi
     });
     if (negative.length) notes.push(`Excluded (negative): ${negative.join(', ')}`);
     if (missing.length) notes.push(`No data: ${missing.join(', ')}`);
-    const units = Array.from(new Set(slices.map((x) => x.unit).filter(Boolean)));
-    if (units.length > 1) notes.push(`Mixed units: ${units.join(', ')} — shares are not comparable`);
+    // A slice without a unit next to one with a unit is mixed too (the total must not borrow "rpm").
+    const units = Array.from(new Set(slices.map((x) => x.unit)));
+    if (units.length > 1) notes.push(`Mixed units: ${units.map((u) => u || 'no unit').join(', ')} — shares are not comparable`);
     const total = slices.reduce((a, b) => a + b.value, 0);
     return { slices, notes: uniqueNotes(notes), modeLabel: modeLabel as string | null, total, unit: units.length === 1 ? units[0] : '', zeroCount };
   }, [data.series, valueMode, timeRange.start, timeRange.end, theme]);

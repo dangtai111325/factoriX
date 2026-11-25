@@ -170,7 +170,37 @@ export function useWidgetData(widget: DashboardWidget): WidgetData {
     const k = keysOf();
     return store.signature(resolveKeys, k.tokens.filter(Boolean) as string[], k.historyKey ? k.historyKey.split('\u0002').filter(Boolean) : []);
   }, [store, keysOf, resolveKeys]);
-  const signature = useSyncExternalStore(store.subscribe, getSignature);
+  // History widgets (charts, tables over up to 20 × 5000 points) re-render at most once a second: with
+  // 20 live series each push (≈20/s per chart) used to re-render the chart, and a 40-widget dashboard
+  // pinned the main thread at 100 %. Latest-only widgets still follow every frame.
+  const minIntervalMs = needsHistory ? 1000 : 0;
+  const subscribe = useCallback(
+    (onChange: () => void) => {
+      if (!minIntervalMs) return store.subscribe(onChange);
+      let timer: number | null = null;
+      let last = 0;
+      const throttled = () => {
+        const wait = minIntervalMs - (performance.now() - last);
+        if (wait <= 0) {
+          last = performance.now();
+          onChange();
+        } else if (timer === null) {
+          timer = window.setTimeout(() => {
+            timer = null;
+            last = performance.now();
+            onChange();
+          }, wait);
+        }
+      };
+      const off = store.subscribe(throttled);
+      return () => {
+        off();
+        if (timer !== null) window.clearTimeout(timer);
+      };
+    },
+    [store, minIntervalMs],
+  );
+  const signature = useSyncExternalStore(subscribe, getSignature);
   const { resolvedList, tokens, tokenKey, historyKey } = keysOf();
 
   // Ref-counted retain/release of live subscriptions and history entries.
@@ -212,7 +242,11 @@ export function useWidgetData(widget: DashboardWidget): WidgetData {
     }
     const resource = equipmentResource(widget, merged, variables, resources);
     if (def.data.max_bindings === 0) return { status: 'ready', error: null, series: [], warnings: [], resource };
-    if (!widget.bindings.length) return { status: 'unbound', error: null, series: [], warnings: [], resource };
+    if (!widget.bindings.length) {
+      // A widget that needs no source (equipment: min 0) with a resource shows that resource, not "No data source".
+      if (def.data.min_bindings === 0 && resource) return { status: 'ready', error: null, series: [], warnings: [], resource };
+      return { status: 'unbound', error: null, series: [], warnings: [], resource };
+    }
 
     const warnings: string[] = [];
     let waiting = false;

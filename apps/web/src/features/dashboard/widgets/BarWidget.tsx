@@ -63,8 +63,8 @@ export function BarWidget({ options: o, data, theme, size, timeRange, mode }: Wi
         return sort === 'asc' ? a.value - b.value : b.value - a.value;
       });
     }
-    const units = Array.from(new Set(items.map((x) => x.unit).filter(Boolean)));
-    if (units.length > 1) notes.push(`Mixed units: ${units.join(', ')}`);
+    const units = Array.from(new Set(items.map((x) => x.unit)));
+    if (units.length > 1) notes.push(`Mixed units: ${units.map((u) => u || 'no unit').join(', ')}`);
     return { items, notes: uniqueNotes(notes), modeLabel: modeLabel as string | null };
   }, [data.series, valueMode, timeRange.start, timeRange.end, theme, thresholds, sort]);
 
@@ -73,7 +73,7 @@ export function BarWidget({ options: o, data, theme, size, timeRange, mode }: Wi
   const footerItems = [modeLabel ?? '', ...notes].filter(Boolean);
   const showFooter = footerItems.length > 0 && H >= 90;
   const chartH = Math.max(40, H - (showFooter ? FOOTNOTE_H : 0));
-  const units = Array.from(new Set(items.map((x) => x.unit).filter(Boolean)));
+  const units = Array.from(new Set(items.map((x) => x.unit)));
   const axisUnit = units.length === 1 ? units[0] : '';
 
   const option = useMemo<ChartOption>(() => {
