@@ -14,7 +14,7 @@ import {
   Radio,
   FileCode,
 } from 'lucide-react';
-import { StorageWizardLayout, useWizardDraft, useStorageBackTarget, PendingDraftBanner } from './WizardShared';
+import { StorageWizardLayout, useWizardDraft, useStorageBackTarget, useStepHistory, PendingDraftBanner } from './WizardShared';
 import { Button } from '../../../components/common/Button';
 import { ActionToast, useActionToast } from '../../../components/common/ActionToast';
 import { WizardHeader, DraftChip, Banner } from '../../historian/hsUi';
@@ -178,6 +178,8 @@ export const CreateStorageObjectWizard: React.FC = () => {
   // Operation In-Progress State
   const [activeOperation, setActiveOperation] = useState<StorageOperation | null>(null);
   const [created, setCreated] = useState<{ kind: string; name: string; objectId: string } | null>(null);
+  // Steps live in the browser history: Back = previous step, not out of the wizard (R1-28).
+  const stepHistory = useStepHistory(currentStep, setCurrentStep, (kind === 'database' || kind === 'stable' || kind === 'subtable') && !created);
 
   // Database wizard state
   const dbDraft = useWizardDraft<DatabaseWizardData>('fx_wizard_draft_database', INITIAL_DB_DATA);
@@ -810,6 +812,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
   if (created) {
     const again = () => {
       setCreated(null);
+      stepHistory.resetReached();
       setCurrentStep(0);
       if (kind === 'subtable') {
         // Keep parent, mode and tag values of the same machine/line; clear name, field and binding.

@@ -1,5 +1,5 @@
 import React from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ArrowRight, Save } from 'lucide-react';
 import { Button } from '../../../components/common/Button';
 import { ConfirmDialog } from '../../../components/common/ConfirmDialog';
@@ -340,6 +340,91 @@ export const WizardFooter: React.FC<WizardFooterProps> = ({
     </div>
   );
 };
+
+// ============================================================================
+// Hook: useStepHistory — wizard steps in the browser history (R1-28 / OP-08)
+// ============================================================================
+
+const STEP_PARAM = 'step';
+
+/**
+ * Every step change of a wizard becomes a history entry (`?step=N`, same page, so the leave guard lets it
+ * through). The browser Back / Forward buttons then move between steps instead of leaving the wizard; the
+ * wizard's own Back button goes back through that history when it can (no duplicate entries).
+ *
+ * - The step in the URL is never trusted beyond the furthest step reached in this visit (the Next checks
+ *   ran up to there). On a reload the wizard data is not in the URL, so a stale `?step` is dropped and the
+ *   wizard starts at step 1 with its "Resume draft" banner.
+ * - Browser Back on step 1 leaves the page like any other page (BrowserRouter cannot hold it).
+ */
+export function useStepHistory(currentStep: number, setCurrentStep: (step: number) => void, enabled = true) {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const raw = Number.parseInt(searchParams.get(STEP_PARAM) || '1', 10);
+  const urlStep = Number.isFinite(raw) && raw > 1 ? raw - 1 : 0;
+  // History entries this wizard created, oldest first; `pos` = the entry the browser shows.
+  const entries = React.useRef<number[]>([0]);
+  const pos = React.useRef(0);
+  const maxReached = React.useRef(0);
+  // The URL / step effects ignore their first run: on mount the URL may still carry a stale ?step.
+  const seenStep = React.useRef(false);
+  const seenUrl = React.useRef(false);
+
+  const searchWith = React.useCallback(
+    (step: number) => {
+      const next = new URLSearchParams(location.search);
+      if (step > 0) next.set(STEP_PARAM, String(step + 1));
+      else next.delete(STEP_PARAM);
+      const s = next.toString();
+      return s ? `?${s}` : '';
+    },
+    [location.search],
+  );
+
+  // Mount: drop a step left in the URL by a reload / bookmark (the data behind it is gone).
+  React.useEffect(() => {
+    if (enabled && urlStep > 0) navigate({ search: searchWith(0) }, { replace: true, state: location.state });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Step changed inside the wizard -> one history entry (or back through the one that is already there).
+  React.useEffect(() => {
+    if (!seenStep.current) {
+      seenStep.current = true;
+      return;
+    }
+    if (!enabled) return;
+    maxReached.current = Math.max(maxReached.current, currentStep);
+    if (currentStep === urlStep) return;
+    if (pos.current > 0 && entries.current[pos.current - 1] === currentStep) {
+      // The previous entry is exactly this step: step back through history (Back button = browser Back).
+      pos.current -= 1;
+      window.history.back();
+      return;
+    }
+    entries.current = [...entries.current.slice(0, pos.current + 1), currentStep];
+    pos.current = entries.current.length - 1;
+    navigate({ search: searchWith(currentStep) }, { state: location.state });
+  }, [currentStep]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Browser Back / Forward changed the URL -> show that step (never one the Next checks did not pass).
+  React.useEffect(() => {
+    if (!seenUrl.current) {
+      seenUrl.current = true;
+      return;
+    }
+    if (!enabled || urlStep === currentStep) return;
+    if (pos.current > 0 && entries.current[pos.current - 1] === urlStep) pos.current -= 1;
+    else if (entries.current[pos.current + 1] === urlStep) pos.current += 1;
+    setCurrentStep(Math.min(urlStep, maxReached.current));
+  }, [urlStep]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Forget the furthest step (e.g. "Create another" restarts the wizard). */
+  const resetReached = React.useCallback(() => {
+    maxReached.current = 0;
+  }, []);
+  return { resetReached };
+}
 
 /** Where "Storage Management" back returns: the page the user came from (router state `from`), else `fallback`. */
 export function useStorageBackTarget(fallback = '/historian/storage'): string {

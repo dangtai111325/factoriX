@@ -13,7 +13,7 @@ import {
   Loader2,
   Info,
 } from 'lucide-react';
-import { StorageWizardLayout, useWizardDraft, useStorageBackTarget, PendingDraftBanner } from './WizardShared';
+import { StorageWizardLayout, useWizardDraft, useStorageBackTarget, useStepHistory, PendingDraftBanner } from './WizardShared';
 import { Button } from '../../../components/common/Button';
 import { DraftChip, EmptyState, LoadingBlock, WizardHeader } from '../../historian/hsUi';
 import {
@@ -94,6 +94,8 @@ export const EditStorageObjectWizard: React.FC = () => {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [versionConflict, setVersionConflict] = useState(false);
   const [activeOperation, setActiveOperation] = useState<StorageOperation | null>(null);
+  // Steps live in the browser history: Back = previous step, not out of the wizard (R1-28).
+  useStepHistory(currentStep, setCurrentStep, !loading && !!objectKind);
 
   // Subtable parent STable ref
   const [parentStable, setParentStable] = useState<TDStable | null>(null);
