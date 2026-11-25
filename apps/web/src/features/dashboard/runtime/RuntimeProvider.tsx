@@ -108,8 +108,21 @@ export function historyParamsOf(widget: DashboardWidget, merged: Record<string, 
   };
 }
 
-function toLatestValue(raw: RawLatest | null, b: Binding): LatestValue | null {
+function toLatestValue(raw: RawLatest | null, b: Binding, contactLost = false): LatestValue | null {
   if (!raw) return null;
+  if (contactLost && raw.found) {
+    // The appliance has not answered for a while: the value is the last known one, never "Good/Fresh".
+    return {
+      value: applyTransform(raw.value, b.scale, b.offset),
+      raw: raw.value,
+      ts: raw.ts,
+      quality: raw.quality,
+      freshness: 'STALE',
+      effective_status: 'STALE',
+      reason_code: 'NO_CONNECTION',
+      state: 'stale',
+    };
+  }
   return {
     value: raw.found ? applyTransform(raw.value, b.scale, b.offset) : null,
     raw: raw.found ? raw.value : null,
@@ -302,7 +315,7 @@ export function useWidgetData(widget: DashboardWidget, gate?: VisibilityGate): W
         return base;
       }
       const raw = resolved.kind === 'model_field' || token.startsWith('mod:') ? store.modelLatest(token) : store.getLatestSignal(token);
-      base.latest = toLatestValue(raw, b);
+      base.latest = toLatestValue(raw, b, store.contactLost);
       if (!raw && !store.isSettled(token)) waiting = true;
       const modelErr = token.startsWith('mod:') ? store.modelError(token) : null;
       if (modelErr) warnings.push(`${label}: ${modelErr}`);

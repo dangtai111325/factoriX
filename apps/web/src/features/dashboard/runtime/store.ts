@@ -102,6 +102,8 @@ interface HistoryEntry {
   appended: number;
   /** Live points pushed while the history request was in flight; merged after the answer (no gap). */
   pending: RawPoint[];
+  /** A catch-up re-query is scheduled/done after the first answer (see runQuery). */
+  caughtUp: boolean;
 }
 
 interface InflightRequest {
@@ -145,6 +147,9 @@ const SIGNAL_POLL_MS = 5000;
 const MODEL_POLL_PUSH_MS = 30000;
 const MODEL_POLL_NO_PUSH_MS = 5000;
 const SETTLE_MS = 1500;
+const CATCH_UP_MS = 15000;
+/** Without any answer from the appliance (push, poll, history) for this long, latest values are stale. */
+const CONTACT_LOST_MS = 15000;
 
 function parseTs(v: unknown): number | null {
   if (typeof v !== 'string' || !v) return null;
@@ -252,6 +257,27 @@ export class DashboardRuntimeStore {
   /** Newest data time seen (latest frame or history answer), for the "Last update" label. */
   lastUpdateAt: number | null = null;
 
+  /** Last time the appliance answered (push, latest poll, model read, history); local clock. */
+  private lastContactAt = Date.now();
+  private contactWasLost = false;
+
+  /**
+   * The live socket is down and nothing (latest poll, model read, history) has answered for
+   * CONTACT_LOST_MS: shown values are the last known ones (stale). With the socket open the appliance is
+   * reachable, and ON_CHANGE signals legitimately stay silent, so silence alone never counts.
+   */
+  get contactLost(): boolean {
+    return getStreamStatus() !== 'open' && Date.now() - this.lastContactAt > CONTACT_LOST_MS;
+  }
+
+  private contact(): void {
+    this.lastContactAt = Date.now();
+    if (this.contactWasLost) {
+      this.contactWasLost = false;
+      this.emit();
+    }
+  }
+
   // ---------------------------------------------------------------- subscription (React)
 
   subscribe = (listener: () => void): (() => void) => {
@@ -277,7 +303,7 @@ export class DashboardRuntimeStore {
 
   /** Compact version string of the parts a widget depends on (React bails out when it is unchanged). */
   signature(resolveKeys: string[], latestTokens: string[], entryKeys: string[]): string {
-    let s = `${this.resolveVersion}:${this.resolveStatus}`;
+    let s = `${this.resolveVersion}:${this.resolveStatus}:${this.contactLost ? 'L' : ''}`;
     for (const k of resolveKeys) s += `|${this.resolved.has(k) ? 1 : 0}`;
     for (const t of latestTokens) {
       const m = parseModelToken(t);
@@ -473,6 +499,7 @@ export class DashboardRuntimeStore {
   }
 
   private applyLatest(id: string, next: RawLatest, pushed: boolean): void {
+    this.contact();
     const prev = this.latest.get(id);
     if (!pushed && prev && prev.ts !== null && next.ts !== null && next.ts < prev.ts) return;
     this.latest.set(id, next);
@@ -567,6 +594,7 @@ export class DashboardRuntimeStore {
     st.lastFetch = Date.now();
     try {
       const res = await getModelLatest(modelId);
+      this.contact();
       const cur = this.models.get(modelId);
       if (!cur) return;
       const at = parseTs(res.sampled_at);
@@ -671,11 +699,19 @@ export class DashboardRuntimeStore {
 
   private poll(): void {
     if (!this.started || document.hidden) return;
+    if (this.contactLost && !this.contactWasLost) {
+      // Re-render: latest values turn stale (never a frozen "Good" while the appliance is unreachable).
+      this.contactWasLost = true;
+      this.emit();
+    }
     const pushed = getPushedSignalIds();
     const notPushed = Array.from(this.signalRefs.keys()).filter((id) => !pushed.has(id));
     if (notPushed.length) {
       getLatestObservations(notPushed)
-        .then((rows) => rows.forEach((r) => this.applyLatest(String(r.signal_id), latestFromRow(r), false)))
+        .then((rows) => {
+          this.contact();
+          rows.forEach((r) => this.applyLatest(String(r.signal_id), latestFromRow(r), false));
+        })
         .catch(() => undefined);
     }
     const open = getStreamStatus() === 'open';
@@ -722,6 +758,7 @@ export class DashboardRuntimeStore {
       fetchedAt: null,
       appended: 0,
       pending: [],
+      caughtUp: false,
     });
     this.scheduleFlush();
     return key;
@@ -762,7 +799,10 @@ export class DashboardRuntimeStore {
   private invalidateHistory(dropAppended: boolean): void {
     this.entries.forEach((e) => {
       e.stale = true;
-      if (dropAppended) e.pending = [];
+      if (dropAppended) {
+        e.pending = [];
+        e.caughtUp = false;
+      }
       if (dropAppended && e.data && e.appended > 0) {
         e.data = null;
         e.appended = 0;
@@ -839,6 +879,7 @@ export class DashboardRuntimeStore {
     let errorText: string | null = null;
     try {
       const res = await queryHistorian(body, req.controller.signal);
+      this.contact();
       series = new Map((res.series_list || []).map((s) => [s.series_key, s]));
       topNotes = res.history_available === false ? res.coverage_notes || [] : [];
     } catch (error) {
@@ -894,6 +935,19 @@ export class DashboardRuntimeStore {
       const last = e.data.points[e.data.points.length - 1];
       if (last) this.lastUpdateAt = Math.max(this.lastUpdateAt ?? 0, last.t);
       e.version++;
+      // The Historian answers up to "now minus the ingestion lag", and pushes only start once the socket
+      // is subscribed: the seconds in between would stay a hole in a live trend (seen: 10-15 s after a
+      // page load or a reconnect). One catch-up re-query, once that window is stored, fills it.
+      if (e.params.liveAppend && e.params.range.kind === 'relative' && !e.caughtUp) {
+        e.caughtUp = true;
+        const key = e.key;
+        window.setTimeout(() => {
+          const again = this.entries.get(key);
+          if (!again || again.refs <= 0 || again.inflight) return;
+          again.stale = true;
+          this.scheduleFlush();
+        }, CATCH_UP_MS);
+      }
     });
     this.emit();
     // Entries that became stale while this request ran (tick, resync) are fetched now.
