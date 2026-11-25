@@ -15,33 +15,35 @@ import { Topbar } from './components/shell/Topbar';
 import { SearchModal } from './components/shell/SearchModal';
 
 import { OverviewPage } from './pages/01_Overview/OverviewPage';
-import { FactoryStructurePage } from './pages/02_FactoryStructure/FactoryStructurePage';
-import { KnowledgeGraphPage } from './pages/04_KnowledgeGraph/KnowledgeGraphPage';
-import { ConnectionsPage } from './pages/05_Connections/ConnectionsPage';
-import { AddDataWizardPage } from './pages/06_AddDataWizard/AddDataWizardPage';
-import { SignalsCatalogPage } from './pages/08_SignalsCatalog/SignalsCatalogPage';
-import { StorageManagementPage } from './pages/storage-management/StorageManagementPage';
-import { CreateStorageObjectWizard } from './pages/storage-management/wizards/CreateStorageObjectWizard';
-import { EditStorageObjectWizard } from './pages/storage-management/wizards/EditStorageObjectWizard';
-import { BulkSubtablesWizard } from './pages/storage-management/wizards/BulkSubtablesWizard';
-import { StorageObjectDetailPage } from './pages/storage-management/StorageObjectDetailPage';
-import { HistorianExplorerPage } from './pages/historian/HistorianExplorerPage';
-import { DataModelsPage } from './pages/13_DataModels/DataModelsPage';
-import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
 import { NotFoundPage } from './pages/NotFound/NotFoundPage';
 
-// Dashboards are code-split: the grid and chart libraries load only when a dashboard page opens.
-const DashboardListPage = React.lazy(() => import('./pages/15_Dashboards/DashboardListPage').then((m) => ({ default: m.DashboardListPage })));
-const DashboardViewPage = React.lazy(() => import('./pages/15_Dashboards/DashboardViewPage').then((m) => ({ default: m.DashboardViewPage })));
-const DashboardStudioPage = React.lazy(() => import('./pages/15_Dashboards/studio/DashboardStudioPage').then((m) => ({ default: m.DashboardStudioPage })));
+// Every page except the landing Overview is code-split, so the first load only carries the shell and Overview.
+// Heavy libraries (graph, grid, charts) are pulled in by the page that uses them.
+function lazyNamed<K extends string>(load: () => Promise<Record<K, React.ComponentType>>, name: K) {
+  return React.lazy(() => load().then((m) => ({ default: m[name] })));
+}
+const FactoryStructurePage = lazyNamed(() => import('./pages/02_FactoryStructure/FactoryStructurePage'), 'FactoryStructurePage');
+const KnowledgeGraphPage = lazyNamed(() => import('./pages/04_KnowledgeGraph/KnowledgeGraphPage'), 'KnowledgeGraphPage');
+const ConnectionsPage = lazyNamed(() => import('./pages/05_Connections/ConnectionsPage'), 'ConnectionsPage');
+const AddDataWizardPage = lazyNamed(() => import('./pages/06_AddDataWizard/AddDataWizardPage'), 'AddDataWizardPage');
+const SignalsCatalogPage = lazyNamed(() => import('./pages/08_SignalsCatalog/SignalsCatalogPage'), 'SignalsCatalogPage');
+const StorageManagementPage = lazyNamed(() => import('./pages/storage-management/StorageManagementPage'), 'StorageManagementPage');
+const CreateStorageObjectWizard = lazyNamed(() => import('./pages/storage-management/wizards/CreateStorageObjectWizard'), 'CreateStorageObjectWizard');
+const EditStorageObjectWizard = lazyNamed(() => import('./pages/storage-management/wizards/EditStorageObjectWizard'), 'EditStorageObjectWizard');
+const BulkSubtablesWizard = lazyNamed(() => import('./pages/storage-management/wizards/BulkSubtablesWizard'), 'BulkSubtablesWizard');
+const StorageObjectDetailPage = lazyNamed(() => import('./pages/storage-management/StorageObjectDetailPage'), 'StorageObjectDetailPage');
+const HistorianExplorerPage = lazyNamed(() => import('./pages/historian/HistorianExplorerPage'), 'HistorianExplorerPage');
+const DataModelsPage = lazyNamed(() => import('./pages/13_DataModels/DataModelsPage'), 'DataModelsPage');
+const ComingSoonPage = lazyNamed(() => import('./pages/FutureModules/ComingSoonPage'), 'ComingSoonPage');
+const DashboardListPage = lazyNamed(() => import('./pages/15_Dashboards/DashboardListPage'), 'DashboardListPage');
+const DashboardViewPage = lazyNamed(() => import('./pages/15_Dashboards/DashboardViewPage'), 'DashboardViewPage');
+const DashboardStudioPage = lazyNamed(() => import('./pages/15_Dashboards/studio/DashboardStudioPage'), 'DashboardStudioPage');
 
 const PageLoading: React.FC = () => (
   <div role="status" aria-live="polite" className="flex items-center justify-center py-16 text-[13px] text-[#657794]">
     Loading…
   </div>
 );
-
-const lazyPage = (node: React.ReactNode) => <React.Suspense fallback={<PageLoading />}>{node}</React.Suspense>;
 
 // Query-preserving redirect helper (TC-UI-NAV-06)
 const RedirectWithQuery: React.FC<{ to: string; extraParams?: Record<string, string> }> = ({
@@ -107,6 +109,7 @@ const ProtectedAppShell: React.FC = () => (
         <Topbar />
         <main id="fx-main-content" tabIndex={-1} className="fx-main outline-none">
           <div className="fx-content">
+            <React.Suspense fallback={<PageLoading />}>
             <Routes>
               {/* Canonical Routes */}
               <Route path="/" element={<Navigate to="/overview" replace />} />
@@ -117,9 +120,9 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/collector/signals" element={<SignalsCatalogPage />} />
               <Route path="/collector/add-data" element={<AddDataWizardPage />} />
               <Route path="/models" element={<DataModelsPage />} />
-              <Route path="/dashboards" element={lazyPage(<DashboardListPage />)} />
-              <Route path="/dashboards/:dashboardId" element={lazyPage(<DashboardViewPage />)} />
-              <Route path="/dashboards/:dashboardId/edit" element={lazyPage(<DashboardStudioPage />)} />
+              <Route path="/dashboards" element={<DashboardListPage />} />
+              <Route path="/dashboards/:dashboardId" element={<DashboardViewPage />} />
+              <Route path="/dashboards/:dashboardId/edit" element={<DashboardStudioPage />} />
 
               {/* Safe Redirects for Removed Product Features (Review 4 S5.4 / S5.8) */}
               <Route path="/factory/layout" element={<Navigate to="/factory/structure" replace />} />
@@ -176,6 +179,7 @@ const ProtectedAppShell: React.FC = () => (
               {/* R3-NAV-01: unknown routes get a real Not Found page instead of a silent redirect. */}
               <Route path="*" element={<NotFoundPage />} />
             </Routes>
+            </React.Suspense>
           </div>
         </main>
       </div>
