@@ -909,6 +909,14 @@ export async function getPgTablePreview(
   return api(`/api/v1/storage/pg/preview/${encodeURIComponent(schema)}/${encodeURIComponent(table)}${qs.size ? '?' + qs : ''}`);
 }
 
+/** "Count exactly" (R1-35): `count(*)` in a read-only transaction, 10 s timeout (504 COUNT_TIMEOUT). */
+export async function countPgRows(
+  schema: string,
+  table: string,
+): Promise<{ schema: string; table: string; exact_rows: number; tenant_scoped: boolean; timeout_ms: number }> {
+  return api(`/api/v1/storage/pg/count/${encodeURIComponent(schema)}/${encodeURIComponent(table)}`);
+}
+
 // --- Historian queries ---
 // Contract: v6_contracts.md H5/H6/H8. Fields marked "newer servers" are optional: the UI degrades
 // gracefully when an older Center does not send them.

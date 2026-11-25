@@ -8,9 +8,21 @@ Provides:
 - Sanitized data preview with secret/password/token masking.
 
 Zero write operations: the explorer never accepts SQL text. Every statement is a SELECT generated
-here from identifiers validated against the catalog, runs under ``SET LOCAL statement_timeout`` and
-is refused for credential/session/audit tables (P1-14). It runs with the application's database
-role (no separate read-only role is provisioned), which the UI states truthfully.
+here from identifiers validated against the catalog and is refused for credential/session/audit
+tables (P1-14). Enforcement (B-14 / OP-19), in this order:
+
+1. ``SET TRANSACTION READ ONLY`` before the first explorer statement of the request transaction, so
+   PostgreSQL itself rejects any INSERT / UPDATE / DELETE / DDL (``25006 read_only_sql_transaction``)
+   even if a statement were ever built wrongly. (Switching a transaction to read-only is allowed at any
+   point; the request's earlier auth bookkeeping is unaffected.)
+2. A statement allowlist: only ``SELECT`` / ``WITH`` text without ``;`` reaches the driver.
+3. ``SET LOCAL statement_timeout`` for previews and exact counts.
+
+A dedicated ``NOLOGIN`` read-only role (``SET LOCAL ROLE``) was not added: provisioning it needs
+``CREATEROLE`` on the appliance database, a grant of the role to the application login and default
+privileges for every future table, i.e. a change to database credentials / authorisation that is the
+owner's decision. The read-only transaction gives the same guarantee for writes; table-level
+visibility stays enforced by ``SENSITIVE_TABLES`` (403) and tenant scoping.
 """
 
 from __future__ import annotations
@@ -21,7 +33,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factorix.modules.common import fetch_all, fetch_one
+from factorix.modules.common import execute, fetch_all, fetch_one
 from factorix.platform.errors import AppError
 
 # Schemas to ignore
@@ -45,6 +57,43 @@ SENSITIVE_TABLES = frozenset({
     "audit_events",
 })
 PREVIEW_TIMEOUT_MS = 5000
+COUNT_TIMEOUT_MS = 10000
+
+_READ_STATEMENT = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+_RO_FLAG = "fx_pg_explorer_read_only"
+
+
+def assert_read_statement(sql: str) -> None:
+    """Allowlist: one SELECT / WITH statement (no statement separator)."""
+    if not _READ_STATEMENT.match(sql or "") or ";" in sql:
+        raise AppError(500, "EXPLORER_STATEMENT_REFUSED", "The explorer only runs single SELECT statements.")
+
+
+async def enter_read_only(session: AsyncSession) -> None:
+    """``SET TRANSACTION READ ONLY`` once per request transaction (PostgreSQL then refuses every write)."""
+    info = getattr(session, "info", None)
+    if isinstance(info, dict) and info.get(_RO_FLAG):
+        return
+    await execute(session, "SET TRANSACTION READ ONLY", {})
+    if isinstance(info, dict):
+        info[_RO_FLAG] = True
+
+
+async def _ro_fetch_all(session: AsyncSession, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    await enter_read_only(session)
+    assert_read_statement(sql)
+    return await fetch_all(session, sql, params)
+
+
+async def _ro_fetch_one(session: AsyncSession, sql: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    await enter_read_only(session)
+    assert_read_statement(sql)
+    return await fetch_one(session, sql, params)
+
+
+def _assert_not_sensitive(table: str, action: str) -> None:
+    if table.lower() in SENSITIVE_TABLES:
+        raise AppError(403, "ACCESS_DENIED", f"Table '{table}' cannot be {action}.")
 
 # Columns whose values MUST be masked in data preview
 SENSITIVE_COLUMN_PATTERNS = re.compile(
@@ -81,7 +130,7 @@ class PostgresExplorerService:
 
     async def list_schemas(self, session: AsyncSession) -> list[dict[str, Any]]:
         """Return non-system schemas."""
-        rows = await fetch_all(
+        rows = await _ro_fetch_all(
             session,
             """
             SELECT schema_name
@@ -93,7 +142,7 @@ class PostgresExplorerService:
             """,
             {},
         )
-        counts = await fetch_all(
+        counts = await _ro_fetch_all(
             session,
             """
             SELECT table_schema, COUNT(*) FILTER (WHERE table_type = 'BASE TABLE') AS tables,
@@ -120,7 +169,7 @@ class PostgresExplorerService:
     ) -> list[dict[str, Any]]:
         """Return tables and views in the schema with row estimates."""
         _validate_ident(schema, "schema name")
-        rows = await fetch_all(
+        rows = await _ro_fetch_all(
             session,
             """
             SELECT
@@ -167,9 +216,10 @@ class PostgresExplorerService:
         """Return columns, primary keys, and indexes for a table."""
         _validate_ident(schema, "schema name")
         _validate_ident(table, "table name")
+        _assert_not_sensitive(table, "inspected")
 
         # 1. Columns
-        col_rows = await fetch_all(
+        col_rows = await _ro_fetch_all(
             session,
             """
             SELECT
@@ -189,7 +239,7 @@ class PostgresExplorerService:
             return None
 
         # 2. Primary key columns
-        pk_rows = await fetch_all(
+        pk_rows = await _ro_fetch_all(
             session,
             """
             SELECT kcu.column_name
@@ -222,7 +272,7 @@ class PostgresExplorerService:
             })
 
         # 3. Indexes
-        idx_rows = await fetch_all(
+        idx_rows = await _ro_fetch_all(
             session,
             """
             SELECT
@@ -271,7 +321,7 @@ class PostgresExplorerService:
         _validate_ident(schema, "schema name")
 
         # 1. Real FK constraints from pg_constraint
-        real_fk_rows = await fetch_all(
+        real_fk_rows = await _ro_fetch_all(
             session,
             """
             SELECT
@@ -318,7 +368,7 @@ class PostgresExplorerService:
             })
 
         # 2. Inferred relationships (naming convention: e.g. <entity>_id -> <entity>s.id)
-        cols_rows = await fetch_all(
+        cols_rows = await _ro_fetch_all(
             session,
             """
             SELECT table_name, column_name
@@ -328,7 +378,7 @@ class PostgresExplorerService:
             """,
             {"schema": schema},
         )
-        all_tables_rows = await fetch_all(
+        all_tables_rows = await _ro_fetch_all(
             session,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = :schema",
             {"schema": schema},
@@ -373,11 +423,10 @@ class PostgresExplorerService:
         _validate_ident(schema, "schema name")
         _validate_ident(table, "table name")
 
-        if table.lower() in SENSITIVE_TABLES:
-            raise AppError(403, "ACCESS_DENIED", f"Table '{table}' cannot be previewed.")
+        _assert_not_sensitive(table, "previewed")
 
         # Get column list first
-        col_rows = await fetch_all(
+        col_rows = await _ro_fetch_all(
             session,
             """
             SELECT column_name, data_type
@@ -408,10 +457,9 @@ class PostgresExplorerService:
         quoted_cols = ", ".join(f'"{c}"' for c in column_names)
         sql = f'SELECT {quoted_cols} FROM "{schema}"."{table}"{where_clause} LIMIT {safe_limit} OFFSET {safe_offset}'
 
-        from factorix.modules.common import execute
-
+        await enter_read_only(session)
         await execute(session, f"SET LOCAL statement_timeout = {int(PREVIEW_TIMEOUT_MS)}", {})
-        rows = await fetch_all(session, sql, params)
+        rows = await _ro_fetch_all(session, sql, params)
         json_cols = {str(r["column_name"]) for r in col_rows if str(r.get("data_type") or "").lower() in ("json", "jsonb")}
 
         # Mask sensitive columns and nested secrets in JSON
@@ -442,7 +490,7 @@ class PostgresExplorerService:
             masked_rows.append(row_dict)
 
         # Total rows count / estimate with tenant scope applied
-        count_row = await fetch_one(
+        count_row = await _ro_fetch_one(
             session,
             f'SELECT count(*) AS total FROM "{schema}"."{table}"{where_clause}',
             params,
@@ -457,4 +505,53 @@ class PostgresExplorerService:
             "total": total,
             "limit": safe_limit,
             "offset": safe_offset,
+        }
+
+    async def count_rows(
+        self,
+        session: AsyncSession,
+        table: str,
+        schema: str = "public",
+        tenant_id: UUID | str | None = None,
+    ) -> dict[str, Any]:
+        """"Count exactly" (R1-35): ``count(*)`` under ``COUNT_TIMEOUT_MS``, tenant-scoped like the preview.
+
+        For tables whose estimate is "unknown, never analyzed" (``reltuples = -1``). A count that does not
+        finish in time answers 504 ``COUNT_TIMEOUT`` (PostgreSQL cancels the statement).
+        """
+        _validate_ident(schema, "schema name")
+        _validate_ident(table, "table name")
+        _assert_not_sensitive(table, "counted")
+        col_rows = await _ro_fetch_all(
+            session,
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = :schema AND table_name = :table",
+            {"schema": schema, "table": table},
+        )
+        if not col_rows:
+            raise AppError(404, "NOT_FOUND", f"Table '{schema}.{table}' not found.")
+        params: dict[str, Any] = {}
+        where_clause = ""
+        if "tenant_id" in {str(r["column_name"]) for r in col_rows}:
+            if not tenant_id:
+                raise AppError(403, "TENANT_REQUIRED", f"Table '{table}' requires tenant context to count.")
+            where_clause = ' WHERE "tenant_id" = CAST(:tenant_id AS uuid)'
+            params["tenant_id"] = str(tenant_id)
+        await enter_read_only(session)
+        await execute(session, f"SET LOCAL statement_timeout = {int(COUNT_TIMEOUT_MS)}", {})
+        try:
+            row = await _ro_fetch_one(session, f'SELECT count(*) AS total FROM "{schema}"."{table}"{where_clause}', params)
+        except Exception as exc:  # noqa: BLE001 - asyncpg QueryCanceledError arrives wrapped by SQLAlchemy
+            if "statement timeout" in str(exc).lower() or "QueryCanceled" in type(getattr(exc, "orig", exc)).__name__:
+                raise AppError(
+                    504, "COUNT_TIMEOUT",
+                    f"Counting '{schema}.{table}' took longer than {COUNT_TIMEOUT_MS // 1000} s; try again later.",
+                    retryable=True,
+                ) from exc
+            raise
+        return {
+            "schema": schema,
+            "table": table,
+            "exact_rows": int(row["total"]) if row else 0,
+            "tenant_scoped": bool(where_clause),
+            "timeout_ms": COUNT_TIMEOUT_MS,
         }
