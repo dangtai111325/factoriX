@@ -1108,9 +1108,10 @@ const CanvasHeader: React.FC<{
 const PreviewCanvas: React.FC<{ doc: DashboardDocument; onNavigate: (t: NavTarget) => void }> = ({ doc, onNavigate }) => {
   const [dataWidget, setDataWidget] = useState<DashboardWidget | null>(null);
   const [fullWidget, setFullWidget] = useState<DashboardWidget | null>(null);
+  const viewActions = useMemo(() => ({ onViewData: setDataWidget, onFullscreen: setFullWidget }), []);
   return (
     <div className="rounded-xl overflow-hidden border border-[#E3EAF3]">
-      <DashboardCanvas document={doc} mode="view" view={{ onViewData: setDataWidget, onFullscreen: setFullWidget }} onNavigate={onNavigate} empty={<span className="text-[13px]">No widget yet.</span>} />
+      <DashboardCanvas document={doc} mode="view" view={viewActions} onNavigate={onNavigate} empty={<span className="text-[13px]">No widget yet.</span>} />
       <WidgetDataDialog widget={dataWidget} onClose={() => setDataWidget(null)} />
       <WidgetFullscreenDialog widget={fullWidget} onClose={() => setFullWidget(null)} onNavigate={onNavigate} />
     </div>

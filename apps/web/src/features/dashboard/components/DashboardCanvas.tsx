@@ -18,7 +18,7 @@ import { IconMenu } from '../../../pages/13_DataModels/ui';
 import { BREAKPOINT_WIDTHS, MAX_ROWS_PER_WIDGET, STUDIO_WIDTHS, breakpointForWidth, minSize, rectsFor } from '../document';
 import { mergeOptions } from '../registry';
 import { themeStyle } from '../theme';
-import { useRuntime, useWidgetData } from '../runtime/RuntimeProvider';
+import { useRuntime, useWidgetData, type VisibilityGate } from '../runtime/RuntimeProvider';
 import { WIDGET_RENDERERS } from '../widgets';
 import { BREAKPOINT_COLUMNS } from '../types';
 import type { Breakpoint, DashboardDocument, DashboardWidget, NavTarget } from '../types';
@@ -241,7 +241,25 @@ export const WidgetCell: React.FC<{
   const { defs, theme, timeRange } = useRuntime();
   const def = defs.get(widget.type);
   const options = useMemo(() => mergeOptions(def, widget.options), [def, widget.options]);
-  const data = useWidgetData(widget);
+  // Off-screen widgets skip re-renders (a 40-widget dashboard is mostly below the fold).
+  const cellRef = useRef<HTMLDivElement>(null);
+  const gate = useMemo<VisibilityGate>(() => ({ visible: { current: true }, onVisible: new Set() }), []);
+  useEffect(() => {
+    const el = cellRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        const vis = entries.some((e) => e.isIntersecting);
+        const was = gate.visible.current;
+        gate.visible.current = vis;
+        if (vis && !was) gate.onVisible.forEach((f) => f());
+      },
+      { rootMargin: '200px' },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [gate]);
+  const data = useWidgetData(widget, gate);
   const range = widget.time.mode === 'custom' ? widget.time.range : timeRange;
   const renderer = WIDGET_RENDERERS[widget.type];
   const title = widget.title || def?.label || widget.type;
@@ -279,6 +297,7 @@ export const WidgetCell: React.FC<{
 
   return (
     <div
+      ref={cellRef}
       className={`h-full w-full ${className || ''}`}
       onMouseDown={edit ? () => edit.onSelect(widget.id) : undefined}
       onFocusCapture={edit ? () => edit.onSelect(widget.id) : undefined}

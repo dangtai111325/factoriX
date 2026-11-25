@@ -266,6 +266,8 @@ const ViewBody: React.FC<{
   const [dataWidget, setDataWidget] = useState<DashboardWidget | null>(null);
   const [fullWidget, setFullWidget] = useState<DashboardWidget | null>(null);
   const kioskRef = useRef<HTMLDivElement>(null);
+  // Stable identity: a new object per render would re-render every widget cell (WidgetCell is memoized).
+  const viewActions = useMemo(() => ({ onViewData: setDataWidget, onFullscreen: setFullWidget }), []);
 
   // Kiosk: Escape leaves (when no dialog is open); leaving browser full screen keeps kiosk on.
   useEffect(() => {
@@ -305,7 +307,7 @@ const ViewBody: React.FC<{
     <DashboardCanvas
       document={doc}
       mode="view"
-      view={{ onViewData: setDataWidget, onFullscreen: setFullWidget }}
+      view={viewActions}
       onNavigate={onNavigate}
       empty={
         <div className="text-center text-[13px]" style={{ color: 'var(--dash-text-muted)' }}>

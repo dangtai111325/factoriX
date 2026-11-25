@@ -84,8 +84,11 @@ export function useRuntimeVersion(): number {
 export function useRuntimeStatus(): { stream: ReturnType<typeof useStreamStatus>; lastUpdateAt: number | null; pending: number; resolveError: string | null; refresh: () => void } {
   const { store } = useRuntime();
   const stream = useStreamStatus();
-  useSyncExternalStore(store.subscribe, store.getVersion);
-  return { stream, lastUpdateAt: store.lastUpdateAt, pending: store.pendingRequests(), resolveError: store.resolveError, refresh: () => store.refreshNow() };
+  // Snapshot of exactly what the header shows (last update to the second): the page that renders the
+  // header (and the whole canvas below it) must not re-render on every pushed value.
+  useSyncExternalStore(store.subscribe, () => `${Math.floor((store.lastUpdateAt ?? 0) / 1000)}|${store.pendingRequests()}|${store.resolveError ?? ''}`);
+  const refresh = useCallback(() => store.refreshNow(), [store]);
+  return { stream, lastUpdateAt: store.lastUpdateAt, pending: store.pendingRequests(), resolveError: store.resolveError, refresh };
 }
 
 // ------------------------------------------------------------------ widget data
@@ -145,7 +148,13 @@ function tokenOf(r: ResolvedSource | null): string | null {
  * Data of one widget. History is requested only when the widget needs it (registry `history: required`,
  * a reduction `value_mode`, or a sparkline) and the source can provide it.
  */
-export function useWidgetData(widget: DashboardWidget): WidgetData {
+/** Visibility gate of a rendered widget: off-screen widgets defer their re-renders until they scroll in. */
+export interface VisibilityGate {
+  visible: React.MutableRefObject<boolean>;
+  onVisible: Set<() => void>;
+}
+
+export function useWidgetData(widget: DashboardWidget, gate?: VisibilityGate): WidgetData {
   const { store, defs, limits, theme, timeRange, variables, resources } = useRuntime();
   const def = defs.get(widget.type);
   const merged = useMemo(() => mergeOptions(def, widget.options), [def, widget.options]);
@@ -170,35 +179,52 @@ export function useWidgetData(widget: DashboardWidget): WidgetData {
     const k = keysOf();
     return store.signature(resolveKeys, k.tokens.filter(Boolean) as string[], k.historyKey ? k.historyKey.split('\u0002').filter(Boolean) : []);
   }, [store, keysOf, resolveKeys]);
-  // History widgets (charts, tables over up to 20 × 5000 points) re-render at most once a second: with
-  // 20 live series each push (≈20/s per chart) used to re-render the chart, and a 40-widget dashboard
-  // pinned the main thread at 100 %. Latest-only widgets still follow every frame.
-  const minIntervalMs = needsHistory ? 1000 : 0;
+  // History widgets (charts, tables over up to 20 × 5000 points) re-render at most once a second, and
+  // charts with many series less often (1 s per 5 series, ≤ 4 s): every push (≈20/s for a 20-series chart)
+  // used to re-render the chart, and a 40-widget dashboard pinned the main thread at 100 %. Widgets
+  // outside the viewport do not re-render until they scroll in. Latest-only widgets follow every frame.
+  const minIntervalMs = needsHistory ? 1000 * Math.min(4, Math.max(1, Math.ceil(widget.bindings.length / 5))) : 0;
   const subscribe = useCallback(
     (onChange: () => void) => {
-      if (!minIntervalMs) return store.subscribe(onChange);
       let timer: number | null = null;
       let last = 0;
+      let deferred = false;
+      const fire = () => {
+        if (gate && !gate.visible.current) {
+          deferred = true;
+          return;
+        }
+        last = performance.now();
+        onChange();
+      };
+      const wake = () => {
+        if (!deferred) return;
+        deferred = false;
+        fire();
+      };
+      gate?.onVisible.add(wake);
       const throttled = () => {
+        if (!minIntervalMs) {
+          fire();
+          return;
+        }
         const wait = minIntervalMs - (performance.now() - last);
-        if (wait <= 0) {
-          last = performance.now();
-          onChange();
-        } else if (timer === null) {
+        if (wait <= 0) fire();
+        else if (timer === null) {
           timer = window.setTimeout(() => {
             timer = null;
-            last = performance.now();
-            onChange();
+            fire();
           }, wait);
         }
       };
       const off = store.subscribe(throttled);
       return () => {
         off();
+        gate?.onVisible.delete(wake);
         if (timer !== null) window.clearTimeout(timer);
       };
     },
-    [store, minIntervalMs],
+    [store, minIntervalMs, gate],
   );
   const signature = useSyncExternalStore(subscribe, getSignature);
   const { resolvedList, tokens, tokenKey, historyKey } = keysOf();
