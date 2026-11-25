@@ -88,7 +88,7 @@ def _stamp(moment: datetime) -> str:
 
 
 @pytest.mark.asyncio
-async def test_auth_resource_ingest_formula_dashboard() -> None:
+async def test_auth_resource_ingest_formula_dashboard(monkeypatch: pytest.MonkeyPatch) -> None:
     await _wipe()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://localhost") as client:
@@ -229,6 +229,12 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
         signal_id = bulk.json()["created"][0]
         token = await client.post(f"/api/v1/edges/{edge.json()['id']}/enrollment-token", headers=headers)
         assert token.status_code == 201, token.text
+        # The default collector mode is ``acquisition`` (CT-14 / B-10): the legacy Edge M2M API (it serves
+        # decrypted secrets) answers 410 there (A4(b)). This flow exercises the Edge collector, so it selects
+        # Edge mode explicitly (FACTORIX_COLLECTOR_MODE=edge) after checking the guard.
+        refused = await client.post("/api/v1/edge-sync/enroll", json={"enrollment_token": token.json()["enrollment_token"]})
+        assert refused.status_code == 410 and refused.json()["error"]["code"] == "EDGE_SYNC_DISABLED", refused.text
+        monkeypatch.setattr(get_settings(), "collector_mode", "edge")
         enrolled = await client.post("/api/v1/edge-sync/enroll", json={"enrollment_token": token.json()["enrollment_token"]})
         assert enrolled.status_code == 200, enrolled.text
         edge_headers = {"Authorization": f"Bearer {enrolled.json()['credential']}"}
