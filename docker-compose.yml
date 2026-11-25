@@ -1,5 +1,90 @@
-# One-click FactoriX appliance: web + Postgres + Center + Edge on port 8080.
+# FactoriX Enterprise IIoT Stack
+name: factoriX
+
 services:
+  factorix-postgres:
+    image: postgres:17-alpine
+    container_name: factorix-postgres
+    hostname: factorix-postgres
+    # Tuning for the ingestion write load (R1 P1-14). The stock image runs with 128 MB
+    # shared_buffers and frequent checkpoints. Durability stays on for the control plane;
+    # only the derived latest_signal_state commits use SET LOCAL synchronous_commit=off.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+    shm_size: 256mb
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-factorix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-factorix}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - factorix-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factorix -d factorix"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - factorix-net
+
+  factorix-rabbitmq:
+    image: rabbitmq:4.4-management-alpine
+    container_name: factorix-rabbitmq
+    hostname: factorix-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${FACTORIX_RABBITMQ_USER:-factorix_mq}
+      RABBITMQ_DEFAULT_PASS: ${FACTORIX_RABBITMQ_PASSWORD}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - factorix-rmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "su-exec", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      start_period: 10s
+      retries: 15
+    restart: unless-stopped
+    networks:
+      - factorix-net
+
+  factorix-tdengine:
+    image: tdengine/tsdb:3.4.3.9
+    container_name: factorix-tdengine
+    hostname: factorix-tdengine
+    ports:
+      - "127.0.0.1:6041:6041"
+    volumes:
+      - factorix-td-data:/var/lib/taos
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:6041/-/ping >/dev/null || taos -s 'SHOW DATABASES;' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 25
+    restart: unless-stopped
+    networks:
+      - factorix-net
+
   factorix:
     build: .
     image: factorix:latest
@@ -10,7 +95,30 @@ services:
       - factorix-data:/data
     env_file:
       - .env
+    environment:
+      - FACTORIX_COLLECTOR_MODE=${FACTORIX_COLLECTOR_MODE:-acquisition}
+      - FACTORIX_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-factorix}:${POSTGRES_PASSWORD}@factorix-postgres:5432/${POSTGRES_DB:-factorix}
+      - FACTORIX_RABBITMQ_URL=${FACTORIX_RABBITMQ_URL:-amqp://${FACTORIX_RABBITMQ_USER:-factorix_mq}:${FACTORIX_RABBITMQ_PASSWORD}@factorix-rabbitmq:5672/}
+      - FACTORIX_RABBITMQ_MGMT_URL=${FACTORIX_RABBITMQ_MGMT_URL:-http://factorix-rabbitmq:15672}
+      - FACTORIX_TDENGINE_DSN=${FACTORIX_TDENGINE_DSN}
+      - FACTORIX_RECORD_OPERATIONAL=true
+    depends_on:
+      factorix-postgres:
+        condition: service_healthy
+      factorix-rabbitmq:
+        condition: service_healthy
+      factorix-tdengine:
+        condition: service_healthy
     restart: unless-stopped
+    networks:
+      - factorix-net
 
 volumes:
   factorix-data:
+  factorix-pg-data:
+  factorix-rmq-data:
+  factorix-td-data:
+
+networks:
+  factorix-net:
+    driver: bridge

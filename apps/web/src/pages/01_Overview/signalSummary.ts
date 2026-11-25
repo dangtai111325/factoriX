@@ -9,7 +9,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { normalizeQuality } from '../../lib/format';
-import type { LoadState } from '../../store/AppContext';
+import { useApp, type LoadState } from '../../store/AppContext';
 
 export interface QualitySummary {
   total: number;
@@ -21,11 +21,13 @@ export interface QualitySummary {
   paused: number;
   disabled: number;
   noConnection: number;
+  /** GOOD signals whose value is late in the pipeline (server freshness DELAYED, R2-02). */
+  delayed: number;
   /** Signals expected to collect: total minus paused and disabled. */
   active: number;
 }
 
-export function summarizeQualities(signals: Array<{ quality?: unknown }>): QualitySummary {
+export function summarizeQualities(signals: Array<{ quality?: unknown; freshness?: unknown }>): QualitySummary {
   const s: QualitySummary = {
     total: signals.length,
     good: 0,
@@ -36,11 +38,15 @@ export function summarizeQualities(signals: Array<{ quality?: unknown }>): Quali
     paused: 0,
     disabled: 0,
     noConnection: 0,
+    delayed: 0,
     active: 0,
   };
   for (const signal of signals) {
     const q = normalizeQuality(signal.quality);
-    if (q === 'GOOD') s.good++;
+    if (q === 'GOOD') {
+      s.good++;
+      if (String(signal.freshness ?? '').toUpperCase() === 'DELAYED') s.delayed++;
+    }
     else if (q === 'UNCERTAIN') s.uncertain++;
     else if (q === 'BAD') s.bad++;
     else if (q === 'STALE') s.stale++;
@@ -53,18 +59,19 @@ export function summarizeQualities(signals: Array<{ quality?: unknown }>): Quali
   return s;
 }
 
-/** Settle time after the metadata load before an all-empty value set is believed. */
-const SETTLE_MS = 1500;
+/** Last-resort settle time when the first latest read never finishes (it has its own request timeout). */
+const SETTLE_MS = 30000;
 
 /**
- * True once latest values can be trusted for counts: the shared load is ready and either a value
- * arrived, there are no signals, or the settle time passed (a real "no data yet" is then shown).
+ * True once latest values can be trusted for counts: the shared load is ready and the first latest
+ * read finished (or there are no signals). Before that pages show a neutral "Loading…" — never
+ * "0 of N good" (R2-18: pushed snapshots arrive in chunks, a partial set is not a verdict).
  * Once true it stays true, so a later refresh never flips counts back to "Loading…".
  */
 export function useValuesReady(loadState: LoadState, signals: Array<{ lastUpdated?: string; receivedTime?: string }>): boolean {
+  const { latestValuesLoaded } = useApp();
   const readyRef = useRef(false);
   const [settled, setSettled] = useState(false);
-  const anyValue = signals.some((s) => Boolean(s.lastUpdated || s.receivedTime));
 
   useEffect(() => {
     if (loadState !== 'ready' || settled) return;
@@ -72,7 +79,7 @@ export function useValuesReady(loadState: LoadState, signals: Array<{ lastUpdate
     return () => window.clearTimeout(timer);
   }, [loadState, settled]);
 
-  if (!readyRef.current && loadState === 'ready' && (anyValue || signals.length === 0 || settled)) readyRef.current = true;
+  if (!readyRef.current && loadState === 'ready' && (latestValuesLoaded || signals.length === 0 || settled)) readyRef.current = true;
   return readyRef.current;
 }
 
@@ -84,6 +91,7 @@ export function qualityLine(summary: QualitySummary, ready: boolean): { text: st
   if (!ready) return { text: 'Loading signal values…', tone: 'loading' };
   if (summary.noConnection > 0) return { text: 'Signal status unknown (no connection to appliance)', tone: 'unknown' };
   const extras = [
+    summary.delayed ? `${summary.delayed} delayed` : '',
     summary.paused ? `${summary.paused} paused` : '',
     summary.disabled ? `${summary.disabled} disabled` : '',
   ].filter(Boolean);
@@ -92,5 +100,5 @@ export function qualityLine(summary: QualitySummary, ready: boolean): { text: st
     return { text: `${summary.total} ${summary.total === 1 ? 'signal' : 'signals'}${suffix}`, tone: 'neutral' };
   }
   const text = `${summary.good} of ${summary.active} ${summary.active === 1 ? 'signal' : 'signals'} good${suffix}`;
-  return { text, tone: summary.good === summary.active ? 'good' : 'warning' };
+  return { text, tone: summary.good === summary.active && summary.delayed === 0 ? 'good' : 'warning' };
 }

@@ -1,0 +1,48 @@
+{
+  "test_id": "SRC-005",
+  "category": "SRC",
+  "suite": "test_src_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Model pause/archived sau l\u00fac ch\u1ecdn",
+  "expected": "source status UNRESOLVED/PAUSED, Publish c\u00f3 validation",
+  "status": "PASS",
+  "duration_ms": 355,
+  "started_at_utc": "2026-11-16T03:00:39.264Z",
+  "finished_at_utc": "2026-11-16T03:00:39.619Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "canonical_uid_resolved",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "row_assembly_policy_enforced",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SRC-005 [SRC]",
+    "Target scenario: Model pause/archived sau l\u00fac ch\u1ecdn",
+    "Evaluating expected behavior: source status UNRESOLVED/PAUSED, Publish c\u00f3 validation",
+    "Verified 3-perspective source binding resolution and carry-forward row assembly.",
+    "Scenario SRC-005 completed successfully with status PASS."
+  ]
+}

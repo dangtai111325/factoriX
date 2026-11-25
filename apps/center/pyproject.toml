@@ -15,6 +15,9 @@ dependencies = [
   "argon2-cffi==25.1.0",
   "httpx==0.28.1",
   "cryptography==50.0.2",
+  "aio-pika==10.2.3",
+  "taos-ws-py==0.7.1",
+  "PyYAML==6.0.3",
 ]
 
 [tool.ruff]
@@ -22,6 +25,6 @@ line-length = 120
 target-version = "py312"
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "../shared/src"]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]

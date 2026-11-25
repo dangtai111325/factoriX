@@ -8,9 +8,9 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from factorix.application.health.health_service import activate_edge_drafts, apply_edge_reports
 from factorix.domain.health import (
     ConnectionUpdate,
-    apply_connection_report,
     edge_config_state,
     effective_connection_health,
     effective_edge_health,
@@ -199,47 +199,8 @@ async def _apply_connection_reports(
         {"ids": [as_uuid(row["id"]) for row in rows]},
     )
     bindings = {str(row["connection_id"]): int(row["active_bindings"] or 0) for row in counts}
-    for row in rows:
-        conn_id = as_uuid(row["id"])
-        update = apply_connection_report(row, by_id[conn_id], now)
-        if update is None:
-            continue
-        await execute(
-            session,
-            "UPDATE connections SET health = :health, last_error = :last_error, last_success_at = :last_success_at WHERE id = :id",
-            {"health": update.health, "last_error": update.last_error, "last_success_at": update.last_success_at, "id": conn_id},
-        )
-        payload = _connection_payload(conn_id, update, bindings.get(str(conn_id), 0))
-        if update.health == row["health"]:
-            if update.last_error != row.get("last_error"):
-                queue_stream_event(session, "health", tenant_id, payload)
-            continue
-        if update.health == "DEGRADED":
-            await audit(
-                session,
-                tenant_id=tenant_id,
-                event_type="CONNECTION_DEGRADED",
-                actor_id=None,
-                entity_type="connection",
-                entity_id=conn_id,
-                before={"health": row["health"]},
-                after={"health": "DEGRADED", "last_error": update.last_error, "source": "edge"},
-                correlation_id="heartbeat",
-            )
-        elif row["health"] == "DEGRADED":
-            await audit(
-                session,
-                tenant_id=tenant_id,
-                event_type="CONNECTION_RECOVERED",
-                actor_id=None,
-                entity_type="connection",
-                entity_id=conn_id,
-                before={"health": "DEGRADED"},
-                after={"health": update.health},
-                correlation_id="heartbeat",
-            )
-        queue_stream_event(session, "health", tenant_id, payload)
-
+    # Edge report -> HealthService, the single writer of connections.health (R2-E C2).
+    await apply_edge_reports(session, tenant_id, rows, by_id, bindings, now)
 
 def _connection_payload(conn_id: UUID, update: ConnectionUpdate, active_bindings: int) -> dict[str, Any]:
     return {
@@ -284,15 +245,7 @@ async def acknowledge(session: AsyncSession, edge: dict[str, Any], revision: int
             "UPDATE edge_nodes SET active_revision = :revision, health = 'CONFIG_VALIDATED' WHERE id = :id",
             {"revision": revision, "id": as_uuid(edge["id"])},
         )
-        await execute(
-            session,
-            """
-            UPDATE connections
-            SET status = 'ACTIVE', health = 'UNKNOWN', updated_at = :now
-            WHERE edge_id = :id AND tenant_id = :tenant_id AND status = 'DRAFT'
-            """,
-            {"now": utcnow(), "id": as_uuid(edge["id"]), "tenant_id": as_uuid(edge["tenant_id"])},
-        )
+        await activate_edge_drafts(session, as_uuid(edge["id"]), as_uuid(edge["tenant_id"]), utcnow())
     else:
         await execute(
             session,

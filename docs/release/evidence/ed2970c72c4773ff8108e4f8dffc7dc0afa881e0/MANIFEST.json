@@ -1,0 +1,45 @@
+{
+  "manifest_version": "1.0.0",
+  "generated_at_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "branch": "TDengine-RabbitMQ-Stoorage-Historian",
+  "environment": {
+    "runner": "Windows NT 10.0 (AMD64) / FactoriX Test Harness",
+    "python": "3.14.5",
+    "pytest": "9.2.0",
+    "node": "v24.16.0",
+    "npm": "11.13.0"
+  },
+  "total_test_scenarios": 262,
+  "scenario_breakdown": {
+    "ZERO": 24,
+    "ACQ": 40,
+    "TD": 40,
+    "SRC": 32,
+    "HIST": 30,
+    "SEC": 24,
+    "RST": 28,
+    "REG": 20,
+    "PERF": 12,
+    "CLEAN": 12
+  },
+  "evidence_files": {
+    "build-provenance.json": "953c717d254494c504087d573eaa78aa656c3d1efada2d2ba677d1f97457733b",
+    "failures-and-limitations.md": "07bb1efcd7a7524e4aa3a226bbe67d26c6cb55baedda7ddbd391c6623667be3c",
+    "historian-query-parity.json": "f28f0b8c4b1daa38197849f026494277e3b1f4d7ab6f4e35d9140df0d610bdef",
+    "ingestion-fidelity-summary.json": "ad55df65aab8ad07a0e27077c0f8aab9df34b21bf078358deed60401328535ee",
+    "issues-status.md": "79c8e98a995c70793fea748c33f83934cac2ebc00a600b1a94c4df075ce88a37",
+    "migration-verification.json": "035f5681ba914d05a3a4ae60502cc04ef2a793a8129b5b806081ab49b01dfe82",
+    "operation-contract-verification.json": "0041f77f3c058b360d0a52bff532e904ea463f2de8e8d6bff8ec09f7fe8fbf6a",
+    "performance-summary.json": "ab04c2f46b75659ef75cc7d218edf19db45c292253c03d15965000541db1ba21",
+    "pg-config-preservation.json": "73719b46aaa6f400d13d560455d6e5571b57a2e4c0cedabc57f3ddd0be714d7f",
+    "rabbitmq-reliability-summary.json": "5503b374b5f67d8e90fe0b9acd4e4c1e9c73b03dff4d8cb3626a9ba38597eb9f",
+    "reset-verification.json": "cfe551bdb9e615f7cded30dfe8ad7f7cb3c5c267cc52c5ef70bff1cbfe66312f",
+    "security-scan-summary.json": "db3444226faa013ed9d6cbcb35749304809da5e6b405b6f39fe2fd06c2dc9bb2",
+    "source-clean-report.json": "d36d90e8ec614ee8f5e11117415d946cc7ca71a514362afb71c6973248641662",
+    "summary.md": "14015f1fbc5b482940dc3e015ac19a92e478b23318a812eed5276600d95f8b8e",
+    "td-schema-parity.json": "560342d7934f1ea673bc4c710b59d30e806f3d331446421ad2dc939ab2ca5486",
+    "test-cases.jsonl": "e739f567745feec3f90f063f28aa9a912c87599bc2c68795cdfb6fd016a966d7",
+    "ui-e2e-summary.json": "1e8ba6d558ed5a58332546fbcd9c28e6196a63b007c4508e6522cdbb2baff165"
+  }
+}

@@ -4,43 +4,17 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from factorix_core.time import iso, iso_ms, utcnow  # noqa: F401  (shared kernel, R2-E B7; re-exported here)
+
 _PARTITION = re.compile(r"observations_\d{4}_\d{2}")
 _DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None) -> str | None:
-    if value is None:
-        return None
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def iso_ms(value: datetime | str | None) -> str | None:
-    """Contract timestamp text: ``YYYY-MM-DDTHH:mm:ss.SSSZ`` (UTC, exactly 3 fraction digits)."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            value = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    moment = value.astimezone(timezone.utc)
-    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
 
 
 def dump(row: Any) -> dict[str, Any] | None:

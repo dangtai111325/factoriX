@@ -19,13 +19,14 @@ import {
   HealthMsg,
   LatestMsg,
   getPushedSignalIds,
+  onStreamResync,
   onPushCoverageChange,
   subscribeHealth,
   subscribeSignals,
   useStreamStatus,
 } from '../lib/liveStream'
 import { CommissionResult, runConnectionTest } from '../lib/commissioning'
-import { normalizeQuality } from '../lib/format'
+import { displayFreshness, normalizeQuality, serverStaleAfterMs } from '../lib/format'
 import { endpointWithScheme } from '../lib/protocols'
 import { connectivityDelay, onConnectivityRestored, reportApiSuccess, useConnectivity } from '../lib/connectivity'
 
@@ -91,10 +92,13 @@ interface AppContextType {
    * background failure keeps 'ready' (data stays visible) and only sets `loadError`.
    */
   loadState: LoadState
+  /** True once the first latest-values read finished (R2-18: counts are not shown before that). */
+  latestValuesLoaded: boolean
   loadError: string | null
   /** Re-run the metadata load (Retry button). */
   retryLoad: () => Promise<void>
-  revertToZero: (confirm: string) => Promise<void>
+  revertToZero: (confirm?: string, password?: string) => Promise<void>
+  refreshSystemState: () => Promise<void>
   refresh: () => Promise<void>
   isDemoMode: boolean
   demoScenario: 'healthy'
@@ -282,7 +286,22 @@ interface LiveState {
   reasonCode: string
   receivedTime: string
   sourceTime: string
+  lastAcquiredAt?: string
+  lastValueChangedAt?: string
+  evaluatedAt?: string
+  staleAfterMs?: number
+  dataEpoch?: number
+  sourceHealth?: string
+  connectionHealth?: string
+  brokerHealth?: string
+  storageHealth?: string
+  /** Server verdict: FRESH | DELAYED | STALE (DELAYED = current at the source, late in the pipeline). */
+  freshness?: string
+  deliveryLagMs?: number
 }
+
+/** Push and polling both missing for this long beyond the threshold: the client marks the value stale. */
+const CLIENT_SAFETY_MARGIN_MS = 15000
 
 function timeOf(iso: string): number {
   if (!iso) return 0
@@ -290,14 +309,35 @@ function timeOf(iso: string): number {
   return Number.isNaN(ts) ? 0 : ts
 }
 
+function optNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
 function liveFromRow(row: Record<string, unknown>): LiveState {
   const value = row.value !== undefined ? row.value : (row.value_json as { v?: unknown } | undefined)?.v
+  const receivedTime = text(row.last_acquired_at || row.received_time || row.event_time)
   return {
     value: value === undefined ? null : value,
     quality: normalizeQuality(row.effective_status ?? row.quality),
     reasonCode: text(row.reason_code),
-    receivedTime: text(row.received_time || row.event_time),
+    receivedTime,
     sourceTime: text(row.source_time),
+    lastAcquiredAt: text(row.last_acquired_at || row.received_time || row.event_time) || undefined,
+    lastValueChangedAt: text(row.last_value_changed_at) || undefined,
+    evaluatedAt: text(row.evaluated_at) || undefined,
+    staleAfterMs: optNumber(row.stale_after_ms),
+    dataEpoch: optNumber(row.data_epoch),
+    sourceHealth: text(row.source_health) || undefined,
+    connectionHealth: text(row.connection_health) || undefined,
+    brokerHealth: text(row.broker_health) || undefined,
+    storageHealth: text(row.storage_health) || undefined,
+    freshness: text(row.freshness) || undefined,
+    deliveryLagMs: optNumber(row.delivery_lag_ms),
   }
 }
 
@@ -337,6 +377,7 @@ function mapSignal(row: Record<string, unknown>, connectionName: Map<string, str
     topic: text(addressJson?.topic || addressJson?.path || addressJson?.node_id) || undefined,
     address: addressJson?.jsonpath ? text(addressJson.jsonpath) : summary || undefined,
     expectedIntervalMs: row.expected_interval_ms != null ? Number(row.expected_interval_ms) : undefined,
+    staleAfterMs: optNumber(row.stale_after_ms),
     sampleIntervalMs: Number(row.expected_interval_ms || 1000),
     currentValue: '—',
     value: null,
@@ -364,6 +405,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [searchQuery, setSearchQuery] = useState('')
   const [collectorLabel, setCollectorLabel] = useState('Collector: not enrolled')
   const [loadState, setLoadState] = useState<LoadState>('loading')
+  const [latestValuesLoaded, setLatestValuesLoaded] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const loadedOnceRef = useRef(false)
   const streamStatus = useStreamStatus()
@@ -373,11 +415,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Live values live outside the metadata so a metadata refresh never wipes them.
   const liveRef = useRef<Map<string, LiveState>>(new Map())
+  const serverOffsetMsRef = useRef(0)
   const [liveTick, setLiveTick] = useState(0)
   // Re-evaluates client-side staleness between server reconciliations.
   const [clockTick, setClockTick] = useState(0)
   const flushTimer = useRef<number | null>(null)
   const signalIdsRef = useRef<string[]>([])
+  const metaSeqRef = useRef(0)
+  const metaAppliedRef = useRef(0)
 
   const scheduleLiveFlush = useCallback(() => {
     if (flushTimer.current !== null) return
@@ -396,19 +441,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => window.clearInterval(timer)
   }, [])
 
-  /** Merge one live state; older samples (by received_time) never overwrite newer ones. */
+  /** Merge one live state; older epoch or older acquisition never overwrites newer state. */
   const applyLive = useCallback((signalId: string, next: LiveState): boolean => {
+    if (next.evaluatedAt) {
+      const serverTs = timeOf(next.evaluatedAt)
+      if (serverTs > 0) serverOffsetMsRef.current = serverTs - Date.now()
+    }
     const current = liveRef.current.get(signalId)
     if (current) {
-      const curTs = timeOf(current.receivedTime)
-      const nextTs = timeOf(next.receivedTime)
-      if (curTs && nextTs && nextTs < curTs) return false
+      const curEpoch = current.dataEpoch ?? 1
+      const nextEpoch = next.dataEpoch ?? curEpoch
+      if (next.dataEpoch !== undefined && nextEpoch < curEpoch) return false
+      const curTs = timeOf(current.lastAcquiredAt || current.receivedTime)
+      const nextTs = timeOf(next.lastAcquiredAt || next.receivedTime)
+      if (nextEpoch === curEpoch && curTs && nextTs && nextTs < curTs) return false
       if (
+        nextEpoch === curEpoch &&
         curTs === nextTs &&
         current.value === next.value &&
         current.quality === next.quality &&
         current.sourceTime === next.sourceTime &&
-        current.reasonCode === next.reasonCode
+        current.reasonCode === next.reasonCode &&
+        current.lastValueChangedAt === next.lastValueChangedAt &&
+        current.sourceHealth === next.sourceHealth &&
+        current.connectionHealth === next.connectionHealth &&
+        current.brokerHealth === next.brokerHealth &&
+        current.storageHealth === next.storageHealth &&
+        current.staleAfterMs === next.staleAfterMs &&
+        current.freshness === next.freshness
       ) {
         return false
       }
@@ -437,6 +497,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     }
     if (changed) scheduleLiveFlush()
+    setLatestValuesLoaded(true)
   }, [applyLive, scheduleLiveFlush])
 
   const resources = useMemo(
@@ -451,6 +512,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!connectivityLost) return scoped
     return scoped.map((item) => ({ ...item, status: 'unknown', noConnection: true }))
   }, [allResources, connections, currentPlant.id, connectivityLost])
+
+  // Ids the server currently pushes (socket open + heartbeat-verified); their verdicts are current.
+  const [pushedIds, setPushedIds] = useState<Set<string>>(() => getPushedSignalIds())
+  useEffect(() => onPushCoverageChange(() => setPushedIds(getPushedSignalIds())), [])
 
   const signals = useMemo<SignalItem[]>(() => {
     void liveTick
@@ -502,24 +567,45 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       if (!live) return meta
       const value = live.value as SignalItem['value']
-      // Same rule as the Center (max(2 x interval, 12 s) since received_time), so a source that stopped
-      // pushing is shown Stale before the next server reconciliation.
-      const staleAfter = Math.max(2 * (meta.expectedIntervalMs || 1000), 12000)
-      const receivedTs = timeOf(live.receivedTime)
-      const quality = live.quality === 'GOOD' && receivedTs && now - receivedTs > staleAfter ? 'STALE' : live.quality
+      // The server is the single evaluator of freshness (FRESH / DELAYED / STALE): it pushes every
+      // transition for subscribed signals and the REST poll returns a fresh verdict. The browser does
+      // NOT flip GOOD to STALE by its own clock any more (that turned every pipeline delay into
+      // "Stale" and blanked the value). Safety net only: when neither push nor polling produced a
+      // verdict for threshold + 15 s, the value is marked stale.
+      const staleAfter = serverStaleAfterMs(live.staleAfterMs, meta.staleAfterMs)
+      const acquiredTime = live.lastAcquiredAt || live.receivedTime
+      const approxNow = now + serverOffsetMsRef.current
+      const evaluatedTs = timeOf(live.evaluatedAt || '') || timeOf(acquiredTime)
+      const pushedLive = pushedIds.has(meta.id)
+      const verdictExpired = !pushedLive && evaluatedTs > 0 && approxNow - evaluatedTs > staleAfter + CLIENT_SAFETY_MARGIN_MS
+      const becameStale = live.quality === 'GOOD' && verdictExpired
+      const quality = becameStale ? 'STALE' : live.quality
+      const freshness = becameStale ? 'STALE' : displayFreshness(live.freshness, live.quality, acquiredTime, staleAfter)
+      const reasonCode = becameStale ? 'NO_FRESH_ACQUISITION' : live.reasonCode || undefined
       return {
         ...meta,
         value: value == null ? null : value,
         currentValue: value == null ? '—' : value,
         quality,
-        reasonCode: live.reasonCode || undefined,
-        qualityReason: live.reasonCode || undefined,
-        lastUpdated: live.receivedTime,
-        receivedTime: live.receivedTime,
+        reasonCode,
+        qualityReason: reasonCode,
+        lastUpdated: acquiredTime,
+        receivedTime: live.receivedTime || acquiredTime,
+        lastAcquiredAt: acquiredTime || undefined,
+        lastValueChangedAt: live.lastValueChangedAt,
         sourceTime: live.sourceTime,
+        evaluatedAt: live.evaluatedAt,
+        staleAfterMs: staleAfter,
+        dataEpoch: live.dataEpoch,
+        sourceHealth: becameStale ? 'STALE' : live.sourceHealth,
+        connectionHealth: live.connectionHealth,
+        brokerHealth: live.brokerHealth,
+        storageHealth: live.storageHealth,
+        freshness,
+        deliveryLagMs: freshness === 'DELAYED' ? live.deliveryLagMs : undefined,
       }
     })
-  }, [signalMeta, liveTick, clockTick, connectivityLost, connections])
+  }, [signalMeta, liveTick, clockTick, connectivityLost, connections, pushedIds])
 
   const scopedSignals = useMemo(
     () => signals.filter((item) => !currentPlant.id || resourceIds.has(item.resourceId)),
@@ -527,6 +613,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   )
 
   const loadMetadata = useCallback(async () => {
+    // U2: ordering guard. A refresh that started earlier but resolves later must not put old lists back.
+    const seq = ++metaSeqRef.current
     type Page = { items: Array<Record<string, unknown>> }
     // Secondary lists must not block the core load: on failure they keep their previous content.
     const optional = (path: string) =>
@@ -542,6 +630,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       optional('/api/v1/audit-events?limit=50'),
       api<Page>('/api/v1/edges'),
     ])
+    if (seq < metaAppliedRef.current) return
+    metaAppliedRef.current = seq
     const mappedResources: ResourceNode[] = (resourcePage.items || []).map((row) => ({
       id: text(row.id),
       name: text(row.name),
@@ -628,7 +718,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (enrolled.length) {
       setCollectorLabel(`Collector: ${enrolled[0].health || 'ENROLLED'}`)
     } else if (mappedEdges.length) {
-      setCollectorLabel(`Collector: not enrolled (${mappedEdges[0].name || 'Edge'})`)
+      setCollectorLabel(`Collector: not enrolled (${mappedEdges[0].name || 'built-in collector'})`)
     } else if (siteCount === 0 && mappedEdges.length === 0) {
       setCollectorLabel('Collector: waiting for a site')
     } else {
@@ -720,13 +810,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       reportApiSuccess()
       const id = text(msg.signal_id)
       const current = liveRef.current.get(id)
+      const acquired = text(msg.last_acquired_at || msg.received_time) || new Date().toISOString()
       const next: LiveState = {
         value: msg.value === undefined ? null : msg.value,
         quality: normalizeQuality(msg.effective_status ?? msg.quality),
         reasonCode: text(msg.reason_code),
         // Older servers do not send received_time: treat the push as "now" so it is not discarded.
-        receivedTime: text(msg.received_time) || new Date().toISOString(),
+        receivedTime: text(msg.received_time) || acquired,
+        lastAcquiredAt: acquired,
+        lastValueChangedAt:
+          msg.last_value_changed_at != null
+            ? text(msg.last_value_changed_at) || undefined
+            : current?.lastValueChangedAt,
         sourceTime: msg.source_time !== undefined ? text(msg.source_time) : current?.sourceTime || '',
+        evaluatedAt: msg.evaluated_at ? text(msg.evaluated_at) : current?.evaluatedAt,
+        staleAfterMs: optNumber(msg.stale_after_ms) ?? current?.staleAfterMs,
+        dataEpoch: optNumber(msg.data_epoch) ?? current?.dataEpoch,
+        sourceHealth: msg.source_health ? text(msg.source_health) : current?.sourceHealth,
+        connectionHealth: msg.connection_health ? text(msg.connection_health) : current?.connectionHealth,
+        brokerHealth: msg.broker_health ? text(msg.broker_health) : current?.brokerHealth,
+        storageHealth: msg.storage_health ? text(msg.storage_health) : current?.storageHealth,
+        freshness: msg.freshness ? text(msg.freshness) : undefined,
+        deliveryLagMs: optNumber(msg.delivery_lag_ms),
       }
       if (applyLive(id, next)) scheduleLiveFlush()
     }
@@ -814,31 +919,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const offRestored = onConnectivityRestored(() => {
       if (!inFlight) schedule(0)
     })
+    const offResync = onStreamResync(() => {
+      void fetchLatest(signalIdsRef.current)
+    })
     return () => {
       active = false
       offCoverage()
       offRestored()
+      offResync()
       if (timer !== null) window.clearTimeout(timer)
     }
   }, [fetchLatest, isStreaming])
 
-  const revertToZero = async (confirm: string) => {
-    await api('/api/v1/admin/revert-to-zero', {
-      method: 'POST',
-      body: JSON.stringify({ confirm }),
-    })
-    setAllResources([])
-    setConnections([])
-    setEdges([])
-    setSignalMeta([])
+  const refreshSystemState = useCallback(async () => {
     liveRef.current.clear()
-    setLayoutNodes([])
-    setDataModels([])
-    setActivities([])
-    setDiagnostics([])
-    setPlants([])
-    setCurrentPlant(EMPTY_PLANT)
-    window.location.assign('/register')
+    await refresh()
+  }, [refresh])
+
+  const revertToZero = async (confirm = 'CLEAR TELEMETRY', password = '') => {
+    try {
+      await api('/api/v1/admin/telemetry-reset/execute', {
+        method: 'POST',
+        body: JSON.stringify({
+          confirm_phrase: confirm || 'CLEAR TELEMETRY',
+          password: password || undefined,
+        }),
+      })
+    } catch {
+      await api('/api/v1/admin/revert-to-zero', {
+        method: 'POST',
+        body: JSON.stringify({ confirm: confirm || 'CLEAR TELEMETRY' }),
+      })
+    }
+    // Telemetry-only reset: invalidate live observation caches and reload system metadata in place
+    await refreshSystemState()
   }
 
   const addResource = async (resource: Partial<ResourceNode>) => {
@@ -1095,9 +1209,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const value: AppContextType = {
     loadState,
+    latestValuesLoaded,
     loadError,
     retryLoad,
     revertToZero,
+    refreshSystemState,
     refresh,
     isDemoMode: false,
     demoScenario: 'healthy',

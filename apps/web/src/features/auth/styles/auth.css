@@ -23,6 +23,8 @@
   inset: 22% 0 0 0;
   z-index: -1;
   background: url('/auth/factory.png') left bottom / cover no-repeat;
+  /* R1-25: the 130 kB WebP instead of the 1.8 MB PNG where supported. */
+  background-image: image-set(url('/auth/factory.webp') type('image/webp'), url('/auth/factory.png') type('image/png'));
   pointer-events: none;
 }
 

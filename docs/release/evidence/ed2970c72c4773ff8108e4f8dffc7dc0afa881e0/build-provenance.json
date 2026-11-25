@@ -1,0 +1,33 @@
+{
+  "build_timestamp_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "branch": "TDengine-RabbitMQ-Stoorage-Historian",
+  "runtime_environment": {
+    "os": "Windows NT 10.0 (AMD64)",
+    "python_version": "3.14.5",
+    "node_version": "v24.16.0",
+    "npm_version": "11.13.0",
+    "typescript_version": "5.6.3",
+    "vite_version": "5.4.11",
+    "pytest_version": "9.2.0"
+  },
+  "pinned_container_images": {
+    "tdengine": {
+      "image": "tdengine/tdengine:3.4.3.9",
+      "digest": "sha256:d8c5f939e6024985220c3a2bf921daea5596489bb8c4091a13437149a4632822"
+    },
+    "rabbitmq": {
+      "image": "rabbitmq:4.4-management-alpine",
+      "digest": "sha256:ef2bc74330689b14299b4dca889bb0c427fa7aa874e0d9b4b66d8f8705646f90"
+    },
+    "postgresql": {
+      "image": "postgres:17-alpine",
+      "digest": "sha256:7b5d2757dc55cfbcad48ad4a86b1fca83057e95454deae522be74ffca6fb84e3"
+    }
+  },
+  "verification_build_verdicts": {
+    "python_unit_tests": "701/702 PASS",
+    "frontend_typecheck": "PASS (0 TS errors)",
+    "frontend_production_build": "PASS (compiled clean)"
+  }
+}

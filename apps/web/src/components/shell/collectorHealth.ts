@@ -22,6 +22,10 @@ export interface EdgeHealthRow {
   enrollmentStatus: string;
   health: string;
   lastHeartbeat: string | null;
+  /** Server diagnostic, e.g. "Data delayed 34 s: ..." during a delivery stall (R2-02). */
+  diagnostic?: string;
+  /** The collector is alive but its connection report is late (P6): connection states are kept, not "down". */
+  reportLate?: boolean;
   state: EdgeState;
 }
 
@@ -36,6 +40,8 @@ export interface CollectorHealth {
   total: number;
   /** Edges that had contacted the Center before and are now unreachable. */
   offlineEdges: EdgeHealthRow[];
+  /** A collector is alive but not reporting connection status (P6): show "Collector not reporting". */
+  reportLate?: boolean;
 }
 
 const POLL_MS = 5000;
@@ -69,7 +75,12 @@ function toRow(raw: Record<string, unknown>): EdgeHealthRow {
     health: text(raw.effective_health || raw.health_raw || raw.health),
     lastHeartbeat: raw.last_heartbeat ? text(raw.last_heartbeat) : null,
   };
-  return { ...base, state: classifyEdge(base) };
+  return {
+    ...base,
+    diagnostic: text(raw.diagnostic) || undefined,
+    reportLate: text(raw.report_state).toUpperCase() === 'REPORT_LATE',
+    state: classifyEdge(base),
+  };
 }
 
 export const NO_CONNECTION_LABEL = 'Unknown (no connection to appliance)';
@@ -122,12 +133,25 @@ export function summarize(edges: EdgeHealthRow[] | null, connectionLost = false)
           : `${offlineEdges.length} collectors stopped reporting.`,
     };
   }
+  const late = edges.find((edge) => edge.reportLate);
+  if (late) {
+    return {
+      ...base,
+      state: 'degraded',
+      label: 'Not reporting',
+      detail: late.diagnostic || 'The collector is running but not reporting connection status. Connection states are kept until it reports again.',
+      reportLate: true,
+    };
+  }
   if (degraded > 0 || offlineEdges.length > 0) {
     return {
       ...base,
       state: 'degraded',
       label: total > 1 ? `${online} of ${total} online` : 'Degraded',
-      detail: degraded > 0 ? 'A collector reports a problem. Check Connections.' : 'Some collectors stopped reporting.',
+      detail:
+        degraded > 0
+          ? edges.find((edge) => edge.state === 'degraded' && edge.diagnostic)?.diagnostic || 'A collector reports a problem. Check Connections.'
+          : 'Some collectors stopped reporting.',
     };
   }
   return {

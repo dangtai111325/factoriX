@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import StrEnum
 
 
 class Quality(StrEnum):
+    """The one quality vocabulary: source quality (GOOD / UNCERTAIN / BAD) plus the STALE serving
+    projection. ``domain.signal_state.SourceQuality`` is this enum (R2-E C1)."""
+
     GOOD = "GOOD"
     UNCERTAIN = "UNCERTAIN"
     BAD = "BAD"
@@ -23,9 +26,13 @@ class Origin(StrEnum):
 
 
 class Freshness(StrEnum):
+    """The one freshness vocabulary (R2-E C1 / CT-11). ``domain.signal_state.Freshness`` is this enum."""
+
     FRESH = "FRESH"
+    DELAYED = "DELAYED"
     STALE = "STALE"
     UNKNOWN = "UNKNOWN"
+    NO_DATA = "NO_DATA"
 
 
 def combine_quality(qualities: list[Quality]) -> Quality:
@@ -43,7 +50,14 @@ def freshness_status(
     expected_interval_ms: int | None,
     now: datetime,
     quality: Quality,
+    source_ok_at: datetime | None = None,
+    source_reported_at: datetime | None = None,
+    delivered_at: datetime | None = None,
 ) -> Freshness:
+    """Freshness of a value with the canonical rule of ``domain.signal_state`` (threshold
+    ``max(2 x interval, 12 s)``, DELAYED when the pipeline evidence says the source is still read).
+    CT-11: this used a private 5 s fallback without the 12 s floor and had no DELAYED. Kept for
+    compatibility; live surfaces use ``FreshnessService`` (which also resolves the interval)."""
     if quality == Quality.BAD:
         return Freshness.UNKNOWN
     reference = event_time or received_time
@@ -53,11 +67,17 @@ def freshness_status(
         raise ValueError("timestamps must be timezone-aware")
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
-    interval = timedelta(milliseconds=expected_interval_ms or 5000)
-    # Two missed intervals marks the serving projection stale without rewriting history.
-    if now - reference > interval * 2:
-        return Freshness.STALE
-    return Freshness.FRESH
+    from factorix.domain.signal_state import canonical_stale_after_ms, classify_freshness
+
+    verdict = classify_freshness(
+        last_acquired_at=reference,
+        now=now,
+        stale_after_ms=canonical_stale_after_ms(expected_interval_ms),
+        source_ok_at=source_ok_at,
+        source_reported_at=source_reported_at,
+        delivered_at=delivered_at,
+    )
+    return Freshness(verdict.freshness)
 
 
 def ensure_utc(value: datetime) -> datetime:

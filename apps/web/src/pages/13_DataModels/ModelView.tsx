@@ -169,13 +169,12 @@ export const ModelView: React.FC<Props> = ({ modelId, summary, refreshToken, bus
       )}
       {running && q.quality && q.quality.pausedSources.length > 0 && (
         <Banner tone="warning">
-          Source connection paused: <strong>{q.quality.pausedSources.join(', ')}</strong>. The model keeps sampling, but {q.quality.affectedFields} field(s) repeat their
-          last value and source_timestamp does not move until the connection is resumed.
+          Source connection paused: <strong>{q.quality.pausedSources.join(', ')}</strong>. Current values from these connections are unavailable.
         </Banner>
       )}
       {running && q.quality && !q.quality.pausedSources.length && q.quality.staleSources.length > 0 && (
         <Banner tone="warning">
-          No fresh data from <strong>{q.quality.staleSources.join(', ')}</strong>: {q.quality.affectedFields} field(s) repeat their last value.
+          No fresh data from <strong>{q.quality.staleSources.join(', ')}</strong>. Current values from these connections are unavailable.
         </Banner>
       )}
 

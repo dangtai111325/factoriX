@@ -21,7 +21,9 @@ NO_DATA_PREFIX = "No samples received"
 EDGE_STATES = ("NOT_ENROLLED", "OFFLINE", "DEGRADED", "ONLINE")
 CONNECTION_STATES = ("HEALTHY", "DEGRADED", "IDLE", "PAUSED", "UNKNOWN", "ARCHIVED")
 
-_REPORT_STATES = {"UP", "DOWN", "RATE_LIMITED", "AUTH_FAILED", "IDLE"}
+_REPORT_STATES = {"UP", "DOWN", "RATE_LIMITED", "AUTH_FAILED", "IDLE", "SILENT"}
+# Evidence window used when a report does not carry ``window_s`` (older acquisition builds).
+DEFAULT_EVIDENCE_WINDOW_S = 10.0
 
 
 def _utc(value: Any) -> datetime | None:
@@ -166,9 +168,14 @@ def apply_connection_report(
     UP            -> HEALTHY, last_error cleared.
     RATE_LIMITED  -> HEALTHY, last_error keeps the rate-limit text (warning, not an outage).
     DOWN/AUTH_FAILED -> DEGRADED with the real error text reported by the edge.
+    SILENT        -> DEGRADED "connected, but no data" (source silent, not a connector error).
     IDLE          -> UNKNOWN (neutral): the edge runs no job for it; effective health is IDLE.
     last_success_at only moves forward and never into the future.
     Returns None when nothing changes or the report is unusable.
+
+    Invariant (owner bug "data keeps arriving but the system records lost connection"): a failure
+    report never degrades a connection whose successful-read evidence (``last_ok_at``) is newer than
+    the report's evidence window. Data that keeps arriving keeps the connection HEALTHY.
     """
     if str(current.get("status") or "").upper() != "ACTIVE":
         return None
@@ -184,18 +191,32 @@ def apply_connection_report(
     if reported_ok is not None and (previous_ok is None or reported_ok > previous_ok):
         last_ok = reported_ok
     advanced = last_ok is not None and (previous_ok is None or last_ok > previous_ok)
+    partial_error: str | None = None
+    if state in {"DOWN", "SILENT"} and reported_ok is not None:
+        try:
+            window_s = float(report.get("window_s") or DEFAULT_EVIDENCE_WINDOW_S)
+        except (TypeError, ValueError):
+            window_s = DEFAULT_EVIDENCE_WINDOW_S
+        if (current_now - reported_ok).total_seconds() < window_s:
+            # Reads succeeded within the window (intermittent error, or one of several jobs failing):
+            # data is arriving, so the connection stays HEALTHY and the error is kept as a warning.
+            partial_error = _report_error(report, "Some reads failed.")
+            state = "UP"
     if state in {"UP", "RATE_LIMITED"} and is_no_data_message(current.get("last_error")) and not advanced:
         # Center saw no samples for the threshold. A transport that is merely connected (for
         # example an MQTT session with a silent publisher) does not clear that evidence; only a
         # newer successful read does. Prevents DEGRADED/HEALTHY flapping every heartbeat.
         return None
     if state == "UP":
-        health, error = "HEALTHY", None
+        health, error = "HEALTHY", partial_error
     elif state == "RATE_LIMITED":
         health, error = "HEALTHY", _report_error(report, "Rate limited by the source; requests are being slowed down.")
     elif state in {"DOWN", "AUTH_FAILED"}:
         default = "Authentication failed." if state == "AUTH_FAILED" else "Source is unreachable."
         health, error = "DEGRADED", _report_error(report, default)
+    elif state == "SILENT":
+        text = str(report.get("last_error") or "").strip() or "Connected, but the source sends no data."
+        health, error = "DEGRADED", text[:500]
     else:
         health, error = "UNKNOWN", None
     if (

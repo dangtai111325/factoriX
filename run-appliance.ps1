@@ -6,19 +6,8 @@ if (-not (Test-Path .env)) {
   Write-Error "Missing .env next to this script. Copy your appliance env file first."
 }
 
-Write-Host "Building factorix image..."
-docker build -t factorix .
-if ($LASTEXITCODE -ne 0) {
-  Write-Error "Image build failed; the running appliance was left unchanged."
-}
-
-Write-Host "Replacing container factorix-appliance..."
-docker rm -f factorix-appliance 2>$null | Out-Null
-docker run -d --name factorix-appliance --restart unless-stopped --env-file .env -p 8080:8080 -v factorix-data:/data factorix
-
-# Docker Desktop sometimes leaves the container in "created"; force start.
-Start-Sleep -Seconds 2
-docker start factorix-appliance | Out-Null
+Write-Host "Deploying FactoriX stack via Docker Compose..."
+docker compose up -d --build
 
 Write-Host "Waiting for health..."
 for ($i = 0; $i -lt 60; $i++) {

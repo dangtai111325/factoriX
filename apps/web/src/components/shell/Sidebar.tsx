@@ -68,6 +68,15 @@ const mainNav: NavGroup[] = [
       { label: 'Model Catalog', path: '/models' },
     ],
   },
+  {
+    id: 'historian',
+    label: 'Historian & Storage',
+    icon: LineChart,
+    children: [
+      { label: 'Storage Management', path: '/historian/storage' },
+      { label: 'Historian', path: '/historian/historian' },
+    ],
+  },
 ];
 
 const COMING_SOON_KEY = 'fx.sidebar.comingSoon.v2';
@@ -84,18 +93,6 @@ const comingSoonNav: NavGroup[] = [
       { label: 'Dashboard Library', path: '/dashboards/library' },
       { label: 'Dashboard Builder', path: '/dashboards/builder' },
       { label: 'Widget Library', path: '/dashboards/widgets' },
-    ],
-  },
-  {
-    id: 'historian',
-    label: 'Historian & Storage',
-    icon: Database,
-    path: '/historian',
-    soon: true,
-    children: [
-      { label: 'Data Explorer', path: '/historian/explorer' },
-      { label: 'Storage Policies', path: '/historian/policies' },
-      { label: 'Retention & Export', path: '/historian/retention' },
     ],
   },
   {
@@ -195,14 +192,20 @@ export const Sidebar: React.FC = () => {
   }, [drawerOpen, isMobile]);
 
   // Group open state persistence
+  // Released groups are open by default. A remembered choice applies only to the groups it names:
+  // a group added later (Historian & Storage) opens like the others instead of starting collapsed.
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() => {
+    const defaults: Record<string, boolean> = { factory: true, collector: true, models: true, historian: true };
     try {
       const saved = localStorage.getItem('fx.sidebar.groups');
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed: unknown = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') return { ...defaults, ...(parsed as Record<string, boolean>) };
+      }
     } catch {
       // fallback
     }
-    return { factory: true, collector: true, models: true };
+    return defaults;
   });
 
   // "Coming soon" section: collapsed by default so the released modules stay in view. The choice is
@@ -298,6 +301,16 @@ export const Sidebar: React.FC = () => {
     }
     if (path === '/models') {
       return location.pathname === '/models';
+    }
+    if (path === '/historian/storage') {
+      return location.pathname.startsWith('/historian/storage');
+    }
+    if (path === '/historian/historian') {
+      return (
+        location.pathname === '/historian/historian' ||
+        location.pathname === '/historian' ||
+        location.pathname === '/historian/explorer'
+      );
     }
     return location.pathname === path;
   };
@@ -555,7 +568,7 @@ export const Sidebar: React.FC = () => {
             type="button"
             onClick={() => setRevertModalOpen(true)}
             className="w-full mb-2 flex items-center justify-center gap-2 py-1.5 px-3 rounded-lg text-[12px] font-medium text-[#EF1B24] border border-[#FAC6C9] hover:bg-white transition-colors"
-            title="Deletes the installation, including all configurations and data."
+            title="Clears operational telemetry and historian observations while preserving all physical schemas, connections, data models, and configurations."
           >
             <RotateCcw className="w-3.5 h-3.5" />
             <span>Revert To Zero</span>

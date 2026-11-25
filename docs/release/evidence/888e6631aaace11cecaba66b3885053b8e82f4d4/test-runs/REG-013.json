@@ -1,0 +1,48 @@
+{
+  "test_id": "REG-013",
+  "category": "REG",
+  "suite": "test_reg_suite",
+  "runner": "browser_e2e_and_api",
+  "scenario": "Cross-tab opening Storage/Signals/Historian",
+  "expected": "canonical source deep links and IDs preserved",
+  "status": "PASS",
+  "duration_ms": 208,
+  "started_at_utc": "2026-11-16T03:01:22.351Z",
+  "finished_at_utc": "2026-11-16T03:01:22.559Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "navigation_path_valid",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "legacy_route_redirected",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for REG-013 [REG]",
+    "Target scenario: Cross-tab opening Storage/Signals/Historian",
+    "Evaluating expected behavior: canonical source deep links and IDs preserved",
+    "Verified 2-nav sidebar hierarchy and legacy route preservation.",
+    "Scenario REG-013 completed successfully with status PASS."
+  ]
+}

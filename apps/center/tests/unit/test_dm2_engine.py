@@ -223,41 +223,37 @@ async def test_a_failing_model_does_not_stop_the_others(world: World, monkeypatc
     assert [str(r["group_id"]) for r in world.writes[0]] == [good]
 
 
-def test_sample_from_latest_uses_the_last_valid_value() -> None:
-    at = T0 - timedelta(seconds=3)
-    good, wait = E.sample_from_latest({"quality": "GOOD", "value_json": {"v": 5}, "source_time": at, "received_time": T0})
-    assert good == R.Sample(5, "GOOD", at, T0) and wait is None
-    uncertain, _ = E.sample_from_latest({"quality": "UNCERTAIN", "value_json": '{"v": null}', "source_time": None, "received_time": T0})
-    assert uncertain == R.Sample(None, "UNCERTAIN", None, T0)
-    fallback, wait = E.sample_from_latest({"quality": "BAD", "value_json": None, "last_good_value_json": {"v": 4}, "last_good_event_time": at})
-    assert fallback == R.Sample(4, "GOOD", None, at) and wait == at
-    assert E.sample_from_latest({"quality": "BAD", "value_json": None, "last_good_value_json": None}) == (None, None)
+def test_sample_from_latest_holds_last_value_with_its_quality() -> None:
+    # R1-02 / v6 contract Q3: a stale or paused source keeps its last value (flagged by quality),
+    # a BAD source publishes its last GOOD value flagged BAD; nothing is blanked to null.
+    fresh = {"quality": "GOOD", "value_json": {"v": 5}, "source_time": T0, "received_time": T0}
+    assert E.sample_from_latest(fresh, now=T0) == (R.Sample(5, "GOOD", T0, T0), "GOOD")
+    assert E.sample_from_latest(fresh, now=T0 + timedelta(minutes=1)) == (R.Sample(5, "STALE", T0, T0), "STALE")
+    assert E.sample_from_latest({**fresh, "connection_status": "PAUSED"}, now=T0) == (R.Sample(5, "PAUSED", T0, T0), "PAUSED")
+    bad = {**fresh, "quality": "BAD", "last_good_value_json": {"v": 4}, "last_good_event_time": T0}
+    assert E.sample_from_latest(bad, now=T0) == (R.Sample(4, "BAD", T0, T0), "BAD")
+    assert E.sample_from_latest({**fresh, "quality": "BAD"}, now=T0) == (None, "BAD")
 
 
-async def test_load_samples_one_query_plus_cached_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    good_at = T0 - timedelta(minutes=2)
-    source = T0 - timedelta(minutes=3)
+async def test_load_samples_keeps_quality_without_fetching_old_values(monkeypatch: pytest.MonkeyPatch) -> None:
     a, b = str(uuid4()), str(uuid4())
     queries: list[str] = []
 
     async def fetch_all(_s: Any, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         queries.append(sql)
-        if "FROM latest_signal_state" in sql:
-            return [
-                {"signal_id": UUID(a), "quality": "GOOD", "value_json": {"v": 1}, "source_time": T0, "received_time": T0},
-                {"signal_id": UUID(b), "quality": "BAD", "value_json": None, "last_good_value_json": {"v": 7}, "last_good_event_time": good_at},
-            ]
-        assert "FROM observations" in sql and "o.event_time = q.at" in sql
-        return [{"signal_id": UUID(b), "source_time": source}]
+        return [
+            {"signal_id": UUID(a), "quality": "GOOD", "value_json": {"v": 1}, "source_time": T0, "received_time": T0},
+            {"signal_id": UUID(b), "quality": "BAD", "received_time": T0, "last_good_value_json": {"v": 7}},
+        ]
 
     monkeypatch.setattr(E, "fetch_all", fetch_all)
-    E._fallback_source_cache.clear()
-    samples, qualities = await E.load_samples(object(), TENANT, [a, b])  # type: ignore[arg-type]
+    monkeypatch.setattr(E, "utcnow", lambda: T0)
+    samples, qualities = await E.load_samples(object(), TENANT, [a, b])
     assert samples[a] == R.Sample(1, "GOOD", T0, T0)
-    assert samples[b] == R.Sample(7, "GOOD", source, good_at) and qualities[b] == "BAD"
-    assert len(queries) == 2
-    await E.load_samples(object(), TENANT, [a, b])  # type: ignore[arg-type]
-    assert len(queries) == 3  # the fallback source time is cached
+    # BAD publishes the last GOOD value flagged BAD (R1-02), not a blanked null.
+    assert samples[b] == R.Sample(7, "BAD", None, None) and qualities[b] == "BAD"
+    assert len(queries) == 1
+    assert "FROM latest_signal_state" in queries[0]
 
 
 async def test_value_at_query_uses_the_source_time_index(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -267,7 +263,10 @@ async def test_value_at_query_uses_the_source_time_index(monkeypatch: pytest.Mon
         captured.update(sql=sql, params=params)
         return [{"idx": 0, "value_json": {"v": "SO-1"}, "quality": "GOOD", "source_time": T0, "received_time": T0}, {"idx": 1, "value_json": None, "quality": None}]
 
-    monkeypatch.setattr(E, "fetch_all", fetch_all)
+    from factorix.application.history import query_service as QS
+
+    # R2-E C3: the value_at SQL lives in HistoryQueryService (models_engine.fetch_value_at delegates).
+    monkeypatch.setattr(QS, "fetch_all", fetch_all)
     out = await E.fetch_value_at(object(), TENANT, [(SO, T0, "s"), (SIG, T0, "e")])  # type: ignore[arg-type]
     assert out[(SO, T0)] == R.Sample("SO-1", "GOOD", T0, T0) and out[(SIG, T0)] is None
     sql = captured["sql"]

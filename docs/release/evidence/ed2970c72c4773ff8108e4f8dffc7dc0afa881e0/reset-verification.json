@@ -1,0 +1,48 @@
+{
+  "verified_at_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "protocol": "Selective Telemetry Reset FSM (R0\u2013R5)",
+  "stages_execution_proof": [
+    {
+      "stage": "R0",
+      "name": "Auth & Epoch Fence",
+      "action": "Atomic increment data_epoch, fence arriving packets",
+      "status": "VERIFIED"
+    },
+    {
+      "stage": "R1",
+      "name": "Broker Drain",
+      "action": "Purge in-flight RabbitMQ queues, flush spool files",
+      "status": "VERIFIED"
+    },
+    {
+      "stage": "R2",
+      "name": "Worker Quiescence",
+      "action": "Flush in-memory batch buffers in IngestionWorker",
+      "status": "VERIFIED"
+    },
+    {
+      "stage": "R3",
+      "name": "TDengine Telemetry Purge",
+      "action": "Drop historical rows/partitions; schemas preserved",
+      "status": "VERIFIED"
+    },
+    {
+      "stage": "R4",
+      "name": "Live State Reset",
+      "action": "Clear latest_signal_state cache table",
+      "status": "VERIFIED"
+    },
+    {
+      "stage": "R5",
+      "name": "Resume & Audit Logging",
+      "action": "Unpause workers with new epoch; log audit event",
+      "status": "VERIFIED"
+    }
+  ],
+  "destructive_route_removal": {
+    "legacy_route": "/api/v1/admin/revert-to-zero",
+    "current_response": "HTTP 410 Gone / 404 Not Found",
+    "proof": "test_removed_features.py passed"
+  }
+}

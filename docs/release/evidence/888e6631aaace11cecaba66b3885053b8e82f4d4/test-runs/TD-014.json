@@ -1,0 +1,53 @@
+{
+  "test_id": "TD-014",
+  "category": "TD",
+  "suite": "test_td_suite",
+  "runner": "pytest",
+  "scenario": "Create Subtable with mixed binding",
+  "expected": "persisted mapping and first sample physically arrives",
+  "status": "PASS",
+  "duration_ms": 765,
+  "started_at_utc": "2026-11-16T03:00:26.804Z",
+  "finished_at_utc": "2026-11-16T03:00:27.569Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "physical_ddl_executed",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "optimistic_version_checked",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "vgroups_allocated",
+      "expected": 1,
+      "actual": 1
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for TD-014 [TD]",
+    "Target scenario: Create Subtable with mixed binding",
+    "Evaluating expected behavior: persisted mapping and first sample physically arrives",
+    "Verified TDengine physical DDL execution, vgroups=1 allocation, and saga state APPLIED.",
+    "Scenario TD-014 completed successfully with status PASS."
+  ]
+}

@@ -11,11 +11,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 ROOT = Path(__file__).resolve().parents[4]
-for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, value = line.split("=", 1)
-    os.environ.setdefault(key.strip(), value)
+for candidate in (ROOT / ".env", ROOT / ".env.test.example"):
+    if candidate.is_file():
+        for line in candidate.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
 os.environ["FACTORIX_BOOTSTRAP_TOKEN"] = "integration-bootstrap-token"
 os.environ["FACTORIX_ENVIRONMENT"] = "test"
 os.environ["FACTORIX_COOKIE_SECURE"] = "false"
@@ -37,6 +39,10 @@ from tests.safety.test_destructive_guard import check_destructive_test_db_guard
 @pytest.fixture(autouse=True)
 async def _close_pool_between_tests():
     yield
+    try:
+        await _wipe()
+    except Exception:
+        pass
     engine = db_module._engine
     db_module._engine = None
     db_module._session_factory = None
@@ -65,7 +71,11 @@ async def _wipe() -> None:
                   configuration_drafts, configuration_releases, deployment_events, commissioning_jobs,
                   observations, ingest_dedup, latest_signal_state, observation_quarantine,
                   dashboards, dashboard_revisions, retention_policies, retention_jobs,
-                  saved_queries, audit_events, export_jobs
+                  saved_queries, audit_events, export_jobs,
+                  storage_operations, storage_dependencies, storage_physical_registry,
+                  storage_design_versions, storage_recording_policies, storage_field_bindings,
+                  storage_datasets, storage_designs,
+                  collector_runtime_status, telemetry_generations
                 RESTART IDENTITY CASCADE
                 """
             )

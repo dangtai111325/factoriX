@@ -31,7 +31,6 @@ export const KPICard: React.FC<KPICardProps> = ({
           <span className="text-[26px] font-extrabold text-[#111B37] tracking-tight tabular-nums">
             {value}
           </span>
-          {unit && <span className="text-[13px] font-bold text-[#657794]">{unit}</span>}
           {total && <span className="text-[13px] font-medium text-[#94A3B8]">/ {total}</span>}
         </div>
         {change && (

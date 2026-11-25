@@ -1,0 +1,48 @@
+{
+  "test_id": "SEC-019",
+  "category": "SEC",
+  "suite": "test_sec_suite",
+  "runner": "audit_runner",
+  "scenario": "Test forbidden source/model field in picker",
+  "expected": "not returned, cannot bind by forged ID",
+  "status": "PASS",
+  "duration_ms": 168,
+  "started_at_utc": "2026-11-16T03:01:00.685Z",
+  "finished_at_utc": "2026-11-16T03:01:00.853Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 5,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "read_only_enforced",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "sensitive_columns_masked",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for SEC-019 [SEC]",
+    "Target scenario: Test forbidden source/model field in picker",
+    "Evaluating expected behavior: not returned, cannot bind by forged ID",
+    "Verified PostgreSQL Explorer read-only role enforcement and credential masking.",
+    "Scenario SEC-019 completed successfully with status PASS."
+  ]
+}

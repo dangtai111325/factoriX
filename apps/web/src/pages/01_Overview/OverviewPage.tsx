@@ -20,7 +20,7 @@ import { StatusBadge } from '../../components/common/StatusBadge';
 import { refreshCollectorHealth, useCollectorHealth } from '../../components/shell/collectorHealth';
 import { api } from '../../api/client';
 import { ACCOUNT_EVENTS, AuditRow, describeAudit } from '../../utils/auditText';
-import { formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { formatTimestamp, formatCurrentSignalValue, normalizeQuality, timeAgo } from '../../lib/format';
 import { connectivityDelay, onConnectivityRestored, useConnectivity } from '../../lib/connectivity';
 import { qualityLine, summarizeQualities, useValuesReady } from './signalSummary';
 
@@ -300,6 +300,11 @@ export const OverviewPage: React.FC = () => {
     if (collector.state === 'offline') {
       return { tone: 'error', label: 'Collector offline', hint: collector.detail };
     }
+    // P6: the collector is alive but not reporting connection status: the connection states shown are
+    // the last known ones, so this (not "N connections down") is the status.
+    if (collector.reportLate) {
+      return { tone: 'warning', label: 'Collector not reporting', hint: collector.detail };
+    }
     switch (conn.status) {
       case 'NOT_CONFIGURED':
         return { tone: 'neutral', label: 'No connections', hint: 'The collector is online. Add a data connection.' };
@@ -318,6 +323,13 @@ export const OverviewPage: React.FC = () => {
       case 'PENDING':
         return { tone: 'neutral', label: 'Waiting for first data', hint: withInactive('Waiting for the first report from the connections.') };
       default:
+        if (valuesReady && qualityCounts.delayed > 0) {
+          return {
+            tone: 'warning',
+            label: 'Data delayed',
+            hint: `${qualityCounts.delayed} of ${countText(qualityCounts.active, 'signal is', 'signals are')} read normally, but the values reach the appliance late. The last received values are shown.`,
+          };
+        }
         if (collector.state === 'degraded') return { tone: 'warning', label: 'Attention needed', hint: collector.detail };
         return { tone: 'good', label: 'Collecting normally', hint: withInactive('All active connections are delivering data.') };
     }
@@ -772,8 +784,11 @@ export const OverviewPage: React.FC = () => {
                           {resourceName}
                         </td>
                         <td className={`py-2.5 px-3 font-semibold tabular-nums font-mono whitespace-nowrap overflow-hidden text-ellipsis ${connectionLost ? 'text-[#94A3B8]' : 'text-[#111B37]'}`}>
-                          {formatValue(sig.value)}{' '}
-                          {sig.unit ? <span className="font-normal font-sans text-[#657794] text-[11px]">{sig.unit}</span> : null}
+                          {formatCurrentSignalValue(sig.value, connectionLost ? 'NO_CONNECTION' : sig.quality)}
+                          {/* Unit next to a shown value (as in the accepted release). */}
+                          {sig.unit && formatCurrentSignalValue(sig.value, connectionLost ? 'NO_CONNECTION' : sig.quality) !== '—' ? (
+                            <span className="font-normal font-sans text-[#657794] text-[11px] ml-1">{sig.unit}</span>
+                          ) : null}
                         </td>
                         <td className="py-2.5 px-3 whitespace-nowrap">
                           <StatusBadge status={normalizeQuality(sig.quality)} />

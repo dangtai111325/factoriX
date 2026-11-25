@@ -12,11 +12,14 @@ import {
   AlertTriangle,
   Play,
   Square,
+  LineChart,
 } from 'lucide-react';
 import { SignalItem } from '../../types';
 import { Button } from '../../components/common/Button';
 import { StatusBadge } from '../../components/common/StatusBadge';
-import { QUALITY_HINT, QUALITY_LABEL, formatTimestamp, formatValue, normalizeQuality, timeAgo } from '../../lib/format';
+import { DELAYED_HINT, QUALITY_HINT, QUALITY_LABEL, delayLabel, formatCurrentSignalValue, formatTimestamp, isDimmedValue, normalizeQuality, serverStaleAfterMs, timeAgo } from '../../lib/format';
+import { historianLinkForSignal } from './historianLink';
+import { collectorSiteLabel } from '../05_Connections/collectorName';
 
 interface SignalInspectorProps {
   signal: SignalItem | null;
@@ -25,6 +28,7 @@ interface SignalInspectorProps {
   onEdit: (signal: SignalItem) => void;
   onToggleEnabled: (signal: SignalItem) => void;
   onDelete: (signal: SignalItem) => void;
+  onOpenHistorian?: (signal: SignalItem) => void;
   /** True while an enable / disable request runs (the button is disabled). */
   togglePending?: boolean;
   resourceName?: string;
@@ -39,6 +43,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
   onEdit,
   onToggleEnabled,
   onDelete,
+  onOpenHistorian,
   togglePending = false,
   resourceName,
   connectionName,
@@ -48,10 +53,13 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
 
   const isEnabled = signal.enabled !== false;
   const quality = !isEnabled ? 'DISABLED' : normalizeQuality(signal.quality);
-  const formattedVal = formatValue(signal.value);
-  // Center rule: stale after max(2 x expected interval, 12 s) without a new read.
-  const staleSec = Math.round(Math.max(2 * (signal.expectedIntervalMs || 1000), 12000) / 1000);
-  const lastRead = signal.receivedTime || signal.lastUpdated;
+  const formattedVal = formatCurrentSignalValue(signal.value, quality);
+  // Threshold evaluated by the server (signal interval, falling back to the job interval).
+  const staleSec = Math.round(serverStaleAfterMs(signal.staleAfterMs) / 1000);
+  const lastRead = signal.lastAcquiredAt || signal.receivedTime || signal.lastUpdated;
+  const lastChange = signal.lastValueChangedAt || signal.sourceTime;
+  const delayed = delayLabel(signal.freshness, lastRead, signal.deliveryLagMs);
+  const openHistorian = () => (onOpenHistorian ? onOpenHistorian(signal) : window.location.assign(historianLinkForSignal(signal.id)));
 
   return (
     <aside
@@ -83,20 +91,33 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
         <div className="p-4 bg-slate-50 border-b border-slate-100 space-y-3">
           <div className="flex items-start justify-between">
             <div>
-              <div className="text-[28px] font-extrabold text-[#111B37] tabular-nums">
-                {formattedVal}{' '}
-                {signal.unit && (
-                  <span className="text-[14px] font-normal text-[#657794]">{signal.unit}</span>
-                )}
+              <div className={`text-[28px] font-extrabold tabular-nums ${isDimmedValue(quality, signal.freshness) ? 'text-slate-400' : 'text-[#111B37]'}`}>
+                {formattedVal}
               </div>
+              {delayed && (
+                <div className="text-[11px] font-semibold text-amber-700" title={DELAYED_HINT}>
+                  {delayed}
+                </div>
+              )}
               <div className="text-[11px] text-[#657794] mt-0.5" title={formatTimestamp(lastRead)}>
                 Last read {timeAgo(lastRead)}
               </div>
-              <div className="text-[11px] text-[#657794]" title={formatTimestamp(signal.sourceTime)}>
-                Last change {signal.sourceTime ? timeAgo(signal.sourceTime) : '—'}
+              <div className="text-[11px] text-[#657794]" title={formatTimestamp(lastChange)}>
+                Last change {lastChange ? timeAgo(lastChange) : '—'}
               </div>
             </div>
-            <StatusBadge status={quality} />
+            <div className="flex flex-col items-end gap-2">
+              <StatusBadge status={quality} />
+              <button
+                type="button"
+                onClick={openHistorian}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold text-[#EF1B24] bg-white border border-[#FAC6C9] hover:bg-[#FEF2F2] transition-colors shadow-2xs cursor-pointer"
+                title="Open this signal in Historian & Storage trend workspace"
+              >
+                <LineChart className="w-3.5 h-3.5 text-[#EF1B24]" />
+                Open in Historian
+              </button>
+            </div>
           </div>
 
           {/* Quality Reason */}
@@ -105,10 +126,14 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
             <span className="font-semibold text-slate-700">{QUALITY_LABEL[quality]}</span>
             {signal.reasonCode ? <span className="font-mono"> · {signal.reasonCode}</span> : null}
             {' — '}
-            {quality === 'GOOD'
+            {quality === 'GOOD' && delayed
+              ? DELAYED_HINT
+              : quality === 'GOOD'
               ? 'Value read successfully within the expected interval.'
               : quality === 'STALE'
-              ? `No new read within ${staleSec} s.`
+              ? `No new read from the source within ${staleSec} s; the last value is shown.`
+              : quality === 'UNCERTAIN' && signal.reasonCode === 'UNVERIFIED_AFTER_RESTART'
+              ? 'Restored from historian after restart; waiting for the first fresh acquisition.'
               : quality === 'UNCERTAIN'
               ? 'The source or the collector flagged this value as uncertain.'
               : quality === 'BAD'
@@ -150,8 +175,10 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
               </span>
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-[#657794]">Edge collector:</span>
-              <span className="font-medium text-[#111B37]">{edgeName || '—'}</span>
+              <span className="text-[#657794]">Collected by:</span>
+              <span className="font-medium text-[#111B37]">
+                {edgeName ? `Built-in collector · ${collectorSiteLabel(edgeName)}` : '—'}
+              </span>
             </div>
           </div>
 
@@ -186,10 +213,12 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({
 
       {/* Bottom Actions Bar (TC-UI-SG-10..12) */}
       <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-2">
-        <Button variant="outline" size="sm" onClick={() => onEdit(signal)}>
-          <Edit2 className="w-3.5 h-3.5 mr-1.5" />
-          Edit
-        </Button>
+        <div className="flex items-center gap-1.5">
+          <Button variant="outline" size="sm" onClick={() => onEdit(signal)}>
+            <Edit2 className="w-3.5 h-3.5 mr-1.5" />
+            Edit
+          </Button>
+        </div>
 
         <div className="flex items-center gap-2">
           <Button

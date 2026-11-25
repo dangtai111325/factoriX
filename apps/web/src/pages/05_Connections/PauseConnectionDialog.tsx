@@ -10,7 +10,8 @@ function plural(count: number, one: string, many: string): string {
 
 /**
  * R3-CN-02: pausing a connection is confirmed and states its impact: how many signals stop
- * collecting and which data models stop receiving new values (they keep their last values).
+ * collecting and which data models stop receiving new values from it. R1-19: the wording follows the
+ * model engine (v6 contract Q3): a PAUSED field keeps its last value with quality "Paused".
  */
 export const PauseConnectionDialog: React.FC<{
   connection: ConnectionItem | null;
@@ -44,7 +45,11 @@ export const PauseConnectionDialog: React.FC<{
     signalCount === 0
       ? 'No signal is collected through this connection, so nothing stops.'
       : `${plural(signalCount, 'signal stops', 'signals stop')} collecting${
-          modelCount === null ? '' : modelCount === 0 ? '. No data model uses them.' : `, ${plural(modelCount, 'data model freezes', 'data models freeze')}: they keep their last values and show the signals as "Paused" until you resume.`
+          modelCount === null
+            ? '.'
+            : modelCount === 0
+              ? '. No data model uses them.'
+              : `. ${plural(modelCount, 'data model uses', 'data models use')} them: those fields keep their last value, marked "Paused", until you resume. Fields from other connections keep updating.`
         }`;
 
   return (
@@ -67,10 +72,10 @@ export const PauseConnectionDialog: React.FC<{
           onRetry={retry}
           onNavigate={onCancel}
           emptyText="No data model uses the signals of this connection."
-          heading={(count) => `Data models that stop receiving new values (${count}):`}
+          heading={(count) => `Data models that stop receiving new values from it (${count}):`}
         />
       )}
-      <p className="mt-2 text-[11px] text-[#657794]">Resume the connection to collect again. Stored history is kept.</p>
+      <p className="mt-2 text-[11px] text-[#657794]">Resume it from the row menu ⋮ or the connection details to collect again. Stored history is kept.</p>
     </ConfirmDialog>
   );
 };

@@ -1,0 +1,57 @@
+{
+  "verified_at_utc": "2026-11-13T09:20:00Z",
+  "commit_sha": "ed2970c72c4773ff8108e4f8dffc7dc0afa881e0",
+  "tool": "alembic",
+  "migration_history": [
+    {
+      "revision": "0001",
+      "name": "base_control_plane",
+      "status": "APPLIED"
+    },
+    {
+      "revision": "0002",
+      "name": "factory_hierarchy_v2",
+      "status": "APPLIED"
+    },
+    {
+      "revision": "0003",
+      "name": "connector_configurations",
+      "status": "APPLIED"
+    },
+    {
+      "revision": "0004",
+      "name": "signal_catalog_and_tags",
+      "status": "APPLIED"
+    },
+    {
+      "revision": "0005",
+      "name": "data_models_and_expressions",
+      "status": "APPLIED"
+    },
+    {
+      "revision": "0006",
+      "name": "audit_and_security_events",
+      "status": "APPLIED"
+    },
+    {
+      "revision": "0007",
+      "name": "telemetry_generations_and_epochs",
+      "status": "APPLIED"
+    },
+    {
+      "revision": "0008",
+      "name": "storage_and_historian_initial",
+      "status": "APPLIED"
+    },
+    {
+      "revision": "0009",
+      "name": "storage_drafts_and_lifecycle",
+      "status": "APPLIED"
+    }
+  ],
+  "zero_loss_verification": {
+    "downgrade_safety_verified": true,
+    "destructive_drop_columns_present": false,
+    "preserved_existing_tenants_and_hierarchies": true
+  }
+}

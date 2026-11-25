@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Search, X, Box, Activity, Database, ArrowRight, Layers } from 'lucide-react';
+import { Search, X, Box, Activity, Database, ArrowRight, Layers, HardDrive } from 'lucide-react';
 import { useApp } from '../../store/AppContext';
 import { PROTOCOL_LABEL } from '../../lib/protocols';
 import { formatValue, normalizeQuality, QUALITY_LABEL } from '../../lib/format';
 import type { ResourceNode } from '../../types';
 import { ModalPortal } from '../modals/ModalPortal';
+import { api } from '../../api/client';
 
 /** Results shown per section; the count of the rest is shown under it. */
 const SECTION_LIMIT = 8;
@@ -18,7 +19,7 @@ interface ResultItem {
 }
 
 interface Section {
-  key: 'resources' | 'signals' | 'connections' | 'models';
+  key: 'resources' | 'signals' | 'connections' | 'models' | 'storage';
   label: string;
   icon: React.ReactNode;
   items: ResultItem[];
@@ -46,6 +47,48 @@ function resourceContext(byId: Map<string, ResourceNode>, resourceId: string): {
   return { machine: own?.name || '', line: line || parentName };
 }
 
+/** R1-31: Historian & Storage objects (TDengine databases, supertables, subtables) from the storage catalog. */
+interface StorageHit {
+  id: string;
+  physical_name: string;
+  display_name?: string;
+  object_type: string;
+  parent_name?: string;
+  status?: string;
+}
+
+const STORAGE_TYPE_LABEL: Record<string, string> = { database: 'Database', stable: 'Supertable', subtable: 'Subtable' };
+
+/** Server-side search of the storage catalog, debounced; empty while the query is shorter than 2 characters. */
+function useStorageSearch(open: boolean, query: string): { items: StorageHit[]; total: number; loading: boolean } {
+  const [state, setState] = useState<{ items: StorageHit[]; total: number; loading: boolean }>({ items: [], total: 0, loading: false });
+  useEffect(() => {
+    const q = query.trim();
+    if (!open || q.length < 2) {
+      setState({ items: [], total: 0, loading: false });
+      return;
+    }
+    const controller = new AbortController();
+    setState((prev) => ({ ...prev, loading: true }));
+    const timer = window.setTimeout(() => {
+      const params = new URLSearchParams({ search: q, page: '1', page_size: String(SECTION_LIMIT) });
+      api<{ items?: StorageHit[]; total?: number }>(`/api/v1/storage/td/catalog?${params}`, { signal: controller.signal })
+        .then((res) => setState({ items: res.items || [], total: Number(res.total ?? res.items?.length ?? 0), loading: false }))
+        .catch((error) => {
+          if (controller.signal.aborted) return;
+          // Search of the other sections still works; storage results are simply not shown.
+          console.warn('Storage search failed', error);
+          setState({ items: [], total: 0, loading: false });
+        });
+    }, 250);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, query]);
+  return state;
+}
+
 export const SearchModal: React.FC = () => {
   const { searchOpen, setSearchOpen, searchQuery, setSearchQuery, resources, signals, connections, dataModels, loadState } = useApp();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -54,6 +97,7 @@ export const SearchModal: React.FC = () => {
   const byId = useMemo(() => new Map(resources.map((r) => [r.id, r])), [resources]);
   const terms = searchQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const hasQuery = terms.length > 0;
+  const storage = useStorageSearch(searchOpen, searchQuery);
 
   const sections = useMemo<Section[]>(() => {
     const resourceItems = resources
@@ -70,7 +114,10 @@ export const SearchModal: React.FC = () => {
       )
       .map(({ s, ctx }) => {
         const quality = normalizeQuality(s.quality);
-        const value = quality === 'GOOD' || quality === 'UNCERTAIN' ? `${formatValue(s.value ?? null)}${s.unit ? ` ${s.unit}` : ''}` : QUALITY_LABEL[quality];
+        const value =
+          quality === 'GOOD' || quality === 'UNCERTAIN'
+            ? `${formatValue(s.value ?? null)}${s.unit && s.value != null ? ` ${s.unit}` : ''}`
+            : QUALITY_LABEL[quality];
         const where = [ctx.machine || s.resourcePath, ctx.line].filter(Boolean).join(' · ');
         return {
           id: s.id,
@@ -102,11 +149,25 @@ export const SearchModal: React.FC = () => {
       { key: 'signals', label: 'Signals', icon: <Activity className="w-3.5 h-3.5 text-[#0DBA67]" />, items: limit(signalItems, 3), total: signalItems.length },
       { key: 'connections', label: 'Connections', icon: <Database className="w-3.5 h-3.5 text-[#8858EA]" />, items: limit(connectionItems, 2), total: connectionItems.length },
       { key: 'models', label: 'Data Models', icon: <Layers className="w-3.5 h-3.5 text-[#7C3AED]" />, items: limit(modelItems, 2), total: modelItems.length },
+      {
+        key: 'storage',
+        label: 'Historian & Storage',
+        icon: <HardDrive className="w-3.5 h-3.5 text-[#0E7490]" />,
+        items: storage.items.map((o) => ({
+          id: o.id,
+          title: o.display_name && o.display_name !== o.physical_name ? `${o.display_name} (${o.physical_name})` : o.physical_name,
+          sub: [STORAGE_TYPE_LABEL[o.object_type] || o.object_type, o.parent_name ? `in ${o.parent_name}` : '', o.status ? o.status.toLowerCase() : '']
+            .filter(Boolean)
+            .join(' · '),
+          path: `/historian/storage/object/${encodeURIComponent(o.id)}`,
+        })),
+        total: storage.total,
+      },
     ];
     return all.filter((section) => section.items.length > 0);
     // `terms` is derived from searchQuery.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchQuery, resources, signals, connections, dataModels, byId]);
+  }, [searchQuery, resources, signals, connections, dataModels, byId, storage.items, storage.total]);
 
   const allResults = sections.flatMap((section) => section.items);
 
@@ -179,8 +240,8 @@ export const SearchModal: React.FC = () => {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search resources, signals, connections, data models…"
-              aria-label="Search resources, signals, connections and data models"
+              placeholder="Search resources, signals, connections, data models, storage…"
+              aria-label="Search resources, signals, connections, data models and storage objects"
               className="flex-1 min-w-0 text-[15px] text-[#111B37] placeholder-[#94A3B8] outline-none"
             />
             {searchQuery && (
@@ -197,7 +258,7 @@ export const SearchModal: React.FC = () => {
           <div className="max-h-[min(380px,calc(100vh-8rem))] overflow-y-auto p-3 space-y-4">
             {hasQuery && allResults.length === 0 && (
               <div className="py-8 text-center text-[14px] text-[#657794]">
-                {loadState === 'loading' ? 'Loading search index…' : `No results for "${searchQuery}"`}
+                {loadState === 'loading' ? 'Loading search index…' : storage.loading ? 'Searching…' : `No results for "${searchQuery}"`}
               </div>
             )}
 

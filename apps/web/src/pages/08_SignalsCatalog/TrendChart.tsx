@@ -5,7 +5,7 @@ import { SignalItem } from '../../types';
 interface ObservationPoint {
   source_time: string;
   received_time: string;
-  value: number | string | boolean;
+  value: number | string | boolean | null;
   quality: string;
 }
 
@@ -47,7 +47,7 @@ export const TrendChart: React.FC<TrendChartProps> = ({
             const color = SERIES_COLORS[idx % SERIES_COLORS.length];
             try {
               const res = await api<{ items: ObservationPoint[] }>(
-                `/api/v1/observations/history?signal_id=${sig.id}&from=now-${timeframe}&limit=120`
+                `/api/v1/observations/history?signal_id=${sig.id}&from=now-${timeframe}&limit=120&order=newest`
               );
               const points = (res.items || [])
                 .filter((pt) => typeof pt.value === 'number')
@@ -123,7 +123,6 @@ export const TrendChart: React.FC<TrendChartProps> = ({
                 <span className="font-semibold text-[#111B37]">
                   {signal.displayName || signal.name || signal.key}
                 </span>
-                {signal.unit && <span className="text-[#657794] text-[11px]">({signal.unit})</span>}
               </div>
             ))}
           </div>
@@ -206,10 +205,10 @@ export const TrendChart: React.FC<TrendChartProps> = ({
 
             {/* Series Paths */}
             {seriesData.map(({ signal, color, points }) => {
-              if (points.length < 2) return null;
-              const pathD = points
-                .map((pt, i) => `${i === 0 ? 'M' : 'L'} ${getX(pt.time)} ${getY(pt.value)}`)
-                .join(' ');
+              if (points.length === 0) return null;
+              const pathD = points.length >= 2
+                ? points.map((pt, i) => `${i === 0 ? 'M' : 'L'} ${getX(pt.time)} ${getY(pt.value)}`).join(' ')
+                : `M ${paddingLeft} ${getY(points[0].value)} L ${getX(points[0].time)} ${getY(points[0].value)}`;
 
               return (
                 <g key={signal.id}>

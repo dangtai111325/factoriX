@@ -9,4 +9,6 @@ os.environ.setdefault("FACTORIX_ENVIRONMENT", "test")
 
 ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT / "apps" / "center" / "src"))
+sys.path.insert(0, str(ROOT / "apps" / "acquisition" / "src"))
 sys.path.insert(0, str(ROOT / "apps" / "edge" / "src"))
+sys.path.insert(0, str(ROOT / "apps" / "shared" / "src"))

@@ -20,6 +20,7 @@ keys and with ``type = kind``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
@@ -33,6 +34,14 @@ Sender = Callable[[dict[str, Any]], Awaitable[None]]
 DEFAULT_MAX_PENDING = 5000
 SEND_TIMEOUT_S = 10.0
 FLUSH_INTERVAL_S = 0.2
+# Server heartbeat on every socket. A browser that sees no frame for 3 heartbeats treats push as
+# not live and polls REST (liveStream.ts). Each tick also re-evaluates time-based freshness of the
+# signals the socket watches and pushes only transitions (FRESH -> DELAYED -> STALE).
+HEARTBEAT_INTERVAL_S = 5.0
+
+Refresher = Callable[[dict[str, Any]], dict[str, Any]]
+Observer = Callable[[dict[str, Any], dict[str, Any]], None]
+Closer = Callable[[], Awaitable[None]]
 _ROUTING_KEYS = {"kind", "tenant_id", "payload"}
 
 
@@ -61,15 +70,22 @@ def coalesce_key(message: dict[str, Any]) -> tuple[str, ...] | None:
         return ("model_body", str(message["group_id"]))
     if kind == "health" and message.get("id") is not None:
         return ("health", str(message.get("entity") or ""), str(message["id"]))
+    if kind == "heartbeat":
+        return ("heartbeat",)
     return None
 
 
 class Channel:
     """One browser socket: subscriptions, a bounded coalescing buffer and a sender task."""
 
-    def __init__(self, send: Sender, tenant_id: str, *, max_pending: int = DEFAULT_MAX_PENDING) -> None:
+    def __init__(self, send: Sender, tenant_id: str, *, max_pending: int = DEFAULT_MAX_PENDING, on_close: Closer | None = None) -> None:
         self._send = send
+        self._on_close = on_close
         self.tenant_id = tenant_id
+        # Last ``latest`` message offered per signal: the basis of the periodic freshness sweep.
+        self.last_latest: dict[str, dict[str, Any]] = {}
+        self.heartbeat_seq = 0
+        self.sent_frames = 0
         self.signals: set[str] = set()
         self.groups: set[str] = set()
         self.max_pending = max_pending
@@ -87,6 +103,8 @@ class Channel:
         """Queue a message without waiting. Coalesces by key; drops the oldest when full."""
         if self.closed:
             return
+        if message.get("type") == "latest" and message.get("signal_id") is not None:
+            self.last_latest[str(message["signal_id"])] = message
         key = coalesce_key(message)
         if key is None:
             self._sequence += 1
@@ -120,10 +138,18 @@ class Channel:
                     continue
                 frame = messages[0] if len(messages) == 1 else {"type": "batch", "messages": messages}
                 await asyncio.wait_for(self._send(frame), timeout=SEND_TIMEOUT_S)
+                self.sent_frames += 1
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - any send failure ends this socket only
             logger.info("Stream socket closed while sending: %s", type(exc).__name__)
+            # Close the socket itself: otherwise the browser keeps an open but silent socket (zombie)
+            # and believes it receives live data.
+            if self._on_close is not None:
+                try:
+                    await asyncio.wait_for(self._on_close(), timeout=2.0)
+                except Exception:  # noqa: BLE001 - already broken
+                    pass
         finally:
             self.closed = True
 
@@ -136,6 +162,12 @@ class Channel:
 class Hub:
     def __init__(self) -> None:
         self.channels: set[Channel] = set()
+        # refresher: re-evaluates time-based freshness of a ``latest`` message (live_state.refresh_live_message).
+        # observer: records delivery evidence for every live event (PipelineEvidence.note_delivery).
+        self.refresher: Refresher | None = None
+        self.observer: Observer | None = None
+        self.summary: Callable[[], dict[str, dict[str, Any]]] | None = None
+        self.connection_of: Callable[[str], str | None] | None = None
 
     def register(self, channel: Channel) -> None:
         self.channels.add(channel)
@@ -159,6 +191,16 @@ class Hub:
                 if signal_id is None:
                     continue
                 signal_id = str(signal_id)
+                if self.observer is not None:
+                    try:
+                        self.observer(event, message)
+                    except Exception:  # noqa: BLE001 - evidence must never block delivery
+                        logger.debug("Delivery evidence update failed", exc_info=True)
+                if self.refresher is not None:
+                    try:
+                        message = self.refresher(message)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("Freshness refresh failed", exc_info=True)
                 targets = [ch for ch in self.channels if ch.tenant_id == tenant and signal_id in ch.signals]
             elif kind == "health":
                 targets = [ch for ch in self.channels if ch.tenant_id == tenant]
@@ -169,6 +211,58 @@ class Hub:
                 targets = [ch for ch in self.channels if ch.tenant_id == tenant and group_id in ch.groups]
             for channel in targets:
                 channel.offer(message)
+
+    def sweep(self, channel: Channel) -> int:
+        """Re-evaluate freshness of the signals ``channel`` watches; offer only status transitions."""
+        if self.refresher is None:
+            return 0
+        sent = 0
+        for signal_id in list(channel.last_latest):
+            if signal_id not in channel.signals:
+                channel.last_latest.pop(signal_id, None)
+                continue
+            previous = channel.last_latest[signal_id]
+            try:
+                current = self.refresher(previous)
+            except Exception:  # noqa: BLE001
+                continue
+            before = (previous.get("effective_status"), previous.get("freshness"), previous.get("reason_code"))
+            after = (current.get("effective_status"), current.get("freshness"), current.get("reason_code"))
+            if before != after:
+                channel.offer(current)
+                sent += 1
+        return sent
+
+    def heartbeat_frame(self, channel: Channel, server_time: str) -> dict[str, Any]:
+        channel.heartbeat_seq += 1
+        frame: dict[str, Any] = {"type": "heartbeat", "seq": channel.heartbeat_seq, "server_time": server_time}
+        if self.summary is not None and self.connection_of is not None:
+            try:
+                summary = self.summary()
+                wanted = set()
+                for sid in channel.signals:
+                    cid = self.connection_of(sid)
+                    if cid:
+                        wanted.add(cid)
+                frame["pipeline"] = {cid: summary[cid] for cid in wanted if cid in summary}
+            except Exception:  # noqa: BLE001
+                logger.debug("Heartbeat pipeline summary failed", exc_info=True)
+        return frame
+
+    def tick(self, server_time: str) -> None:
+        for channel in list(self.channels):
+            if channel.closed:
+                continue
+            self.sweep(channel)
+            channel.offer(self.heartbeat_frame(channel, server_time))
+
+    async def heartbeat_loop(self, clock: Callable[[], str], interval_s: float = HEARTBEAT_INTERVAL_S) -> None:
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                self.tick(clock())
+            except Exception:  # noqa: BLE001 - the heartbeat must keep running
+                logger.warning("Stream heartbeat tick failed", exc_info=True)
 
 
 def origin_allowed(origin: str | None, host: str | None, allowed_origins: Iterable[str]) -> bool:
@@ -190,3 +284,22 @@ def origin_allowed(origin: str | None, host: str | None, allowed_origins: Iterab
     if host and parsed.netloc.lower() == host.strip().lower():
         return True
     return False
+
+
+def parse_pg_notify_events(channel: str, payload: str) -> list[dict[str, Any]]:
+    """Decode asyncpg NOTIFY payloads from IngestionWorker or local Acquisition pg_control."""
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    events = data.get("events")
+    if isinstance(events, list):
+        return [ev for ev in events if isinstance(ev, dict) and ev.get("kind") and ev.get("tenant_id")]
+    if isinstance(data.get("event"), dict) and data.get("tenant_id"):
+        kind = "health" if channel == "factorix_health_changed" or data["event"].get("type") == "health" else str(data["event"].get("type") or "health")
+        return [{"kind": kind, "tenant_id": str(data["tenant_id"]), "payload": data["event"]}]
+    return []

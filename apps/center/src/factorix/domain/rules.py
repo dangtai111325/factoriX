@@ -31,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
+from factorix_core.time import as_utc as _core_as_utc
+
 # Rule size limits (R4-DM-02). The character budget measures what the user writes: every data
 # point / resource reference counts as ONE character, whatever its stored token or display length
 # (``{{sig:<uuid>}}`` is 44 characters, ``$machine[AA10-01].machine_temp_1`` 32). Without that a
@@ -130,21 +132,7 @@ class Sample:
         return self.source_time or self.received_time
 
 
-def as_utc(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
-        except ValueError:
-            return None
-        return as_utc(parsed)
-    return None
+as_utc = _core_as_utc  # shared kernel ``factorix_core.time.as_utc`` (R2-E B7; same implementation as before)
 
 
 def fmt_ts(value: datetime) -> str:

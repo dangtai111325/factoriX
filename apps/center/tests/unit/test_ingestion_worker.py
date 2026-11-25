@@ -1,0 +1,1180 @@
+"""Unit tests for IngestionWorker, chunked PG NOTIFY bridge, and local-acquisition app helpers (S06)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timedelta, timezone
+import time
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID, uuid4
+
+import pytest
+
+from factorix.domain.canonical import CanonicalObservation, CanonicalProvenance, derive_event_uid
+from factorix.domain.quality import Origin, Quality
+from factorix.modules.ingestion_worker import (
+    MAX_MESSAGE_BYTES,
+    IngestionWorker,
+    TenantCatalog,
+    _emit_chunked_notify,
+)
+from factorix.platform.broker import BrokerConfig, ConsumeOutcome
+from factorix.platform.tdengine import BatchWriteFailure, BatchWriteResult, TDEngineError, TDEngineHealth
+from factorix.transport.app import _parse_pg_notify_events
+
+
+def _now() -> datetime:
+    return datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(("prefetch", "concurrency"), [(2, 4), (4, 2), (0, 2)])
+async def test_ingestion_flushes_a_full_delivery_window_without_waiting_for_timer(prefetch, concurrency):
+    worker = IngestionWorker(
+        pg_store=MagicMock(), tdengine=MagicMock(), batch_size=8, flush_ms=5_000,
+        broker_cfg=BrokerConfig(amqp_url="amqp://localhost/", prefetch_count=prefetch, consumer_concurrency=concurrency),
+    )
+
+    async def commit_batch(batch):
+        assert len(batch) == 2
+        for envelope in batch:
+            envelope.future.set_result(ConsumeOutcome.ACK)
+
+    worker._process_batch = commit_batch
+    batcher = asyncio.create_task(worker._batcher_loop())
+    messages = [MagicMock(body=b"{}", message_id=str(index), headers={}, redelivered=False) for index in range(2)]
+    try:
+        outcomes = await asyncio.wait_for(asyncio.gather(*(worker.handle_message(message) for message in messages)), 1)
+        assert outcomes == [ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+    finally:
+        worker._stop_event.set()
+        worker._wake_batcher.set()
+        await batcher
+
+
+@pytest.mark.asyncio
+async def test_each_lane_wakes_on_its_own_delivery_window():
+    worker = IngestionWorker(
+        pg_store=MagicMock(), tdengine=MagicMock(), batch_size=8, flush_ms=5_000,
+        broker_cfg=BrokerConfig(
+            amqp_url="amqp://localhost/", prefetch_count=2, consumer_concurrency=2,
+            live_prefetch_count=4, live_consumer_concurrency=3,
+        ),
+    )
+    message = MagicMock(body=b"{}", message_id="message", headers={}, redelivered=False)
+    handlers = [worker.handle_live_message, worker.handle_legacy_message,
+                worker.handle_live_message, worker.handle_live_message, worker.handle_legacy_message]
+    expected = [(False, False), (False, False), (False, False), (True, False), (True, True)]
+    tasks = []
+    try:
+        for index, handle in enumerate(handlers):
+            tasks.append(asyncio.create_task(handle(message)))
+            await asyncio.sleep(0)
+            assert (worker._wake_live.is_set(), worker._wake_legacy.is_set()) == expected[index]
+        assert len(worker._take_lane_batch("live")) == 3
+        assert len(worker._take_lane_batch("legacy")) == 2
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _make_obs(
+    *,
+    tenant_id: UUID,
+    signal_id: UUID,
+    resource_id: UUID,
+    connection_id: UUID,
+    source_field_id: UUID,
+    site_id: UUID | None = None,
+    value: Any = 42.5,
+    value_type: str = "float64",
+    quality: Quality = Quality.GOOD,
+    origin: Origin = Origin.LIVE,
+    data_epoch: int = 1,
+    event_uid: str | None = None,
+    acquired_at: datetime | None = None,
+    seq: int = 1,
+) -> CanonicalObservation:
+    acq = acquired_at or _now()
+    uid = event_uid or derive_event_uid(
+        tenant_id=tenant_id,
+        connection_id=connection_id,
+        source_field_id=source_field_id,
+        signal_id=signal_id,
+        acquired_at=acq,
+        sequence_or_key=f"seq-{seq}-{uuid4().hex[:6]}",
+        data_epoch=data_epoch,
+    )
+    return CanonicalObservation(
+        event_uid=uid,
+        tenant_id=tenant_id,
+        site_id=site_id,
+        connection_id=connection_id,
+        acquisition_job_id=uuid4(),
+        source_field_id=source_field_id,
+        signal_id=signal_id,
+        resource_id=resource_id,
+        source_time=acq - timedelta(milliseconds=10),
+        acquired_at=acq,
+        value_type=value_type,
+        value=value,
+        unit="°C" if value_type == "float64" else None,
+        quality=quality,
+        origin=origin,
+        data_epoch=data_epoch,
+        config_revision=1,
+        source_sequence=seq,
+        provenance=CanonicalProvenance(
+            protocol="modbus_tcp",
+            connection_id=connection_id,
+            source_field_id=source_field_id,
+            config_revision=1,
+        ),
+    )
+
+
+class _FakePgStore:
+    def __init__(self, catalog: TenantCatalog) -> None:
+        self.catalog = catalog
+        self.quarantined: list[dict[str, Any]] = []
+        self.audits: list[dict[str, Any]] = []
+        self.commits: list[dict[str, Any]] = []
+        self.latest_values: dict[UUID, dict[str, Any]] = {}
+        self.load_calls = 0
+
+    async def start(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    @staticmethod
+    def is_retryable_pg_error(exc: BaseException) -> bool:
+        return isinstance(exc, TimeoutError)
+
+    async def fetch_tenant_epoch(self, _tenant_id: UUID) -> tuple[int, str]:
+        return self.catalog.active_epoch, self.catalog.lifecycle_state
+
+    async def load_tenant_catalog(self, _tenant_id: UUID) -> TenantCatalog:
+        self.load_calls += 1
+        return self.catalog
+
+    async def write_quarantine(self, **kwargs: Any) -> None:
+        self.quarantined.append(kwargs)
+
+    async def write_audit(self, **kwargs: Any) -> None:
+        self.audits.append(kwargs)
+
+    async def fetch_latest_values(self, _tenant_id: UUID, signal_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
+        return {sid: self.latest_values[sid] for sid in signal_ids if sid in self.latest_values}
+
+    async def commit_batch_metadata(self, **kwargs: Any) -> tuple[set[UUID], list[dict[str, Any]]]:
+        self.commits.append(kwargs)
+        replaced = {r["signal_id"] for r in kwargs["latest_rows"]}
+        return replaced, []
+
+
+class _FakeTDEngine:
+    def __init__(self) -> None:
+        self.ensured: list[UUID] = []
+        self.writes: list[list[dict[str, Any]]] = []
+        self.scripted: list[Any] = []
+
+    async def ensure_operational_schema(self, tenant_id: UUID, **_kw: Any) -> str:
+        self.ensured.append(tenant_id)
+        return f"fx_t_{tenant_id.hex}"
+
+    async def write_operational_observations(
+        self, _tenant_id: UUID, records: list[dict[str, Any]], **_kw: Any
+    ) -> BatchWriteResult:
+        if self.scripted:
+            action = self.scripted.pop(0)
+            if callable(action):
+                return action(records)
+            if isinstance(action, Exception):
+                raise action
+            return action
+        self.writes.append(list(records))
+        return BatchWriteResult(succeeded_ids=tuple(str(r["event_uid"]) for r in records), failures=())
+
+    async def health_probe(self) -> TDEngineHealth:
+        return TDEngineHealth(reachable=True, server_version="3.3.6.13", edition="community")
+
+
+def _catalog_with_signal(
+    *,
+    tenant_id: UUID | None = None,
+    sig_id: UUID | None = None,
+    res_id: UUID | None = None,
+    conn_id: UUID | None = None,
+    field_id: UUID | None = None,
+    site_id: UUID | None = None,
+    active_epoch: int = 1,
+    lifecycle_state: str = "ACTIVE",
+) -> tuple[TenantCatalog, dict[str, UUID]]:
+    tid = tenant_id or uuid4()
+    sid = sig_id or uuid4()
+    rid = res_id or uuid4()
+    cid = conn_id or uuid4()
+    fid = field_id or uuid4()
+    stid = site_id or uuid4()
+    cat = TenantCatalog(
+        tenant_id=tid,
+        active_epoch=active_epoch,
+        lifecycle_state=lifecycle_state,
+        bindings={
+            sid: [
+                {
+                    "signal_id": sid,
+                    "valid_from": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "valid_to": None,
+                    "resource_id": rid,
+                    "expected_interval_ms": 1000,
+                    "site_id": stid,
+                    "connection_id": cid,
+                    "source_field_id": fid,
+                    "nullable": False,
+                }
+            ]
+        },
+    )
+    return cat, {"tenant_id": tid, "signal_id": sid, "resource_id": rid, "connection_id": cid, "field_id": fid, "site_id": stid}
+
+
+def test_parse_pg_notify_events_supports_batch_and_single_formats() -> None:
+    tid = str(uuid4())
+    sid = str(uuid4())
+    batch_payload = json.dumps(
+        {"events": [{"kind": "latest", "tenant_id": tid, "signal_id": sid, "payload": {"type": "latest", "value": 1}}]}
+    )
+    parsed = _parse_pg_notify_events("factorix_stream_events", batch_payload)
+    assert len(parsed) == 1 and parsed[0]["kind"] == "latest" and parsed[0]["signal_id"] == sid
+
+    single_payload = json.dumps({"tenant_id": tid, "event": {"type": "health", "entity": "connection", "id": sid}})
+    parsed_single = _parse_pg_notify_events("factorix_health_changed", single_payload)
+    assert len(parsed_single) == 1 and parsed_single[0]["kind"] == "health" and parsed_single[0]["tenant_id"] == tid
+
+    assert _parse_pg_notify_events("factorix_stream_events", "{bad json") == []
+    assert _parse_pg_notify_events("factorix_stream_events", "") == []
+
+
+@pytest.mark.asyncio
+async def test_oversize_malformed_test_and_calculated_handling() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)  # type: ignore[arg-type]
+
+    test_obs = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        origin=Origin.TEST,
+    )
+    calc_obs = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        origin=Origin.CALCULATED,
+    )
+
+    outcomes = await w.ingest_direct_bytes(
+        [
+            (b"x" * (MAX_MESSAGE_BYTES + 1), {"x-tenant-id": str(ids["tenant_id"])}, "big-1", False),
+            (b"{not valid json", {"x-tenant-id": str(ids["tenant_id"])}, "bad-json", False),
+            (test_obs.to_json_bytes(), {}, test_obs.event_uid, False),
+            (calc_obs.to_json_bytes(), {}, calc_obs.event_uid, False),
+        ]
+    )
+
+    assert outcomes == [
+        ConsumeOutcome.DEAD_LETTER,
+        ConsumeOutcome.DEAD_LETTER,
+        ConsumeOutcome.ACK,
+        ConsumeOutcome.DEAD_LETTER,
+    ]
+    assert len(pg.quarantined) == 3
+    assert td.writes == []
+    assert w.metrics.test_dropped == 1
+    assert w.metrics.dlq_total == 3
+
+
+@pytest.mark.asyncio
+async def test_epoch_fencing_and_resetting_lifecycle_hold() -> None:
+    cat, ids = _catalog_with_signal(active_epoch=5, lifecycle_state="RESETTING")
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)  # type: ignore[arg-type]
+
+    # 1. Old epoch drops immediately even while RESETTING
+    stale_obs = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        data_epoch=4,
+    )
+    ahead_obs = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        data_epoch=6,
+    )
+    out = await w.ingest_direct_bytes(
+        [
+            (stale_obs.to_json_bytes(), {}, stale_obs.event_uid, False),
+            (ahead_obs.to_json_bytes(), {}, ahead_obs.event_uid, False),
+        ]
+    )
+    assert out == [ConsumeOutcome.ACK, ConsumeOutcome.DEAD_LETTER]
+    assert w.metrics.epoch_fenced_dropped == 1
+    assert td.writes == []
+
+    # 2. Active epoch holds cleanly while RESETTING, then commits as soon as lifecycle returns to ACTIVE
+    cur_obs = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        data_epoch=5,
+    )
+
+    async def _release_reset() -> None:
+        await asyncio.sleep(0.15)
+        cat.lifecycle_state = "ACTIVE"
+
+    rel_task = asyncio.create_task(_release_reset())
+    out2 = await w.ingest_direct_bytes([(cur_obs.to_json_bytes(), {}, cur_obs.event_uid, False)])
+    await rel_task
+    assert out2 == [ConsumeOutcome.ACK]
+    assert len(td.writes) == 1 and len(td.writes[0]) == 1
+
+    # 3. Worker stopping while RESETTING returns RETRY cleanly (requeue, not DLQ)
+    cat.lifecycle_state = "RESETTING"
+    w._stopping = True
+    w._stop_event.set()
+    out3 = await w.ingest_direct_bytes([(cur_obs.to_json_bytes(), {}, cur_obs.event_uid, False)])
+    assert out3 == [ConsumeOutcome.RETRY]
+
+
+@pytest.mark.asyncio
+async def test_unbound_and_scope_mismatch_quarantined_and_dead_lettered() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)  # type: ignore[arg-type]
+
+    wrong_signal = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=uuid4(),
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+    )
+    wrong_resource = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=uuid4(),
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+    )
+    wrong_conn = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=uuid4(),
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+    )
+
+    outcomes = await w.ingest_direct_bytes(
+        [
+            (wrong_signal.to_json_bytes(), {}, wrong_signal.event_uid, False),
+            (wrong_resource.to_json_bytes(), {}, wrong_resource.event_uid, False),
+            (wrong_conn.to_json_bytes(), {}, wrong_conn.event_uid, False),
+        ]
+    )
+    assert outcomes == [ConsumeOutcome.DEAD_LETTER] * 3
+    assert len(pg.quarantined) == 3
+    assert td.writes == []
+
+
+@pytest.mark.asyncio
+async def test_tdengine_schema_missing_retryable_hold_and_partial_isolation() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)  # type: ignore[arg-type]
+
+    # Case A: Schema missing (retryable=False in driver) triggers ensure_operational_schema retry & succeeds
+    o1 = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        value=11.5,
+    )
+    td.scripted.append(TDEngineError("QUERY_FAILED", "Table does not exist", retryable=False))
+    res = await w.ingest_direct_bytes([(o1.to_json_bytes(), {}, o1.event_uid, False)])
+    assert res == [ConsumeOutcome.ACK]
+    assert len(td.ensured) == 2
+
+    # Case B: Retryable outage (6 failures) is absorbed in-worker without returning RETRY to RMQ
+    o2 = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        value=12.5,
+    )
+    for _ in range(3):
+        td.scripted.append(TDEngineError("CONN", "ws down", retryable=True))
+    res2 = await w.ingest_direct_bytes([(o2.to_json_bytes(), {}, o2.event_uid, False)])
+    assert res2 == [ConsumeOutcome.ACK]
+    assert w.metrics.tdengine_retryable_errors == 3
+
+    # Case C: Partial batch failure isolates ONLY permanent bad item while good sibling commits
+    good = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        value=13.5,
+        seq=10,
+    )
+    bad = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+        value=14.5,
+        seq=11,
+    )
+
+    def _partial(recs: list[dict[str, Any]]) -> BatchWriteResult:
+        td.writes.append(list(recs))
+        return BatchWriteResult(
+            succeeded_ids=(good.event_uid,),
+            failures=(BatchWriteFailure(bad.event_uid, "sub_1", "BAD_TYPE", "Permanent type error", retryable=False),),
+        )
+
+    td.scripted.append(_partial)
+    res3 = await w.ingest_direct_bytes(
+        [
+            (good.to_json_bytes(), {}, good.event_uid, False),
+            (bad.to_json_bytes(), {}, bad.event_uid, False),
+        ]
+    )
+    assert res3 == [ConsumeOutcome.ACK, ConsumeOutcome.DEAD_LETTER]
+    assert len(pg.quarantined) == 1 and pg.quarantined[0]["event_uid"] == bad.event_uid
+    assert pg.commits[-1]["latest_rows"][0]["event_uid"] == good.event_uid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("update_connection_liveness", [True, False])
+async def test_connection_freshness_respects_source_health_ownership(update_connection_liveness: bool) -> None:
+    catalog, ids = _catalog_with_signal()
+    pg = _FakePgStore(catalog)
+    worker = IngestionWorker(
+        pg_store=pg, tdengine=_FakeTDEngine(), update_connection_liveness=update_connection_liveness,
+    )
+    newest = datetime.now(timezone.utc) - timedelta(minutes=10)
+    observations = [
+        _make_obs(
+            tenant_id=ids["tenant_id"], signal_id=ids["signal_id"], resource_id=ids["resource_id"],
+            connection_id=ids["connection_id"], source_field_id=ids["field_id"], site_id=ids["site_id"],
+            acquired_at=sample_time, quality=quality,
+        )
+        for sample_time, quality in (
+            (newest, Quality.GOOD),
+            (newest - timedelta(minutes=2), Quality.UNCERTAIN),
+            (newest + timedelta(minutes=1), Quality.BAD),
+        )
+    ]
+
+    outcomes = await worker.ingest_direct_bytes([
+        (obs.to_json_bytes(), {}, obs.event_uid, False) for obs in observations
+    ])
+
+    assert outcomes == [ConsumeOutcome.ACK] * len(observations)
+    expected = {ids["connection_id"]: newest} if update_connection_liveness else {}
+    assert pg.commits[0]["connection_sample_times"] == expected
+
+
+@pytest.mark.asyncio
+async def test_in_batch_and_lru_dedup_and_redelivery_replay() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)  # type: ignore[arg-type]
+
+    obs = _make_obs(
+        tenant_id=ids["tenant_id"],
+        signal_id=ids["signal_id"],
+        resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"],
+        source_field_id=ids["field_id"],
+        site_id=ids["site_id"],
+    )
+    # Same batch duplicate -> processed once, dedup_hits += 1
+    res = await w.ingest_direct_bytes(
+        [
+            (obs.to_json_bytes(), {}, obs.event_uid, False),
+            (obs.to_json_bytes(), {}, obs.event_uid, False),
+        ]
+    )
+    assert res == [ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+    assert len(td.writes[-1]) == 1
+    assert w.metrics.dedup_hits == 1
+
+    # Fresh non-redelivered message with same UID hits LRU
+    res2 = await w.ingest_direct_bytes([(obs.to_json_bytes(), {}, obs.event_uid, False)])
+    assert res2 == [ConsumeOutcome.ACK]
+    assert w.metrics.dedup_hits == 2
+
+    # Broker redelivered=True bypasses LRU so unACKed crash recovery still commits cleanly
+    writes_before = len(td.writes)
+    res3 = await w.ingest_direct_bytes([(obs.to_json_bytes(), {}, obs.event_uid, True)])
+    assert res3 == [ConsumeOutcome.ACK]
+    assert len(td.writes) == writes_before + 1
+
+
+@pytest.mark.asyncio
+async def test_synchronous_formula_cascade_bounded_to_depth_4() -> None:
+    tid = uuid4()
+    rid = uuid4()
+    cid = uuid4()
+    fid = uuid4()
+    stid = uuid4()
+    s = [uuid4() for _ in range(6)]  # s0 -> s1 (d0) -> s2 (d1) -> s3 (d2) -> s4 (d3) -> s5 (d4 skipped!)
+    formulas = [uuid4() for _ in range(5)]
+
+    formulas_by_dep: dict[UUID, list[dict[str, Any]]] = {}
+    formula_aliases: dict[UUID, list[dict[str, Any]]] = {}
+    for idx in range(5):
+        f_id = formulas[idx]
+        dep = s[idx]
+        out = s[idx + 1]
+        formulas_by_dep[dep] = [
+            {
+                "dependency_signal_id": dep,
+                "formula_id": f_id,
+                "output_id": out,
+                "expression_source": "x + 1",
+                "revision": 1,
+                "resource_id": rid,
+                "data_type": "float64",
+                "unit": "°C",
+                "expected_interval_ms": 1000,
+                "site_id": stid,
+            }
+        ]
+        formula_aliases[f_id] = [{"formula_id": f_id, "variable_alias": "x", "dependency_signal_id": dep}]
+
+    cat = TenantCatalog(
+        tenant_id=tid,
+        active_epoch=1,
+        lifecycle_state="ACTIVE",
+        bindings={
+            s[0]: [
+                {
+                    "signal_id": s[0],
+                    "valid_from": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "valid_to": None,
+                    "resource_id": rid,
+                    "expected_interval_ms": 1000,
+                    "site_id": stid,
+                    "connection_id": cid,
+                    "source_field_id": fid,
+                    "nullable": False,
+                }
+            ]
+        },
+        formula_inputs={s[0], s[1], s[2], s[3], s[4]},
+        formulas_by_dep=formulas_by_dep,
+        formula_aliases=formula_aliases,
+    )
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)  # type: ignore[arg-type]
+
+    obs = _make_obs(
+        tenant_id=tid,
+        signal_id=s[0],
+        resource_id=rid,
+        connection_id=cid,
+        source_field_id=fid,
+        site_id=stid,
+        value=10.0,
+    )
+    out = await w.ingest_direct_bytes([(obs.to_json_bytes(), {}, obs.event_uid, False)])
+    assert out == [ConsumeOutcome.ACK]
+
+    # td.writes[0] = raw s[0], td.writes[1] = 4 calculated hops (s[1]..s[4]), depth 4 (s[5]) skipped!
+    assert len(td.writes) == 2
+    calc_records = td.writes[1]
+    assert [r["signal_id"] for r in calc_records] == [s[1], s[2], s[3], s[4]]
+    assert [r["val"] if "val" in r else r["value"] for r in calc_records] == [11.0, 12.0, 13.0, 14.0]
+    assert all(r["event_uid"].startswith("calc:") for r in calc_records)
+    latest_by_sig = {r["signal_id"]: r["value"] for r in pg.commits[-1]["latest_rows"]}
+    assert s[5] not in latest_by_sig
+    assert latest_by_sig == {s[0]: 10.0, s[1]: 11.0, s[2]: 12.0, s[3]: 13.0, s[4]: 14.0}
+
+
+@pytest.mark.asyncio
+async def test_emit_chunked_notify_respects_count_and_8kb_limit() -> None:
+    conn = MagicMock(execute=AsyncMock())
+    events = [
+        {"kind": "latest", "tenant_id": "t1", "signal_id": f"s{i}", "payload": {"value": i}}
+        for i in range(45)
+    ]
+    await _emit_chunked_notify(conn, "factorix_stream_events", events)
+    conn.execute.assert_awaited_once()
+    _, channel, payloads = conn.execute.await_args.args
+    assert channel == "factorix_stream_events"
+    batches = [json.loads(payload)["events"] for payload in payloads]
+    assert [len(batch) for batch in batches] == [45]  # one NOTIFY while the payload fits
+    assert [event for batch in batches for event in batch] == events
+    assert all(len(payload.encode("utf-8")) < 8000 for payload in payloads)
+
+    # Wide single event shrinks payload value field automatically if > 7900 bytes
+    conn.execute.reset_mock()
+    huge_event = {
+        "kind": "latest",
+        "tenant_id": "t1",
+        "signal_id": "s-big",
+        "payload": {"type": "latest", "signal_id": "s-big", "value": "A" * 9000},
+    }
+    await _emit_chunked_notify(conn, "factorix_stream_events", [huge_event, *events])
+    conn.execute.assert_awaited_once()
+    _, _, payloads = conn.execute.await_args.args
+    assert all(len(payload.encode("utf-8")) < 8000 for payload in payloads)
+    assert "value" not in json.loads(payloads[0])["events"][0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_overview_and_ready_report_degraded_or_503_when_ingestion_missing_under_tdengine(monkeypatch: pytest.MonkeyPatch) -> None:
+    from factorix.platform.errors import AppError
+    from factorix.transport import app as transport_app
+
+    now = datetime.now(timezone.utc)
+    fake_settings = MagicMock()
+    fake_settings.appliance = True
+    fake_settings.collector_mode = "acquisition"
+    fake_settings.tdengine_dsn = "ws://root:taosdata@127.0.0.1:6041"
+    monkeypatch.setattr(transport_app, "settings", fake_settings)
+
+    class _FakeNested:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            return False
+
+    class _FakeSession:
+        def begin_nested(self) -> _FakeNested:
+            return _FakeNested()
+
+    # Case 1: /health/ready fails with INGESTION_DOWN when acquisition is fresh but ingestion row is missing
+    acq_only_rows = [{"role": "acquisition", "health": "HEALTHY", "broker_ok": True, "last_heartbeat": now}]
+    monkeypatch.setattr(transport_app, "fetch_one", AsyncMock(return_value={"ok": 1}))
+    monkeypatch.setattr(transport_app, "fetch_all", AsyncMock(return_value=acq_only_rows))
+    with pytest.raises(AppError) as exc:
+        await transport_app.ready(session=_FakeSession())  # type: ignore[arg-type]
+    assert exc.value.code == "INGESTION_DOWN"
+
+    # Case 2: /health/ready succeeds when both acquisition & ingestion heartbeats are fresh
+    both_rows = [
+        {"role": "acquisition", "health": "HEALTHY", "broker_ok": True, "last_heartbeat": now},
+        {"role": "ingestion", "health": "HEALTHY", "broker_ok": True, "last_heartbeat": now},
+    ]
+    monkeypatch.setattr(transport_app, "fetch_all", AsyncMock(return_value=both_rows))
+    assert await transport_app.ready(session=_FakeSession()) == {"status": "ready"}  # type: ignore[arg-type]
+
+    # Case 3: /api/v1/overview marks collector_status='DEGRADED' when tdengine_dsn is set and ingestion row is missing
+    async def _fake_fetch_one(_s: Any, sql: str, _p: dict[str, Any]) -> dict[str, Any]:
+        if "FROM resources r" in sql or "FROM resources WHERE" in sql:
+            return {"count": 1}
+        if "latest_signal_state" in sql:
+            return {"last_at": now}
+        return {}
+
+    async def _fake_fetch_all(_s: Any, sql: str, _p: dict[str, Any]) -> list[dict[str, Any]]:
+        if "collector_runtime_status" in sql:
+            return [{"instance_id": "acq-1", "role": "acquisition", "health": "HEALTHY", "broker_ok": True, "last_heartbeat": now}]
+        return []
+
+    monkeypatch.setattr(transport_app, "fetch_one", _fake_fetch_one)
+    monkeypatch.setattr(transport_app, "fetch_all", _fake_fetch_all)
+    monkeypatch.setattr(transport_app.collect, "list_connections", AsyncMock(return_value=[]))
+    monkeypatch.setattr(transport_app.telemetry, "storage_overview", AsyncMock(return_value={"ingest_per_minute": 12}))
+
+    ov = await transport_app.overview(principal={"tenant_id": str(uuid4()), "admin_id": str(uuid4())}, session=_FakeSession())  # type: ignore[arg-type]
+    assert ov["collector_status"] == "DEGRADED"
+
+
+@pytest.mark.asyncio
+async def test_multi_sample_formula_batch_evaluates_chronologically() -> None:
+    tid, rid, cid, fid, stid = uuid4(), uuid4(), uuid4(), uuid4(), uuid4()
+    s0, s1, f0 = uuid4(), uuid4(), uuid4()
+    cat = TenantCatalog(
+        tenant_id=tid,
+        active_epoch=1,
+        lifecycle_state="ACTIVE",
+        bindings={
+            s0: [
+                {
+                    "signal_id": s0,
+                    "valid_from": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "valid_to": None,
+                    "resource_id": rid,
+                    "expected_interval_ms": 1000,
+                    "site_id": stid,
+                    "connection_id": cid,
+                    "source_field_id": fid,
+                    "nullable": False,
+                }
+            ]
+        },
+        formula_inputs={s0},
+        formulas_by_dep={
+            s0: [
+                {
+                    "dependency_signal_id": s0,
+                    "formula_id": f0,
+                    "output_id": s1,
+                    "expression_source": "x * 2",
+                    "revision": 1,
+                    "resource_id": rid,
+                    "data_type": "float64",
+                    "unit": "°C",
+                    "expected_interval_ms": 1000,
+                    "site_id": stid,
+                }
+            ]
+        },
+        formula_aliases={f0: [{"formula_id": f0, "variable_alias": "x", "dependency_signal_id": s0}]},
+    )
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)  # type: ignore[arg-type]
+
+    t0 = _now()
+    b0 = _make_obs(tenant_id=tid, signal_id=s0, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=10.0, acquired_at=t0, seq=1)
+    b1 = _make_obs(tenant_id=tid, signal_id=s0, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=10.5, acquired_at=t0 + timedelta(seconds=1), seq=2)
+    b2 = _make_obs(tenant_id=tid, signal_id=s0, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=12.0, quality=Quality.BAD, acquired_at=t0 + timedelta(seconds=2), seq=3)
+
+    # Deliberately pass b2 before b0/b1 inside the same batch to verify causal chronological ordering!
+    out = await w.ingest_direct_bytes(
+        [
+            (b2.to_json_bytes(), {}, b2.event_uid, False),
+            (b0.to_json_bytes(), {}, b0.event_uid, False),
+            (b1.to_json_bytes(), {}, b1.event_uid, False),
+        ]
+    )
+    assert out == [ConsumeOutcome.ACK, ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+    assert len(td.writes) == 2
+    calc_recs = td.writes[1]
+    assert [r["value"] for r in calc_recs] == [20.0, 21.0, 24.0]
+    assert [r["raw_quality"] for r in calc_recs] == ["GOOD", "GOOD", "BAD"]
+    latest_s1 = next(r for r in pg.commits[-1]["latest_rows"] if r["signal_id"] == s1)
+    assert latest_s1["value"] == 24.0 and latest_s1["quality"] == "BAD"
+
+    late = _make_obs(tenant_id=tid, signal_id=s0, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=9.0, acquired_at=t0 - timedelta(seconds=1))
+    assert await w.ingest_direct_bytes([(late.to_json_bytes(), {}, late.event_uid, False)]) == [ConsumeOutcome.ACK]
+    assert len(td.writes) == 3
+    assert td.writes[-1][0]["event_uid"] == late.event_uid
+    assert pg.commits[-1]["latest_rows"] == []
+    assert pg.commits[-1]["stream_events"] == []
+    assert w._live_cache[tid][s0].last_acquired_at == b2.acquired_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("alias_epoch", "alias_offset", "should_calculate"), [(2, 1, False), (1, -1, False), (2, -1, True)])
+async def test_formula_seed_requires_causal_active_epoch_sample(alias_epoch: int, alias_offset: int, should_calculate: bool) -> None:
+    tid, rid, cid, fid, stid = uuid4(), uuid4(), uuid4(), uuid4(), uuid4()
+    trigger, other_input, output, formula = uuid4(), uuid4(), uuid4(), uuid4()
+    now = _now()
+    cat = TenantCatalog(
+        tenant_id=tid,
+        active_epoch=2,
+        lifecycle_state="ACTIVE",
+        bindings={
+            trigger: [{
+                "signal_id": trigger, "valid_from": now - timedelta(days=1), "valid_to": None,
+                "resource_id": rid, "site_id": stid, "connection_id": cid, "source_field_id": fid,
+            }]
+        },
+        formula_inputs={trigger, other_input},
+        formulas_by_dep={
+            trigger: [{
+                "formula_id": formula, "output_id": output, "expression_source": "x + y",
+                "revision": 1, "resource_id": rid, "data_type": "float64", "site_id": stid,
+            }]
+        },
+        formula_aliases={
+            formula: [
+                {"variable_alias": "x", "dependency_signal_id": trigger},
+                {"variable_alias": "y", "dependency_signal_id": other_input},
+            ]
+        },
+    )
+    pg = _FakePgStore(cat)
+    pg.latest_values[other_input] = {
+        "value": 5.0, "quality": "GOOD", "received_time": now + timedelta(seconds=alias_offset),
+        "data_epoch": alias_epoch,
+    }
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)
+    obs = _make_obs(tenant_id=tid, signal_id=trigger, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid, value=2.0, acquired_at=now, data_epoch=2)
+
+    assert await w.ingest_direct_bytes([(obs.to_json_bytes(), {}, obs.event_uid, False)]) == [ConsumeOutcome.ACK]
+    assert td.writes[0][0]["event_uid"] == obs.event_uid
+    if should_calculate:
+        assert td.writes[1][0]["signal_id"] == output
+        assert td.writes[1][0]["value"] == 7.0
+    else:
+        assert len(td.writes) == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_lane_never_blocks_live_lane_and_batches_stay_single_lane() -> None:
+    worker = IngestionWorker(
+        pg_store=MagicMock(), tdengine=MagicMock(), batch_size=8, flush_ms=5_000,
+    )
+    loop = asyncio.get_running_loop()
+    from factorix.modules.ingestion_worker import _PendingEnvelope
+
+    for i in range(10):
+        worker._pending_legacy.append(_PendingEnvelope(
+            raw_body=b"{}", message_id=f"legacy-{i}", headers={}, redelivered=False,
+            ingested_at=_now(), future=loop.create_future(),
+        ))
+    release_replay = asyncio.Event()
+    batches: list[list[str]] = []
+
+    async def capture_batch(batch):
+        ids = [str(e.message_id) for e in batch]
+        batches.append(ids)
+        if ids[0].startswith("legacy-"):
+            await release_replay.wait()  # e.g. TDengine retry loop on the replay lane
+        for env in batch:
+            env.future.set_result(ConsumeOutcome.ACK)
+
+    worker._process_batch = capture_batch
+    batcher = asyncio.create_task(worker._batcher_loop())
+    worker._wake_legacy.set()
+    try:
+        await asyncio.sleep(0.05)
+        assert batches == [[f"legacy-{i}" for i in range(8)]]  # replay batch stuck in flight
+        for i in range(3):
+            worker._pending_live.append(_PendingEnvelope(
+                raw_body=b"{}", message_id=f"live-{i}", headers={}, redelivered=False,
+                ingested_at=_now(), future=loop.create_future(),
+            ))
+        worker._wake_live.set()
+        await asyncio.sleep(0.05)
+        # The live lane committed while the replay batch is still blocked.
+        assert batches[1] == ["live-0", "live-1", "live-2"]
+        release_replay.set()
+        await asyncio.sleep(0.4)
+        assert batches[2] == ["legacy-8", "legacy-9"]
+        assert all(len({name.split("-")[0] for name in batch}) == 1 for batch in batches)
+        assert worker.lane_metrics()["live"]["batches"] == 1
+    finally:
+        release_replay.set()
+        worker._stop_event.set()
+        worker._wake_batcher.set()
+        await batcher
+
+
+@pytest.mark.asyncio
+async def test_dual_consumers_start_and_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    mock_start = AsyncMock()
+    mock_stop = AsyncMock()
+    mock_consumer_cls = MagicMock()
+    mock_consumer_cls.return_value.start = mock_start
+    mock_consumer_cls.return_value.stop = mock_stop
+    monkeypatch.setattr("factorix.modules.ingestion_worker.RabbitMQConsumer", mock_consumer_cls)
+
+    cfg = BrokerConfig(amqp_url="amqp://localhost/")
+    pg = MagicMock(start=AsyncMock(), close=AsyncMock())
+    td = MagicMock()
+    worker = IngestionWorker(pg_store=pg, tdengine=td, broker_cfg=cfg)
+    await worker.start()
+
+    assert worker._legacy_consumer is not None
+    assert worker._live_consumer is not None
+    assert mock_start.await_count == 2
+
+    await worker.stop()
+    assert mock_stop.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("batch_size", "queued", "expected"), [(8, 10, [8, 2]), (1, 3, [1, 1, 1]), (4096, 4500, [4096, 404])])
+async def test_lane_batch_capacity(batch_size, queued, expected) -> None:
+    from factorix.modules.ingestion_worker import _PendingEnvelope
+
+    worker = IngestionWorker(pg_store=MagicMock(), tdengine=MagicMock(), batch_size=batch_size)
+    loop = asyncio.get_running_loop()
+    for i in range(queued):
+        worker._pending_live.append(_PendingEnvelope(b"{}", f"live-{i}", {}, False, _now(), loop.create_future()))
+    worker._pending_legacy.append(_PendingEnvelope(b"{}", "legacy", {}, False, _now(), loop.create_future()))
+    sizes = []
+    while worker._pending_live:
+        sizes.append(len(worker._take_lane_batch("live")))
+    assert sizes == expected
+    assert [e.message_id for e in worker._take_lane_batch("legacy")] == ["legacy"]
+
+
+def _batch_message(observations, *, message_id="fxb-test", delivery_count=0, body=None):
+    from factorix.domain.canonical import OBS_BATCH_HEADER, OBS_BATCH_HEADER_VALUE, encode_observation_batch
+
+    headers = {OBS_BATCH_HEADER: OBS_BATCH_HEADER_VALUE}
+    if delivery_count:
+        headers["x-delivery-count"] = delivery_count
+    raw = body if body is not None else encode_observation_batch(observations, batch_id=message_id)
+    return MagicMock(body=raw, message_id=message_id, headers=headers, redelivered=bool(delivery_count))
+
+
+async def _run_lanes(worker, coro):
+    batcher = asyncio.create_task(worker._batcher_loop())
+    try:
+        return await asyncio.wait_for(coro, 5)
+    finally:
+        worker._stop_event.set()
+        worker._wake_batcher.set()
+        await batcher
+
+
+@pytest.mark.asyncio
+async def test_batch_envelope_is_ingested_with_one_td_write_one_pg_commit_and_ingested_at() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    worker = IngestionWorker(pg_store=pg, tdengine=td, batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    base = datetime.now(timezone.utc) - timedelta(seconds=1)
+    observations = [
+        _make_obs(
+            tenant_id=ids["tenant_id"], signal_id=ids["signal_id"], resource_id=ids["resource_id"],
+            connection_id=ids["connection_id"], source_field_id=ids["field_id"], site_id=ids["site_id"],
+            value=float(i), seq=i + 1, acquired_at=base + timedelta(milliseconds=i),
+        )
+        for i in range(50)
+    ]
+    outcome = await _run_lanes(worker, worker.handle_live_message(_batch_message(observations)))
+    assert outcome == ConsumeOutcome.ACK
+    assert len(td.writes) == 1 and len(td.writes[0]) == 50  # one multi-row TDengine write
+    assert len(pg.commits) == 1  # one batched latest-state upsert (+ its NOTIFY) for the envelope
+    latest = pg.commits[0]["latest_rows"]
+    assert len(latest) == 1 and latest[0]["value"] == 49.0
+    assert latest[0]["ingested_at"] is not None
+    assert worker.metrics.received_total == 50 and worker.envelopes_received == 1
+    assert worker.metrics.acked_total == 50
+
+
+@pytest.mark.asyncio
+async def test_batch_envelope_isolates_bad_items_and_keeps_old_single_format_working() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    worker = IngestionWorker(pg_store=pg, tdengine=td, batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    good = _make_obs(
+        tenant_id=ids["tenant_id"], signal_id=ids["signal_id"], resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"], source_field_id=ids["field_id"], site_id=ids["site_id"],
+        acquired_at=datetime.now(timezone.utc),
+    )
+    unbound = _make_obs(
+        tenant_id=ids["tenant_id"], signal_id=uuid4(), resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"], source_field_id=ids["field_id"], acquired_at=datetime.now(timezone.utc),
+    )
+    # One unbound item: quarantined with durable evidence, the good neighbour still commits, message ACKed.
+    outcome = await _run_lanes(worker, worker.handle_live_message(_batch_message([good, unbound])))
+    assert outcome == ConsumeOutcome.ACK
+    assert [q["event_uid"] for q in pg.quarantined] == [unbound.event_uid]
+    assert len(td.writes) == 1 and td.writes[0][0]["event_uid"] == good.event_uid
+
+    # Quarantine evidence could not be written -> the envelope is retried (never silently dropped).
+    async def failing_quarantine(**_kw):
+        raise TimeoutError("pg down")
+
+    worker2 = IngestionWorker(pg_store=pg, tdengine=td, batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    pg.write_quarantine = failing_quarantine  # type: ignore[method-assign]
+    unbound2 = _make_obs(
+        tenant_id=ids["tenant_id"], signal_id=uuid4(), resource_id=ids["resource_id"],
+        connection_id=ids["connection_id"], source_field_id=ids["field_id"], acquired_at=datetime.now(timezone.utc),
+    )
+    outcome2 = await _run_lanes(worker2, worker2.handle_live_message(_batch_message([good, unbound2])))
+    assert outcome2 == ConsumeOutcome.RETRY
+
+    # Malformed envelope: DEAD_LETTER (whole message to the DLQ as evidence).
+    worker3 = IngestionWorker(pg_store=_FakePgStore(cat), tdengine=td, batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    bad = _batch_message([], body=b'{"schema":"factorix.obs-batch","envelope_version":2,"observations":[]}')
+    assert await _run_lanes(worker3, worker3.handle_live_message(bad)) == ConsumeOutcome.DEAD_LETTER
+
+    # Transition: legacy single-observation messages (backlog in queues/spool) still ingest.
+    worker4 = IngestionWorker(pg_store=_FakePgStore(cat), tdengine=_FakeTDEngine(), batch_size=500, flush_ms=10)  # type: ignore[arg-type]
+    single = MagicMock(body=good.to_json_bytes(), message_id=good.event_uid, headers={}, redelivered=False)
+    assert await _run_lanes(worker4, worker4.handle_legacy_message(single)) == ConsumeOutcome.ACK
+
+
+@pytest.mark.asyncio
+async def test_unexpected_exception_is_isolated_to_the_poison_item() -> None:
+    from factorix.modules.ingestion_worker import _PendingEnvelope
+
+    pg = _FakePgStore(_catalog_with_signal()[0])
+    worker = IngestionWorker(pg_store=pg, tdengine=MagicMock(), batch_size=8, broker_cfg=BrokerConfig(amqp_url="amqp://x/", delivery_limit=3))  # type: ignore[arg-type]
+    loop = asyncio.get_running_loop()
+    envs = [
+        _PendingEnvelope(b"{}", f"m{i}", {}, False, _now(), loop.create_future(), delivery_count=dc)
+        for i, dc in enumerate([0, 0, 2])
+    ]
+
+    async def process(batch):
+        # m0 and m2 are poison; any batch containing them raises.
+        if len(batch) > 1 or batch[0].message_id in {"m0", "m2"}:
+            raise RuntimeError("poison")
+        batch[0].future.set_result(ConsumeOutcome.ACK)
+
+    worker._process_batch = process
+    await worker._process_batch_isolated(envs)
+    # m0 fails on its first delivery -> RETRY; m1 succeeds alone; m2 fails on its last delivery -> quarantined.
+    assert [e.future.result() for e in envs] == [ConsumeOutcome.RETRY, ConsumeOutcome.ACK, ConsumeOutcome.DEAD_LETTER]
+    assert [q["event_uid"] for q in pg.quarantined] == ["m2"]
+    assert "INGEST_EXCEPTION" in pg.quarantined[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_anti_rewind_ensures_live_sample_wins_in_newest_map() -> None:
+    tid = uuid4()
+    rid = uuid4()
+    cid = uuid4()
+    fid = uuid4()
+    sig_id = uuid4()
+    stid = uuid4()
+    now = _now()
+
+    cat = TenantCatalog(
+        tenant_id=tid,
+        loaded_at=time.monotonic(),
+        active_epoch=1,
+        epoch_loaded_at=time.monotonic(),
+        lifecycle_state="ACTIVE",
+        bindings={
+            sig_id: [
+                {
+                    "signal_id": sig_id,
+                    "valid_from": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "valid_to": None,
+                    "resource_id": rid,
+                    "expected_interval_ms": 1000,
+                    "site_id": stid,
+                    "connection_id": cid,
+                    "source_field_id": fid,
+                    "nullable": False,
+                }
+            ]
+        },
+    )
+    pg = _FakePgStore(cat)
+    td = _FakeTDEngine()
+    w = IngestionWorker(pg_store=pg, tdengine=td)
+
+    # Legacy replay: older timestamp, seq=1
+    legacy_obs = _make_obs(
+        tenant_id=tid, signal_id=sig_id, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid,
+        value=10.0, acquired_at=now - timedelta(hours=1), data_epoch=1, seq=1,
+    )
+    # Live sample: fresh timestamp, seq=2
+    live_obs = _make_obs(
+        tenant_id=tid, signal_id=sig_id, resource_id=rid, connection_id=cid, source_field_id=fid, site_id=stid,
+        value=99.0, acquired_at=now, data_epoch=1, seq=2,
+    )
+
+    # Ingest in out-of-order sequence: live first, then legacy
+    outcomes = await w.ingest_direct_bytes([
+        (live_obs.to_json_bytes(), {}, live_obs.event_uid, False),
+        (legacy_obs.to_json_bytes(), {}, legacy_obs.event_uid, False),
+    ])
+    assert outcomes == [ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+
+    # In PostgreSQL latest_rows passed to commit_batch_metadata, the state should be the live sample (value 99.0)
+    assert len(pg.commits) == 1
+    latest_rows = pg.commits[0]["latest_rows"]
+    assert len(latest_rows) == 1
+    assert latest_rows[0]["signal_id"] == sig_id
+    assert latest_rows[0]["value"] == 99.0
+    assert latest_rows[0]["event_uid"] == live_obs.event_uid
+
+    # In worker live cache, the state should also be the live sample
+    assert w._live_cache[tid][sig_id].value == 99.0
+    assert w._live_cache[tid][sig_id].event_uid == live_obs.event_uid
+
+
+
+@pytest.mark.asyncio
+async def test_v2_latest_ids_notify_is_bounded_and_parsed_by_the_api_bridge() -> None:
+    from factorix.modules.ingestion_worker import NOTIFY_CHUNK_MAX_BYTES, _latest_ids_payloads
+    from factorix.transport.app import _parse_latest_ids
+
+    tid = uuid4()
+    ids = [str(uuid4()) for _ in range(500)]
+    payloads = _latest_ids_payloads(tid, ids, [str(uuid4())], datetime.now(timezone.utc))
+    assert 1 < len(payloads) <= 4
+    assert all(len(p.encode()) <= NOTIFY_CHUNK_MAX_BYTES for p in payloads)
+    parsed = [_parse_latest_ids(p) for p in payloads]
+    assert all(t == str(tid) for t, _ in parsed)
+    assert [sid for _, chunk in parsed for sid in chunk] == ids
+
+
+@pytest.mark.asyncio
+async def test_replay_lane_has_its_own_sli_and_smaller_batches() -> None:
+    cat, ids = _catalog_with_signal()
+    pg = _FakePgStore(cat)
+    worker = IngestionWorker(pg_store=pg, tdengine=_FakeTDEngine(), batch_size=500, flush_ms=10, replay_batch_size=2)  # type: ignore[arg-type]
+    now = datetime.now(timezone.utc)
+
+    def obs(age_s: float, seq: int) -> CanonicalObservation:
+        return _make_obs(
+            tenant_id=ids["tenant_id"], signal_id=ids["signal_id"], resource_id=ids["resource_id"],
+            connection_id=ids["connection_id"], source_field_id=ids["field_id"], site_id=ids["site_id"],
+            acquired_at=now - timedelta(seconds=age_s), seq=seq,
+        )
+
+    live = _batch_message([obs(0.5, 1)], message_id="fxb-live")
+    replay = _batch_message([obs(21 * 3600, 10 + i) for i in range(5)], message_id="fxb-replay")
+    outcomes = await _run_lanes(
+        worker, asyncio.gather(worker.handle_live_message(live), worker.handle_legacy_message(replay))
+    )
+    assert outcomes == [ConsumeOutcome.ACK, ConsumeOutcome.ACK]
+    snap = worker.hist.snapshot()
+    # 21-hour-old replay rows no longer pollute the live SLI.
+    assert snap["sli_acq_to_commit_p50_ms"] < 60_000
+    assert snap["sli_replay_acq_to_commit_p50_ms"] > 20 * 3600 * 1000
+    assert worker.lane_metrics()["legacy"]["batches"] == 3  # 5 items in replay batches of 2

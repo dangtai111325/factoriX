@@ -46,6 +46,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const refreshSession = useCallback(async () => {
     const platform = await getAuthStatus()
+    // R1-25 / R1-45: one request at boot. The status carries the session user, so a guest on the
+    // login page causes no 401 and a signed-in user waits for one round trip, not two.
+    if (platform.user !== undefined) {
+      setState(
+        platform.user
+          ? { status: 'authenticated', user: platform.user, platform }
+          : { status: 'guest', user: null, platform },
+      )
+      return
+    }
     try {
       const user = await currentUser()
       setState({ status: 'authenticated', user, platform })

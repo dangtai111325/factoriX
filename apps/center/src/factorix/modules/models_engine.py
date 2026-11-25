@@ -2,9 +2,9 @@
 
 Every RUNNING model is sampled every ``sample_ms`` (independent of the collectors). A sample:
 
-1. reads the latest **valid** value (GOOD/UNCERTAIN) of every referenced signal with one query
-   per tenant and tick; a signal whose latest row is BAD falls back to its last good value (the
-   source time of that value is looked up once in ``observations`` and cached);
+1. reads the latest value of every referenced signal with one query per tenant and tick; a STALE /
+   PAUSED signal keeps its last value and a BAD one its last good value (the field quality shows the
+   condition, R1-02); only signals without any value (NO_DATA / DISABLED) are emitted as null;
 2. evaluates the body (:func:`factorix.domain.body.evaluate_detailed`); ``value_at`` lookups use
    the ``observations (tenant_id, signal_id, source_time DESC)`` index and are cached;
 3. stores the ordered JSON text in ``model_state`` and appends it to the ``model_snapshots`` ring
@@ -35,6 +35,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.domain import rules as R
 from factorix.domain.body import BodyContext, CompiledSpec, EvalResult, compile_spec, evaluate_detailed
+from factorix.domain.signal_state import evaluate_signal_state  # noqa: F401
+from factorix.modules import storage_model_recorder
 from factorix.modules.common import execute, fetch_all, queue_stream_event, utcnow
 from factorix.platform import after_commit
 
@@ -111,7 +113,6 @@ class _Lru:
 
 
 _value_at_cache = _Lru(4096)
-_fallback_source_cache = _Lru(8192)
 
 
 def _value_at_ttl(at: datetime, now: datetime, found: bool) -> float | None:
@@ -182,93 +183,269 @@ async def load_catalog(session: AsyncSession, tenant_id: UUID, signal_ids: Itera
     )
 
 
-def sample_from_latest(row: Mapping[str, Any]) -> tuple[R.Sample | None, datetime | None]:
-    """Latest valid sample of a ``latest_signal_state`` row (pure).
+#: Effective statuses whose last value is still published in the body (flagged by the field quality,
+#: never blanked to null — R1-02 / v6 contract Q3). BAD publishes the last GOOD value.
+HOLD_LAST_QUALITIES = ("STALE", "PAUSED", "DELAYED")
 
-    Returns ``(sample, fallback_at)``. When the latest row is not valid (BAD) the last good value
-    is used and ``fallback_at`` is its event time (its source time must be looked up).
+
+def live_sample(rec: Any, status: str, last_good_source_time: datetime | None = None) -> R.Sample | None:
+    """Sample handed to the body for a live-state record with effective ``status``.
+
+    GOOD/UNCERTAIN → current value; STALE/PAUSED/DELAYED → last value with that quality;
+    BAD → the last good value (and its source time) with quality BAD; DISABLED → no sample.
     """
-    quality = str(row.get("quality") or "")
-    if quality in VALID_QUALITIES:
-        value_json = _json(row.get("value_json"))
-        return (
-            R.Sample(
-                value=value_json.get("v") if isinstance(value_json, dict) else None,
-                quality=quality,
-                source_time=R.as_utc(row.get("source_time")),
-                received_time=R.as_utc(row.get("received_time")),
-            ),
-            None,
-        )
-    good = _json(row.get("last_good_value_json"))
-    good_at = R.as_utc(row.get("last_good_event_time"))
-    if isinstance(good, dict) and good.get("v") is not None and good_at is not None:
-        # event_time == received_time (time model); source_time is filled from observations.
-        return R.Sample(value=good.get("v"), quality="GOOD", source_time=None, received_time=good_at), good_at
-    return None, None
+    status = str(status or "").upper()
+    if status in VALID_QUALITIES or status in HOLD_LAST_QUALITIES:
+        value = rec.value
+        if value is None and getattr(rec, "last_good_value", None) is not None and status in HOLD_LAST_QUALITIES:
+            value = rec.last_good_value
+        return R.Sample(value, status, rec.source_time, rec.last_acquired_at)
+    if status == "BAD":
+        good = getattr(rec, "last_good_value", None)
+        if good is None:
+            return None
+        return R.Sample(good, "BAD", last_good_source_time, getattr(rec, "last_good_at", None) or rec.last_acquired_at)
+    return None
+
+
+def sample_from_latest(
+    row: Mapping[str, Any], *, now: datetime | None = None, freshness: Any = None
+) -> tuple[R.Sample | None, str]:
+    """Apply canonical freshness (``FreshnessService``: job-interval fallback, pipeline evidence,
+    connection health) before making a PostgreSQL sample available to the model (R2-E C1 / CT-10)."""
+    from factorix.application.live.freshness_service import freshness_service
+
+    value_json = _json(row.get("value_json"))
+    value = value_json.get("v") if isinstance(value_json, dict) else None
+    received_at = R.as_utc(row.get("received_time"))
+    service = freshness or freshness_service()
+    evaluation = service.evaluate(
+        signal_id=row.get("signal_id"),
+        has_observation=True,
+        raw_quality=row.get("quality"),
+        raw_value=value,
+        event_time=received_at,
+        last_acquired_at=R.as_utc(row.get("last_acquired_at")),
+        expected_interval_ms=row.get("expected_interval_ms"),
+        job_interval_ms=row.get("job_interval_ms"),
+        connection_id=row.get("connection_id"),
+        null_allowed=bool(row.get("nullable")),
+        binding_enabled=bool(row.get("binding_enabled", True)),
+        connection_paused=row.get("connection_status") == "PAUSED",
+        connection_health=row.get("connection_health"),
+        now=now,
+    )
+    quality = evaluation.effective_status
+    if quality == "BAD":
+        good_json = _json(row.get("last_good_value_json"))
+        good = good_json.get("v") if isinstance(good_json, dict) else None
+        if good is None:
+            return None, quality
+        good_at = R.as_utc(row.get("last_good_event_time"))
+        return R.Sample(good, quality, good_at, good_at), quality
+    if quality not in VALID_QUALITIES and quality not in HOLD_LAST_QUALITIES:
+        return None, quality
+    return R.Sample(value, quality, R.as_utc(row.get("source_time")), received_at), quality
+
+
+def _evidence_kwargs(provider: Any, meta: Mapping[str, Any]) -> dict[str, Any]:
+    """connection / job interval for ``evaluate_signal`` (only for providers that accept them)."""
+    from factorix.modules.live_state import TDengineLiveStateProvider
+
+    if not isinstance(provider, TDengineLiveStateProvider):
+        return {}
+    return {"connection_id": meta.get("connection_id"), "job_interval_ms": meta.get("job_interval_ms")}
 
 
 async def load_samples(
-    session: AsyncSession, tenant_id: UUID, signal_ids: Iterable[Any]
+    session: AsyncSession,
+    tenant_id: UUID,
+    signal_ids: Iterable[Any],
+    *,
+    live_provider: Any = None,
 ) -> tuple[dict[str, R.Sample | None], dict[str, str | None]]:
-    """Latest valid sample and actual latest quality of each signal: one query (+ one for BAD fallbacks)."""
+    """Latest valid sample and effective quality of each signal via LiveStateProvider (when enabled) or PG."""
     ids = _uuids(signal_ids)
     if not ids:
         return {}, {}
+
+    from factorix.modules.live_state import get_live_state_provider, record_from_pg_row
+
+    provider = live_provider or (get_live_state_provider() if isinstance(session, AsyncSession) else None)
+    if provider is not None:
+        from sqlalchemy import text as _sa_text
+        from sqlalchemy.exc import SQLAlchemyError as _SQLAlchemyError
+
+        active_epoch = 1
+        meta_by_id: dict[UUID, dict[str, Any]] = {}
+        pg_by_id: dict[UUID, dict[str, Any]] = {}
+        now = utcnow()
+        if isinstance(session, AsyncSession):
+            try:
+                async with session.begin_nested():
+                    gen_row = (
+                        await session.execute(
+                            _sa_text("SELECT active_epoch FROM telemetry_generations WHERE tenant_id = :tenant_id"),
+                            {"tenant_id": tenant_id},
+                        )
+                    ).mappings().first()
+                    if gen_row and gen_row.get("active_epoch") is not None:
+                        active_epoch = max(1, int(gen_row["active_epoch"]))
+            except _SQLAlchemyError:
+                active_epoch = 1
+
+            try:
+                async with session.begin_nested():
+                    meta_res = await session.execute(
+                        _sa_text(
+                            """
+                            SELECT s.id, s.resource_id, s.data_type, s.unit, s.expected_interval_ms, s.status AS signal_status,
+                                   COALESCE(nb.nullable, FALSE) AS nullable,
+                                   COALESCE(nb.enabled, TRUE) AS binding_enabled,
+                                   nb.connection_status, nb.connection_health, nb.connection_id, nb.job_interval_ms
+                            FROM signal_definitions s
+                            LEFT JOIN LATERAL (
+                                SELECT COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable, b.enabled,
+                                       c.status AS connection_status, c.health AS connection_health,
+                                       c.id AS connection_id, j.interval_ms AS job_interval_ms
+                                FROM signal_bindings b
+                                JOIN source_fields f ON f.id = b.source_field_id
+                                LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+                                LEFT JOIN connections c ON c.id = j.connection_id
+                                WHERE b.signal_id = s.id AND b.valid_to IS NULL
+                                ORDER BY b.enabled DESC, b.valid_from DESC
+                                LIMIT 1
+                            ) nb ON TRUE
+                            WHERE s.tenant_id = :tenant_id AND s.id = ANY(:ids)
+                            """
+                        ),
+                        {"tenant_id": tenant_id, "ids": ids},
+                    )
+                    for mr in meta_res.mappings().all():
+                        meta_by_id[UUID(str(mr["id"]))] = dict(mr)
+            except _SQLAlchemyError:
+                meta_by_id = {}
+
+            try:
+                async with session.begin_nested():
+                    pg_res = await session.execute(
+                        _sa_text(
+                            """
+                            SELECT signal_id, resource_id, observation_id, event_uid, value_type, value_json,
+                                   unit, quality, reason_code, event_time, received_time, last_acquired_at,
+                                   last_value_changed_at, source_time, data_epoch, source_sequence,
+                                   config_revision, origin, last_good_value_json, last_good_event_time, updated_at
+                            FROM latest_signal_state
+                            WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids)
+                            """
+                        ),
+                        {"tenant_id": tenant_id, "ids": ids},
+                    )
+                    for pr in pg_res.mappings().all():
+                        pg_by_id[UUID(str(pr["signal_id"]))] = dict(pr)
+            except _SQLAlchemyError:
+                pg_by_id = {}
+
+        if hasattr(provider, "set_active_epoch"):
+            provider.set_active_epoch(tenant_id, active_epoch)
+        if hasattr(provider, "warm_from_tdengine") and meta_by_id:
+            missing_specs = {
+                sid_u: meta
+                for sid_u, meta in meta_by_id.items()
+                if provider.get_entry(tenant_id, sid_u) is None
+            }
+            if missing_specs:
+                await provider.warm_from_tdengine(
+                    tenant_id, missing_specs, active_epoch=active_epoch, mark_unverified=True
+                )
+        elif hasattr(provider, "get_latest"):
+            try:
+                await provider.get_latest(tenant_id, ids)
+            except TypeError:
+                pass
+
+        for sid_u, pr in pg_by_id.items():
+            if int(pr.get("data_epoch") or 1) < active_epoch:
+                continue
+            pg_rec, pg_seq, pg_upd = record_from_pg_row(pr, tenant_id=tenant_id)
+            post_boot = (
+                hasattr(provider, "is_verified_in_session") and provider.is_verified_in_session(tenant_id, sid_u)
+            ) or (
+                hasattr(provider, "started_at")
+                and pg_upd is not None
+                and pg_upd > provider.started_at
+                and pg_rec.last_acquired_at > provider.started_at
+            )
+            meta = meta_by_id.get(sid_u, {})
+            if hasattr(provider, "seed_from_record"):
+                provider.seed_from_record(
+                    pg_rec,
+                    source_sequence=pg_seq,
+                    restored_unverified=not post_boot,
+                    expected_interval_ms=meta.get("expected_interval_ms"),
+                    null_allowed=bool(meta.get("nullable")),
+                )
+
+        samples_p: dict[str, R.Sample | None] = {}
+        qualities_p: dict[str, str | None] = {}
+        for sid_u in ids:
+            sid_key = str(sid_u).lower()
+            meta = meta_by_id.get(sid_u, {})
+            binding_enabled = bool(meta.get("binding_enabled", True)) and str(meta.get("signal_status") or "ACTIVE") == "ACTIVE"
+            conn_paused = str(meta.get("connection_status") or "") == "PAUSED"
+            evaluated = provider.evaluate_signal(
+                tenant_id,
+                sid_u,
+                binding_enabled=binding_enabled,
+                expected_interval_ms=meta.get("expected_interval_ms"),
+                null_allowed=bool(meta.get("nullable")),
+                connection_paused=conn_paused,
+                connection_health=meta.get("connection_health"),
+                connection_status=meta.get("connection_status"),
+                active_bindings=1 if binding_enabled else 0,
+                now=now,
+                **_evidence_kwargs(provider, meta),
+            )
+            rec = evaluated.record
+            ev = evaluated.evaluation
+            if rec is None or ev.effective_status == "NO_DATA":
+                continue
+            qualities_p[sid_key] = ev.effective_status
+            samples_p[sid_key] = live_sample(rec, ev.effective_status, evaluated.last_good_source_time)
+        return samples_p, qualities_p
+
     rows = await fetch_all(
         session,
         """
-        SELECT signal_id, value_json, quality, source_time, received_time, last_good_value_json, last_good_event_time
-        FROM latest_signal_state
-        WHERE tenant_id = :tenant_id AND signal_id = ANY(:ids)
+        SELECT l.signal_id, l.value_json, l.quality, l.source_time, l.received_time, l.last_acquired_at,
+               s.expected_interval_ms,
+               COALESCE(b.enabled, TRUE) AND s.status = 'ACTIVE' AS binding_enabled,
+               COALESCE((f.address_json->>'nullable') = 'true', FALSE) AS nullable,
+               c.status AS connection_status, c.health AS connection_health,
+               c.id AS connection_id, j.interval_ms AS job_interval_ms
+        FROM latest_signal_state l
+        JOIN signal_definitions s ON s.id = l.signal_id AND s.tenant_id = l.tenant_id
+        LEFT JOIN LATERAL (
+            SELECT sb.enabled, sb.source_field_id
+            FROM signal_bindings sb
+            WHERE sb.signal_id = l.signal_id AND sb.valid_to IS NULL
+            ORDER BY sb.enabled DESC, sb.valid_from DESC
+            LIMIT 1
+        ) b ON TRUE
+        LEFT JOIN source_fields f ON f.id = b.source_field_id
+        LEFT JOIN acquisition_jobs j ON j.id = f.acquisition_job_id
+        LEFT JOIN connections c ON c.id = j.connection_id
+        WHERE l.tenant_id = :tenant_id AND l.signal_id = ANY(:ids)
         """,
         {"tenant_id": tenant_id, "ids": ids},
     )
     samples: dict[str, R.Sample | None] = {}
     qualities: dict[str, str | None] = {}
-    fallbacks: dict[str, datetime] = {}
+    now = utcnow()
     for row in rows:
         sid = str(row["signal_id"]).lower()
-        sample, fallback_at = sample_from_latest(row)
-        samples[sid] = sample
-        qualities[sid] = row.get("quality")
-        if fallback_at is not None:
-            fallbacks[sid] = fallback_at
-    missing = []
-    for sid, at in fallbacks.items():
-        cached = _fallback_source_cache.get((str(tenant_id), sid, at))
-        if cached is _Lru.MISS:
-            missing.append((sid, at))
-        elif cached is not None:
-            samples[sid] = _with_source(samples[sid], cached)
-    if missing:
-        found = await fetch_all(
-            session,
-            """
-            SELECT q.signal_id, o.source_time
-            FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[])) AS q(signal_id, at)
-            LEFT JOIN LATERAL (
-                SELECT source_time FROM observations o
-                WHERE o.tenant_id = :tenant_id AND o.signal_id = q.signal_id AND o.event_time = q.at
-                ORDER BY o.received_time DESC
-                LIMIT 1
-            ) o ON TRUE
-            """,
-            {"tenant_id": tenant_id, "ids": [UUID(sid) for sid, _ in missing], "ats": [at for _, at in missing]},
-        )
-        by_id = {str(row["signal_id"]).lower(): R.as_utc(row.get("source_time")) for row in found}
-        for sid, at in missing:
-            source = by_id.get(sid)
-            _fallback_source_cache.put((str(tenant_id), sid, at), source)
-            if source is not None:
-                samples[sid] = _with_source(samples[sid], source)
+        samples[sid], qualities[sid] = sample_from_latest(row, now=now)
     return samples, qualities
-
-
-def _with_source(sample: R.Sample | None, source: datetime) -> R.Sample | None:
-    if sample is None:
-        return None
-    return R.Sample(sample.value, sample.quality, source, sample.received_time)
 
 
 async def fetch_value_at(
@@ -276,56 +453,22 @@ async def fetch_value_at(
 ) -> dict[tuple[str, datetime], R.Sample | None]:
     """Value of each signal as of an instant: ``requests`` = ``[(signal_id, at, mode)]``.
 
-    ``mode`` ``"s"`` searches by source_time (index ``observations_signal_source``); ``"e"`` by
-    event_time for sources without a group timestamp (index ``observations_signal_time``).
+    ``mode`` ``"s"`` searches by source_time; ``"e"`` by event_time. Reads through
+    ``HistoryQueryService.value_at`` (TDengine first; PostgreSQL ``observations`` only for epoch 1 and
+    only when the PG fallback setting allows it, R2-E C3).
     """
     if not requests:
         return {}
-    rows = await fetch_all(
-        session,
-        """
-        SELECT q.idx, o.value_json, o.quality, o.source_time, o.received_time
-        FROM unnest(CAST(:ids AS uuid[]), CAST(:ats AS timestamptz[]), CAST(:modes AS text[]), CAST(:idx AS integer[]))
-             AS q(signal_id, at, mode, idx)
-        LEFT JOIN LATERAL (
-            SELECT * FROM (
-                (SELECT o.value_json, o.quality, o.source_time, o.received_time
-                 FROM observations o
-                 WHERE q.mode = 's' AND o.tenant_id = :tenant_id AND o.signal_id = q.signal_id
-                   AND o.source_time <= q.at AND o.quality IN ('GOOD', 'UNCERTAIN')
-                 ORDER BY o.source_time DESC, o.received_time DESC
-                 LIMIT 1)
-                UNION ALL
-                (SELECT o.value_json, o.quality, o.source_time, o.received_time
-                 FROM observations o
-                 WHERE q.mode = 'e' AND o.tenant_id = :tenant_id AND o.signal_id = q.signal_id
-                   AND o.event_time <= q.at AND o.quality IN ('GOOD', 'UNCERTAIN')
-                 ORDER BY o.event_time DESC
-                 LIMIT 1)
-            ) found
-            LIMIT 1
-        ) o ON TRUE
-        """,
-        {
-            "tenant_id": tenant_id,
-            "ids": [UUID(sid) for sid, _at, _mode in requests],
-            "ats": [at for _sid, at, _mode in requests],
-            "modes": [mode for _sid, _at, mode in requests],
-            "idx": list(range(len(requests))),
-        },
-    )
-    out: dict[tuple[str, datetime], R.Sample | None] = {(sid, at): None for sid, at, _mode in requests}
-    for row in rows:
-        sid, at, _mode = requests[int(row["idx"])]
-        if row.get("quality") is None:
+    from factorix.application.history.query_service import history_query_service
+
+    raw = await history_query_service().value_at(session, tenant_id, requests)
+    out: dict[tuple[str, datetime], R.Sample | None] = {}
+    for key, hit in raw.items():
+        if hit is None:
+            out[key] = None
             continue
-        value_json = _json(row.get("value_json"))
-        out[(sid, at)] = R.Sample(
-            value=value_json.get("v") if isinstance(value_json, dict) else None,
-            quality=row.get("quality"),
-            source_time=R.as_utc(row.get("source_time")),
-            received_time=R.as_utc(row.get("received_time")),
-        )
+        value, quality, source_time, received_time = hit
+        out[key] = R.Sample(value=value, quality=quality, source_time=R.as_utc(source_time), received_time=R.as_utc(received_time))
     return out
 
 
@@ -344,15 +487,18 @@ async def evaluate_once(
         samples, qualities = await load_samples(session, tenant_id, compiled.signal_ids)
     qualities = qualities or {}
     tenant_key = str(tenant_id)
+    from factorix.modules.history_repository import _active_epoch_for
+
+    active_epoch = await _active_epoch_for(session, tenant_id) if isinstance(session, AsyncSession) else 1
 
     def lookup(signal_id: str, at: datetime) -> R.Sample | None:
-        hit = _value_at_cache.get((tenant_key, signal_id, at))
+        hit = _value_at_cache.get((tenant_key, active_epoch, signal_id, at))
         if hit is _Lru.MISS:
             raise R.LookupPending(signal_id, at)
         return hit
 
     def lookup_final(signal_id: str, at: datetime) -> R.Sample | None:
-        hit = _value_at_cache.get((tenant_key, signal_id, at))
+        hit = _value_at_cache.get((tenant_key, active_epoch, signal_id, at))
         return None if hit is _Lru.MISS else hit
 
     result: EvalResult | None = None
@@ -369,16 +515,28 @@ async def evaluate_once(
             requests.append((signal_id, at, mode))
         fetched = await fetch_value_at(session, tenant_id, requests)
         for (signal_id, at), sample in fetched.items():
-            _value_at_cache.put((tenant_key, signal_id, at), sample, _value_at_ttl(at, now, sample is not None))
+            _value_at_cache.put((tenant_key, active_epoch, signal_id, at), sample, _value_at_ttl(at, now, sample is not None))
     assert result is not None
     return result
 
 
 async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> None:
-    """Upsert ``model_state`` and append ``model_snapshots`` for one batch (two statements)."""
+    """Upsert ``model_state`` (PG control plane) and append ``model_snapshots`` (TDengine or PG fallback)."""
     if not rows:
         return
-    rows = sorted(rows, key=lambda row: str(row["group_id"]))
+    rows = sorted(rows, key=lambda row: (str(row["group_id"]), row["sampled_at"]))
+    latest_by_group: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        latest_by_group[str(row["group_id"])] = row
+    state_rows = [latest_by_group[k] for k in sorted(latest_by_group)]
+    state_params = {
+        "ids": [row["group_id"] for row in state_rows],
+        "tenants": [row["tenant_id"] for row in state_rows],
+        "bodies": [row["body"] for row in state_rows],
+        "ats": [row["sampled_at"] for row in state_rows],
+        "errors": [row["errors_json"] for row in state_rows],
+        "counts": [row["error_count"] for row in state_rows],
+    }
     params = {
         "ids": [row["group_id"] for row in rows],
         "tenants": [row["tenant_id"] for row in rows],
@@ -395,6 +553,7 @@ async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> No
         FROM unnest(CAST(:ids AS uuid[]), CAST(:tenants AS uuid[]), CAST(:bodies AS text[]),
                     CAST(:ats AS timestamptz[]), CAST(:errors AS text[]), CAST(:counts AS integer[]))
              AS t(group_id, tenant_id, body, at, errors, n)
+        JOIN output_groups og ON og.id = t.group_id
         ON CONFLICT (group_id) DO UPDATE SET
             body_text = EXCLUDED.body_text,
             sampled_at = EXCLUDED.sampled_at,
@@ -402,8 +561,37 @@ async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> No
             error_count = EXCLUDED.error_count,
             updated_at = EXCLUDED.updated_at
         """,
-        params,
+        state_params,
     )
+
+    from factorix.modules.history_repository import _active_epoch_for, get_model_snapshot_provider
+    from factorix.modules.providers import ModelSnapshotRecord
+
+    snap_provider = get_model_snapshot_provider() if isinstance(session, AsyncSession) else None
+    if snap_provider is not None:
+        by_tenant: dict[UUID, list[dict[str, Any]]] = {}
+        for row in rows:
+            tid = row["tenant_id"] if isinstance(row["tenant_id"], UUID) else UUID(str(row["tenant_id"]))
+            by_tenant.setdefault(tid, []).append(row)
+        for tid, t_rows in by_tenant.items():
+            epoch = await _active_epoch_for(session, tid)
+            records = []
+            for r in t_rows:
+                raw_errs = _json(r.get("errors_json"))
+                errs_list = raw_errs if isinstance(raw_errs, list) else []
+                records.append(
+                    ModelSnapshotRecord(
+                        group_id=r["group_id"] if isinstance(r["group_id"], UUID) else UUID(str(r["group_id"])),
+                        sampled_at=r["sampled_at"],
+                        body=str(r.get("body") or ""),
+                        errors=errs_list,
+                        error_count=int(r.get("error_count") or len(errs_list)),
+                        data_epoch=epoch,
+                    )
+                )
+            await snap_provider.append_snapshots_batch(tid, records)
+        return
+
     await execute(
         session,
         """
@@ -412,6 +600,7 @@ async def write_samples(session: AsyncSession, rows: list[dict[str, Any]]) -> No
         FROM unnest(CAST(:ids AS uuid[]), CAST(:tenants AS uuid[]), CAST(:bodies AS text[]),
                     CAST(:ats AS timestamptz[]), CAST(:errors AS text[]), CAST(:counts AS integer[]))
              AS t(group_id, tenant_id, body, at, errors, n)
+        JOIN output_groups og ON og.id = t.group_id
         """,
         params,
     )
@@ -421,6 +610,24 @@ async def prune_snapshots(session: AsyncSession, group_ids: list[Any], keep: int
     ids = _uuids(group_ids)
     if not ids:
         return
+    from factorix.modules.history_repository import get_model_snapshot_provider
+
+    snap_provider = get_model_snapshot_provider() if isinstance(session, AsyncSession) else None
+    if snap_provider is not None:
+        owner_rows = await fetch_all(
+            session,
+            "SELECT id, tenant_id FROM output_groups WHERE id = ANY(:ids)",
+            {"ids": ids},
+        )
+        by_tenant: dict[UUID, list[UUID]] = {}
+        for orow in owner_rows:
+            tid = orow["tenant_id"] if isinstance(orow["tenant_id"], UUID) else UUID(str(orow["tenant_id"]))
+            gid = orow["id"] if isinstance(orow["id"], UUID) else UUID(str(orow["id"]))
+            by_tenant.setdefault(tid, []).append(gid)
+        for tid, gids in by_tenant.items():
+            await snap_provider.prune_snapshots(tid, gids, keep=keep)
+        return
+
     await execute(
         session,
         """
@@ -483,8 +690,9 @@ def body_message(model_id: Any, body: str, sampled_at: datetime, errors: list[di
 class ModelEngine:
     """Single-writer scheduler. ``session_factory`` returns an async session context manager."""
 
-    def __init__(self, session_factory: Any = None) -> None:
+    def __init__(self, session_factory: Any = None, live_provider: Any = None) -> None:
         self._session_factory = session_factory
+        self.live_provider = live_provider
         self.models: dict[str, ModelDef] = {}
         self._catalogs: dict[str, tuple[float, R.Catalog]] = {}
         self._reload_at = 0.0
@@ -600,15 +808,20 @@ class ModelEngine:
                 await after_commit.flush(session)
         return self.next_delay(utcnow())
 
-    async def _catalog(self, session: AsyncSession, tenant_id: str) -> R.Catalog:
+    async def _catalog(
+        self,
+        session: AsyncSession,
+        tenant_id: str,
+        extra_signal_ids: Iterable[str] | None = None,
+    ) -> R.Catalog:
         cached = self._catalogs.get(tenant_id)
         if cached is not None and time.monotonic() - cached[0] < CATALOG_TTL_S:
             return cached[1]
-        signal_ids: set[str] = set()
+        signal_ids: set[str] = set(extra_signal_ids or ())
         for model in self.models.values():
             if model.tenant_id == tenant_id:
                 signal_ids |= model.compiled.signal_ids
-        catalog = await load_catalog(session, UUID(tenant_id), signal_ids)
+        catalog = await load_catalog(session, UUID(tenant_id), signal_ids or None)
         self._catalogs[tenant_id] = (time.monotonic(), catalog)
         return catalog
 
@@ -620,13 +833,19 @@ class ModelEngine:
             by_tenant.setdefault(model.tenant_id, []).append(model)
         rows: list[dict[str, Any]] = []
         prune: list[str] = []
+        recorded: dict[UUID, list[Any]] = {}
         for tenant_id, group in by_tenant.items():
             tenant = UUID(tenant_id)
-            catalog = await self._catalog(session, tenant_id)
             signal_ids: set[str] = set()
             for model in group:
                 signal_ids |= model.compiled.signal_ids
-            samples, qualities = await load_samples(session, tenant, signal_ids)
+            catalog = await self._catalog(session, tenant_id, signal_ids)
+            await storage_model_recorder.ensure_targets(session, tenant)
+            samples, qualities = (
+                await load_samples(session, tenant, signal_ids, live_provider=self.live_provider)
+                if self.live_provider is not None
+                else await load_samples(session, tenant, signal_ids)
+            )
             for model in group:
                 try:
                     result = await evaluate_once(session, tenant, model.compiled, catalog, now, model.filter_state, samples, qualities)
@@ -645,12 +864,27 @@ class ModelEngine:
                     }
                 )
                 queue_stream_event(session, "model_body", tenant_id, body_message(model.id, result.text, now, errors), group_id=model.id)
+                if storage_model_recorder.has_targets(tenant_id, model.id):
+                    recorded.setdefault(tenant, []).append(
+                        storage_model_recorder.ModelResult(
+                            model_id=model.id,
+                            model_revision=model.version,
+                            sampled_at=now,
+                            body=result.body,
+                            field_quality=storage_model_recorder.field_quality_map(model.compiled, result, qualities),
+                            # R2-20: a mapping field's own sample time (guide D2 field provenance)
+                            field_source_ts=storage_model_recorder.field_source_times(model.compiled, samples),
+                        )
+                    )
                 model.samples_since_prune += 1
                 if model.samples_since_prune >= PRUNE_EVERY:
                     model.samples_since_prune = 0
                     prune.append(model.id)
                 await asyncio.sleep(0)  # yield between models
         await write_samples(session, rows)
+        # Bound Data Model fields -> durable outbox, in the same transaction as model_state (G-05).
+        for tenant, results in recorded.items():
+            await storage_model_recorder.capture_safely(session, tenant, results)
         if prune:
             await prune_snapshots(session, prune)
         return len(rows)

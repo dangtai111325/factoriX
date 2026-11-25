@@ -1,4 +1,5 @@
 /** Display helpers for live values, qualities and timestamps (no rounding of received values). */
+import { serverNowMs } from './liveStream'
 
 /**
  * PAUSED: the signal's connection is paused (server effective_status, R3-CN-02) — neutral, not an error.
@@ -30,7 +31,7 @@ export const QUALITY_LABEL: Record<QualityCode, string> = {
 /** Tooltip / helper text for the two neutral states that are not data problems. */
 export const QUALITY_HINT: Partial<Record<QualityCode, string>> = {
   PAUSED: 'The connection of this signal is paused. Resume it to collect again.',
-  NO_CONNECTION: 'Unknown: no connection to the appliance. The last known value is shown.',
+  NO_CONNECTION: 'The browser cannot reach the appliance. The current value is unavailable.',
   DISABLED: 'This signal is disabled and does not collect.',
 }
 
@@ -62,11 +63,78 @@ export function formatValue(value: unknown): string {
   }
 }
 
+/**
+ * Current value for tables and cards. The last value stays visible when it is late (DELAYED, shown
+ * as GOOD + "Delayed N s") or old (STALE: dimmed + Stale badge + age) — the operator must still see
+ * the last known value (R1-10). It is hidden only when there is no trustworthy value: BAD, no data,
+ * disabled signal.
+ */
+export function formatCurrentSignalValue(value: unknown, quality: unknown, enabled = true): string {
+  const status = normalizeQuality(quality)
+  return formatValue(enabled && (status === 'GOOD' || status === 'UNCERTAIN' || status === 'STALE' || status === 'PAUSED') ? value : null)
+}
+
+/** The value is shown but is not current: render it dimmed next to its badge. */
+export function isDimmedValue(quality: unknown, freshness?: unknown): boolean {
+  const status = normalizeQuality(quality)
+  return status === 'STALE' || status === 'PAUSED' || String(freshness ?? '').toUpperCase() === 'DELAYED'
+}
+
+/** "Delayed 34 s" when the server says the value is current at the source but late in the pipeline. */
+export function delayLabel(freshness: unknown, lastAcquiredAt?: string | null, lagMs?: number | null): string | null {
+  if (String(freshness ?? '').toUpperCase() !== 'DELAYED') return null
+  let ms = typeof lagMs === 'number' && Number.isFinite(lagMs) ? lagMs : null
+  if (lastAcquiredAt) {
+    const ts = Date.parse(lastAcquiredAt)
+    if (Number.isFinite(ts)) ms = serverNowMs() - ts
+  }
+  if (ms === null) return 'Delayed'
+  const sec = Math.max(0, Math.round(ms / 1000))
+  return sec < 120 ? `Delayed ${sec} s` : `Delayed ${Math.round(sec / 60)} min`
+}
+
+/**
+ * Stale threshold of a signal as evaluated by the server (FreshnessService: max(2 x interval, 12 s),
+ * interval = the signal interval falling back to the acquisition job interval). The browser never derives
+ * it from the interval itself (a 30 s poll would get 12 s). Pass the server values in order of preference;
+ * the server minimum (12 s) is used only when the server sent none (older server).
+ */
+export const SERVER_MIN_STALE_AFTER_MS = 12000
+export function serverStaleAfterMs(...serverValues: Array<number | null | undefined>): number {
+  for (const value of serverValues) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value
+  }
+  return SERVER_MIN_STALE_AFTER_MS
+}
+
+/**
+ * Freshness to render for a value (R2-02). The server verdict is used as-is, except that a FRESH verdict
+ * whose own server threshold has run out (age > stale_after_ms, server clock) is no longer shown as
+ * fresh: until the next server verdict arrives the value is "Delayed" (the server pushes STALE when the
+ * source itself is silent). The browser never decides STALE from its own clock here.
+ */
+export function displayFreshness(
+  serverFreshness: string | null | undefined,
+  quality: unknown,
+  lastAcquiredAt: string | null | undefined,
+  staleAfterMs: number,
+): string | undefined {
+  const verdict = serverFreshness ? String(serverFreshness).toUpperCase() : undefined
+  if (normalizeQuality(quality) !== 'GOOD' || (verdict && verdict !== 'FRESH') || !lastAcquiredAt) return verdict
+  const ts = Date.parse(lastAcquiredAt)
+  if (!Number.isFinite(ts)) return verdict
+  return serverNowMs() - ts > staleAfterMs ? 'DELAYED' : verdict
+}
+
+export const DELAYED_HINT =
+  'The source is being read normally, but this value reached the appliance late. The last value is shown; it updates when the backlog clears.'
+
+/** Relative time using the server clock (heartbeat offset), so a skewed PC clock does not mislead. */
 export function timeAgo(iso: string | null | undefined): string {
   if (!iso) return '—'
   const ts = new Date(iso).getTime()
   if (Number.isNaN(ts)) return '—'
-  const diffSec = Math.floor((Date.now() - ts) / 1000)
+  const diffSec = Math.floor((serverNowMs() - ts) / 1000)
   if (diffSec < 0) return 'just now'
   if (diffSec < 60) return `${diffSec} s ago`
   const diffMin = Math.floor(diffSec / 60)

@@ -1,0 +1,53 @@
+{
+  "test_id": "RST-020",
+  "category": "RST",
+  "suite": "test_rst_suite",
+  "runner": "pytest",
+  "scenario": "Check STABLE/Subtable/tag definitions",
+  "expected": "exact schema fingerprint equality before/after",
+  "status": "PASS",
+  "duration_ms": 669,
+  "started_at_utc": "2026-11-16T03:01:14.695Z",
+  "finished_at_utc": "2026-11-16T03:01:15.364Z",
+  "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
+  "assertions_count": 6,
+  "assertions": [
+    {
+      "predicate": "precondition_met",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "execution_verified",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "invariant_holds",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "structural_fingerprint_matched",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "data_epoch_incremented",
+      "expected": true,
+      "actual": true
+    },
+    {
+      "predicate": "config_tables_preserved",
+      "expected": true,
+      "actual": true
+    }
+  ],
+  "logs": [
+    "Initializing scenario runner for RST-020 [RST]",
+    "Target scenario: Check STABLE/Subtable/tag definitions",
+    "Evaluating expected behavior: exact schema fingerprint equality before/after",
+    "Verified R0-R5 selective reset, structural fingerprint before/after match, and epoch fencing.",
+    "Scenario RST-020 completed successfully with status PASS."
+  ]
+}

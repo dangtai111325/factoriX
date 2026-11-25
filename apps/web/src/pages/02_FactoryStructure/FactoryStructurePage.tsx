@@ -35,10 +35,11 @@ import { ImportTopicsModal } from '../../components/modals/ImportTopicsModal';
 import { ArchiveResourceModal } from '../../components/modals/ArchiveResourceModal';
 import { translateApiError } from '../../utils/apiErrors';
 import { AuditRow, describeAudit } from '../../utils/auditText';
-import { formatTimestamp, formatValue, normalizeQuality, QUALITY_HINT, QUALITY_LABEL, timeAgo } from '../../lib/format';
+import { formatTimestamp, formatCurrentSignalValue, normalizeQuality, QUALITY_HINT, QUALITY_LABEL, timeAgo } from '../../lib/format';
 import { ActionToast, ToastSpec, useActionToast } from '../../components/common/ActionToast';
 import { ImpactModel, archiveResourceWithModels } from '../../lib/impactApi';
 import { useConnectivity } from '../../lib/connectivity';
+import { notifyModelChanged } from '../../components/shell/modelSync';
 import {
   allowedChildTypes,
   ancestorPath,
@@ -166,6 +167,34 @@ async function fetchArchivedResources(): Promise<ResourceNode[]> {
     if (!cursor) break;
   }
   return result;
+}
+
+/**
+ * R1-20: the resource shown when the selected id is not (or no longer) in the active model, e.g. it
+ * was archived in another tab. Never an unrelated resource picked silently: the nearest active
+ * ancestor of what was shown, else the first resource (the initial default).
+ */
+function fallbackSelection(
+  resources: ResourceNode[],
+  lastShown: ResourceNode | undefined,
+  archived: ResourceNode[],
+): ResourceNode | undefined {
+  if (!resources.length) return undefined;
+  if (lastShown) {
+    const active = new Map(resources.map((item) => [item.id, item]));
+    const known = new Map([...archived, ...resources].map((item) => [item.id, item]));
+    const same = active.get(lastShown.id);
+    if (same) return same;
+    let parentId = lastShown.parentId;
+    const seen = new Set<string>();
+    while (parentId && !seen.has(parentId)) {
+      seen.add(parentId);
+      const hit = active.get(parentId);
+      if (hit) return hit;
+      parentId = known.get(parentId)?.parentId;
+    }
+  }
+  return resources[0];
 }
 
 interface ResourceDetail {
@@ -370,8 +399,11 @@ export const FactoryStructurePage: React.FC = () => {
   const [rightPanelTab, setRightPanelTab] = useState<'children' | 'telemetry'>('children');
 
   const [isAddModalOpen, setIsAddModalOpen] = useState(searchParams.get('modal') === 'add');
-  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
-  const [isMoveModalOpen, setIsMoveModalOpen] = useState(searchParams.get('modal') === 'move');
+  // R1-20: Edit / Move act on the resource they were opened for, pinned by id at opening. A later
+  // change of the selection (refresh, another tab, a fallback) can never retarget an open dialog.
+  const [editTargetId, setEditTargetId] = useState<string | null>(null);
+  const [moveTargetId, setMoveTargetId] = useState<string | null>(null);
+  const moveDeepLinkPending = useRef(searchParams.get('modal') === 'move');
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [archiveTarget, setArchiveTarget] = useState<ResourceNode | null>(null);
 
@@ -415,6 +447,37 @@ export const FactoryStructurePage: React.FC = () => {
     }
   }, [refresh]);
 
+  // R1-42: after a change, the tree must show it. A slower metadata reload that started before the
+  // change can still land after ours with the old list; while the expected state is missing (up to
+  // 15 s) the model is reloaded again, at most every 1.5 s.
+  const expectRef = useRef<{ check: (list: ResourceNode[]) => boolean; until: number; last: number } | null>(null);
+  const expectTimer = useRef<number | null>(null);
+  const expectModel = useCallback((check: (list: ResourceNode[]) => boolean) => {
+    expectRef.current = { check, until: Date.now() + 15000, last: Date.now() };
+  }, []);
+  useEffect(() => {
+    const expected = expectRef.current;
+    if (!expected) return;
+    const now = Date.now();
+    if (now > expected.until) {
+      expectRef.current = null;
+      return;
+    }
+    if (expected.check(rawResources)) return;
+    if (expectTimer.current !== null) return;
+    const wait = Math.max(0, expected.last + 1500 - now);
+    expectTimer.current = window.setTimeout(() => {
+      expectTimer.current = null;
+      const current = expectRef.current;
+      if (!current || Date.now() > current.until) return;
+      current.last = Date.now();
+      void safeRefresh();
+    }, wait);
+  }, [rawResources, safeRefresh]);
+  useEffect(() => () => {
+    if (expectTimer.current !== null) window.clearTimeout(expectTimer.current);
+  }, []);
+
   // Archived resources the active model no longer lists (a restore makes them active again).
   const visibleArchived = useMemo(() => {
     if (!showArchived) return [];
@@ -440,19 +503,48 @@ export const FactoryStructurePage: React.FC = () => {
     return order;
   }, [tree, expandedNodes, archivedIds]);
 
-  // Apply a deep link (?resourceId=) once per link, not on every data refresh.
+  // R1-20: the selection shown is the selection acted on. When the selected id is not in the active
+  // model the page shows a fallback (see fallbackSelection) and commits it to the shared selection,
+  // so the panel, the buttons and every dialog name the same resource.
+  const lastShownRef = useRef<ResourceNode | undefined>(undefined);
+  // A resource to select once it appears in the reloaded model (after a restore). Until then the
+  // current selection stays: the page never jumps to an unrelated resource while it waits.
+  const pendingSelectRef = useRef<{ id: string; until: number } | null>(null);
+  const selectedResource =
+    resources.find((r) => r.id === selectedResourceId) || fallbackSelection(resources, lastShownRef.current, archivedResources);
+  if (selectedResource) lastShownRef.current = selectedResource;
+  const selectedId = selectedResource?.id || '';
+
+  // Apply a deep link (?resourceId=) once per link, not on every data refresh; then a pending
+  // selection; otherwise commit the fallback.
   const appliedDeepLink = useRef<string | null>(null);
   useEffect(() => {
     const resourceId = searchParams.get('resourceId');
-    if (!resourceId || appliedDeepLink.current === resourceId) return;
-    if (resources.some((item) => item.id === resourceId)) {
+    if (resourceId && appliedDeepLink.current !== resourceId && resources.some((item) => item.id === resourceId)) {
       appliedDeepLink.current = resourceId;
       setSelectedResourceId(resourceId);
+      if (moveDeepLinkPending.current) {
+        moveDeepLinkPending.current = false;
+        setMoveTargetId(resourceId);
+      }
+      return;
     }
-  }, [resources, searchParams, setSelectedResourceId]);
-
-  const selectedResource = resources.find((r) => r.id === selectedResourceId) || resources[0];
-  const selectedId = selectedResource?.id || '';
+    const pending = pendingSelectRef.current;
+    if (pending) {
+      if (resources.some((item) => item.id === pending.id)) {
+        pendingSelectRef.current = null;
+        setSelectedResourceId(pending.id);
+        return;
+      }
+      if (Date.now() < pending.until) return;
+      pendingSelectRef.current = null;
+    }
+    if (selectedId && selectedId !== selectedResourceId) setSelectedResourceId(selectedId);
+    if (moveDeepLinkPending.current && !resourceId && selectedId) {
+      moveDeepLinkPending.current = false;
+      setMoveTargetId(selectedId);
+    }
+  }, [resources, searchParams, selectedId, selectedResourceId, setSelectedResourceId]);
 
   // Keep ancestors of the selected node expanded so it stays visible.
   useEffect(() => {
@@ -623,15 +715,41 @@ export const FactoryStructurePage: React.FC = () => {
       description: input.description,
     });
     if (input.parent_id) setExpandedNodes((prev) => ({ ...prev, [input.parent_id as string]: true }));
+    notifyModelChanged('resource');
     showToast({ message: `Added "${input.name}"`, tone: 'info' });
   };
 
+  // Resources the open Edit / Move dialogs act on (pinned by id; data refreshed from the model).
+  const editTarget = editTargetId ? resources.find((item) => item.id === editTargetId) || null : null;
+  const moveTarget = moveTargetId ? resources.find((item) => item.id === moveTargetId) || null : null;
+
+  /** Move through the API directly: a failed reload after a successful move is not a failed move. */
+  const moveTo = useCallback(
+    async (resource: ResourceNode, parentId: string): Promise<{ success: boolean; error?: string }> => {
+      if (resource.id === parentId) return { success: false, error: 'A resource cannot contain itself.' };
+      try {
+        await api(`/api/v1/resources/${encodeURIComponent(resource.id)}/move`, {
+          method: 'POST',
+          body: JSON.stringify({ version: Number(resource.attributes?.version || 1), parent_id: parentId }),
+        });
+      } catch (caught) {
+        return { success: false, error: translateApiError(caught) };
+      }
+      expectModel((list) => list.find((item) => item.id === resource.id)?.parentId === parentId);
+      notifyModelChanged('resource');
+      await safeRefresh();
+      return { success: true };
+    },
+    [expectModel, safeRefresh],
+  );
+
   const handleMoveResource = async (targetParentId: string) => {
-    if (!selectedResource) return { success: false, error: 'No resource selected.' };
-    const moved = selectedResource;
+    // The resource the dialog was opened for, never the current selection (R1-20).
+    const moved = moveTarget;
+    if (!moved) return { success: false, error: 'The resource to move is no longer in the model. Close this dialog and try again.' };
     const oldParentId = moved.parentId;
-    const res = await moveResource(moved.id, targetParentId);
-    if (!res.success) return { success: false, error: translateApiError(res.error || 'Move failed') };
+    const res = await moveTo(moved, targetParentId);
+    if (!res.success) return { success: false, error: res.error || 'Move failed' };
     setExpandedNodes((prev) => ({ ...prev, [targetParentId]: true }));
     setPageError(null);
     const newParent = resources.find((item) => item.id === targetParentId);
@@ -642,11 +760,15 @@ export const FactoryStructurePage: React.FC = () => {
         ? {
             label: 'Undo',
             run: async () => {
-              const undo = await moveResource(moved.id, oldParentId);
+              // Undo uses the moved resource's current version (the move bumped it).
+              const latest = rawResources.find((item) => item.id === moved.id);
+              const undo = latest
+                ? await moveTo(latest, oldParentId)
+                : await moveResource(moved.id, oldParentId).then((r) => ({ ...r, error: r.error && translateApiError(r.error) }));
               if (undo.success) {
                 showToast({ message: `Moved "${moved.name}" back`, tone: 'info' });
               } else {
-                showToast({ message: `Undo failed: ${translateApiError(undo.error || 'Move failed')}`, tone: 'error' });
+                showToast({ message: `Undo failed: ${undo.error || 'Move failed'}`, tone: 'error' });
               }
             },
           }
@@ -662,9 +784,13 @@ export const FactoryStructurePage: React.FC = () => {
       setRestoringId(target.id);
       try {
         await api(`/api/v1/resources/${encodeURIComponent(target.id)}/restore`, { method: 'POST' });
+        // R1-20: select the restored resource once the reloaded model lists it, not before: until
+        // then the current selection stays (no fallback to an unrelated resource).
+        pendingSelectRef.current = { id: target.id, until: Date.now() + 15000 };
+        expectModel((list) => list.some((item) => item.id === target.id));
+        notifyModelChanged('resource');
         await safeRefresh();
         if (showArchived) await reloadArchived();
-        setSelectedResourceId(target.id);
         setHistoryTick((value) => value + 1);
         // The Center has no restore for data models: models archived together stay archived.
         const kept = archivedModels.length;
@@ -688,7 +814,7 @@ export const FactoryStructurePage: React.FC = () => {
         setRestoringId(null);
       }
     },
-    [archivedResources, reloadArchived, safeRefresh, setSelectedResourceId, showArchived, showToast],
+    [archivedResources, expectModel, reloadArchived, safeRefresh, showArchived, showToast],
   );
 
   const confirmArchive = async (options: {
@@ -706,10 +832,13 @@ export const FactoryStructurePage: React.FC = () => {
     } catch (caught) {
       return { success: false, error: translateApiError(caught) };
     }
+    // Keep the user in context: select the parent of the archived resource.
+    pendingSelectRef.current = null;
+    setSelectedResourceId(target.parentId || '');
+    expectModel((list) => !list.some((item) => item.id === target.id));
+    notifyModelChanged('resource');
     await safeRefresh();
     if (showArchived) await reloadArchived();
-    // Keep the user in context: select the parent of the archived resource.
-    setSelectedResourceId(target.parentId || '');
     setPageError(null);
     const keptModels = options.models.length - archivedModels.length;
     const parts = [
@@ -787,7 +916,7 @@ export const FactoryStructurePage: React.FC = () => {
       if (event.key === 'F2') {
         event.preventDefault();
         setSelectedResourceId(resource.id);
-        setIsEditModalOpen(true);
+        setEditTargetId(resource.id);
         return;
       }
       if (event.key === 'Delete') {
@@ -1121,9 +1250,11 @@ export const FactoryStructurePage: React.FC = () => {
                             </span>
                           </div>
                           <div className="flex items-baseline justify-between gap-2 mt-1">
-                            <span className="text-base font-bold font-mono text-[#0B2545] truncate" title={formatValue(sig.value)}>
-                              {formatValue(sig.value)}
-                              {sig.unit && <span className="text-xs font-normal text-[#657794] ml-1">{sig.unit}</span>}
+                            <span className="text-base font-bold font-mono text-[#0B2545] truncate" title={formatCurrentSignalValue(sig.value, sig.quality)}>
+                              {formatCurrentSignalValue(sig.value, sig.quality)}
+                              {sig.unit && formatCurrentSignalValue(sig.value, sig.quality) !== '—' && (
+                                <span className="text-xs font-normal text-[#657794] ml-1">{sig.unit}</span>
+                              )}
                             </span>
                             <span className="text-[10px] text-[#94A3B8] shrink-0" title={sig.lastUpdated ? formatTimestamp(sig.lastUpdated) : undefined}>
                               {sig.lastUpdated ? timeAgo(sig.lastUpdated) : '—'}
@@ -1215,7 +1346,7 @@ export const FactoryStructurePage: React.FC = () => {
                 <Button size="sm" variant="primary" icon={<Plus className="w-3.5 h-3.5" />} onClick={goToAddData}>
                   Add data
                 </Button>
-                <Button size="sm" variant="secondary" icon={<Edit2 className="w-3.5 h-3.5" />} onClick={() => setIsEditModalOpen(true)}>
+                <Button size="sm" variant="secondary" icon={<Edit2 className="w-3.5 h-3.5" />} onClick={() => setEditTargetId(selectedResource.id)}>
                   Edit
                 </Button>
                 <MenuButton
@@ -1228,7 +1359,7 @@ export const FactoryStructurePage: React.FC = () => {
                       key: 'move',
                       label: 'Move…',
                       icon: <ArrowRightLeft className="w-4 h-4" />,
-                      onSelect: () => setIsMoveModalOpen(true),
+                      onSelect: () => setMoveTargetId(selectedResource.id),
                     },
                     {
                       key: 'archive',
@@ -1369,24 +1500,34 @@ export const FactoryStructurePage: React.FC = () => {
       />
 
       <EditResourceModal
-        isOpen={isEditModalOpen}
-        onClose={() => setIsEditModalOpen(false)}
-        resource={selectedResource}
+        isOpen={Boolean(editTarget)}
+        onClose={() => setEditTargetId(null)}
+        resource={editTarget}
         resources={resources}
         onSuccess={async (updated) => {
+          const editedId = editTarget?.id;
+          if (editedId) {
+            expectModel((list) => {
+              const item = list.find((row) => row.id === editedId);
+              return !item || (item.name === updated.name && item.code === updated.code);
+            });
+          }
+          notifyModelChanged('resource');
           await safeRefresh();
           setHistoryTick((value) => value + 1);
           showToast({ message: `Saved "${updated.name}"`, tone: 'info' });
         }}
       />
 
+      {moveTarget && (
       <MoveResourceModal
-        isOpen={isMoveModalOpen}
-        onClose={() => setIsMoveModalOpen(false)}
-        selectedResource={selectedResource}
+        isOpen
+        onClose={() => setMoveTargetId(null)}
+        selectedResource={moveTarget}
         allResources={resources}
         onMoveResource={handleMoveResource}
       />
+      )}
 
       <ArchiveResourceModal
         isOpen={Boolean(archiveTarget)}

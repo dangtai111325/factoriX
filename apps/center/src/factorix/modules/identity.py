@@ -544,18 +544,14 @@ def safe_settings_view() -> dict[str, Any]:
 
 
 async def revert_to_zero(session: AsyncSession) -> int:
-    """Delete every tenant row, including the administrator. Schema and migrations stay."""
-    names = await fetch_all(
-        session,
-        """
-        SELECT tablename FROM pg_tables
-        WHERE schemaname = 'public' AND tablename <> 'alembic_version'
-        ORDER BY tablename
-        """,
-        {},
+    """Permanently disabled (A4(c) safety guard). Kept only so old imports keep resolving.
+
+    The former body ran ``TRUNCATE <every public table> RESTART IDENTITY CASCADE`` (configuration, accounts and
+    all). It must never be reachable again: it raises before touching the session. Clearing telemetry is the
+    selective reset (``modules.telemetry_reset``, ``/api/v1/admin/telemetry-reset``).
+    """
+    raise AppError(
+        410,
+        "ENDPOINT_GONE",
+        "Destructive revert-to-zero is permanently disabled. Use the selective telemetry reset instead.",
     )
-    if not names:
-        return 0
-    quoted = ", ".join(f'"{row["tablename"]}"' for row in names)
-    await execute(session, f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE", {})
-    return len(names)

@@ -429,7 +429,7 @@ export async function getLatestValues(ids: string[]): Promise<Map<string, { valu
       out.set(str(r.signal_id), {
         value: r.value !== undefined ? r.value : vj && typeof vj === 'object' ? vj.v : null,
         quality: strOrNull(r.effective_status ?? r.quality),
-        receivedTime: strOrNull(r.received_time),
+        receivedTime: strOrNull(r.last_acquired_at ?? r.received_time),
       });
     }
   }
