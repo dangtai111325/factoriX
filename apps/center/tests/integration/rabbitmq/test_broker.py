@@ -215,36 +215,25 @@ async def test_retry_delivery_limit_routes_poison_to_quorum_dlq() -> None:
             f"Expected >= {cfg.delivery_limit} delivery attempts, got {attempts}"
         )
 
-        # Verify the message arrived in the DLQ via Management HTTP
-        # (AMQP passive declare message_count may lag for at-least-once dead-lettered messages)
-        parsed = urlparse(cfg.amqp_url)
-        dlq_check_auth = (parsed.username or "", parsed.password or "")
-        dlq_msg_found = False
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            # Retry DLQ check a few times to allow Management stats to settle
-            for _ in range(6):
-                resp = await client.get(
-                    f"{cfg.mgmt_url}/api/queues/%2F/{cfg.dlq_name}",
-                    auth=dlq_check_auth,
-                )
-                if resp.status_code == 200 and int(resp.json().get("messages", 0)) >= 1:
-                    dlq_msg_found = True
-                    break
-                await asyncio.sleep(1.0)
-
-        assert dlq_msg_found, (
-            f"Expected poison message in DLQ after {cfg.delivery_limit} deliveries "
-            f"(attempts={attempts})"
-        )
-
-        # Read and verify the message inside DLQ has intact payload & headers
-        # Use plain connect (not robust) to avoid aiormq reconnect task teardown noise on Python 3.14
+        # Verify the message reached the DLQ. Dead-lettering with the at-least-once strategy is
+        # asynchronous (the quorum queue republishes to the DLX after the consumer gave up), and the
+        # Management API message count lags behind on slow runners, so poll the DLQ itself with
+        # basic.get for up to 30 s instead of trusting a statistics snapshot.
         conn = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
         try:
             ch = await conn.channel()
             dlq = await ch.declare_queue(cfg.dlq_name, passive=True)
-            dlq_msg = await dlq.get(timeout=5.0)
-            assert dlq_msg is not None
+            dlq_msg = None
+            deadline = asyncio.get_running_loop().time() + 30.0
+            while dlq_msg is None and asyncio.get_running_loop().time() < deadline:
+                dlq_msg = await dlq.get(fail=False, timeout=5.0)
+                if dlq_msg is None:
+                    await asyncio.sleep(0.5)
+            assert dlq_msg is not None, (
+                f"Expected poison message in DLQ after {cfg.delivery_limit} deliveries "
+                f"(attempts={attempts})"
+            )
+            # The dead-lettered message keeps its payload and headers.
             restored = CanonicalObservation.from_json_bytes(dlq_msg.body)
             assert restored.correlation_id == "test-99"
             await dlq_msg.ack()
