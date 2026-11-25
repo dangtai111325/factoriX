@@ -779,12 +779,19 @@ class TDEngineClient:
             assert acq_ts is not None
             # Typed fast path: identical literals to sql_literal() per column type, without
             # re-converting timestamps and re-dispatching on every value.
-            values_sql = (
-                f"({ts_us}, {sql_literal(val, value_type=norm_vtype)}, {to_td_timestamp_us(acq_ts)}, "
-                f"{to_td_timestamp_us(src_ts) if src_ts is not None else 'NULL'}, {text(raw_quality)}, {text(reason)}, "
-                f"{text(origin)}, {text(unit)}, {text(ev_uid)}, {config_rev}, {data_epoch}, "
-                f"{source_seq if source_seq is not None else 'NULL'}, {text(record_kind[:24])})"
-            )
+            values_sql: str | None
+            try:
+                values_sql = (
+                    f"({ts_us}, {sql_literal(val, value_type=norm_vtype)}, {to_td_timestamp_us(acq_ts)}, "
+                    f"{to_td_timestamp_us(src_ts) if src_ts is not None else 'NULL'}, {text(raw_quality)}, {text(reason)}, "
+                    f"{text(origin)}, {text(unit)}, {text(ev_uid)}, {config_rev}, {data_epoch}, "
+                    f"{source_seq if source_seq is not None else 'NULL'}, {text(record_kind[:24])})"
+                )
+            except TDEngineError:
+                # A value with no valid literal (e.g. NaN/Infinity -> NON_FINITE_FLOAT) must reject only its
+                # own row: leave it unrendered so write_batch() renders it in its per-item guard and reports
+                # a BatchWriteFailure for this event_uid while the rest of the batch is written.
+                values_sql = None
             items.append(
                 SubtableWriteItem(
                     item_id=str(rec["event_uid"]),

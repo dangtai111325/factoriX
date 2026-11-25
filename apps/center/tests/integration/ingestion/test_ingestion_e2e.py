@@ -24,6 +24,7 @@ from factorix.platform.broker import BrokerConfig, RabbitMQPublisher, probe_brok
 from factorix.platform.security import new_token
 from factorix.platform.tdengine import TDEngineClient, TDEngineError, op_subtable_name, tenant_database_name
 from factorix.transport.hub import parse_pg_notify_events as _parse_pg_notify_events
+from factorix_core.contracts.notify import LatestIdsV2, StreamEventsV1, parse_stream_events
 
 
 def _pg_dsn() -> str:
@@ -53,7 +54,7 @@ async def _cleanup_broker(cfg: BrokerConfig) -> None:
     conn = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
     try:
         ch = await conn.channel()
-        for qname in (cfg.queue_name, cfg.dlq_name):
+        for qname in (cfg.queue_name, cfg.live_queue_name, cfg.dlq_name):
             try:
                 await ch.queue_delete(qname, if_unused=False, if_empty=False)
             except Exception:
@@ -363,7 +364,14 @@ async def test_rabbitmq_to_tdengine_and_pg_end_to_end_with_shadow_parity() -> No
         ]
 
         async with RabbitMQPublisher(cfg) as pub:
-            for msg in messages:
+            # f_new is stored first so f_old is deterministically a late, strictly older delivery (not in the
+            # same chronologically-ordered batch): it is kept in raw history but must not rewind formula state.
+            await pub.publish_observation(messages[0])
+            first_deadline = asyncio.get_running_loop().time() + 30.0
+            while asyncio.get_running_loop().time() < first_deadline and worker.metrics.acked_total < 1:
+                await asyncio.sleep(0.05)
+            assert worker.metrics.acked_total >= 1, f"Metrics: {worker.metrics}"
+            for msg in messages[1:]:
                 await pub.publish_observation(msg)
 
             deadline = asyncio.get_running_loop().time() + 30.0
@@ -405,7 +413,9 @@ async def test_rabbitmq_to_tdengine_and_pg_end_to_end_with_shadow_parity() -> No
             data_epoch=1,
         )
         assert report.ok, f"Parity diff found: missing={report.missing_in_td}, extra={report.extra_in_td}, mismatches={report.mismatches}"
-        assert report.td_count == 9  # 7 collected valid + 2 calculated (from f_new & f_old)
+        # 7 collected valid + 1 calculated (from f_new). The late, older f_old is stored as raw history but
+        # triggers no calculation: a late delivery cannot rewind formula input state (causal formula inputs).
+        assert report.td_count == 8
 
         # Verify latest_signal_state chose f_new (25.0) and calculated 77.0 °F despite out-of-order arrival of f_old (10.0)
         async with pg_pool.acquire() as conn:
@@ -431,15 +441,28 @@ async def test_rabbitmq_to_tdengine_and_pg_end_to_end_with_shadow_parity() -> No
             q_rows = await conn.fetch("SELECT reason FROM observation_quarantine WHERE tenant_id = $1", tid)
             assert len(q_rows) == 1
 
-        # Verify PG NOTIFY delivered valid WebSocket bridge payloads
+        # Verify PG NOTIFY announced the committed latest state to the WebSocket bridge. Default wire format is
+        # v2 ``latest_ids`` (the bridge re-reads the committed rows); FACTORIX_NOTIFY_FORMAT=v1 sends full events.
+        f_sig = str(sigs["float64"][0])
+
+        def _latest_announced() -> bool:
+            for _ch, p in stream_payloads:
+                msg = parse_stream_events(p)
+                if isinstance(msg, LatestIdsV2) and msg.tenant_id == str(tid) and f_sig in msg.signal_ids:
+                    return True
+                if isinstance(msg, StreamEventsV1) and any(
+                    ev.get("kind") == "latest" and ev.get("signal_id") == f_sig for ev in msg.events
+                ):
+                    return True
+            return False
+
         notify_deadline = asyncio.get_running_loop().time() + 3.0
-        parsed_ws_events: list[dict[str, Any]] = []
-        while asyncio.get_running_loop().time() < notify_deadline:
-            parsed_ws_events = [ev for ch, p in stream_payloads for ev in _parse_pg_notify_events(ch, p)]
-            if any(ev.get("kind") == "latest" and ev.get("signal_id") == str(sigs["float64"][0]) for ev in parsed_ws_events):
-                break
+        while asyncio.get_running_loop().time() < notify_deadline and not _latest_announced():
             await asyncio.sleep(0.05)
-        assert any(ev.get("kind") == "latest" and ev.get("signal_id") == str(sigs["float64"][0]) for ev in parsed_ws_events)
+        assert _latest_announced(), f"No latest NOTIFY for {f_sig}: {stream_payloads[:5]}"
+        if pg_store.notify_format == "v1":
+            parsed_ws_events = [ev for ch, p in stream_payloads for ev in _parse_pg_notify_events(ch, p)]
+            assert any(ev.get("kind") == "latest" and ev.get("signal_id") == f_sig for ev in parsed_ws_events)
     finally:
         await worker.stop(drain_timeout_s=5.0)
         await notify_conn.close()

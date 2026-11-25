@@ -9,13 +9,15 @@ import pytest
 from aio_pika.abc import AbstractIncomingMessage
 
 from factorix.domain.canonical import CanonicalObservation
-from factorix.platform.broker import ConsumeOutcome, RabbitMQConsumer, RabbitMQPublisher
+from factorix.platform.broker import ConsumeOutcome, RabbitMQPublisher
 from factorix_acquisition.config_provider import ConfigProvider, LkgSnapshotStore, PgSecretStore
 from factorix_acquisition.pg_control import PgControlPlane
 from factorix_acquisition.publisher import ObservationPublisher
 from factorix_acquisition.runtime import AcquisitionRuntime
 from factorix_acquisition.spool import AcquisitionSpool
 from acq_int_helpers import (
+    TwoLaneConsumer,
+    delivered_observations,
     assert_isolated_test_env,
     cleanup_broker_topology,
     isolated_broker_cfg,
@@ -41,10 +43,10 @@ async def test_broker_outage_spills_and_replays_to_rabbitmq_and_lkg_cold_start_s
     received: list[CanonicalObservation] = []
 
     async def handle(msg: AbstractIncomingMessage) -> ConsumeOutcome:
-        received.append(CanonicalObservation.from_json_bytes(msg.body))
+        received.extend(delivered_observations(msg))
         return ConsumeOutcome.ACK
 
-    consumer = RabbitMQConsumer(broker_cfg, handle)
+    consumer = TwoLaneConsumer(broker_cfg, handle)
     broker = RabbitMQPublisher(broker_cfg)
     runtime, lkg_store, spool, pub = make_runtime(pool, asyncpg_dsn, broker, tmp_path, data_key=data_key, use_leader_lock=False)
     rt_task: asyncio.Task[None] | None = None
@@ -150,10 +152,10 @@ async def test_epoch_bump_fences_spooled_observations_against_replay_after_outag
     received: list[CanonicalObservation] = []
 
     async def handle(msg: AbstractIncomingMessage) -> ConsumeOutcome:
-        received.append(CanonicalObservation.from_json_bytes(msg.body))
+        received.extend(delivered_observations(msg))
         return ConsumeOutcome.ACK
 
-    consumer = RabbitMQConsumer(broker_cfg, handle)
+    consumer = TwoLaneConsumer(broker_cfg, handle)
     broker = RabbitMQPublisher(broker_cfg)
     # Start with broker=None so all epoch=1 samples spill into SQLite spool
     runtime, _lkg, spool, pub = make_runtime(pool, asyncpg_dsn, None, tmp_path, data_key=data_key, use_leader_lock=False)

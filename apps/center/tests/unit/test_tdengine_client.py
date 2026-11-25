@@ -265,6 +265,39 @@ async def test_operational_fast_values_render_identically_to_generic_literals(mo
 
 
 @pytest.mark.asyncio
+async def test_operational_non_finite_value_fails_only_its_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NaN / Infinity has no TDengine DOUBLE literal: that row is reported NON_FINITE_FLOAT, the batch is written."""
+    client = TDEngineClient(TDEngineConfig(dsn="ws://localhost:6041"))
+    statements: list[str] = []
+
+    async def execute(sql: str, **_kw: Any) -> int:
+        statements.append(sql)
+        return 0
+
+    monkeypatch.setattr(client, "execute_sql", execute)
+    now = datetime(2026, 11, 18, 1, 2, 3, tzinfo=timezone.utc)
+    base = {"signal_id": uuid4(), "resource_id": uuid4(), "connection_id": uuid4(), "value_type": "float64"}
+    records = [
+        {**base, "event_uid": "ok-1", "value": 1.0, "event_time": now},
+        {**base, "event_uid": "nan", "value": float("nan"), "raw_quality": "BAD", "event_time": now.replace(second=4)},
+        {**base, "event_uid": "inf", "value": float("-inf"), "raw_quality": "BAD", "event_time": now.replace(second=5)},
+        {**base, "event_uid": "ok-2", "value": 2.0, "event_time": now.replace(second=6)},
+    ]
+    try:
+        result = await client.write_operational_observations(uuid4(), records)
+        assert result.succeeded_ids == ("ok-1", "ok-2")
+        assert [(f.item_id, f.code, f.retryable) for f in result.failures] == [
+            ("nan", "NON_FINITE_FLOAT", False),
+            ("inf", "NON_FINITE_FLOAT", False),
+        ]
+        assert len(statements) == 1
+        assert "'ok-1'" in statements[0] and "'ok-2'" in statements[0]
+        assert "'nan'" not in statements[0] and "'inf'" not in statements[0]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_ping_is_one_cheap_query_and_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     client = TDEngineClient(TDEngineConfig(dsn="ws://localhost:6041"))
     seen: list[tuple[str, bool]] = []

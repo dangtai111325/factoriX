@@ -25,7 +25,9 @@ class BrokerSettings(BaseSettings):
     rabbitmq_mgmt_url: str = ""
     rabbitmq_exchange: str = "factorix.telemetry.ingress"
     rabbitmq_queue: str = "factorix.telemetry.ingest.q"
-    rabbitmq_live_queue: str = "factorix.telemetry.live.q"
+    # Empty (default) = derived from ``rabbitmq_queue`` by ``BrokerConfig`` (``factorix.telemetry.live.q``
+    # for the default ingest queue), so ingest and live lanes of one topology always share a prefix.
+    rabbitmq_live_queue: str = ""
     rabbitmq_dlx: str = "factorix.telemetry.dlx"
     rabbitmq_dlq: str = "factorix.telemetry.dlq"
     rabbitmq_binding_pattern: str = "telemetry.v1.*"

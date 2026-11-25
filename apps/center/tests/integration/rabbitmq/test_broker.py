@@ -52,7 +52,7 @@ async def _cleanup_topology(cfg: BrokerConfig) -> None:
     conn = await aio_pika.connect(cfg.amqp_url, timeout=5.0)
     try:
         ch = await conn.channel()
-        for qname in (cfg.queue_name, cfg.dlq_name):
+        for qname in (cfg.queue_name, cfg.live_queue_name, cfg.dlq_name):
             try:
                 await ch.queue_delete(qname, if_unused=False, if_empty=False)
             except Exception:
@@ -130,6 +130,18 @@ async def test_quorum_topology_arguments_and_health_probe() -> None:
                 assert args["x-dead-letter-strategy"] == "at-least-once"
                 assert args["x-overflow"] == "reject-publish"
                 assert args["x-delivery-limit"] == 3
+
+                # The live lane belongs to the same isolated topology (own name, same DLX), never a shared queue.
+                assert cfg.live_queue_name != "factorix.telemetry.live.q"
+                live_resp = await client.get(
+                    f"{cfg.mgmt_url}/api/queues/%2F/{cfg.live_queue_name}",
+                    auth=(parsed.username or "", parsed.password or ""),
+                )
+                assert live_resp.status_code == 200
+                live_info = live_resp.json()
+                assert live_info["type"] == "quorum"
+                assert live_info["arguments"]["x-dead-letter-exchange"] == cfg.dlx_name
+                assert live_info["arguments"]["x-delivery-limit"] == 3
     finally:
         await _cleanup_topology(cfg)
 
@@ -148,7 +160,8 @@ async def test_publisher_confirm_manual_ack_and_epoch_headers() -> None:
             done.set()
         return ConsumeOutcome.ACK
 
-    consumer = RabbitMQConsumer(cfg, handle)
+    # Fresh observations (acquired within freshness_window_s) are routed to the live lane by default.
+    consumer = RabbitMQConsumer(cfg, handle, queue_name=cfg.live_queue_name)
     try:
         async with RabbitMQPublisher(cfg) as pub:
             for i in range(3):
@@ -184,7 +197,7 @@ async def test_retry_delivery_limit_routes_poison_to_quorum_dlq() -> None:
     consumer = RabbitMQConsumer(cfg, failing_handler)
     try:
         async with RabbitMQPublisher(cfg) as pub:
-            await pub.publish_observation(_make_obs(tenant_id, seq=99))
+            await pub.publish_observation(_make_obs(tenant_id, seq=99), routing_key=tenant_routing_key(tenant_id))
             await consumer.start()
             # With at-least-once DLX strategy, RabbitMQ 4.0 may crash the quorum queue
             # process (noproc) when dead-lettering – this IS the dead-letter event.
@@ -253,7 +266,8 @@ async def test_overflow_reject_publish_raises_backpressure_without_drop_head() -
         async with RabbitMQPublisher(cfg) as pub:
             for seq in range(1, 8):
                 try:
-                    await pub.publish_observation(_make_obs(tenant_id, seq=seq))
+                    # x-max-length applies to the ingest (legacy) queue: route there explicitly.
+                    await pub.publish_observation(_make_obs(tenant_id, seq=seq), routing_key=tenant_routing_key(tenant_id))
                 except BrokerBackpressureError:
                     rejected_at = seq
                     break
@@ -296,7 +310,7 @@ async def test_unacked_consumer_crash_redelivers_message() -> None:
         ch1 = await conn1.channel()
         _, q1, _ = await declare_telemetry_topology(ch1, cfg)
         async with RabbitMQPublisher(cfg) as pub:
-            await pub.publish_observation(_make_obs(tenant_id, seq=777))
+            await pub.publish_observation(_make_obs(tenant_id, seq=777), routing_key=tenant_routing_key(tenant_id))
         msg1 = await q1.get(timeout=5.0, no_ack=False)
         assert msg1 is not None
         assert msg1.redelivered is False

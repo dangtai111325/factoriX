@@ -32,6 +32,7 @@ from acq_int_helpers import (  # noqa: E402
 )
 from factorix.domain.canonical import CanonicalObservation, CanonicalProvenance, derive_event_uid  # noqa: E402
 from factorix.domain.quality import Origin, Quality  # noqa: E402
+from factorix.domain.signal_state import OFFLINE_CONNECTION_HEALTH  # noqa: E402
 from factorix.modules import models_engine, telemetry  # noqa: E402
 from factorix.modules.ingestion_worker import IngestionWorker, PgIngestionStore  # noqa: E402
 from factorix.modules.live_state import TDengineLiveStateProvider, configure_live_state_provider  # noqa: E402
@@ -257,7 +258,14 @@ async def test_live_state_5_protocols_quality_stale_recovery_and_cold_tdengine_r
             mt = latest.get(sig_mq_temp)
             if mr and mt and mr["effective_status"] == "STALE" and mt["effective_status"] == "STALE":
                 mq_stale = True
-                assert mr["reason_code"] == "NO_FRESH_ACQUISITION"
+                # CT-12: a stale value of a connection whose health is DEGRADED/OFFLINE (the acquisition reports
+                # the silent MQTT source as SILENT -> DEGRADED) is explained as CONNECTION_OFFLINE.
+                expected_reason = (
+                    "CONNECTION_OFFLINE"
+                    if str(mr["connection_health"] or "").upper() in OFFLINE_CONNECTION_HEALTH
+                    else "NO_FRESH_ACQUISITION"
+                )
+                assert mr["reason_code"] == expected_reason, mr
                 assert mr["source_health"] == "STALE"
                 # Independent health dimensions: broker and storage remain HEALTHY while source is STALE!
                 assert mr["broker_health"] == "HEALTHY"
@@ -266,15 +274,18 @@ async def test_live_state_5_protocols_quality_stale_recovery_and_cold_tdengine_r
             await asyncio.sleep(0.4)
         assert mq_stale, f"MQTT signals did not become STALE after publisher silence: {latest}"
 
-        # Models expose quality but leave unavailable source values empty.
+        # Models (R1-02 / v6 contract Q3): a STALE source keeps its last value flagged STALE, a BAD source
+        # publishes its last GOOD value flagged BAD; nothing is blanked to null.
         async with sa_maker() as session:
             samples, qualities = await models_engine.load_samples(
                 session, tid, [sig_mq_run, sig_opc_temp], live_provider=api_provider
             )
         assert qualities[str(sig_mq_run).lower()] == "STALE"
-        assert samples[str(sig_mq_run).lower()] is None
+        mq_sample = samples[str(sig_mq_run).lower()]
+        assert mq_sample is not None and mq_sample.quality == "STALE" and mq_sample.value is True
         assert qualities[str(sig_opc_temp).lower()] == "BAD"
-        assert samples[str(sig_opc_temp).lower()] is None
+        opc_sample = samples[str(sig_opc_temp).lower()]
+        assert opc_sample is not None and opc_sample.quality == "BAD" and opc_sample.value is not None
 
         # Replay an older timestamped MQTT packet -> must be rejected and MUST NOT clear STALE
         stale_acq_before = latest[sig_mq_run]["last_acquired_at"]

@@ -197,6 +197,19 @@ def test_two_lane_broker_config_and_routing_keys() -> None:
     assert cfg.live_prefetch_count == 256
     assert cfg.live_consumer_concurrency == 256
 
+    # The live lane follows the configured topology (isolated / prefixed topologies never share a live queue
+    # whose DLX arguments belong to another topology); an explicit name is kept as given.
+    prefixed = BrokerConfig(amqp_url="amqp://localhost/", queue_name="factorix.s06.ingest.q.abc", dlx_name="factorix.s06.dlx.abc")
+    assert prefixed.live_queue_name == "factorix.s06.live.q.abc"
+    assert BrokerConfig(amqp_url="amqp://localhost/", queue_name="custom").live_queue_name == "custom.live"
+    assert BrokerConfig(amqp_url="amqp://localhost/", live_queue_name="x.live.q").live_queue_name == "x.live.q"
+    from factorix.platform.settings import BrokerSettings
+
+    from_env = BrokerConfig.from_settings(BrokerSettings(rabbitmq_url="amqp://localhost/"))
+    assert (from_env.queue_name, from_env.live_queue_name, from_env.dlq_name) == (
+        "factorix.telemetry.ingest.q", "factorix.telemetry.live.q", "factorix.telemetry.dlq",
+    )
+
     tid = UUID("11111111-2222-3333-4444-555555555555")
     legacy_key = tenant_routing_key(tid)
     live_key = tenant_live_routing_key(tid)

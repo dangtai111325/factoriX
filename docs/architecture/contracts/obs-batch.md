@@ -13,7 +13,7 @@
 | Object | Name (default) | Type / arguments |
 |---|---|---|
 | ingress exchange | `factorix.telemetry.ingress` | **topic**, durable |
-| live queue | `factorix.telemetry.live.q` | quorum; bound `telemetry.live.v1.*`; `x-overflow=reject-publish`, `x-max-length-bytes=256 MiB`, `x-delivery-limit=5`, DLX at-least-once |
+| live queue | `factorix.telemetry.live.q` (unless `FACTORIX_RABBITMQ_LIVE_QUEUE` is set: derived from the ingest queue name, `*.ingest.q*` → `*.live.q*`, so every topology has its own live queue) | quorum; bound `telemetry.live.v1.*`; `x-overflow=reject-publish`, `x-max-length-bytes=256 MiB`, `x-delivery-limit=5`, DLX at-least-once |
 | replay ("legacy") queue | `factorix.telemetry.ingest.q` | quorum; bound `telemetry.v1.*`; same arguments with `x-max-length-bytes=512 MiB` |
 | DLX / DLQ | `factorix.telemetry.dlx` (direct) → `factorix.telemetry.dlq` | quorum, routing key `dlq`, `reject-publish`, 256 MiB |
 
