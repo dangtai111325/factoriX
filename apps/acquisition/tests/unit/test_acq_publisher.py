@@ -409,8 +409,13 @@ async def test_live_ram_drains_before_replay_and_replay_is_rate_limited(tmp_path
         await publisher.emit(spec, [Sample(spec.fields[0]["id"], float(i + 10), "GOOD") for i in range(9)])
 
         controller = publisher.replay.controller
+        # B-15: a frozen clock — the token bucket must not refill with real time between two calls
+        # (a slow host used to see 3 replay rows where the test grants 2).
+        frozen = [1000.0]
+        controller.clock = lambda: frozen[0]
+        controller.last_tick = frozen[0]
         # Replay paused by the controller: live RAM still flows completely, replay waits without failing.
-        controller.paused_until = time.monotonic() + 3600.0
+        controller.paused_until = frozen[0] + 3600.0
         assert await publisher.flush_once(budget_s=0) == (9, False)
         assert publisher.fast_buffered == 0 and spool.pending_count() == 3
         assert [o.value for o in broker.published] == [float(i + 10) for i in range(9)]
@@ -418,9 +423,10 @@ async def test_live_ram_drains_before_replay_and_replay_is_rate_limited(tmp_path
         # Pause over, two tokens: replay resumes, newest-per-signal first.
         controller.paused_until = 0.0
         controller.tokens = 2.0
-        controller.last_tick = time.monotonic()
+        controller.last_tick = frozen[0]
         assert await publisher.flush_once(budget_s=0) == (2, False)
         assert spool.pending_count() == 1
+        assert controller.tokens == 0.0  # no refill without elapsed (fake) time
         controller.tokens = 1000.0
         assert await publisher.flush_once(budget_s=0) == (1, False)
         assert spool.pending_count() == 0

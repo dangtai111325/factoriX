@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -69,11 +70,14 @@ class ReplayController:
     reason: str = "start"
     decreases: int = 0
     pauses: int = 0
+    # Monotonic clock of every rate / pause decision; tests inject a fake one (B-15: the token bucket
+    # refilled with real elapsed time between two calls, so a slow CI host saw one replay row too many).
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
 
     def __post_init__(self) -> None:
         self.rate = min(self.limits.max_rate, max(self.limits.min_rate, self.limits.initial_rate))
         self.tokens = self.capacity()
-        self.last_tick = time.monotonic()
+        self.last_tick = self.clock()
 
     def capacity(self) -> float:
         # Bucket holds about one second of the current rate (at least a few envelopes' worth).
@@ -89,7 +93,7 @@ class ReplayController:
 
     def note_live_failure(self, reason: str) -> None:
         """A live publish failed or timed out: replay stops for a cooldown and restarts slowly."""
-        now = time.monotonic()
+        now = self.clock()
         self.paused_until = max(self.paused_until, now + self.limits.failure_pause_s)
         self.rate = max(self.limits.min_rate, self.rate * self.limits.decrease_factor)
         self.tokens = 0.0
@@ -117,7 +121,7 @@ class ReplayController:
 
     async def refresh_queue_depths(self, broker: Any) -> None:
         probe = getattr(broker, "queue_depths", None)
-        now = time.monotonic()
+        now = self.clock()
         if probe is None or now - self.depths_at < self.limits.depth_probe_interval_s:
             return
         self.depths_at = now
@@ -130,7 +134,7 @@ class ReplayController:
 
     def allowance(self, publisher: "ObservationPublisher", wanted: int) -> int:
         """How many rows replay may send now (0 = wait). Updates the AIMD rate."""
-        now = time.monotonic()
+        now = self.clock()
         elapsed = max(0.0, now - self.last_tick)
         self.last_tick = now
         if now < self.paused_until:
@@ -154,14 +158,14 @@ class ReplayController:
         self.tokens = max(0.0, self.tokens - rows)
 
     def seconds_until(self, rows: float) -> float:
-        now = time.monotonic()
+        now = self.clock()
         if now < self.paused_until:
             return self.paused_until - now
         missing = max(0.0, rows - self.tokens)
         return missing / max(1.0, self.rate)
 
     def snapshot(self) -> dict[str, Any]:
-        now = time.monotonic()
+        now = self.clock()
         return {
             "rate_obs_s": round(self.rate, 1),
             "paused_s": round(max(0.0, self.paused_until - now), 2),
