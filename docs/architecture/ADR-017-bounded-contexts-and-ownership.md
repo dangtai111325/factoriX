@@ -36,6 +36,7 @@ in Phase B/C need one agreed owner per concept, otherwise every move re-opens th
 | Storage | API | `storage_objects, storage_object_drafts, storage_bindings, storage_operations`; logical `storage_designs*` | `storage_revisions` saga, `storage_bindings`, `storage_topology` |
 | Recording | ingestion (signal), API model worker (model field) | signal policy state (RAM), `storage_field_state`, `storage_record_outbox` | `recording_policy`, `storage_model_recorder` (ADR-016) → shared pure `decide()` (Phase C4) |
 | Data Models | API | `output_groups*, model_templates, model_refs, model_state, model_snapshots` | `data_models`, `models_engine` |
+| Dashboards (read side, ADR-019) | API | `dashboards, dashboard_revisions, dashboard_templates` | `application/dashboards/service.py`, `/api/v1/dashboards/*` (reads signals, models, resources, storage bindings; writes nothing else) |
 | Telemetry Lifecycle (Reset) | API | `telemetry_generations` | `telemetry_reset` saga; other stores purged through ports (Phase C10) |
 | Legacy Edge (frozen) | API, only in edge mode | `edge_nodes, edge_enrollment_tokens, configuration_drafts/releases, deployment_events` | `/api/v1/edge-sync/*` (410 in acquisition mode), `/api/v1/edges` (still the collector status API) |
 

@@ -45,7 +45,10 @@ All keys are snake_case. Unknown keys are rejected (422). Strings are bounded.
 ```
 
 A legacy draft (`{"widgets":[...]}` written before v1, no `schema_version`) is upgraded on read by
-`documents.upgrade_document()`; nothing is lost, unknown legacy widget types become `text` with a note.
+`documents.upgrade_document()` (deterministic, so widget ids are stable across reads); widgets and their
+bindings are kept, unknown legacy widget types become `text` quoting their legacy configuration, a legacy
+widget with more sources than its v1 type accepts becomes a `latest_table`. The notes are returned in
+`upgrade_notes` (detail) / as `LEGACY_UPGRADED` warnings (validate). Variables: at most 10 per document.
 
 ## 2. Widget
 
@@ -67,7 +70,9 @@ A legacy draft (`{"widgets":[...]}` written before v1, no `schema_version`) is u
 }
 ```
 
-Layout rules: integers, `x ≥ 0`, `y ≥ 0`, `w ≥ min_w`, `h ≥ min_h`, `x + w ≤ columns`, `h ≤ 40`.
+Layout rules: integers, `x ≥ 0`, `0 ≤ y ≤ 2000`, `w ≥ min(min_w, columns)` (so every widget fits the
+1-column `sm` grid), `h ≥ min_h`, `x + w ≤ columns`, `h ≤ 40`. `hidden`, `time`, `title`, `version` (= 1),
+`bindings` and `options` may be omitted (defaults); the stored draft is always the normalized document.
 
 ## 3. Binding (source reference)
 
@@ -76,7 +81,7 @@ Layout rules: integers, `x ≥ 0`, `y ≥ 0`, `w ≥ min_w`, `h ≥ min_h`, `x +
   "id": "b_1",                             // unique inside the widget
   "role": "value",                         // only for widgets that declare roles (§4); else omitted
   "source": { "kind": "signal", "signal_id": "<uuid>" },
-  //      | { "kind": "model_field", "model_id": "<uuid>", "field_path": "spindle.speed" }
+  //      | { "kind": "model_field", "model_id": "<uuid>", "field_path": "spindle/speed" }
   //      | { "kind": "signal_key", "variable": "machine", "key": "speed_1" }
   //        (the ACTIVE signal with that key on the resource selected in the variable;
   //         resolution is exact on (resource_id, key) — never by display name)
@@ -88,7 +93,14 @@ Layout rules: integers, `x ≥ 0`, `y ≥ 0`, `w ≥ min_w`, `h ≥ min_h`, `x +
 ```
 
 Only these three kinds exist. There is no URL, SQL, table or script kind. Inside a saved *template*
-the source is `{ "kind": "role", "role": "<role id>" }` until the template is instantiated.
+the source is `{ "kind": "role", "role": "<role id>" }` until the template is instantiated; a draft may
+keep such a placeholder (an unmapped required template role): it never resolves (`UNBOUND`) and blocks
+publishing.
+
+`field_path` is the Data Model leaf path exactly as listed by `GET /sources` (`field_path`): segments
+separated by `/` (JSON-pointer escaping: `~1` = `/`, `~0` = `~`), a leading `/` is ignored; containers
+(objects/arrays) are not bindable. Binding ids match `^[A-Za-z0-9_-]{1,40}$`, variable and role ids
+`^[a-z][a-z0-9_]{0,39}$`. `scale`/`offset` are finite numbers.
 
 ## 4. Widget registry (`GET /api/v1/dashboards/widget-types`)
 
@@ -100,13 +112,14 @@ validates `options` with it and the Studio renders the inspector from it. Each e
   "icon": "gauge",                          // lucide icon name
   "default_size": {"w": 3, "h": 3}, "min_size": {"w": 2, "h": 2},
   "data": { "min_bindings": 1, "max_bindings": 1,
-            "value_kinds": ["number"],      // number | boolean | string | any
+            "value_kinds": ["number"],      // accepted kinds: number | boolean | string | any (any = everything);
+                                            // the first entry is the preferred kind for the source picker
             "history": "optional",          // none | optional | required
-            "roles": null },                // or [{"id":"actual","label":"Actual","required":true}, …]
+            "roles": null },                // or [{"id":"actual","label":"Actual","required":true,"max":1}, …]
   "options": [ /* OptionSpec */ ] }
 ```
 
-`OptionSpec` = `{ key, label, group, type, default, min?, max?, choices?, max_length?, help?, show_if? }`
+`OptionSpec` = `{ key, label, group, type, default, nullable, min?, max?, choices?, max_length?, help?, show_if? }`
 with `group ∈ general | data | display | thresholds | style` and
 `type ∈ boolean | integer | number | string | text | color | enum | thresholds | mappings | image | dashboard_ref | page_ref | resource_ref | variable_ref`.
 `show_if` = `{ "key": "<other option>", "in": [values] }` (inspector visibility only; validation still
@@ -116,10 +129,16 @@ Composite option values:
 
 * `thresholds`: ≤ 10 × `{ "value": number, "color": "#RRGGBB", "label": string ≤ 40 }` — a value ≥
   `value` takes that color (highest matching threshold wins); below every threshold → base color.
+  Two thresholds may not have the same `value`; `label` defaults to `""`.
 * `mappings`: ≤ 30 × `{ "kind": "value", "value": string ≤ 80, "label": string ≤ 40, "color": "#RRGGBB" }`
   or `{ "kind": "range", "from": number|null, "to": number|null, "label", "color" }` (from ≤ v < to).
-  Value matching compares the string form (`true`/`false` for booleans).
-* `image`: `data:image/(png|jpeg|webp|gif);base64,…` ≤ 400 000 chars (no SVG, no remote URL).
+  Value matching compares the string form (`true`/`false` for booleans). `label` defaults to `""`, `color`
+  may be `null` (= keep the widget color); for a range `from < to` when both are set.
+* `image`: `data:image/(png|jpeg|webp|gif);base64,…` ≤ 400 000 chars (no SVG, no remote URL); the base64
+  must decode and the bytes must match the declared format.
+* `text` (`content`): Markdown link targets must be `http(s)://…`, an internal path `/…` or `#…`.
+* `dashboard_ref` / `resource_ref`: a UUID (checked to exist in the tenant at validate/publish);
+  `variable_ref`: the id of a variable of the same document.
 * `page_ref`: one of `overview, factory_structure, factory_graph, connections, signals, models, storage, historian`.
 
 **Common options (every type):** `show_title` (boolean, true, general), `description` (string ≤ 300,
@@ -160,55 +179,102 @@ reduction (min/max/avg/sum/count/first/delta = last − first) is computed over 
 labelled with the Historian fidelity/notes (a downsampled series reduces bucket averages and says so).
 
 Limits (returned in `limits`): 40 widgets, 20 series per Historian request, 1500 default / 5000 max
-points, 366-day window, 400 resolve refs per call, 1.5 MB document.
+points, 366-day window, 400 resolve refs per call, 1.5 MB document, 400 bindings per document (so one
+resolve call covers a whole dashboard), 10 variables.
 
 ## 5. Endpoints
 
-All under `/api/v1/dashboards`, JSON, errors `{error:{code,message,details?}}` as elsewhere.
+All under `/api/v1/dashboards`, JSON, errors `{error:{code,message,details?}}` as elsewhere (issues are in
+`error.details.issues`). Request bodies reject unknown keys (FastAPI 422 `detail`), so a `tenant_id` in a body
+is never accepted. Every mutation takes the `version` the client read; a mismatch is 409
+`RESOURCE_VERSION_CONFLICT` (`error.current_version`) and nothing changes. A mutation of an archived
+dashboard (other than unarchive) is 409 `ARCHIVED`.
 
 | Method · path | Body / query | Result |
 |---|---|---|
-| `GET /` | `?include_archived=false&q=` | `{items:[{id,name,description,status,draft_revision,published_revision,published_at,has_unpublished_changes,widget_count,theme_preset,version,updated_at,archived_at}]}` · `status ∈ DRAFT PUBLISHED` |
-| `POST /` | `{name, description?, template_id?, role_map?, source_dashboard_id?}` | 201 detail. `template_id` instantiates a template (`role_map: {role_id: source}`; unmapped optional roles drop their binding, unmapped required roles stay unbound and are reported) |
-| `GET /{id}` | | detail `{id,name,description,version,draft_revision,published_revision,published_at,archived_at,has_unpublished_changes,updated_at,document}` (draft) |
-| `PATCH /{id}` | `{version, name?, description?, document?}` | detail; 409 `RESOURCE_VERSION_CONFLICT`; 422 `VALIDATION` `details.issues[]` (structural) |
-| `POST /{id}/validate` | `{document?}` (default: stored draft) | `{ok, issues:[{severity,code,message,widget_id?,binding_id?}]}` — structural + every binding resolves and fits the widget |
-| `POST /{id}/publish` | `{version, note?}` | detail; 422 `PUBLISH_BLOCKED` with `details.issues` when `ok=false`; empty dashboards cannot publish |
-| `GET /{id}/published` | | `{id,name,description,revision,published_at,document}`; 404 `NOT_PUBLISHED` |
-| `GET /{id}/revisions` | | `{items:[{revision,published_at,published_by,note,widget_count}]}` newest first |
-| `GET /{id}/revisions/{revision}` | | `{revision,published_at,note,document}` |
-| `POST /{id}/restore` | `{revision, version}` | detail — the revision's document becomes the draft; revisions are immutable |
+| `GET /` | `?include_archived=false&q=` | `{items:[{id,name,description,status,draft_revision,published_revision,published_at,has_unpublished_changes,widget_count,theme_preset,version,created_at,updated_at,archived_at}]}` · `status ∈ DRAFT PUBLISHED` (archived = `archived_at ≠ null`) · `has_unpublished_changes` = never published, or draft ≠ published document |
+| `POST /` | `{name, description?, template_id?, role_map?, source_dashboard_id?, site_id?}` | 201 detail + `warnings:[issue]`. `template_id` (built-in id or tenant template UUID) instantiates a template (`role_map: {role_id: source}`; unmapped optional roles drop their binding and a data widget left without bindings is removed; unmapped required roles stay as `role` placeholders and are reported as `UNBOUND`); `source_dashboard_id` copies that draft. Unknown role / invalid mapped source → 422 `VALIDATION`; `template_id` + `source_dashboard_id` together → 422 |
+| `GET /{id}` | | detail `{id,name,description,status,version,draft_revision,published_revision,published_at,archived_at,has_unpublished_changes,site_id,created_at,updated_at,document,upgrade_notes:[string]}` (`document` = the normalized draft) |
+| `PATCH /{id}` | `{version, name?, description?, document?}` | detail; 409 `RESOURCE_VERSION_CONFLICT`; 422 `VALIDATION` `details.issues[]` (structural errors only: a draft may be incomplete) |
+| `POST /{id}/validate` | `{document?}` (default: stored draft) | `{ok, issues:[issue]}` — structural + completeness + every binding resolves (variables at their defaults) and fits the widget; `ok` = no `error` issue |
+| `POST /{id}/publish` | `{version, note? ≤ 500}` | detail; 422 `PUBLISH_BLOCKED` with `details.issues` when `ok=false` (an empty dashboard is `EMPTY_DASHBOARD`) |
+| `GET /{id}/published` | | `{id,name,description,revision,published_at,archived_at,document}`; 404 `NOT_PUBLISHED` |
+| `GET /{id}/revisions` | | `{items:[{revision,published_at,published_by,published_by_name,note,widget_count}]}` newest first |
+| `GET /{id}/revisions/{revision}` | | `{revision,published_at,published_by,published_by_name,note,document}`; 404 `REVISION_NOT_FOUND` |
+| `POST /{id}/restore` | `{revision, version}` | detail — the revision's document becomes the draft (draft_revision + 1); revisions are immutable, newer ones are kept |
 | `POST /{id}/duplicate` | `{name}` | 201 detail (draft copy, unpublished) |
-| `POST /{id}/archive` · `POST /{id}/unarchive` | `{version}` | detail |
-| `GET /{id}/export` | | `{format:"factorix.dashboard",format_version:1,exported_at,name,description,document}` |
-| `POST /import` | `{name?, payload}` | 201 detail + `warnings` (bindings that do not resolve in this tenant stay, reported, and block publish) |
-| `GET /widget-types` | | `{schema_version:1, widget_types:[…], limits:{…}}` |
-| `GET /themes` | | `{items:[{id,label,description,tokens}]}` |
-| `GET /templates` | | `{items:[{id,label,description,category,builtin,roles:[{id,label,value_kinds,required}],widget_count,variables}]}` |
-| `POST /templates` | `{dashboard_id, name, description?}` | 201 template (the dashboard's bindings become roles) |
-| `DELETE /templates/{id}` | | 204 (tenant templates only) |
-| `GET /sources` | `?q=` | Historian catalog restricted to `signal` + `model_field`, each item + `capabilities` (§6); plus `resources:[{id,name,code,type_key,path,parent_id}]` |
-| `POST /resolve` | `{variables:{id: resource_id}, sources:[source]}` (≤ 400) | `{items:[{source, ok, token?, kind?, label?, resource?, value_type?, unit?, capabilities?, error?:{code,message}}]}` in request order |
+| `POST /{id}/archive` · `POST /{id}/unarchive` | `{version}` | detail; 409 `ARCHIVED` / `NOT_ARCHIVED` when already in that state |
+| `GET /{id}/export` | | `{format:"factorix.dashboard",format_version:1,exported_at,name,description,document}` (the draft) |
+| `POST /import` | `{name?, payload}` (`payload` = an export) | 201 detail + `warnings:[issue]` (bindings that do not resolve in this tenant stay, are reported, and block publish); 422 `IMPORT_FORMAT` (format/version), 422 `VALIDATION` (structural) |
+| `GET /widget-types` | | `{schema_version:1, widget_types:[…], limits:{…}, enums:{relative_ranges,refresh,theme_presets,pages,value_kinds,option_groups,option_types}}` |
+| `GET /themes` | | `{items:[{id,label,description,tokens}]}` · tokens `canvas, surface, surface_alt, text, text_muted, border, accent, good, warning, bad, stale, palette[8], chart_grid, chart_axis, radius, gap, font_scale, dark`; `accent` (= `palette[0]`) is the default data fill (bars, gauges, progress, series 1) and is never a status color; `good`/`warning`/`bad`/`stale` are reserved for status |
+| `GET /templates` | | `{items:[{id,label,description,category,builtin,roles:[{id,label,value_kinds,required,description}],widget_count,variables,created_at}]}` (built-ins first; built-in ids are stable keys such as `machine_overview`, tenant ids are UUIDs) |
+| `POST /templates` | `{dashboard_id, name, description?, category? = "custom"}` | 201 template item (every distinct source of the draft becomes a required role; variable defaults are cleared) |
+| `DELETE /templates/{id}` | | 204; 409 `TEMPLATE_BUILTIN`; 404 `TEMPLATE_NOT_FOUND` |
+| `GET /sources` | `?q=` | see below |
+| `POST /resolve` | `{variables:{id: resource_id or null}, sources:[source]}` (≤ 400, else 422 `LIMIT`) | `{items:[result]}` in request order, see below |
+
+`issue` = `{severity: "error"|"warning", code, message, widget_id?, binding_id?, path?}`.
+
+**`GET /sources`** — the Historian picker read model restricted to `signal` + `model_field`:
+
+```jsonc
+{ "items": [ {                                       // one group per resource that owns data
+    "resource": {"id","name","code","type_key"}, "path": ["Site","Line"], "ancestors": [{…}],
+    "signals": [ { "kind": "signal", "token": "<uuid>", "key", "label", "value_type", "unit", "quality",
+                   "freshness", "last_value", "last_at",
+                   "source": {"kind": "signal", "signal_id": "<uuid>"}, "value_kind", "capabilities" } ],
+    "models": [ { "model_id", "name", "state", "freshness",
+                  "fields": [ { "kind": "model_field", "token": "mod:<uuid>:<path>", "key", "field_path", "label",
+                                "value_type", "is_timestamp", "freshness", "model_state", "quality", "last_value",
+                                "has_last_value", "last_at", "recorded_in",
+                                "source": {"kind": "model_field", "model_id", "field_path"}, "model_id",
+                                "value_kind", "capabilities" } ] } ] } ],
+  "total_groups", "total_series", "observed_at",
+  "resources": [ {"id","name","code","type_key","parent_id","path"} ] }   // every non-archived resource (variable pickers)
+```
+
+**`POST /resolve`** result: `{source, ok: true, token, kind: "signal"|"model_field", label, resource:
+{id,name,code,type_key,parent_id,path}|null, value_type, value_kind, unit, capabilities}` plus `signal_id`,
+`key` (signals, also for `signal_key`) or `model_id`, `field_path` (normalized), `is_timestamp` (model
+fields); or `{source, ok: false, error: {code, message}}`. `source` echoes the request item. `variables`
+must list every document variable (`null` = no resource selected). Matching is exact and tenant-scoped:
+signal by id, model by id + exact leaf path, `signal_key` by the ACTIVE signal with exactly that key on the
+selected resource. Duplicate references are resolved once.
+
+`value_kind` ∈ `number | boolean | string | json | unknown` (signal `int64/float64` → number, `bool` →
+boolean, `string/enum` → string, `json` → json; model `float/int` → number, `bool` → boolean,
+`string/timestamp` → string, `json` → json, `auto` → the kind of the signal it maps, else unknown). A widget
+accepting `any` takes every kind; otherwise an `unknown` kind is a warning and another kind an error.
 
 `token` is the Historian series token (`<signal uuid>` or `mod:<model uuid>:<field path>`), used as-is
 in `POST /api/v1/historian/query`; for signals it is also the live-stream `signal_id`.
 
 Resolve error codes: `NOT_FOUND`, `ARCHIVED`, `FIELD_NOT_FOUND`, `VARIABLE_UNSET`, `VARIABLE_UNKNOWN`,
-`KEY_NOT_ON_RESOURCE`, `INVALID_REF`.
+`KEY_NOT_ON_RESOURCE`, `INVALID_REF` (malformed or unsupported kind), `UNBOUND` (template role placeholder).
+
+Publish additionally reports (all `error` unless noted): `EMPTY_DASHBOARD`, `TOO_FEW_BINDINGS`,
+`ROLE_MISSING`, `UNBOUND`, `VALUE_KIND_MISMATCH`, `VALUE_KIND_UNKNOWN` (warning), `HISTORY_UNAVAILABLE`
+(the widget needs history: `history: required`, `value_mode ≠ latest`, `sparkline`), `HISTORY_LIMITED`
+(warning: model snapshots / PostgreSQL fallback), `HISTORY_MODE_UNAVAILABLE` (`history_mode=recorded` on a
+source without a recording), `VARIABLE_UNSET` (warning: a `signal_key` whose variable has no default is
+resolved at view time), `VARIABLE_DEFAULT_NOT_FOUND`, `VARIABLE_TYPE_MISMATCH`, `RESOURCE_NOT_FOUND`,
+`LINK_TARGET_MISSING`, `LINK_TARGET_NOT_FOUND`, `OPTION_MISSING`, `ARCHIVED` (warning) and the resolve codes.
 
 ## 6. Source capabilities (computed by the backend, never guessed by the browser)
 
 ```jsonc
 { "latest": true, "live": true, "historical": true,
-  "history_modes": ["operational"],                 // + "recorded" when a recording exists
-  "fidelity": "operational_full",                   // operational_full | managed_recorded | model_snapshots | unavailable
+  "history_modes": ["operational"],                 // + "recorded" when a recording exists; [] when not historical
+  "fidelity": "operational_full",                   // operational_full | postgres_fallback | managed_recorded | model_snapshots | unavailable
   "notes": ["Not recorded: only recent model snapshots are kept."] }
 ```
 
 * Signal: live via `/stream`; history `operational_full` when TDengine history is configured, otherwise
-  `postgres_fallback` if enabled, else `unavailable`.
+  `postgres_fallback` if enabled, else `unavailable`. `recorded` is listed when the signal has an
+  ACTIVE/PAUSED managed recording (what `mode=recorded` reads).
 * Model field: live via `model_body`; history `managed_recorded` when an ACTIVE storage binding records
-  it, otherwise `model_snapshots` (≤ 500 recent samples, noted).
+  it, otherwise `model_snapshots` (≤ 500 recent samples, noted); `unavailable` without TDengine history.
 
 ## 7. Runtime data flow (browser)
 

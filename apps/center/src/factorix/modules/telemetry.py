@@ -84,9 +84,8 @@ from factorix.application.dashboards import (  # noqa: F401
     DashboardIn,
     DashboardPatch,
     WIDGETS,
-    _dashboard,
-    _validate_widgets,
     create_dashboard,
+    get_dashboard,
     patch_dashboard,
     publish_dashboard,
 )
