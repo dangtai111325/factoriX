@@ -256,7 +256,11 @@ async def catalog(session: AsyncSession, tenant_id: UUID, *, q: str | None = Non
             for f in m["fields"]:
                 f["source"] = {"kind": "model_field", "model_id": m["model_id"], "field_path": f["field_path"]}
                 f["model_id"] = m["model_id"]
-                f["value_kind"] = model_value_kind(f.get("value_type"))
+                # An ``auto`` field has no declared type; like the binding defaults (R2-14) its kind follows the
+                # live value, so the picker's Numeric/Text filters do not hide every auto field.
+                inferred, _how = SB.infer_value_type(str(f.get("value_type") or ""), None, bool(f.get("has_last_value")),
+                                                     f.get("last_value"))
+                f["value_kind"] = model_value_kind(inferred)
                 f["capabilities"] = model_field_capabilities(recorded=(str(m["model_id"]).lower(), f["field_path"]) in bound, state=state)
     picker["total_series"] = sum(len(g["signals"]) + sum(len(m["fields"]) for m in g["models"]) for g in picker["items"])
     picker["resources"] = resources_payload(await load_resources(session, tenant_id))

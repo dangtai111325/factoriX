@@ -174,7 +174,11 @@ async def test_catalog_is_restricted_and_decorated(db: CatalogDB, monkeypatch: p
             "resource": {"id": M1, "name": "Machine A", "code": "MA", "type_key": "machine"}, "path": ["Line 1"], "ancestors": [],
             "signals": [{"kind": "signal", "token": SIG_SPEED_1, "key": "speed_1", "label": "Speed", "value_type": "float64"}],
             "models": [{"model_id": MODEL, "name": "Spindle", "fields": [
-                {"kind": "model_field", "token": f"mod:{MODEL}:status", "key": "status", "field_path": "status", "value_type": "string"}]}],
+                {"kind": "model_field", "token": f"mod:{MODEL}:status", "key": "status", "field_path": "status", "value_type": "string"},
+                {"kind": "model_field", "token": f"mod:{MODEL}:t", "key": "t", "field_path": "t", "value_type": "auto",
+                 "has_last_value": True, "last_value": 40.5},
+                {"kind": "model_field", "token": f"mod:{MODEL}:n", "key": "n", "field_path": "n", "value_type": "auto",
+                 "has_last_value": False, "last_value": None}]}],
             "subtables": [],
         }], "total_groups": 1, "total_series": 9, "observed_at": "2026-11-25T08:00:00.000Z"}
 
@@ -188,7 +192,10 @@ async def test_catalog_is_restricted_and_decorated(db: CatalogDB, monkeypatch: p
     f = group["models"][0]["fields"][0]
     assert f["source"] == {"kind": "model_field", "model_id": MODEL, "field_path": "status"} and f["value_kind"] == "string"
     assert f["capabilities"]["fidelity"] == "model_snapshots"
-    assert out["total_series"] == 2
+    # an ``auto`` field takes the kind of its live value (picker filters), and stays unknown without one
+    auto_num, auto_none = group["models"][0]["fields"][1:]
+    assert auto_num["value_kind"] == "number" and auto_num["value_type"] == "auto" and auto_none["value_kind"] == "unknown"
+    assert out["total_series"] == 4
     ids = [r["id"] for r in out["resources"]]
     assert M_ARCHIVED not in ids and M_OTHER not in ids and set(ids) == {"00000000-0000-0000-0000-000000000101", M1, M2}
     assert next(r for r in out["resources"] if r["id"] == M2)["path"] == ["Line 1"]
