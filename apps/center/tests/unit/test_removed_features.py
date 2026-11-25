@@ -66,4 +66,7 @@ def test_sidebar_navigation_matches_strict_spec() -> None:
     assert "Knowledge Graph" in sidebar_text
     assert "Connections" in sidebar_text
     assert "Signals" in sidebar_text
-    assert "Model Catalog" in sidebar_text
+    # Data Models and Dashboard are single items (no sub-navigation).
+    assert "Data Models" in sidebar_text
+    assert "'/models'" in sidebar_text
+    assert "label: 'Dashboard'" in sidebar_text

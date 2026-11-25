@@ -28,8 +28,8 @@ const ROUTE_BREADCRUMBS: Record<string, { group?: string; title: string }> = {
   '/collector/connections': { group: 'Data Collector', title: 'Connections' },
   '/collector/signals': { group: 'Data Collector', title: 'Signals' },
   '/collector/add-data': { group: 'Data Collector', title: 'Add Data' },
-  '/models': { group: 'Data Models', title: 'Model Catalog' },
-  '/dashboards': { group: 'Coming soon', title: 'Dashboards' },
+  '/models': { title: 'Data Models' },
+  '/dashboards': { title: 'Dashboard' },
   '/historian': { group: 'Historian & Storage', title: 'Storage Management' },
   '/historian/storage': { group: 'Historian & Storage', title: 'Storage Management' },
   '/historian/historian': { group: 'Historian & Storage', title: 'Historian' },
@@ -95,7 +95,13 @@ export const Topbar: React.FC = () => {
       return { group: 'Data Collector', title: 'Connections' };
     }
     if (location.pathname.startsWith('/models')) {
-      return { group: 'Data Models', title: 'Model Catalog' };
+      return { title: 'Data Models' };
+    }
+    if (location.pathname.endsWith('/edit') && location.pathname.startsWith('/dashboards/')) {
+      return { group: 'Dashboard', title: 'Studio' };
+    }
+    if (location.pathname.startsWith('/dashboards/')) {
+      return { group: 'Dashboard', title: 'View' };
     }
     if (location.pathname.startsWith('/historian/storage')) {
       return { group: 'Historian & Storage', title: 'Storage Management' };
