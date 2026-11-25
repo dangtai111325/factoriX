@@ -26,4 +26,4 @@
 | **S14** | Data Migration, Audit & Cutover Rehearsal | `TODO` | Restartable chunked PG `observations` -> TDengine migrator + parity verification on cloned backup | Pending |
 | **S15** | Reliability, Scale & Computer Use E2E | `TODO` | Playwright visible browser `E2E-J01..J07`, `OLD/COL/DM/DES/CAT/HIS/SEC/RESET` matrix, fault injection `F-01..30`, `docs/benchmark/report.md`, `docs/testing/e2e-ledger.csv` | Pending |
 | **S16** | Controlled Cutover & User-Authorized Telemetry Reset | `TODO` | Cutover only with explicit user approval on staging/target; never auto-wipe live `:8080` | Pending |
-| **S17** | Legacy Removal, Docs & Final Handover PR | `TODO` | Remove `apps/edge` / `/api/v1/edge-sync/*`, complete wiki `README.md`, `docs/release/acceptance-matrix.md`, clean push | Pending |
+| **S17** | Legacy Removal, Docs & Final Handover PR | `TODO` | Remove `apps/edge` / `/api/v1/edge-sync/*`, complete wiki `README.md`, `RELEASE_READINESS.md`, clean push | Pending |

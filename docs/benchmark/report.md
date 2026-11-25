@@ -14,7 +14,7 @@
 > * **Scope.** "Ingestion throughput" was one TDengine batch of 300 / 3 000 rows
 >   (`test_tdengine_x1_and_x10_batched_benchmark`), not the acquisition -> RabbitMQ -> ingestion -> TDengine /
 >   PostgreSQL pipeline, and on a different machine (8C/16T, 32 GB).
-> * **Load.** The companion `docs/release/evidence/888e663…/performance-summary.json` (appliance 48 % CPU,
+> * **Load.** The former release-evidence file `performance-summary.json` (removed 2026-11-25; appliance 48 % CPU,
 >   RabbitMQ 8.5 % at 1×, "10× PASS", "11.1× margin") contradicts the measurement on the appliance host at 1×:
 >   appliance 278–327 % CPU and RabbitMQ 126–161 % CPU (review R1-A §3.1).
 >
