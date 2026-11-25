@@ -785,20 +785,28 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
         return {**job, "status_url": f"/api/v1/storage/td/bulk-jobs/{job['job_id']}", "poll_after_ms": 1000}
 
     @router.get("/api/v1/storage/td/bulk-jobs", tags=["storage"])
-    async def list_bulk_jobs(principal: dict[str, Any] = Depends(admin_dep)) -> dict[str, Any]:
-        """Recent bulk jobs of the tenant (kept 1 h after they finish; no per-row items)."""
+    async def list_bulk_jobs(
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Recent bulk jobs of the tenant, live and stored (no per-row items)."""
         tenant_id, _actor = ids(principal)
-        items = SBULK.list_jobs(tenant_id)
+        items = await SBULK.load_jobs(session, tenant_id)
         return {"items": items, "total": len(items)}
 
     @router.get("/api/v1/storage/td/bulk-jobs/{job_id}", tags=["storage"])
-    async def get_bulk_job(job_id: str, principal: dict[str, Any] = Depends(admin_dep)) -> dict[str, Any]:
-        """Progress + per-row results of a bulk job: ``status`` QUEUED | RUNNING | DONE | FAILED,
+    async def get_bulk_job(
+        job_id: str,
+        principal: dict[str, Any] = Depends(admin_dep),
+        session: AsyncSession = Depends(db_dep),
+    ) -> dict[str, Any]:
+        """Progress + per-row results of a bulk job: ``status`` QUEUED | RUNNING | DONE | FAILED |
+        INTERRUPTED (the API restarted while it ran; ``error`` says how many rows were processed),
         ``total``, ``done``, ``progress_pct``, ``summary``, ``items`` (rows finished so far), ``error``."""
         tenant_id, _actor = ids(principal)
-        job = SBULK.get_job(tenant_id, job_id)
+        job = await SBULK.load_job(session, tenant_id, job_id)
         if job is None:
-            raise AppError(404, "NOT_FOUND", f"Bulk job '{job_id}' not found (jobs are kept 1 h after they finish).")
+            raise AppError(404, "NOT_FOUND", f"Bulk job '{job_id}' not found.")
         return job
 
     @router.get("/api/v1/storage/td/summary", tags=["storage"])

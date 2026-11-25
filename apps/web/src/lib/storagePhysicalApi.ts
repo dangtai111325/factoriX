@@ -669,10 +669,14 @@ export interface BulkRowResult {
   ddl?: string[];
 }
 
-/** A background bulk-create job (H-R4.3): progress in memory on the Center, kept 1 h, lost on an API restart (404). */
+/**
+ * A background bulk-create job (H-R4.3): runs on the Center, progress stored in `storage_bulk_jobs` (B-12).
+ * INTERRUPTED = the Center restarted while it ran; `error` says how many rows were processed.
+ */
 export interface BulkJob {
   job_id: string;
-  status: 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | string;
+  status: 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED' | 'INTERRUPTED' | string;
+  interrupted?: boolean;
   total: number;
   done: number;
   progress_pct?: number;

@@ -353,7 +353,7 @@ export const BulkSubtablesWizard: React.FC = () => {
             writeStoredJob(null);
             setJob(null);
             setJobGone(
-              'The Center no longer knows this bulk job (jobs are kept 1 hour after they finish and are lost when the Center restarts). Every row it created is kept: press Validate to see which subtables already exist.',
+              'The Center no longer knows this bulk job. Every row it created is kept: press Validate to see which subtables already exist.',
             );
             return;
           }
@@ -368,10 +368,12 @@ export const BulkSubtablesWizard: React.FC = () => {
           });
           return next;
         });
-        if (j.status === 'DONE' || j.status === 'FAILED') {
+        if (j.status === 'DONE' || j.status === 'FAILED' || j.status === 'INTERRUPTED') {
           const sm = j.summary || {};
           setSummary({ dryRun: false, created: sm.CREATED || 0, exists: sm.EXISTS || 0, failed: sm.FAILED || 0, invalid: sm.INVALID || 0, valid: 0, at: new Date(j.finished_at || Date.now()).toLocaleTimeString() });
           if (j.status === 'FAILED') setRunError(`The bulk job stopped: ${j.error || 'unknown error'}. Rows already created are kept; press Create again for the rest.`);
+          // B-12: the Center restarted mid-job; the stored job says how far it got (job lost -> re-validate).
+          if (j.status === 'INTERRUPTED') setJobGone(j.error || 'The Center restarted while this job was running. Press Validate: subtables already created show as Exists.');
           writeStoredJob(null);
           if ((sm.CREATED || 0) + (sm.EXISTS || 0) > 0) {
             setReloading(true);
