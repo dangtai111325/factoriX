@@ -15,6 +15,12 @@ export default defineConfig({
         target: process.env.FACTORIX_WS_TARGET || 'ws://127.0.0.1:8080',
         ws: true,
       },
+      // The live stream (lib/liveStream.ts) connects to `/stream`; without this entry the dev server
+      // never delivers pushes and every page falls back to polling.
+      '/stream': {
+        target: process.env.FACTORIX_WS_TARGET || 'ws://127.0.0.1:8080',
+        ws: true,
+      },
     },
   },
 });
