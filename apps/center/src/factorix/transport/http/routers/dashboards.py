@@ -126,6 +126,14 @@ async def patch_dashboard(dashboard_id: str, body: DashboardPatch, request: Requ
     return await dashboard_service.patch_dashboard(session, tenant_id, actor, parse_uuid(dashboard_id), body, correlation_id(request))
 
 
+@router.delete(f"{_BASE}/{{dashboard_id}}", status_code=204)
+async def delete_dashboard(dashboard_id: str, request: Request, principal: dict[str, Any] = Depends(admin),
+                           session: AsyncSession = Depends(db_session)) -> Response:
+    tenant_id, actor = _ids(principal)
+    await dashboard_service.delete_dashboard(session, tenant_id, actor, parse_uuid(dashboard_id), correlation_id(request))
+    return Response(status_code=204)
+
+
 @router.post(f"{_BASE}/{{dashboard_id}}/validate")
 async def validate_dashboard(dashboard_id: str, body: ValidateIn | None = None, principal: dict[str, Any] = Depends(admin),
                              session: AsyncSession = Depends(db_session)) -> dict[str, Any]:

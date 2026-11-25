@@ -9,7 +9,8 @@ Rules:
 * drafts are stored *normalized* (schema v1, defaults filled); a legacy draft is upgraded on read;
 * published revisions are immutable: publish appends a revision (and still writes ``breakpoints_json`` /
   ``widget_configs_json`` for older readers), restore copies a revision into the draft;
-* create/update/publish/restore/archive/unarchive/duplicate/import and template changes are audited.
+* an archived dashboard can be deleted permanently (with its revisions); an active one cannot (409 ``NOT_ARCHIVED``);
+* create/update/publish/restore/archive/unarchive/delete/duplicate/import and template changes are audited.
 """
 
 from __future__ import annotations
@@ -397,6 +398,22 @@ async def set_archived(session: AsyncSession, tenant_id: UUID, actor: UUID, dash
     await _audit(session, tenant_id, actor, "DASHBOARD_ARCHIVE" if archived else "DASHBOARD_UNARCHIVE", dashboard_id, correlation_id,
                  before={"archived": not archived}, after={"archived": archived})
     return await _detail(session, tenant_id, dashboard_id)
+
+
+async def delete_dashboard(session: AsyncSession, tenant_id: UUID, actor: UUID, dashboard_id: UUID, correlation_id: str) -> None:
+    """Permanently delete an archived dashboard and its revisions; audited as ``DASHBOARD_DELETE``."""
+    current = await _load(session, tenant_id, dashboard_id)
+    if current.get("archived_at") is None:
+        raise AppError(409, "NOT_ARCHIVED", "Only an archived dashboard can be deleted permanently. Archive it first.")
+    revisions = await store.delete_archived_dashboard(session, tenant_id, dashboard_id)
+    if revisions is None:  # unarchived (or deleted) concurrently
+        raise AppError(409, "NOT_ARCHIVED", "Only an archived dashboard can be deleted permanently. Archive it first.")
+    document, _notes = draft_document(current)
+    await _audit(session, tenant_id, actor, "DASHBOARD_DELETE", dashboard_id, correlation_id,
+                 before={"name": current["name"], "version": int(current["version"]),
+                         "published_revision": current.get("published_revision"), "widget_count": len(document["widgets"]),
+                         "archived_at": iso_ms(current.get("archived_at"))},
+                 after={"deleted": True, "revisions_deleted": revisions})
 
 
 # ---------------------------------------------------------------------------------------------------------

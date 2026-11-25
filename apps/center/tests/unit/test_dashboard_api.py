@@ -47,7 +47,7 @@ def test_every_dashboard_route_requires_the_admin_principal() -> None:
     from factorix.transport.http.deps import admin
 
     routes = [r for r in app.routes if getattr(r, "path", "").startswith("/api/v1/dashboards")]
-    assert len(routes) == 22
+    assert len(routes) == 23
     for route in routes:
         deps = [d.call for d in route.dependant.dependencies]
         assert admin in deps, route.path
@@ -103,6 +103,12 @@ async def test_flow_and_shapes(client: AsyncClient) -> None:
         assert imported.status_code == 201 and imported.json()["warnings"] == []
         dup = await client.post(f"/api/v1/dashboards/{d['id']}/duplicate", json={"name": "Copy"})
         assert dup.status_code == 201
+        refused = await client.delete(f"/api/v1/dashboards/{dup.json()['id']}")
+        assert refused.status_code == 409 and refused.json()["error"]["code"] == "NOT_ARCHIVED"
+        await client.post(f"/api/v1/dashboards/{dup.json()['id']}/archive", json={"version": dup.json()["version"]})
+        deleted = await client.delete(f"/api/v1/dashboards/{dup.json()['id']}")
+        assert deleted.status_code == 204 and deleted.content == b""
+        assert (await client.get(f"/api/v1/dashboards/{dup.json()['id']}")).status_code == 404
         resolved = (await client.post("/api/v1/dashboards/resolve", json={"variables": {}, "sources": [
             {"kind": "signal", "signal_id": SIG_SPEED_1}]})).json()["items"]
         assert resolved[0]["token"] == SIG_SPEED_1

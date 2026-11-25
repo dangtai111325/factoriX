@@ -198,6 +198,13 @@ class DashboardStore:
         wanted = {str(i) for i in ids}
         return {k: v["archived_at"] is not None for k, v in self.dashboards.items() if k in wanted and v["tenant_id"] == tenant_id}
 
+    async def delete_archived_dashboard(self, _s: Any, tenant_id: UUID, dashboard_id: UUID) -> int | None:
+        row = self.dashboards.get(str(dashboard_id))
+        if row is None or row["tenant_id"] != tenant_id or row["archived_at"] is None:
+            return None
+        del self.dashboards[str(dashboard_id)]
+        return len(self.revisions.pop(str(dashboard_id), []))
+
     async def list_templates(self, _s: Any, tenant_id: UUID) -> list[dict[str, Any]]:
         return [copy.deepcopy(t) for t in self.templates.values() if t["tenant_id"] == tenant_id]
 
@@ -226,7 +233,7 @@ def install_store(monkeypatch: Any, store_fake: DashboardStore) -> None:
     from factorix.application.dashboards import service, store
 
     for name in ("list_dashboards", "get_dashboard", "insert_dashboard", "update_dashboard", "next_revision", "insert_revision",
-                 "list_revisions", "get_revision", "dashboard_states", "list_templates", "get_template", "insert_template",
+                 "list_revisions", "get_revision", "dashboard_states", "delete_archived_dashboard", "list_templates", "get_template", "insert_template",
                  "delete_template"):
         monkeypatch.setattr(store, name, getattr(store_fake, name))
     monkeypatch.setattr(service, "audit", store_fake.audit)

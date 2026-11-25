@@ -188,7 +188,7 @@ All under `/api/v1/dashboards`, JSON, errors `{error:{code,message,details?}}` a
 `error.details.issues`). Request bodies reject unknown keys (FastAPI 422 `detail`), so a `tenant_id` in a body
 is never accepted. Every mutation takes the `version` the client read; a mismatch is 409
 `RESOURCE_VERSION_CONFLICT` (`error.current_version`) and nothing changes. A mutation of an archived
-dashboard (other than unarchive) is 409 `ARCHIVED`.
+dashboard (other than unarchive and permanent delete) is 409 `ARCHIVED`.
 
 | Method · path | Body / query | Result |
 |---|---|---|
@@ -204,6 +204,7 @@ dashboard (other than unarchive) is 409 `ARCHIVED`.
 | `POST /{id}/restore` | `{revision, version}` | detail — the revision's document becomes the draft (draft_revision + 1); revisions are immutable, newer ones are kept |
 | `POST /{id}/duplicate` | `{name}` | 201 detail (draft copy, unpublished) |
 | `POST /{id}/archive` · `POST /{id}/unarchive` | `{version}` | detail; 409 `ARCHIVED` / `NOT_ARCHIVED` when already in that state |
+| `DELETE /{id}` | | 204 — permanent delete of an **archived** dashboard together with all its revisions (one transaction; audit `DASHBOARD_DELETE` with name/revision count). 409 `NOT_ARCHIVED` for an active dashboard (archive first); 404 `NOT_FOUND` (other tenant / unknown). No `version`: the archived state is re-checked under a row lock, so a concurrent unarchive wins. Link widgets of other dashboards that targeted it are then reported by validate as `LINK_TARGET_NOT_FOUND` |
 | `GET /{id}/export` | | `{format:"factorix.dashboard",format_version:1,exported_at,name,description,document}` (the draft) |
 | `POST /import` | `{name?, payload}` (`payload` = an export) | 201 detail + `warnings:[issue]` (bindings that do not resolve in this tenant stay, are reported, and block publish); 422 `IMPORT_FORMAT` (format/version), 422 `VALIDATION` (structural) |
 | `GET /widget-types` | | `{schema_version:1, widget_types:[…], limits:{…}, enums:{relative_ranges,refresh,theme_presets,pages,value_kinds,option_groups,option_types}}` |

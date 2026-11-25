@@ -53,7 +53,7 @@ list, signal-only bindings checked one SQL query per binding, and no revision co
    (checked, then a `WHERE version = :expected` UPDATE). Publish appends an immutable revision with the full
    document (`document_json`) and still writes `breakpoints_json` / `widget_configs_json` for older readers;
    restore copies a revision into the draft; nothing ever updates or deletes a revision. Create, update,
-   publish, restore, archive/unarchive, duplicate, import and template changes are audited.
+   publish, restore, archive/unarchive, permanent delete (archived dashboards only), duplicate, import and template changes are audited.
 8. **Forward-only, data-safe migration.** `0013_dashboard_studio` only adds nullable/defaulted columns and a new
    table. Legacy drafts are upgraded on read (deterministically, so widget ids are stable); revisions without
    `document_json` are rebuilt from `widget_configs_json` on read.

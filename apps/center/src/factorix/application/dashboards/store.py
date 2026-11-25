@@ -1,7 +1,8 @@
 """PostgreSQL access of the Dashboard context (``dashboards``, ``dashboard_revisions``, ``dashboard_templates``).
 
 SQL only; every statement is tenant-scoped (revisions through their dashboard). Revisions are immutable:
-this module never updates or deletes a ``dashboard_revisions`` row. Mutations of ``dashboards`` are
+this module never updates a ``dashboard_revisions`` row and deletes them only together with their (archived)
+dashboard in :func:`delete_archived_dashboard`. Mutations of ``dashboards`` are
 optimistic (``WHERE version = :expected``) and report whether a row was changed.
 """
 
@@ -162,6 +163,29 @@ async def get_revision(session: AsyncSession, dashboard_id: UUID, revision: int)
         """,
         {"id": dashboard_id, "revision": revision},
     )
+
+
+async def delete_archived_dashboard(session: AsyncSession, tenant_id: UUID, dashboard_id: UUID) -> int | None:
+    """Permanently delete an *archived* dashboard and its revisions (same transaction as the caller).
+
+    The row is locked first (``FOR UPDATE``) and must still be archived, so a concurrent unarchive either
+    wins (nothing is deleted, ``None``) or waits. Returns the number of deleted revisions, or ``None`` when
+    no archived dashboard with that id exists in the tenant.
+    """
+    row = await fetch_one(
+        session,
+        "SELECT id FROM dashboards WHERE id = :id AND tenant_id = :tenant_id AND archived_at IS NOT NULL FOR UPDATE",
+        {"id": dashboard_id, "tenant_id": tenant_id},
+    )
+    if row is None:
+        return None
+    revisions = await execute_rowcount(session, "DELETE FROM dashboard_revisions WHERE dashboard_id = :id", {"id": dashboard_id})
+    deleted = await execute_rowcount(
+        session,
+        "DELETE FROM dashboards WHERE id = :id AND tenant_id = :tenant_id AND archived_at IS NOT NULL",
+        {"id": dashboard_id, "tenant_id": tenant_id},
+    )
+    return revisions if deleted == 1 else None
 
 
 async def dashboard_states(session: AsyncSession, tenant_id: UUID, ids: list[UUID]) -> dict[str, bool]:

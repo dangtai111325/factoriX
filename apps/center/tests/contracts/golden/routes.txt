@@ -40,6 +40,7 @@ POST /api/v1/dashboards/templates
 DELETE /api/v1/dashboards/templates/{template_id}
 GET /api/v1/dashboards/themes
 GET /api/v1/dashboards/widget-types
+DELETE /api/v1/dashboards/{dashboard_id}
 GET /api/v1/dashboards/{dashboard_id}
 PATCH /api/v1/dashboards/{dashboard_id}
 POST /api/v1/dashboards/{dashboard_id}/archive

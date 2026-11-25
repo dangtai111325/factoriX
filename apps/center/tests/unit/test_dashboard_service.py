@@ -284,6 +284,46 @@ async def test_duplicate_archive_unarchive(env: tuple[DashboardStore, CatalogDB]
     assert {"DASHBOARD_DUPLICATE", "DASHBOARD_ARCHIVE", "DASHBOARD_UNARCHIVE"} <= set(events(store))
 
 
+async def test_delete_permanently_only_archived_dashboards(env: tuple[DashboardStore, CatalogDB]) -> None:
+    store, _ = env
+    d = await publish(await patch(await create(), document=document(kpi())))
+    d = await publish(await patch(d, name="Line A v2"))
+    assert len(store.revisions[d["id"]]) == 2
+    # an active dashboard cannot be deleted
+    active = await raises(svc.delete_dashboard(SESSION, TENANT, ACTOR, UUID(d["id"]), CID))
+    assert active.status == 409 and active.code == "NOT_ARCHIVED" and d["id"] in store.dashboards
+    archived = await svc.set_archived(SESSION, TENANT, ACTOR, UUID(d["id"]), VersionIn(version=d["version"]), CID, archived=True)
+    # tenant-scoped: another tenant sees 404 and nothing is deleted
+    foreign = await raises(svc.delete_dashboard(SESSION, OTHER_TENANT, ACTOR, UUID(d["id"]), CID))
+    assert foreign.status == 404 and d["id"] in store.dashboards
+    await svc.delete_dashboard(SESSION, TENANT, ACTOR, UUID(archived["id"]), CID)
+    assert d["id"] not in store.dashboards and d["id"] not in store.revisions
+    assert (await svc.list_dashboards(SESSION, TENANT, include_archived=True))["items"] == []
+    gone = await raises(svc.get_dashboard(SESSION, TENANT, UUID(d["id"])))
+    assert gone.status == 404
+    deleted = [a for a in store.audits if a["event_type"] == "DASHBOARD_DELETE"]
+    assert len(deleted) == 1 and deleted[0]["entity_id"] == UUID(d["id"]) and deleted[0]["actor_id"] == ACTOR
+    assert deleted[0]["before"]["name"] == "Line A v2" and deleted[0]["after"] == {"deleted": True, "revisions_deleted": 2}
+    again = await raises(svc.delete_dashboard(SESSION, TENANT, ACTOR, UUID(d["id"]), CID))
+    assert again.status == 404
+
+
+async def test_delete_loses_a_race_with_unarchive(env: tuple[DashboardStore, CatalogDB], monkeypatch: pytest.MonkeyPatch) -> None:
+    store, _ = env
+    d = await create()
+    await svc.set_archived(SESSION, TENANT, ACTOR, UUID(d["id"]), VersionIn(version=d["version"]), CID, archived=True)
+    real = store.delete_archived_dashboard
+
+    async def unarchived_meanwhile(s: Any, tenant_id: UUID, dashboard_id: UUID) -> int | None:
+        store.dashboards[str(dashboard_id)]["archived_at"] = None
+        return await real(s, tenant_id, dashboard_id)
+
+    from factorix.application.dashboards import store as real_store
+    monkeypatch.setattr(real_store, "delete_archived_dashboard", unarchived_meanwhile)
+    assert (await raises(svc.delete_dashboard(SESSION, TENANT, ACTOR, UUID(d["id"]), CID))).code == "NOT_ARCHIVED"
+    assert d["id"] in store.dashboards and "DASHBOARD_DELETE" not in events(store)
+
+
 async def test_export_import_round_trip(env: tuple[DashboardStore, CatalogDB]) -> None:
     store, _ = env
     d = await patch(await create(description="desc"), document=document(kpi(), kpi("w_gone", "00000000-0000-0000-0000-00000000aaaa")))
