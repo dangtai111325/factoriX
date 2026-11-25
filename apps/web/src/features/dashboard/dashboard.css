@@ -97,3 +97,58 @@ html.fx-studio-open .fx-banner-stack {
 .dash-widget.dash-tiny .dash-tiny-head:focus-within {
   opacity: 1;
 }
+
+/* Widget rules (formerly injected at runtime, which the appliance CSP blocks). */
+@keyframes fx-w-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@keyframes fx-w-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.fx-w-blink {
+  animation: fx-w-blink 1.6s ease-in-out infinite;
+}
+
+.fx-w-skeleton {
+  animation: fx-w-pulse 1.4s ease-in-out infinite;
+}
+
+.fx-w-table tbody tr:hover td {
+  background: var(--fx-w-hover);
+}
+
+.fx-w-link:focus-visible {
+  outline: 2px solid var(--fx-w-focus);
+  outline-offset: 2px;
+}
+
+.fx-w-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.fx-w-scroll::-webkit-scrollbar-thumb {
+  background: var(--fx-w-thumb, #d4dfec);
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fx-w-blink,
+  .fx-w-skeleton {
+    animation: none;
+  }
+}

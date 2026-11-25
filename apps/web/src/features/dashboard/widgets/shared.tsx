@@ -7,6 +7,7 @@
  *   timestamps; `unknown` is shown as unknown, never as good. Degraded states (stale/bad/no data) are dimmed.
  * - Sizing: `fontScale()` combines the dashboard `font_scale` with the body box so text shrinks in small boxes.
  */
+import '../dashboard.css';
 import React, { useEffect, useState } from 'react';
 import type { DataState, Mapping, SeriesData, ThemeTokens, Threshold } from '../types';
 import { formatAge, isNumber, STATE_LABEL, stateColor } from '../format';
@@ -327,25 +328,14 @@ export function ChartPlaceholder({ theme, size }: { theme: ThemeTokens; size: { 
 
 // ------------------------------------------------------------------------------------------ CSS
 
-let stylesInjected = false;
-/** Keyframes used by widgets (blink, skeleton). Injected once; disabled under prefers-reduced-motion. */
+/**
+ * Keyframes and rules used by widgets (blink, skeleton, table hover, link focus, scrollbars) live in
+ * `../dashboard.css`: the appliance's Content-Security-Policy (`style-src 'self' …`, no 'unsafe-inline')
+ * blocks a runtime <style> element, which silently disabled them in production (DASH-021).
+ * Kept as a no-op so the call sites stay valid.
+ */
 export function ensureWidgetStyles(): void {
-  if (stylesInjected || typeof document === 'undefined') return;
-  stylesInjected = true;
-  const el = document.createElement('style');
-  el.setAttribute('data-fx-widgets', '');
-  el.textContent = `
-@keyframes fx-w-blink { 0%, 100% { opacity: 1 } 50% { opacity: 0.25 } }
-@keyframes fx-w-pulse { 0%, 100% { opacity: 0.55 } 50% { opacity: 1 } }
-.fx-w-blink { animation: fx-w-blink 1.6s ease-in-out infinite; }
-.fx-w-skeleton { animation: fx-w-pulse 1.4s ease-in-out infinite; }
-.fx-w-table tbody tr:hover td { background: var(--fx-w-hover); }
-.fx-w-link:focus-visible { outline: 2px solid var(--fx-w-focus); outline-offset: 2px; }
-.fx-w-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
-.fx-w-scroll::-webkit-scrollbar-thumb { background: var(--fx-w-thumb, #D4DFEC); border-radius: 4px; }
-@media (prefers-reduced-motion: reduce) { .fx-w-blink, .fx-w-skeleton { animation: none; } }
-`;
-  document.head.appendChild(el);
+  /* styles are bundled in dashboard.css */
 }
 
 export function prefersReducedMotion(): boolean {
