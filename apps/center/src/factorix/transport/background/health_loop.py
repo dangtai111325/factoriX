@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.modules import edge_sync, telemetry
+from factorix.application.health import broker_depth
 from factorix.application.health.health_service import report_continuity, sweep_no_data
 from factorix.application.live.freshness_service import FreshnessService
 from factorix.modules.live_state import get_pipeline_evidence, refresh_live_message  # noqa: F401
@@ -336,6 +337,21 @@ def _wire_hub_freshness() -> None:
     hub.connection_of = evidence.connection_of
 
 
+_broker_probe: asyncio.Task[Any] | None = None
+
+
+def _maybe_probe_broker(cfg: Any) -> None:
+    """Every 30 s in acquisition mode: refresh the RabbitMQ depth/DLQ view (CT-20) in its own task, so a slow
+    broker never delays the 5 s health sweep; at most one probe runs at a time."""
+    global _broker_probe
+    if cfg.collector_mode != "acquisition" or not getattr(cfg, "rabbitmq_url", ""):
+        return
+    if _broker_probe is not None and not _broker_probe.done():
+        return
+    if broker_depth.due():
+        _broker_probe = asyncio.create_task(broker_depth.refresh(cfg), name="broker-depth-probe")
+
+
 async def _background_health_loop() -> None:
     tick = 0
     while True:
@@ -355,6 +371,7 @@ async def _background_health_loop() -> None:
             cfg = _settings()
             if cfg.appliance and cfg.collector_mode != "acquisition":
                 await _run_step("appliance_enrollment", _ensure_appliance_enrollment)
+            _maybe_probe_broker(cfg)
             if tick % PRUNE_EVERY_TICKS == 0:
                 await _run_step("prune", _prune)
         except asyncio.CancelledError:

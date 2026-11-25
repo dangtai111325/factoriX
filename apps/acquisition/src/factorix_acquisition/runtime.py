@@ -43,6 +43,7 @@ from factorix_acquisition.pg_control import PgControlPlane
 from factorix_acquisition.publisher import BATCH_ROWS, FLUSH_BUDGET_S, HISTORY_SLICE_S, ObservationPublisher
 from factorix_acquisition.spool import AcquisitionSpool
 from factorix_acquisition.timeutil import iso_ms, now_iso
+from factorix_core.contracts.runtime_status import QUEUES_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -630,7 +631,11 @@ class AcquisitionRuntime:
         if not self._is_leader:
             return
         pending = self.publisher.spool.pending_count()
-        queues: dict[str, Any] = {
+        # queues_json v1 (runtime-status.md, CT-18): MQTT counters live under "connectors" (they used to be
+        # top-level keys named by connection UUID); readers accept both (factorix_core.contracts.runtime_status).
+        queues: dict[str, Any] = {}
+        queues["schema_version"] = QUEUES_SCHEMA_VERSION
+        queues["connectors"] = {
             cid: {
                 "pending": connector.queue_length,
                 "dropped": connector.dropped,

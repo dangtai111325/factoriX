@@ -5,7 +5,7 @@
 | Table | `collector_runtime_status` (PK `instance_id`), one row per process instance, upserted every 5 s |
 | Producers | acquisition `PgControlPlane.record_heartbeat` (role `acquisition`, leader only); ingestion `PgIngestionStore.write_heartbeat` (role `ingestion`) |
 | Readers | API: health sweep (`app.py::_evaluate_connections` via `_acquisition_runtime_info`), `/health/ready`, `/api/v1/edges` (acquisition mode), `/api/v1/overview`, `live_state.extract_runtime_health`, `collect.list_connections` (rates), `telemetry.storage_overview` / ingestion health |
-| Version | **none** — `queues_json` is free JSON; readers must tolerate missing keys and a JSON string instead of an object |
+| Version | `schema_version: 1` (both roles, B-11); rows written before carry no version (= 0). Readers must tolerate missing keys and a JSON string instead of an object; `factorix_core.contracts.runtime_status` parses both shapes |
 | Tests | `apps/center/tests/contracts/test_runtime_status_contract.py` |
 
 ## 1. Row columns
@@ -31,10 +31,14 @@ The acquisition also still updates every non-revoked `edge_nodes` row (compatibi
 ## 2. `queues_json` — acquisition
 
 ```
-{ "<mqtt connection uuid>": {"pending","dropped","connects","disconnects","session_present"},   # one per MQTT connector (CT-18)
+{ "schema_version": 1,
+  "connectors": {"<mqtt connection uuid>": {"pending","dropped","connects","disconnects","session_present"}},  # one per MQTT connector
   "publisher": publish_metrics(),
-  "runtime":   {"started_at","leader_since","jobs_expected","jobs_running","connections_running":[uuid…]} }
+  "runtime":   {"started_at","leader_since","jobs_expected","jobs_running","connections_running":[uuid…],"last_report_at"} }
 ```
+
+Before v1 (unversioned rows) the MQTT counters were top-level keys named by the connection UUID (CT-18);
+`connector_counters()` reads both.
 
 * `publisher` keys (owned by WS-P, additive): `published_fast, published_replay, spilled, overflow_dropped,
   spool_expired, spool_full, spool_occupied_bytes, publish_failed, publish_failed_by_lane, last_publish_failure,
@@ -44,12 +48,12 @@ The acquisition also still updates every non-revoked `edge_nodes` row (compatibi
   broker exposes them.
 * `runtime` is read by the Center health sweep: connections listed in `connections_running` are judged only by
   acquisition's own windowed evidence; `leader_since` / `started_at` reset the "no data" reference time.
-* Readers must skip top-level keys that are UUIDs (MQTT counters) — the mix is CT-18.
+* Readers of unversioned rows must skip top-level keys that are UUIDs (MQTT counters, CT-18 — fixed in v1).
 
 ## 3. `queues_json` — ingestion
 
 ```
-{ "tenant_rates": {tenant: obs/min}, "conn_rates": {connection: obs/min},
+{ "schema_version": 1, "tenant_rates": {tenant: obs/min}, "conn_rates": {connection: obs/min},
   "acked_total","dlq_total","retried_total","epoch_fenced_dropped","tdengine_writes",
   "managed_writes","managed_checkpoints","managed_gap_markers","managed_write_errors","managed_skips_by_reason",
   "tdengine_ok": bool, "envelopes_received",
@@ -65,5 +69,15 @@ Readers: `collect.list_connections` (`conn_rates`, rows of the last 45 s), `tele
 
 * Keys are additive only. Renaming or changing the meaning of a key that a reader uses needs a
   `schema_version` key in `queues_json` and a reader that accepts both shapes for one release (ADR-018).
-* Target (Phase C / D4): `RuntimeStatus v1` per role with `schema_version`, MQTT counters moved under
-  `"connectors"`, and one parser shared by the five readers.
+* Done in v1 (B-11): `schema_version`, MQTT counters under `"connectors"`, shared parser
+  `factorix_core.contracts.runtime_status` (`parse_queues`, `queues_schema_version`, `connector_counters`).
+  Still open (Phase D4): one typed `RuntimeStatus` model for all five readers.
+
+## 5. Broker depth (CT-20)
+
+The API process probes RabbitMQ read-only every 30 s from its health loop (`application/health/broker_depth.py`
+→ `platform.broker.probe_broker_health`: passive declares + management HTTP GETs, 12 s bound, own task) and
+keeps the last answer. Shape (`null` = not measured): `{schema_version, broker_ok, live_q_depth, ingest_q_depth,
+live_q_unacked, ingest_q_unacked, dlq_depth, oldest_age_s, checked_at, error, warnings, age_s}`.
+Exposed (additive) by `GET /health/ready?verbose=1` (`processes[]` + `broker` + `notify_bridge`, also inside the 503 error body)
+and by every `GET /api/v1/edges` item in acquisition mode (`broker`).

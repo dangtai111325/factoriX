@@ -16,6 +16,7 @@ from factorix.modules.providers import LiveSignalRecord, RecordingPolicyEvaluato
 from factorix.modules.recording_policy import DefaultRecordingPolicyEvaluator
 from factorix.application.live.latest_api import RejectionThrottle
 from factorix.platform.broker import BrokerConfig, RabbitMQConsumer
+from factorix_core.contracts.runtime_status import QUEUES_SCHEMA_VERSION
 from factorix.platform.tdengine import TDEngineClient
 
 from factorix.platform.db import to_asyncpg_dsn
@@ -227,6 +228,7 @@ class IngestionWorker(
                 slis = self.hist.snapshot()
                 self._sync_policy_metrics()
                 queues_json = {
+                    "schema_version": QUEUES_SCHEMA_VERSION,  # runtime-status.md v1 (additive, CT-19)
                     "tenant_rates": rates,
                     "conn_rates": conn_rates,
                     "acked_total": self.metrics.acked_total,
