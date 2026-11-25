@@ -399,7 +399,7 @@ export const StableColumnsStep: React.FC<StableStepProps> = ({ data, onChange, e
             className="flex items-center gap-1.5 h-9 px-3 bg-white border border-[#D4DFEC] hover:bg-[#F9FAFD] text-[#111B37] rounded-lg text-[13px] font-semibold transition-colors"
           >
             <Plus className="w-4 h-4" />
-            <span>Add Column</span>
+            <span>Add column</span>
           </button>
         </div>
       </div>
@@ -632,7 +632,7 @@ export const StableTagsStep: React.FC<StableStepProps> = ({ data, onChange, erro
           className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-[#D4DFEC] hover:bg-[#F9FAFD] text-[#111B37] rounded-lg text-[13px] font-semibold transition-colors shadow-2xs"
         >
           <Plus className="w-4 h-4 text-[#EF1B24]" />
-          <span>Add Tag</span>
+          <span>Add tag</span>
         </button>
       </div>
 

@@ -16,6 +16,7 @@ import '@xyflow/react/dist/style.css';
 import { Activity, Cable, ChevronRight, Crosshair, ListTree, Loader2, Map as MapIcon, Maximize, RotateCcw, X } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useApp } from '../../store/AppContext';
+import { Button } from '../../components/common/Button';
 import { api } from '../../api/client';
 import { ResourceNode, SignalItem } from '../../types';
 import { resourceTypeLabel } from '../../components/common/ResourceTypeIcon';
@@ -619,14 +620,14 @@ export const KnowledgeGraphPage: React.FC = () => {
           The graph is drawn from the factory model. Add an enterprise and its sites, lines and machines in Hierarchy
           Structure first.
         </p>
-        <button
+        <Button
           type="button"
+          variant="primary"
+          icon={<ListTree className="w-4 h-4" aria-hidden="true" />}
           onClick={() => navigate('/factory/structure')}
-          className="inline-flex items-center gap-1.5 h-9 px-4 rounded-lg bg-[#EF1B24] text-white text-[13px] font-semibold hover:bg-[#D9141D]"
         >
-          <ListTree className="w-4 h-4" aria-hidden="true" />
           Open Hierarchy Structure
-        </button>
+        </Button>
       </div>
     );
   }
