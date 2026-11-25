@@ -24,11 +24,11 @@ React 18, TypeScript 5, Vite 5, TailwindCSS 3, React Router 6, ECharts 5 (charts
 | Path | Target | Override |
 |---|---|---|
 | `/api` | `http://127.0.0.1:8080` | `FACTORIX_BACKEND_TARGET` |
-| `/ws` | `ws://127.0.0.1:8080` | `FACTORIX_WS_TARGET` |
+| `/stream` | `ws://127.0.0.1:8080` | `FACTORIX_WS_TARGET` |
 
-The live stream client (`src/lib/liveStream.ts`) connects to `/stream` on the page's own host, and that path is not in
-the proxy list, so in `npm run dev` live push does not reach the backend; the UI then falls back to REST polling
-(`src/lib/connectivity.ts`). Use the appliance on `:8080` to check live behaviour.
+The live stream client (`src/lib/liveStream.ts`) connects to `/stream` on the page's own host, so with both entries
+the dev server shows live pushes exactly like the appliance. If the socket cannot connect, the UI falls back to REST
+polling (`src/lib/connectivity.ts`).
 
 ## Layout (`src/`)
 
