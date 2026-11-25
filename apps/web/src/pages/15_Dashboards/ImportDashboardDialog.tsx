@@ -55,9 +55,15 @@ export const ImportDashboardDialog: React.FC<{
       try {
         const data = JSON.parse(String(reader.result || '')) as Record<string, unknown>;
         if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('not an object');
-        const doc = (data.document || data) as { widgets?: unknown[] };
+        const doc = (data.document || {}) as { widgets?: unknown[] };
         if (data.format && data.format !== 'factorix.dashboard') {
           setParseError(`This file is a “${String(data.format)}” export, not a FactoriX dashboard.`);
+          return;
+        }
+        // The server only imports full exports (format + format_version + document); a bare document
+        // used to pass this check and then fail with IMPORT_FORMAT.
+        if (data.format !== 'factorix.dashboard' || !data.document) {
+          setParseError('This file is not a FactoriX dashboard export. Use “Export JSON” of a dashboard to create one.');
           return;
         }
         if (!Array.isArray(doc.widgets)) {
