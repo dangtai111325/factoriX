@@ -139,7 +139,10 @@ async def test_background_replay_never_delays_the_live_lane(tmp_path: Path) -> N
     assert spool.pending_count() == 300
     pub.set_broker(broker)
     try:
-        broker.delay_s = 0.3  # every publish (live or replay) takes 300 ms to confirm
+        # Every publish (live or replay) takes 500 ms to confirm. A live publish that queued behind the replay
+        # slice in flight would need >= 1.0 s; on its own it needs one confirm. The 0.9 s bound separates the two
+        # cases with room for a slow CI runner (a 0.3 s / 0.55 s pair flaked at 0.568 s on a 1.5-CPU container).
+        broker.delay_s = 0.5
         pub.replay.controller.tokens = 1000.0
         await pub.flush_once(budget_s=0.01)  # starts the replay task
         await asyncio.sleep(0.05)  # replay slice now in flight, waiting for its confirm
@@ -147,7 +150,7 @@ async def test_background_replay_never_delays_the_live_lane(tmp_path: Path) -> N
         started = time.monotonic()
         sent, failed = await pub.flush_once(budget_s=0.01)
         # Live publish costs one confirm, it never waits behind the replay slice in flight.
-        assert (sent, failed) == (1, False) and time.monotonic() - started < 0.55
+        assert (sent, failed) == (1, False) and time.monotonic() - started < 0.9
         for _ in range(100):
             if spool.pending_count() == 0:
                 break
