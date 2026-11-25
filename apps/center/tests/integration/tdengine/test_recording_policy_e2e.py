@@ -25,6 +25,7 @@ from factorix.modules.storage_dsl import (
 )
 from factorix.platform.broker import BrokerConfig, RabbitMQPublisher
 from factorix.platform.tdengine import TDEngineClient, op_subtable_name, tenant_database_name
+from tests.integration_guard import isolated_topology_names
 
 
 def _pg_dsn() -> str:
@@ -44,10 +45,7 @@ def _broker_cfg(suffix: str) -> BrokerConfig:
     return BrokerConfig(
         amqp_url=os.environ["FACTORIX_RABBITMQ_URL"],
         mgmt_url=os.environ.get("FACTORIX_RABBITMQ_MGMT_URL", "http://127.0.0.1:15672"),
-        exchange_name=f"factorix.s07.ingress.{suffix}",
-        queue_name=f"factorix.s07.ingest.q.{suffix}",
-        dlx_name=f"factorix.s07.dlx.{suffix}",
-        dlq_name=f"factorix.s07.dlq.{suffix}",
+        **isolated_topology_names("s07", suffix),
         delivery_limit=2,
         prefetch_count=64,
         consumer_concurrency=16,

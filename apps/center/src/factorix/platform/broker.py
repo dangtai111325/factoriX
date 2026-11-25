@@ -84,7 +84,7 @@ def derive_live_queue_name(queue_name: str) -> str:
     """Live-lane queue name of the topology whose ingest (legacy lane) queue is ``queue_name``.
 
     ``factorix.telemetry.ingest.q`` -> ``factorix.telemetry.live.q`` (production name, unchanged);
-    ``factorix.s06.ingest.q.<suffix>`` -> ``factorix.s06.live.q.<suffix>``; any other name gets ``.live``.
+    ``fxtest.s06.ingest.q.<suffix>`` -> ``fxtest.s06.live.q.<suffix>``; any other name gets ``.live``.
     """
     if ".ingest.q" in queue_name:
         return queue_name.replace(".ingest.q", ".live.q", 1)
