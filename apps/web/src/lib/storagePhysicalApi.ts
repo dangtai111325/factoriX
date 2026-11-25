@@ -138,6 +138,8 @@ export interface TDStable {
   source_mapping_template?: SourceBinding[] | null;
   default_recording_mode?: RecordingMode | null;
   retention_days?: number | null;
+  /** Bulk wizard name prefix proposed by the server (R2-14), e.g. `order_` for `st_production_order_change`. */
+  suggested_prefix?: string | null;
 }
 
 export interface TDSubtable {
@@ -266,6 +268,12 @@ export interface SourceRef {
   freshness?: string | null;
   has_last_value?: boolean;
   bound_to?: { database: string; subtable: string; column: string } | null;
+  /** Server suggestion for `auto` fields (R2-14): the type of the mapped signal, else of the live value. */
+  inferred_type?: string | null;
+  /** Where `inferred_type` comes from: `declared`, `signal` or `live_value`. */
+  type_source?: 'declared' | 'signal' | 'live_value' | string | null;
+  /** Value column of the standard template the server proposes for this field. */
+  suggested_column?: string | null;
   resource_code?: string | null;
   is_timestamp?: boolean;
   display_name: string;
