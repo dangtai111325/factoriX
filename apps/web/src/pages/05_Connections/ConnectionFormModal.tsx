@@ -9,6 +9,7 @@ import { ConfirmDialog } from '../../components/common/ConfirmDialog';
 import { TestResultPanel } from './TestResultPanel';
 import { httpPathsOfConnection, rateBudget } from './httpRate';
 import { pollIntervalMin, validatePollInterval } from './pollInterval';
+import { Button } from '../../components/common/Button';
 
 export interface SavedConnection {
   id: string;
@@ -1175,26 +1176,22 @@ export const ConnectionFormModal: React.FC<ConnectionFormModalProps> = ({
           />
 
           <div className="pt-3 border-t border-[#E2E8F0] flex flex-wrap items-center justify-between gap-2">
-            <button
+            <Button
               type="button"
+              variant="outline"
               disabled={busy}
               onClick={() => void handleTest()}
-              className="py-2 px-3 rounded-xl border border-[#CBD5E1] hover:border-[#134074] bg-white text-xs font-bold text-[#134074] flex items-center gap-1.5 shadow-sm transition-all disabled:opacity-50"
+              icon={<Activity className="w-3.5 h-3.5" />}
             >
-              <Activity className="w-3.5 h-3.5" />
-              <span>{testLabel}</span>
-            </button>
+              {testLabel}
+            </Button>
             <div className="flex items-center gap-2">
-              <button type="button" onClick={requestClose} className="py-2 px-4 rounded-xl border border-[#CBD5E1] text-xs font-semibold text-[#475569] hover:bg-[#F8FAFC]">
+              <Button type="button" variant="outline" onClick={requestClose}>
                 {isEdit && !hasUnsavedEdits ? 'Close' : 'Cancel'}
-              </button>
-              <button
-                type="submit"
-                disabled={busy}
-                className="py-2 px-5 rounded-xl bg-[#EF1B24] hover:bg-[#D9141D] active:bg-[#C7111A] text-white text-xs font-bold shadow-sm transition-all disabled:opacity-50"
-              >
+              </Button>
+              <Button type="submit" variant="primary" disabled={busy}>
                 {isSaving ? 'Saving…' : isEdit ? 'Save changes' : 'Create connection'}
-              </button>
+              </Button>
             </div>
           </div>
         </form>

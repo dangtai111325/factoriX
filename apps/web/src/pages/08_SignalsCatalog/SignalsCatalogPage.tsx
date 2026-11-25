@@ -651,8 +651,7 @@ export const SignalsCatalogPage: React.FC = () => {
             </button>
           </div>
 
-          <Button variant="outline" size="sm" onClick={() => void refresh()}>
-            <RefreshCw className="w-3.5 h-3.5 mr-1.5" />
+          <Button variant="outline" size="sm" icon={<RefreshCw className="w-3.5 h-3.5" />} onClick={() => void refresh()}>
             Refresh
           </Button>
 

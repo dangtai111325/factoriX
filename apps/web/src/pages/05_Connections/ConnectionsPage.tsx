@@ -27,6 +27,7 @@ import { ConnectionFormModal } from './ConnectionFormModal';
 import { ConnectionStatusCell } from './connectionStatus';
 import { TestResultPanel } from './TestResultPanel';
 import { ConfirmDialog } from '../../components/common/ConfirmDialog';
+import { Button } from '../../components/common/Button';
 import { api, ApiError } from '../../api/client';
 import { CommissionResult, runConnectionTest } from '../../lib/commissioning';
 import { timeAgo } from '../../lib/format';
@@ -346,20 +347,21 @@ export const ConnectionsPage: React.FC = () => {
     <div className="space-y-4 animate-in fade-in duration-200 pb-8">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="text-xl md:text-2xl font-black text-[#0B2545] tracking-tight">Data Connections</h1>
-          <p className="text-xs text-[#64748B]">PLCs, OPC UA servers, MQTT brokers, REST APIs and WebSocket streams read by the FactoriX collector.</p>
+          <h1 className="text-[20px] font-bold text-[#111B37]">Data Connections</h1>
+          <p className="text-[13px] text-[#657794]">PLCs, OPC UA servers, MQTT brokers, REST APIs and WebSocket streams read by the FactoriX collector.</p>
         </div>
-        <button
-          type="button"
+        <Button
+          variant="primary"
+          size="lg"
+          className="shrink-0 self-start md:self-auto"
+          icon={<Plus className="w-4 h-4" />}
           onClick={() => {
             setEditingConn(null);
             setIsFormOpen(true);
           }}
-          className="py-2 px-4 rounded-xl bg-[#EF1B24] hover:bg-[#D9141D] active:bg-[#C7111A] text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all shrink-0"
         >
-          <Plus className="w-4 h-4" />
-          <span>New Connection</span>
-        </button>
+          New connection
+        </Button>
       </div>
 
       {notice && !actionError && (
@@ -497,7 +499,7 @@ export const ConnectionsPage: React.FC = () => {
             </div>
             <h3 className="text-sm font-bold text-[#0B2545]">No connections found</h3>
             <p className="text-xs text-[#64748B] max-w-sm mx-auto">
-              {connections.length === 0 ? 'Click "New Connection" to connect a PLC, server, broker or API.' : 'No connection matches the filters.'}
+              {connections.length === 0 ? 'Click "New connection" to connect a PLC, server, broker or API.' : 'No connection matches the filters.'}
             </p>
           </div>
         ) : (

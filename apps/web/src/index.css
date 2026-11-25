@@ -139,18 +139,18 @@ html:has([aria-modal='true']) {
   box-shadow: var(--fx-shadow-card);
 }
 
+/* Same scale as the shared page header (hsUi PageHeader): 20px bold title, 13px muted subtitle. */
 .fx-page-title {
-  font-size: 30px;
-  font-weight: 800;
-  letter-spacing: -0.025em;
-  line-height: 1.2;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.25;
   color: var(--fx-ink);
 }
 
 .fx-page-subtitle {
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1.5;
-  margin-top: 4px;
+  margin-top: 2px;
   color: var(--fx-muted);
 }
 
@@ -353,9 +353,6 @@ button:disabled[class*='bg-blue-6'] {
   .fx-content {
     padding: 12px var(--fx-content-padding) 28px;
     min-width: 0;
-  }
-  .fx-page-title {
-    font-size: 22px;
   }
   /* Safety net: media and preformatted text never widen the page. */
   .fx-content img,
