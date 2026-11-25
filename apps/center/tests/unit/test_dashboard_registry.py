@@ -165,7 +165,8 @@ def test_type_shape(type_key: str) -> None:
         if spec.show_if:
             assert wt.option(spec.show_if["key"]) is not None, spec.key
             target = wt.option(spec.show_if["key"])
-            assert set(spec.show_if["in"]) <= set(target.choices or ()), spec.key
+            allowed = {True, False} if target.type == "boolean" else set(target.choices or ())
+            assert set(spec.show_if["in"]) <= allowed, spec.key
 
 
 def test_payloads_are_json_and_complete() -> None:
@@ -207,3 +208,13 @@ def test_contract_limits_line_matches() -> None:
     text = _contract()
     assert "40 widgets" in text and "400 resolve refs per call" in text and "1.5 MB document" in text
     assert f"{R.MAX_BINDINGS_PER_DOCUMENT} bindings per document" in text
+
+
+def test_dependent_options_are_hidden_when_they_have_no_effect() -> None:
+    from factorix.application.dashboards import registry as R
+
+    types = {t["type"]: t for t in R.widget_types_payload()["widget_types"]}
+    pie = {o["key"]: o for o in types["pie"]["options"]}
+    ts = {o["key"]: o for o in types["timeseries"]["options"]}
+    assert pie["inner_radius"]["show_if"] == {"key": "doughnut", "in": [True]}
+    assert ts["legend_values"]["show_if"] == {"key": "legend", "in": ["top", "bottom", "right"]}

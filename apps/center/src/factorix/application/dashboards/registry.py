@@ -304,7 +304,8 @@ _TYPES: tuple[WidgetType, ...] = (
             _bool("show_points", "Show points", False),
             _bool("stack", "Stack", False),
             _enum("legend", "Legend", ("top", "bottom", "right", "hidden"), "bottom"),
-            _enum("legend_values", "Legend values", ("none", "last", "minmaxavg"), "none"),
+            _enum("legend_values", "Legend values", ("none", "last", "minmaxavg"), "none",
+                  show_if={"key": "legend", "in": ["top", "bottom", "right"]}),
             _num("y_min", "Y min", None),
             _num("y_max", "Y max", None),
             _bool("split_axes_by_unit", "One axis per unit", True),
@@ -337,7 +338,7 @@ _TYPES: tuple[WidgetType, ...] = (
         (4, 5), (3, 4), (1, 12), ("number",), "optional", (
             _enum("value_mode", "Value", _VALUE_MODES, "latest", "data"),
             _bool("doughnut", "Doughnut", True),
-            _int("inner_radius", "Inner radius (%)", 55, 0, 90),
+            _int("inner_radius", "Inner radius (%)", 55, 0, 90, show_if={"key": "doughnut", "in": [True]}),
             _enum("label", "Slice label", ("percent", "value", "name", "none"), "percent"),
             _enum("legend", "Legend", ("right", "bottom", "hidden"), "right"),
             _bool("show_total", "Show total", True),
