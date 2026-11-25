@@ -22,7 +22,7 @@ this check and **0** requests to `/api/v1/edge-sync/*`.
 
 Since 2026-11-18 every `/api/v1/edge-sync/*` route answers **410 Gone** with
 `{"error":{"code":"EDGE_SYNC_DISABLED",…}}` when `FACTORIX_COLLECTOR_MODE=acquisition`, before any database
-session is opened and before body validation (`transport/app.py::_legacy_edge_sync_enabled`). Reason:
+session is opened and before body validation (`transport/http/routers/edge_legacy.py::_legacy_edge_sync_enabled`). Reason:
 `GET /edge-sync/secrets/{id}` returns a **decrypted** connection secret to any valid Edge bearer token, and
 nothing in acquisition mode uses the API. In `edge` mode the routes behave exactly as before. The routes stay
 registered (route table unchanged) until plan S17 retires the Edge path (Phase D2).

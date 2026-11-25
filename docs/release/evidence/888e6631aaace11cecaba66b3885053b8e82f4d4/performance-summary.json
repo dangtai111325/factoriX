@@ -1,4 +1,9 @@
 {
+  "retracted": {
+    "at": "2026-11-25",
+    "reason": "Not reproducible on the target hardware (review R1-A P1-13, I-01 / OP-20): measured at 1x on the appliance host the appliance container used 278-327 % CPU and RabbitMQ 126-161 %, not the figures below; the hardware listed is not the appliance. Do not use as release evidence.",
+    "see": "docs/benchmark/report.md (banner and 'What is actually measured today')"
+  },
   "verified_at_utc": "2026-11-16T09:20:00Z",
   "commit_sha": "888e6631aaace11cecaba66b3885053b8e82f4d4",
   "workload_benchmarks": [

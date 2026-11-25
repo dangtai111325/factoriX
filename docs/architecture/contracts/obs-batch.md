@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Producer | acquisition `ObservationPublisher` → `platform/broker.py::RabbitMQPublisher` (also the SQLite spool replay) |
-| Consumer | ingestion `modules/ingestion_worker.py::IngestionWorker` (two lanes) |
+| Consumer | ingestion `application/ingestion/worker.py::IngestionWorker` (two lanes) |
 | Code | `domain/canonical.py` (`CanonicalObservation`, `encode_observation_batch`, `decode_observation_batch`), `platform/broker.py` (`build_envelopes`, `_batch_envelope`, `_single_envelope`, `declare_telemetry_topology`) |
 | Versions | observation `schema_version = 1` (`CANONICAL_SCHEMA_VERSION`); envelope `envelope_version = 2` (`OBS_BATCH_ENVELOPE_VERSION`) |
 | Tests | `apps/center/tests/contracts/test_obs_batch_golden.py` (golden bytes in `apps/center/tests/contracts/golden/`) |

@@ -1,5 +1,37 @@
 # FactoriX Storage & Historian Benchmark Report (Stage S15)
 
+> **RETRACTED (2026-11-25, review item I-01 / OP-20, R1-A P1-13).** The figures in sections 1-6 below are
+> **not reproducible** and must not be used as release evidence. They were not measured on the target
+> hardware nor on the production stack, and several statements are wrong:
+>
+> * **Versions.** Production runs `tdengine/tsdb:3.4.3.9` and `rabbitmq:4.4-management-alpine`
+>   (`docker-compose.yml`), not TDengine 3.3.6.13 / RabbitMQ 4.0.
+> * **Protocols.** The acquisition runtime supports Modbus TCP, OPC UA, MQTT, WebSocket and HTTP. There are no
+>   EtherNet/IP, Siemens S7 or MQTT Sparkplug B simulators or connectors in the code.
+> * **Broker settings.** The delivery limit is 5 (`FACTORIX_RABBITMQ_DELIVERY_LIMIT`, default in
+>   `platform/settings.py`), not 2; dead letters go to `factorix.telemetry.dlq` (via `factorix.telemetry.dlx`),
+>   not `factorix.s07.dlq.*`.
+> * **Scope.** "Ingestion throughput" was one TDengine batch of 300 / 3 000 rows
+>   (`test_tdengine_x1_and_x10_batched_benchmark`), not the acquisition -> RabbitMQ -> ingestion -> TDengine /
+>   PostgreSQL pipeline, and on a different machine (8C/16T, 32 GB).
+> * **Load.** The companion `docs/release/evidence/888e663…/performance-summary.json` (appliance 48 % CPU,
+>   RabbitMQ 8.5 % at 1×, "10× PASS", "11.1× margin") contradicts the measurement on the appliance host at 1×:
+>   appliance 278–327 % CPU and RabbitMQ 126–161 % CPU (review R1-A §3.1).
+>
+> **What is actually measured today**
+>
+> 1. *Pipeline work per observation, in-process* — `tests/load/bench_pipeline.py --signals 336 --cycles 30 --repeat 2`
+>    runs the real publisher, envelope, ingestion, TDengine-SQL and PostgreSQL/NOTIFY building code with the
+>    network replaced by counters (nothing connects to a broker or database). For 10 080 observations it reports
+>    51 AMQP messages (≈ 198 observations per envelope), 11 TDengine statements, 6 PostgreSQL commits and
+>    11 NOTIFY payloads; these counts are the regression gate of every pipeline change. CPU per 1 000
+>    observations is printed too but depends on the machine; it is not a capacity figure.
+> 2. *Live behaviour on the appliance* — the review samplers (data age per protocol, API probes, host
+>    `% Processor Performance`; see the engagement report of 2026-11-18) at 1× (336 signals, 5 connections).
+>
+> A capacity statement (1× / 10× headroom) needs the load test of the review plan (§9 of R1-A) on the target
+> hardware; until then there is none.
+
 ## 1. Executive Summary
 
 This report documents measured performance, throughput, latency, and resource utilization across the **FactoriX Storage & Historian Architecture** (TDengine 3.3.6.13 + RabbitMQ 4.0 Quorum Queues + PostgreSQL 17 Control Plane), fulfilling the benchmark requirements of `plan.md` (§15).

@@ -4,7 +4,7 @@
 |---|---|
 | Table | `collector_runtime_status` (PK `instance_id`), one row per process instance, upserted every 5 s |
 | Producers | acquisition `PgControlPlane.record_heartbeat` (role `acquisition`, leader only); ingestion `PgIngestionStore.write_heartbeat` (role `ingestion`) |
-| Readers | API: health sweep (`app.py::_evaluate_connections` via `_acquisition_runtime_info`), `/health/ready`, `/api/v1/edges` (acquisition mode), `/api/v1/overview`, `live_state.extract_runtime_health`, `collect.list_connections` (rates), `telemetry.storage_overview` / ingestion health |
+| Readers | API: health sweep (`transport/background/health_loop.py::_evaluate_connections` via `_acquisition_runtime_info`), `/health/ready`, `/api/v1/edges` (acquisition mode), `/api/v1/overview`, `live_state.extract_runtime_health`, `collect.list_connections` (rates), `telemetry.storage_overview` / ingestion health |
 | Version | `schema_version: 1` (both roles, B-11); rows written before carry no version (= 0). Readers must tolerate missing keys and a JSON string instead of an object; `factorix_core.contracts.runtime_status` parses both shapes |
 | Tests | `apps/center/tests/contracts/test_runtime_status_contract.py` |
 
