@@ -56,7 +56,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       rabbitmq:
-        image: rabbitmq:4.0-management-alpine
+        image: rabbitmq:4.4-management-alpine
         env:
           RABBITMQ_DEFAULT_USER: factorix_mq
           RABBITMQ_DEFAULT_PASS: factorix-mq-pw
@@ -68,10 +68,10 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       tdengine:
-        image: tdengine/tdengine:3.3.6.13
+        image: tdengine/tsdb:3.4.3.9
         ports: ["6041:6041"]
         options: >-
-          --health-cmd "curl -fsS http://127.0.0.1:6041/-/ping"
+          --health-cmd "curl -fsS http://127.0.0.1:6041/-/ping >/dev/null || taos -s 'SHOW DATABASES;' >/dev/null"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
