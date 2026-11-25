@@ -95,6 +95,40 @@ def test_image_and_compose_default_to_acquisition_mode() -> None:
     assert "FACTORIX_COLLECTOR_MODE=${FACTORIX_COLLECTOR_MODE:-acquisition}" in compose
 
 
+def test_entrypoint_and_settings_default_to_acquisition_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CT-14 (B-10): the bare image, the supervisor script and the Settings model agree on acquisition."""
+    from factorix.platform.settings import Settings
+
+    entrypoint = (REPO / "infrastructure" / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+    assert 'MODE="${FACTORIX_COLLECTOR_MODE:-acquisition}"' in entrypoint
+    assert ":-edge}" not in entrypoint
+    # Acquisition without its broker / time-series DSN refuses to start (no silent fallback to Edge).
+    assert "refusing unsafe startup" in entrypoint
+    assert Settings.model_fields["collector_mode"].default == "acquisition"
+    # The explicit override keeps working (deliberate rollback to the legacy Edge path).
+    monkeypatch.setenv("FACTORIX_COLLECTOR_MODE", "edge")
+    assert Settings().collector_mode == "edge"
+
+
+def _compose_images(path: Path) -> dict[str, str]:
+    """``{image name: tag}`` of a compose file (no YAML dependency needed for these flat files)."""
+    out: dict[str, str] = {}
+    for m in re.finditer(r"^\s*image:\s*([^\s#]+)", path.read_text(encoding="utf-8"), re.M):
+        name, _, tag = m.group(1).rpartition(":")
+        out[name] = tag
+    return out
+
+
+def test_test_stack_uses_production_images() -> None:
+    """CT-15 (B-10): the isolated test stack runs the same infrastructure images as production."""
+    prod = _compose_images(REPO / "docker-compose.yml")
+    test = _compose_images(REPO / "docker-compose.test.yml")
+    for image in ("postgres", "rabbitmq", "tdengine/tsdb"):
+        assert image in prod, image
+        assert test.get(image) == prod[image], (image, test.get(image), prod[image])
+    assert "tdengine/tdengine" not in test
+
+
 def test_settings_carry_no_personal_mail_defaults() -> None:
     from factorix.platform.settings import Settings
 

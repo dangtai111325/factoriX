@@ -257,6 +257,10 @@ async def test_load_samples_keeps_quality_without_fetching_old_values(monkeypatc
 
 
 async def test_value_at_query_uses_the_source_time_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    from factorix.platform.settings import get_settings
+
+    # value_at reads the PostgreSQL observations fallback, enabled in Edge mode only (default: acquisition, CT-14).
+    monkeypatch.setattr(get_settings(), "collector_mode", "edge")
     captured: dict[str, Any] = {}
 
     async def fetch_all(_s: Any, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
