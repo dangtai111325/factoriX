@@ -125,7 +125,12 @@ async def request_context(request: Request, call_next):  # type: ignore[no-untyp
     response.headers["X-Correlation-Id"] = request.state.correlation_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; frame-ancestors 'none'; base-uri 'self'"
+    # img-src data: — Dashboard image widgets embed their (validated PNG/JPEG/WebP/GIF) image as a data URL
+    # and the grid's resize handle is an inline SVG; without it the browser blocks every such image.
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; frame-ancestors 'none'; base-uri 'self'"
+    )
     return response
 
 

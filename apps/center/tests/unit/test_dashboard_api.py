@@ -113,3 +113,11 @@ async def test_flow_and_shapes(client: AsyncClient) -> None:
             {"kind": "signal", "signal_id": SIG_SPEED_1}]})).json()["items"]
         assert resolved[0]["token"] == SIG_SPEED_1
         assert (await client.get("/api/v1/dashboards/not-a-uuid")).status_code == 422
+
+
+async def test_csp_allows_embedded_dashboard_images_only(client: AsyncClient) -> None:
+    async with client:
+        csp = (await client.get("/api/v1/dashboards/themes")).headers["content-security-policy"]
+    directives = dict(d.strip().split(" ", 1) for d in csp.split(";") if d.strip())
+    assert directives["img-src"] == "'self' data:"  # image widgets are data URLs; nothing remote
+    assert directives["default-src"] == "'self'" and "unsafe-inline" not in csp
