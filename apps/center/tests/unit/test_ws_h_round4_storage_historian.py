@@ -476,6 +476,8 @@ async def test_prune_deletes_in_bounded_batches(monkeypatch):
         return next(counts)
 
     monkeypatch.setattr(REC, "execute_rowcount", rowcount)
+    # Reproduce fresh-booted CI VMs where time.monotonic() < 300 s.
+    monkeypatch.setattr(REC.time, "monotonic", lambda: 10.0)
     d = REC.RecordingDispatcher(session_factory=sessions)
     assert await d._prune() == 2 * REC.PRUNE_BATCH + 17
     assert len(sqls) == 3 and "ORDER BY confirmed_at LIMIT :batch" in sqls[0] and sessions.commits == 3

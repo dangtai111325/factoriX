@@ -632,7 +632,7 @@ class RecordingDispatcher:
         self._schemas: dict[str, tuple[float, list[tuple[str, str, int | None]]]] = {}
         self._precision: dict[str, tuple[float, str]] = {}
         self.stats: dict[str, Any] = {"written": 0, "failed": 0, "retries": 0, "last_write_at": None, "last_error": None}
-        self._last_prune = 0.0
+        self._last_prune: float | None = None
 
     def start(self, td_client: Any) -> None:
         self.td = td_client
@@ -836,7 +836,7 @@ class RecordingDispatcher:
         """Delete CONFIRMED rows older than ``CONFIRMED_KEEP`` in bounded batches (WS-P P6: the single
         DELETE was a full scan of the table every 5 min). Uses the partial index of migration 0012; each
         batch is its own short transaction."""
-        if time.monotonic() - self._last_prune < 300:
+        if self._last_prune is not None and time.monotonic() - self._last_prune < 300:
             return 0
         self._last_prune = time.monotonic()
         cutoff = utcnow() - CONFIRMED_KEEP
