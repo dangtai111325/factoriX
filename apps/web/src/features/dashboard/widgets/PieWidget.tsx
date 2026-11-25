@@ -88,7 +88,7 @@ export function PieWidget({ options: o, data, theme, size, timeRange, mode }: Wi
   const cx = plotW / 2;
   const cy = plotH / 2;
   const showLabels = labelMode !== 'none' && Math.min(plotW, plotH) >= 150;
-  const outer = Math.max(16, Math.min(plotW, plotH) / 2 - (showLabels ? 26 : 6));
+  const outer = Math.max(16, Math.min(plotW, plotH) / 2 - (showLabels ? 34 : 6));
   const innerR = doughnut ? (outer * inner) / 100 : 0;
 
   const option = useMemo<ChartOption>(() => {
@@ -133,6 +133,7 @@ export function PieWidget({ options: o, data, theme, size, timeRange, mode }: Wi
           itemStyle: { borderColor: theme.surface, borderWidth: 1.5, borderRadius: doughnut ? 3 : 0 },
           label: {
             show: showLabels,
+            overflow: 'none',
             color: theme.text,
             fontSize: Math.round(10.5 * fs),
             formatter: (p: { dataIndex: number }) => {

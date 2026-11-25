@@ -100,6 +100,8 @@ interface HistoryEntry {
   version: number;
   fetchedAt: number | null;
   appended: number;
+  /** Live points pushed while the history request was in flight; merged after the answer (no gap). */
+  pending: RawPoint[];
 }
 
 interface InflightRequest {
@@ -433,7 +435,8 @@ export class DashboardRuntimeStore {
 
   getResolved(ref: SourceRef): ResolvedSource | null {
     if (ref.kind === 'role') {
-      return { source: ref, ok: false, error: { code: 'ROLE_UNMAPPED', message: `Template role “${ref.role}” is not mapped to a source.` } };
+      const label = ref.role.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
+      return { source: ref, ok: false, error: { code: 'ROLE_UNMAPPED', message: `“${label}” is not mapped yet: pick a source in the Data tab.` } };
     }
     return this.resolved.get(sourceKey(ref)) ?? null;
   }
@@ -718,6 +721,7 @@ export class DashboardRuntimeStore {
       version: 0,
       fetchedAt: null,
       appended: 0,
+      pending: [],
     });
     this.scheduleFlush();
     return key;
@@ -758,6 +762,7 @@ export class DashboardRuntimeStore {
   private invalidateHistory(dropAppended: boolean): void {
     this.entries.forEach((e) => {
       e.stale = true;
+      if (dropAppended) e.pending = [];
       if (dropAppended && e.data && e.appended > 0) {
         e.data = null;
         e.appended = 0;
@@ -860,6 +865,7 @@ export class DashboardRuntimeStore {
       e.fetchedAt = now;
       if (errorText !== null) {
         e.error = errorText;
+        e.pending = [];
         e.version++;
         return;
       }
@@ -881,6 +887,10 @@ export class DashboardRuntimeStore {
             next_cursor: sr.next_cursor ?? null,
           }
         : { status: 'NOT_FOUND', points: [], downsampled: false, truncated: false, fidelity: '', notes: ['The Historian did not return this series.'], bucket_ms: null, next_cursor: null };
+      // Pushes that arrived while the request ran: keep those newer than the answer's last point.
+      const pending = e.pending;
+      e.pending = [];
+      if (e.params.liveAppend) for (const p of pending) this.appendTo(e, p.t, p.v, p.q, p.epoch);
       const last = e.data.points[e.data.points.length - 1];
       if (last) this.lastUpdateAt = Math.max(this.lastUpdateAt ?? 0, last.t);
       e.version++;
@@ -897,7 +907,13 @@ export class DashboardRuntimeStore {
   }
 
   private appendTo(e: HistoryEntry, t: number, v: unknown, q: string | null, epoch: number | null): void {
-    if (!e.data || e.inflight || e.params.range.kind !== 'relative') return;
+    if (e.params.range.kind !== 'relative') return;
+    if (e.inflight) {
+      // Not lost: merged when the answer arrives (bounded).
+      if (e.pending.length < 5000) e.pending.push({ t, v, q, epoch });
+      return;
+    }
+    if (!e.data) return;
     const pts = e.data.points;
     const last = pts[pts.length - 1];
     if (last && t <= last.t) return; // dedupe by timestamp, only newer points

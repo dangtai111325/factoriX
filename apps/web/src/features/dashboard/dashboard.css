@@ -85,3 +85,15 @@ html.fx-studio-open .fx-banner-stack {
 html.fx-studio-open .fx-banner-stack {
   left: 0;
 }
+
+/* One-row widgets: the Studio header floats over the body and shows on hover, focus or selection. */
+.dash-widget.dash-tiny .dash-tiny-head {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.dash-widget.dash-tiny:hover .dash-tiny-head,
+.dash-widget.dash-tiny:focus-within .dash-tiny-head,
+.dash-widget.dash-tiny[data-selected='true'] .dash-tiny-head {
+  opacity: 1;
+}

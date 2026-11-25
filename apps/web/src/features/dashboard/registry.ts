@@ -21,6 +21,39 @@ export const FALLBACK_LIMITS: RegistryLimits = {
   max_y: 2000,
 };
 
+/** Display labels of enum choices whose humanized value reads badly ("Lg", "Minmaxavg", "Led"); `key:value` wins. */
+const CHOICE_LABELS: Record<string, string> = {
+  sm: 'Small',
+  md: 'Medium',
+  lg: 'Large',
+  xl: 'Extra large',
+  led: 'LED',
+  asc: 'Ascending',
+  desc: 'Descending',
+  avg: 'Average',
+  min: 'Minimum',
+  max: 'Maximum',
+  delta: 'Change',
+  minmaxavg: 'Min · max · avg',
+  cpu: 'CPU',
+  'legend_values:last': 'Last value',
+  'color_mode:value': 'Value',
+  'color_mode:background': 'Background',
+  'color_mode:none': 'No color',
+  'sort:label': 'By label',
+  'sort:value': 'By value',
+  'resource_source:fixed': 'Fixed',
+  'resource_source:variable': 'Variable',
+  'target_type:page': 'App page',
+  'resolution:auto': 'Auto',
+  'resolution:raw': 'Raw samples',
+  'blink:slow': 'Slow blink',
+};
+
+export function choiceLabel(key: string, value: string): string {
+  return CHOICE_LABELS[`${key}:${value}`] ?? CHOICE_LABELS[value] ?? humanize(value);
+}
+
 function humanize(v: string): string {
   const t = v.replace(/_/g, ' ');
   return t.charAt(0).toUpperCase() + t.slice(1);
@@ -43,7 +76,7 @@ export function normalizeRegistry(raw: WidgetRegistry): WidgetRegistry {
         ...o,
         choices: Array.isArray(o.choices)
           ? (o.choices as unknown[]).map((c) =>
-              c && typeof c === 'object' ? (c as { value: string; label: string }) : { value: String(c), label: humanize(String(c)) },
+              c && typeof c === 'object' ? (c as { value: string; label: string }) : { value: String(c), label: choiceLabel(String(o.key), String(c)) },
             )
           : o.choices,
       })),

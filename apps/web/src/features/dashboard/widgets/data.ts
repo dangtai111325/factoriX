@@ -165,8 +165,13 @@ export function historyNotes(h: HistoryData | null | undefined, label?: string):
   else if (st === 'PARTIAL') out.push(`${pre}partial history`);
   if (h.downsampled) out.push(`${pre}downsampled${isNumber(h.bucket_ms) && h.bucket_ms > 0 ? ` (${formatDuration(h.bucket_ms)} buckets)` : ''}`);
   if (h.truncated) out.push(`${pre}truncated at ${h.points.length.toLocaleString('en-US')} points`);
-  for (const n of h.notes || []) if (n) out.push(`${pre}${n}`);
+  for (const n of h.notes || []) if (n) out.push(`${pre}${operatorNote(n)}`);
   return out;
+}
+
+/** Server coverage notes may name internal storage ("Recorded in db.table (col); …"); operators get the meaning only. */
+export function operatorNote(n: string): string {
+  return /^Recorded in \S+ \([^)]*\); rows are changes only\.?$/.test(n) ? 'recorded changes only' : n;
 }
 
 /** Merge equal notes from several series (keeps first-seen order). */

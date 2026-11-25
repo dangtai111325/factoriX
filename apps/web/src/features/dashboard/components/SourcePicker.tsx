@@ -25,6 +25,18 @@ const BADGE_CLS: Record<string, string> = {
   neutral: 'bg-slate-100 text-slate-600 border-slate-200',
 };
 
+/**
+ * Value kind of a catalog item; an `auto` Data Model field (kind unknown) takes the kind of its live value,
+ * so the Numeric / Text filters do not hide every such field (a server older than this rule says unknown).
+ */
+function itemKind(i: SourceItem): ReturnType<typeof valueKindOf> {
+  const k = valueKindOf(i.value_type, i.value_kind);
+  if (k !== 'unknown' || !i.has_last_value) return k;
+  const v = i.last_value;
+  return typeof v === 'number' ? 'number' : typeof v === 'boolean' ? 'boolean' : typeof v === 'string' ? 'string' : k;
+}
+const itemKind_ = itemKind;
+
 export const CapabilityChip: React.FC<{ item: Pick<SourceItem, 'capabilities'> | null; className?: string }> = ({ item, className = '' }) => {
   const b = capabilityBadge(item?.capabilities);
   return (
@@ -70,7 +82,7 @@ export const SourcePicker: React.FC<SourcePickerProps> = ({ acceptKinds = [], se
   const items = useMemo(
     () =>
       (catalog?.items || []).filter(
-        (i) => i.kind === tab && (kind === 'all' || valueKindOf(i.value_type, i.value_kind) === kind),
+        (i) => i.kind === tab && (kind === 'all' || itemKind(i) === kind),
       ),
     [catalog, tab, kind],
   );
@@ -126,7 +138,7 @@ export const SourcePicker: React.FC<SourcePickerProps> = ({ acceptKinds = [], se
   const selected = selectedToken ? byToken.get(selectedToken) || null : null;
 
   const leaf = (it: SourceItem, depth: number) => {
-    const itemKind = valueKindOf(it.value_type, it.value_kind);
+    const itemKind = itemKind_(it);
     const ok = kindAccepted(itemKind, acceptKinds);
     const on = it.token === selectedToken;
     const dot = qualityDot(it.quality, it.freshness);

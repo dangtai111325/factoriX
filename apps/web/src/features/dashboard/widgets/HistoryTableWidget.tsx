@@ -141,8 +141,14 @@ export function HistoryTableWidget({ options: o, data, theme, size, mode }: Widg
                 else if (c.key === 'quality')
                   content = (
                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, color: st === 'bad' ? theme.bad : st === 'uncertain' ? theme.warning : st === 'good' ? theme.text : theme.text_muted }}>
-                      <StateDot state={st} theme={theme} />
-                      {st === 'unknown' ? 'Unknown' : st.charAt(0).toUpperCase() + st.slice(1)}
+                      {r.q === null && s.history?.downsampled ? (
+                        <span title="Bucket average: no per-sample quality">—</span>
+                      ) : (
+                        <>
+                          <StateDot state={st} theme={theme} />
+                          {st === 'unknown' ? 'Unknown' : st.charAt(0).toUpperCase() + st.slice(1)}
+                        </>
+                      )}
                     </span>
                   );
                 return (

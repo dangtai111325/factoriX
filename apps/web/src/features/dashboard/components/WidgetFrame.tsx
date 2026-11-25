@@ -158,13 +158,19 @@ export const WidgetFrame: React.FC<WidgetFrameProps> = ({
   className = '',
 }) => {
   const [bodyRef, size] = useElementSize<HTMLDivElement>();
+  // A one-row widget (link, divider, text at the default 40 px rows) has no room for a title row: the
+  // header would take the whole height and the body would get 0 px (nothing rendered). Such a widget is
+  // "tiny": compact padding, no in-flow header; in the Studio its title and controls float over it on
+  // hover/selection, in view mode the title stays available as the frame's accessible name.
+  const [frameRef, frameSize] = useElementSize<HTMLDivElement>();
+  const tiny = frameSize.height > 0 && frameSize.height < 76;
   const showTitle = options.show_title !== false && Boolean(widget.title);
   const description = typeof options.description === 'string' ? options.description : '';
   const background =
     options.background === 'transparent' ? 'transparent' : options.background === 'custom' && isHexColor(options.background_color) ? options.background_color : theme.surface;
   const textColor = options.background === 'custom' && isHexColor(options.background_color) ? readableOn(options.background_color) : theme.text;
   const accent = isHexColor(options.accent_color) ? options.accent_color : null;
-  const pad = PADDING[String(options.padding)] ?? 12;
+  const pad = Math.min(PADDING[String(options.padding)] ?? 12, tiny ? 6 : Infinity);
   const widgetTheme = useMemo<ThemeTokens>(
     () => (accent || textColor !== theme.text ? { ...theme, ...(accent ? { accent } : {}), ...(textColor !== theme.text ? { text: textColor } : {}) } : theme),
     [theme, accent, textColor],
@@ -239,13 +245,20 @@ export const WidgetFrame: React.FC<WidgetFrameProps> = ({
       ) : null;
   }
 
-  const showHeader = showTitle || mode === 'edit' || Boolean(controls) || Boolean(badge) || data.warnings.length > 0;
+  const headerWanted = showTitle || mode === 'edit' || Boolean(badge) || data.warnings.length > 0;
+  // In view mode the header row exists for the title / state badge / notes; the actions menu alone floats
+  // in the corner (so "Show title" off really gives the space back to the body).
+  const showHeader = !tiny && headerWanted;
+  const floatingHeader = tiny && mode === 'edit';
+  const floatingMenu = !showHeader && !floatingHeader && Boolean(controls);
   const align = options.title_align === 'center' ? 'center' : 'left';
 
   return (
     <div
-      className={`dash-widget relative h-full w-full flex flex-col overflow-hidden ${className}`}
+      ref={frameRef}
+      className={`dash-widget relative h-full w-full flex flex-col overflow-hidden ${tiny ? 'dash-tiny' : ''} ${className}`}
       data-selected={selected ? 'true' : undefined}
+      aria-label={mode === 'view' && widget.title ? widget.title : undefined}
       style={{
         background,
         color: textColor,
@@ -257,10 +270,11 @@ export const WidgetFrame: React.FC<WidgetFrameProps> = ({
             .join(', ') || undefined,
       }}
     >
-      {showHeader && (
+      {floatingMenu && <div className="absolute top-1 right-1 z-[3]">{controls}</div>}
+      {(showHeader || floatingHeader) && (
         <div
-          className={`flex items-center gap-1.5 shrink-0 min-h-[28px] ${mode === 'edit' ? 'dash-drag-handle cursor-move' : ''}`}
-          style={{ padding: `${Math.max(4, pad - 4)}px ${pad}px 0 ${pad}px` }}
+          className={`flex items-center gap-1.5 shrink-0 min-h-[28px] ${mode === 'edit' ? 'dash-drag-handle cursor-move' : ''} ${floatingHeader ? 'dash-tiny-head absolute inset-x-0 top-0 z-[3]' : ''}`}
+          style={{ padding: floatingHeader ? `2px ${pad}px` : `${Math.max(4, pad - 4)}px ${pad}px 0 ${pad}px`, ...(floatingHeader ? { background } : {}) }}
         >
           <div className={`min-w-0 flex-1 flex items-center gap-1 ${align === 'center' ? 'justify-center' : ''}`}>
             {showTitle ? (
