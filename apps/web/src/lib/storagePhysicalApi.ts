@@ -506,6 +506,34 @@ export async function getDatabase(nameOrId: string): Promise<TDDatabase> {
   return api(`/api/v1/storage/td/databases/${encodeURIComponent(nameOrId)}`);
 }
 
+// --- Additive schema change of a user supertable (H9) ---
+
+export interface StableSchemaAddition {
+  name: string;
+  td_type: string;
+  length?: number | null;
+}
+
+export interface StableAlterResult {
+  valid?: boolean;
+  status?: 'APPLIED' | string;
+  /** dry run: the statements that would run; apply: the statements that ran. */
+  ddl: string[];
+  columns?: string[];
+  tags?: string[];
+}
+
+/**
+ * `POST /storage/td/objects/stable:<db>.<name>/alter`: add columns / tags only (no drop, no retype).
+ * `dry_run: true` validates and returns the ALTER statements without executing them.
+ */
+export function alterStable(
+  objectId: string,
+  change: { add_columns?: StableSchemaAddition[]; add_tags?: StableSchemaAddition[]; dry_run?: boolean },
+): Promise<StableAlterResult> {
+  return api(`/api/v1/storage/td/objects/${encodeURIComponent(objectId)}/alter`, { method: 'POST', body: JSON.stringify(change) });
+}
+
 // --- Name check (wizard step 1, R1-17a / R1-29) ---
 
 export type StorageNameErrorCode =
