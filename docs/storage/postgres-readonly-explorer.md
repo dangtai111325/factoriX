@@ -24,19 +24,18 @@ The **PostgreSQL Read-Only Explorer** provides this visibility directly within `
 To ensure that internal secrets and sensitive user credentials are never exposed, the PostgreSQL Explorer enforces three layers of defense:
 
 ### Layer 1: Table & Schema Denylist (Server-Side)
-The following tables are strictly forbidden from inspection, schema listing, or data preview:
-- `admin_accounts` (password hashes, salts, MFA tokens)
-- `user_sessions` / `sessions` (active session tokens, auth cookies)
-- `secret_store` (API keys, connection credentials, TLS private keys)
-- `password_reset_codes` (temporary auth tokens)
-- `alembic_version` (migration lock state — hidden from general browsing)
+The following tables (`SENSITIVE_TABLES` in `apps/center/src/factorix/modules/postgres_explorer.py`) are hidden from the table list and refused for preview and count:
+- `admin_accounts`, `sessions`, `password_reset_codes`, `login_throttle` (credentials and sign-in state)
+- `secret_store`, `edge_enrollment_tokens` (connection credentials and enrollment tokens)
+- `audit_events`
+- `alembic_version`
 
-Any API query requesting metadata or previews for denylisted tables will immediately fail with `403 Forbidden` (`FORBIDDEN_PROTECTED_TABLE`).
+A preview or count request for one of these tables fails with `403` (`ACCESS_DENIED`).
 
 ### Layer 2: Column Masking & Redaction
 For tables that are visible (e.g., `connections`, `signal_definitions`), columns matching sensitive naming patterns are automatically masked:
 - `*password*`, `*secret*`, `*token*`, `*credential*`, `*private_key*`
-- Masked values appear in data preview as `••••••••` or are omitted from the payload.
+- Masked values appear in data preview as `********`.
 
 ### Layer 3: Database Role Privileges (Least Privilege)
 The backend connection pool for PostgreSQL Explorer queries uses a dedicated read-only role or explicitly enforces read-only transactions:
@@ -66,24 +65,24 @@ When the user selects `PostgreSQL (Read Only)` in Storage Management, the UI pro
 3. **Indexes & Constraints:**
    - Unique constraints, primary keys, and B-tree/GIN indexes with indexed columns.
 4. **Data Preview:**
-   - Paginated preview table (default 25 rows, up to 100).
-   - Column sorting and cursor-based pagination.
-   - Query execution timeout capped at 3000ms with strict row limits (`LIMIT 100`).
+   - Paginated preview table (default 50 rows, at most 200, `limit` / `offset` pagination).
+   - Preview statement timeout 5000 ms; exact count (`Count exactly`) 10 s.
    - Read-only watermark badge: `READ-ONLY VIEW • MUTATIONS DISABLED`.
 
 ---
 
 ## 4. API Endpoints
 
-All endpoints require active authentication and `VIEW_PG_METADATA` / `VIEW_STORAGE` permission:
+All endpoints require a signed-in administrator session (`apps/center/src/factorix/transport/http/routers/storage/pg_explorer.py`):
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/v1/storage/pg/schemas` | List all visible schemas in the control plane database |
 | `GET` | `/api/v1/storage/pg/tables?schema=public` | List visible tables with approximate row counts |
-| `GET` | `/api/v1/storage/pg/tables/{table_name}/schema` | Column definitions, types, nullability, PK/FK flags |
-| `GET` | `/api/v1/storage/pg/tables/{table_name}/preview?limit=25&cursor=...` | Sanitized paginated data preview |
-| `GET` | `/api/v1/storage/pg/relationships` | Graph edges representing genuine PostgreSQL foreign keys |
+| `GET` | `/api/v1/storage/pg/tables/{schema}/{table}` | Column definitions, types, nullability, PK/FK flags |
+| `GET` | `/api/v1/storage/pg/preview/{schema}/{table}?limit=50&offset=0` (also `/api/v1/storage/pg/preview?schema=&table=`) | Sanitized paginated data preview |
+| `GET` | `/api/v1/storage/pg/count/{schema}/{table}` | Exact `count(*)` in a read-only transaction (504 `COUNT_TIMEOUT` after 10 s) |
+| `GET` | `/api/v1/storage/pg/relationships?schema=public` | Tables plus graph edges of genuine PostgreSQL foreign keys |
 
 ---
 
@@ -95,6 +94,6 @@ All endpoints require active authentication and `VIEW_PG_METADATA` / `VIEW_STORA
 | `PG-004` | Inspect `signal_definitions` schema | Columns, types, and FK to `resources` displayed accurately. |
 | `PG-006` | Forged POST/PUT/DELETE request to PG explorer API | Returns `405 Method Not Allowed` or `403 Forbidden`. |
 | `PG-007` | SQL injection attempt in preview filters | Parameterized query protects DB; error returned cleanly without leaking stack trace. |
-| `PG-008` | Direct API request for `admin_accounts` | Returns `403 Forbidden` (`FORBIDDEN_PROTECTED_TABLE`). |
-| `PG-010` | Long-running query / large table preview | Statement timeout fires at 3s; returns `408 Request Timeout` without locking DB. |
+| `PG-008` | Direct API request for `admin_accounts` | Returns `403` (`ACCESS_DENIED`). |
+| `PG-010` | Long-running query / large table preview | Statement timeout fires (5 s preview, 10 s exact count → 504 `COUNT_TIMEOUT`) without locking DB. |
 | `PG-014` | TDengine container down, PG container up | PostgreSQL Explorer operates normally; TDengine tab shows degraded status banner. |

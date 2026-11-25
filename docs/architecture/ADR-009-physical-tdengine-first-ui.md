@@ -43,7 +43,7 @@ Legacy routes (`/historian/designer`, `/historian/catalog`) redirect with query 
 **Negative / Mitigations:**
 - Existing `StorageDesignerPage.tsx` and `StorageCatalogPage.tsx` must be replaced, not extended — mitigated by keeping legacy routes as redirects
 - `storage_dsl.py` DatasetAst reader kept as compatibility layer; physical AST v2 added alongside
-- Migration from `storage_designs`/`storage_datasets` to `storage_object_specs` must be additive (no DROP of old tables until migration parity verified)
+- Migration from `storage_designs`/`storage_datasets` to the physical object registry (implemented as `storage_objects`, `storage_object_drafts`, `storage_bindings` in migration `0009_storage_drafts_lifecycle`) must be additive (no DROP of old tables until migration parity verified)
 
 ## Implementation Notes
 

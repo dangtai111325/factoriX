@@ -22,7 +22,7 @@ In FactoriX, there is a fundamental distinction between two operations that must
 During `Revert To Zero`, the following entities are strictly protected and verified before and after execution:
 
 1. **User Accounts & Authentication Sessions:**
-   - `admin_accounts`, `roles`, active JWT sessions, password hashes.
+   - `admin_accounts` (incl. password hashes) and `sessions`.
    - User is never logged out or redirected to `/register`.
 2. **Factory Model & Hierarchy:**
    - Enterprise, Site, Area, Line, Machine/Asset nodes and graph relations.
@@ -34,7 +34,7 @@ During `Revert To Zero`, the following entities are strictly protected and verif
    - 36 Data Model definitions, AST formula expressions, body definitions, and published revisions.
 6. **Physical Storage Schema Registry:**
    - TDengine Database, Supertable, and Subtable definitions.
-   - `storage_object_specs`, `storage_object_revisions`, `storage_source_bindings_v2`, `storage_row_assembly`.
+   - Protected tables include `storage_designs`, `storage_design_versions`, `storage_datasets`, `storage_field_bindings`, `storage_recording_policies`, `storage_physical_registry`, `storage_dependencies` (full list: `PROTECTED_CONTROL_PLANE_TABLES` in `apps/center/src/factorix/application/reset/constants.py`).
    - Physical table schemas in TDengine (empty tables ready to receive new rows).
 
 ---
@@ -42,7 +42,7 @@ During `Revert To Zero`, the following entities are strictly protected and verif
 ## 3. What IS Cleared During Reset
 
 1. **TDengine Time-Series Rows:** All rows across subtables within the active tenant/site scope.
-2. **PostgreSQL Latest State:** `latest_signal_state` values reset to `UNKNOWN`/`NO_DATA` (row definitions preserved).
+2. **PostgreSQL runtime tables:** the tenant's rows in `latest_signal_state` are deleted (signals then show `NO_DATA` until new data arrives), together with `observations`, `ingest_dedup`, `observation_quarantine`, `model_snapshots`, `model_state`, `commissioning_jobs`, `export_jobs` (`CLEARED_PG_TABLES` in `application/reset/constants.py`).
 3. **Model Snapshots & Transient History:** Model evaluation snapshots derived from old telemetry.
 4. **RabbitMQ In-Flight Backlog:** Queued messages tagged with the old epoch are rejected/drained.
 5. **Acquisition Local Spool:** SQLite spool records tagged with the old epoch are cleared.
@@ -68,7 +68,7 @@ stateDiagram-v2
 ```
 
 ### 4.1 Epoch Fencing Guarantee
-- When the reset starts, PostgreSQL updates `telemetry_generations.data_epoch = data_epoch + 1`.
+- When the reset starts, PostgreSQL updates `telemetry_generations.active_epoch = active_epoch + 1`.
 - Any delayed message arriving from RabbitMQ or SQLite spool with `data_epoch <= old_epoch` is dropped immediately by the ingestion worker.
 - Fresh observations arrive with `data_epoch = new_epoch` and begin recording cleanly.
 
@@ -96,7 +96,7 @@ stateDiagram-v2
 | User Session Intact | Browser reload after reset | User remains authenticated at `/` or current page. |
 | Connections Preserved | `SELECT count(*) FROM connections;` | Exactly matches baseline count (5). |
 | Signals Preserved | `SELECT count(*) FROM signal_definitions;` | Exactly matches baseline count (336). |
-| Models Preserved | `SELECT count(*) FROM data_models;` | Exactly matches baseline count (36). |
+| Models Preserved | `SELECT count(*) FROM output_groups WHERE status = 'ACTIVE';` | Exactly matches baseline count (36). |
 | Schemas Preserved | TDengine `SHOW STABLES;` | Supertables still exist and have identical schema. |
 | Rows Cleared | TDengine `SELECT count(*) FROM <subtable>;` | 0 rows in all subtables immediately after reset. |
 | Fresh Data Resumes | Watch Signals Catalog for 10 seconds | Values transition from `UNKNOWN` to fresh `GOOD` values under new epoch. |

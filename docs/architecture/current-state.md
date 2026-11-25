@@ -1,5 +1,7 @@
 # Current State Architecture (Pre-TDengine Baseline)
 
+> **Historical document (state as of 2026-11-10).** Current behaviour: see [`README.md`](../../README.md) and [`docs/architecture/ADR-*`](./).
+
 ## 1. Runtime & Data Flow Overview
 
 On `main` (`1cd21f38`), the appliance packages PostgreSQL 17, FastAPI Center (`factorix.transport.app`), the React SPA, and an enrolled Edge daemon (`factorix_edge`) inside a single container (`infrastructure/docker/entrypoint.sh`), yet models Edge-to-Center synchronization as if Edge were a remote enrolled node:
