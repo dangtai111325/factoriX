@@ -467,7 +467,16 @@ class StorageTopologyInspector:
 
         for row in rows:
             row["status"] = statuses.get(row["id"], "ACTIVE")
-        if status is not None:
+        if status == RECORDING_ERROR_STATUS:
+            # "Error" is not an object state: it means "the writer could not store rows into this
+            # subtable" (FAILED outbox rows), the same set the "N with write errors" KPI counts.
+            failing = {
+                f"subtable:{db}.{sub}" for db, sub in await recording_error_subtables(session, tenant_id, limit=10_000)
+            }
+            rows = [row for row in rows if row["id"] in failing]
+            for row in rows:
+                row["recording_error"] = True
+        elif status is not None:
             rows = [row for row in rows if row["status"] == status]
         query = search.strip().casefold()
         if query:
@@ -908,6 +917,33 @@ class StorageTopologyInspector:
 # ---------------------------------------------------------------------------
 # Helper serialization
 # ---------------------------------------------------------------------------
+
+RECORDING_ERROR_STATUS = "ERROR"
+
+
+async def recording_error_subtables(session: Any, tenant_id: UUID, *, limit: int = 200) -> list[tuple[str, str]]:
+    """``(database, subtable)`` of the tenant's existing subtables with FAILED writer-outbox rows (R2-07).
+
+    One query shared by the "N with write errors" KPI (``/td/stats``) and the Objects table filter
+    "Error" (``/td/catalog?status=ERROR``) so both always name the same tables. Served by the partial
+    index on FAILED outbox rows (migration ``0014_bulk_jobs_failed_idx``), so it never scans the outbox.
+    """
+    from factorix.modules.common import fetch_all
+
+    rows = await fetch_all(
+        session,
+        """
+        SELECT DISTINCT x.physical_db, x.physical_subtable
+        FROM storage_record_outbox x
+        JOIN storage_objects o ON o.tenant_id = x.tenant_id AND o.object_type = 'subtable'
+         AND o.physical_db = x.physical_db AND o.physical_name = x.physical_subtable AND o.status <> 'PURGED'
+        WHERE x.tenant_id = :tenant_id AND x.status = 'FAILED'
+        ORDER BY 1, 2 LIMIT :limit
+        """,
+        {"tenant_id": tenant_id, "limit": int(limit)},
+    )
+    return [(str(r["physical_db"]), str(r["physical_subtable"])) for r in rows]
+
 
 async def registered_databases(session: Any | None, tenant_id: UUID) -> list[str]:
     """User databases registered to *tenant_id* (created through the Storage wizard)."""

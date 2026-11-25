@@ -308,7 +308,7 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
     @router.get("/api/v1/storage/td/catalog", tags=["storage"])
     async def get_td_catalog(
         object_type: Literal["database", "stable", "subtable"] | None = None,
-        status: Literal["ACTIVE", "DRAFT", "OUT_OF_SYNC", "ERROR"] | None = None,
+        status: Literal["ACTIVE", "PAUSED", "RETIRED", "DRAFT", "OUT_OF_SYNC", "ERROR"] | None = None,
         search: str = Query("", max_length=200),
         page: int = Query(1, ge=1),
         page_size: int = Query(15, ge=1, le=100),
@@ -356,18 +356,7 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
         active_cnt = status_map.get("ACTIVE", 0)
         paused_cnt = status_map.get("PAUSED", 0)
         # R2-07: only objects that still exist count, and the KPI says which ones they are.
-        err_rows = await fetch_all(
-            session,
-            """
-            SELECT DISTINCT x.physical_db, x.physical_subtable
-            FROM storage_record_outbox x
-            JOIN storage_objects o ON o.tenant_id = x.tenant_id AND o.object_type = 'subtable'
-             AND o.physical_db = x.physical_db AND o.physical_name = x.physical_subtable AND o.status <> 'PURGED'
-            WHERE x.tenant_id = :tenant_id AND x.status = 'FAILED'
-            ORDER BY 1, 2 LIMIT 200
-            """,
-            {"tenant_id": tenant_id},
-        )
+        err_rows = await ST.recording_error_subtables(session, tenant_id, limit=200)
         error_cnt = len(err_rows)
 
         return {
@@ -377,7 +366,7 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
             "recording_active": active_cnt,
             "recording_paused": paused_cnt,
             "recording_error": error_cnt,
-            "recording_error_objects": [f"{r['physical_db']}.{r['physical_subtable']}" for r in err_rows[:50]],
+            "recording_error_objects": [f"{db}.{sub}" for db, sub in err_rows[:50]],
             "observed_at": iso_ms(utcnow()),
         }
 

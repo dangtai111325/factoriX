@@ -19,6 +19,7 @@ export type StorageObjectStatus =
   | 'VERIFYING'
   | 'OUT_OF_SYNC'
   | 'ERROR'
+  | 'PAUSED'
   | 'RETIRED'
   | 'READ_ONLY'
   | 'UNKNOWN';
@@ -221,6 +222,8 @@ export interface StorageCatalogRow {
   binding_count?: number;
   last_verified_at: string;
   status: StorageObjectStatus;
+  /** Only on `?status=ERROR` rows: the writer could not store rows into this subtable (R2-07). */
+  recording_error?: boolean;
 }
 
 export function getTDStorageCatalog(params: URLSearchParams, signal: AbortSignal): Promise<PaginatedList<StorageCatalogRow>> {
@@ -1225,7 +1228,27 @@ export async function getStorageStats(signal?: AbortSignal): Promise<{
   recording_active: number;
   recording_paused: number;
   recording_error: number;
+  /** `db.subtable` of (up to 50 of) the subtables counted in `recording_error`. */
+  recording_error_objects?: string[];
   observed_at: string;
 }> {
   return api('/api/v1/storage/td/stats', { signal });
+}
+
+/** One subtable whose rows the writer could not store (`GET /storage/recording/failures`, R2-07). */
+export interface RecordingFailure {
+  object_id: string;
+  database: string;
+  subtable: string;
+  display_name: string;
+  object_status: string | null;
+  failed: number;
+  attempts: number;
+  last_error: string | null;
+  first_failed_at: string | null;
+  last_failed_at: string | null;
+}
+
+export function listRecordingFailures(signal?: AbortSignal): Promise<{ items: RecordingFailure[]; total: number }> {
+  return api('/api/v1/storage/recording/failures', { signal });
 }
