@@ -3,6 +3,7 @@ import { X, Lock, CheckCircle, AlertCircle } from 'lucide-react';
 import { ApiError, api } from '../../api/client';
 import { useDialogA11y } from './useDialogA11y';
 import { ModalPortal } from './ModalPortal';
+import { Button } from '../common/Button';
 
 interface ChangePasswordModalProps {
   isOpen: boolean;
@@ -205,21 +206,12 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               </div>
 
               <div className="flex items-center justify-end gap-3 pt-3 border-t border-[#F1F5F9]">
-                <button
-                  type="button"
-                  onClick={onClose}
-                  disabled={isSubmitting}
-                  className="px-4 py-2 text-[13px] font-medium text-[#475569] hover:bg-[#F1F5F9] rounded-lg transition-colors"
-                >
+                <Button type="button" variant="outline" onClick={onClose} disabled={isSubmitting}>
                   Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="px-4 py-2 text-[13px] font-semibold bg-[#EF1B24] text-white hover:bg-[#D9141D] active:bg-[#C7111A] rounded-lg shadow-sm transition-colors disabled:opacity-50"
-                >
+                </Button>
+                <Button type="submit" variant="primary" disabled={isSubmitting}>
                   {isSubmitting ? 'Updating…' : 'Change password'}
-                </button>
+                </Button>
               </div>
             </form>
           </div>

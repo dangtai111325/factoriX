@@ -110,7 +110,7 @@ export const DatabaseBasicsStep: React.FC<StepProps> = ({ data, onChange, errors
             maxLength={DESCRIPTION_MAX_LENGTH}
             onChange={(e) => onChange({ description: e.target.value })}
             rows={3}
-            placeholder="Document what data streams this database holds, retention expectations, and plant context..."
+            placeholder="Document what data streams this database holds, retention expectations, and plant context…"
             className={`w-full p-3 rounded-lg border text-[13px] transition-colors focus:outline-none focus:ring-2 resize-none ${
               errors.description ? 'border-[#EF1B24] focus:ring-red-100' : 'border-[#D4DFEC] focus:border-blue-500 focus:ring-blue-100'
             }`}
@@ -507,7 +507,7 @@ export const DatabaseReviewStep: React.FC<StepProps> = ({ data, onChange, errors
           />
           <div className="text-[12px] text-[#334568] leading-relaxed">
             <span className="font-semibold text-[#111B37]">
-              I confirm the creation of physical database "{data.physical_name || '...'}"
+              I confirm the creation of physical database "{data.physical_name || '…'}"
             </span>
             . I acknowledge that timestamp precision ({data.precision}) and structural settings cannot be altered once created.
           </div>

@@ -211,7 +211,7 @@ export const ModelCatalog: React.FC<Props> = ({ models, loading, loaded, error, 
     <div className="space-y-4">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-[20px] font-bold text-[#111B37]">Data models</h1>
+          <h1 className="text-[20px] font-bold text-[#111B37]">Data Models</h1>
           <p className="text-[13px] text-[#657794]">Design clean JSON bodies from any signals and watch them live at their own sampling rate.</p>
         </div>
         <Button variant="primary" size="lg" onClick={onCreate} icon={<Plus className="w-4 h-4" />}>

@@ -1,6 +1,7 @@
 import React from 'react';
 import { AlertCircle, AlertTriangle, RefreshCw, Database, ServerOff } from 'lucide-react';
 import { ApiError } from '../../api/client';
+import { Button } from './Button';
 
 export interface RemoteErrorInfo {
   message: string;
@@ -107,15 +108,15 @@ export const RemoteErrorState: React.FC<RemoteErrorStateProps> = ({
       </div>
 
       {onRetry && (
-        <button
+        <Button
           type="button"
+          variant="primary"
           onClick={handleRetry}
           disabled={retrying}
-          className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#EF1B24] hover:bg-[#D9141D] text-white text-[12px] font-semibold rounded-lg shadow-xs transition-colors disabled:opacity-60"
+          icon={<RefreshCw className={`w-3.5 h-3.5 ${retrying ? 'animate-spin' : ''}`} />}
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${retrying ? 'animate-spin' : ''}`} />
-          <span>{retrying ? 'Retrying…' : 'Retry Request'}</span>
-        </button>
+          {retrying ? 'Retrying…' : 'Retry'}
+        </Button>
       )}
     </div>
   );
@@ -168,13 +169,9 @@ export const RemoteEmptyState: React.FC<RemoteEmptyStateProps> = ({
       <h3 className="text-[15px] font-bold text-[#111B37] mb-1">{title}</h3>
       <p className="text-[13px] text-[#657794] mb-4 max-w-md">{description}</p>
       {actionLabel && onAction && (
-        <button
-          type="button"
-          onClick={onAction}
-          className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#EF1B24] hover:bg-[#D9141D] text-white text-[12px] font-semibold rounded-lg shadow-xs transition-colors"
-        >
+        <Button type="button" variant="primary" onClick={onAction}>
           {actionLabel}
-        </button>
+        </Button>
       )}
     </div>
   );

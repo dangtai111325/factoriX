@@ -519,7 +519,7 @@ export const EditStorageObjectWizard: React.FC = () => {
         lastSavedAt={dbDraft.lastSavedAt}
         loading={submitting}
         error={submitError}
-        submitLabel="Save Changes"
+        submitLabel="Save changes"
       >
         <PendingDraftBanner draft={dbDraft.pendingDraft} onResume={dbDraft.resumeDraft} onDiscard={dbDraft.discardPendingDraft} />
         {versionConflict && (

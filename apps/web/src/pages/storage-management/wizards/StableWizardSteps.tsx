@@ -202,7 +202,7 @@ export const StableTargetStep: React.FC<StableStepProps> = ({ data, onChange, er
               }`}
             >
               <option value="" disabled>
-                {loadingDbs ? 'Loading databases...' : 'Select a database...'}
+                {loadingDbs ? 'Loading databases…' : 'Select a database…'}
               </option>
               {databases.map((db) => (
                 <option key={db.id} value={db.physical_name}>
@@ -272,7 +272,7 @@ export const StableTargetStep: React.FC<StableStepProps> = ({ data, onChange, er
             maxLength={DESCRIPTION_MAX_LENGTH}
             onChange={(e) => onChange({ description: e.target.value })}
             rows={3}
-            placeholder="Describe the machinery family, sensor payload, or telemetry archetype..."
+            placeholder="Describe the machinery family, sensor payload, or telemetry archetype…"
             className={`w-full p-3 rounded-lg border text-[13px] transition-colors focus:outline-none focus:ring-2 resize-none ${
               errors.description ? 'border-[#EF1B24] focus:ring-red-100' : 'border-[#D4DFEC] focus:border-blue-500 focus:ring-blue-100'
             }`}
@@ -399,7 +399,7 @@ export const StableColumnsStep: React.FC<StableStepProps> = ({ data, onChange, e
             className="flex items-center gap-1.5 h-9 px-3 bg-white border border-[#D4DFEC] hover:bg-[#F9FAFD] text-[#111B37] rounded-lg text-[13px] font-semibold transition-colors"
           >
             <Plus className="w-4 h-4" />
-            <span>Add Column</span>
+            <span>Add column</span>
           </button>
         </div>
       </div>
@@ -632,7 +632,7 @@ export const StableTagsStep: React.FC<StableStepProps> = ({ data, onChange, erro
           className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-[#D4DFEC] hover:bg-[#F9FAFD] text-[#111B37] rounded-lg text-[13px] font-semibold transition-colors shadow-2xs"
         >
           <Plus className="w-4 h-4 text-[#EF1B24]" />
-          <span>Add Tag</span>
+          <span>Add tag</span>
         </button>
       </div>
 
@@ -888,7 +888,7 @@ export const StableSourceMappingStep: React.FC<StableStepProps> = ({ data, onCha
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Filter available signals..."
+                  placeholder="Filter available signals…"
                   className="w-full h-8 pl-8 pr-3 rounded-lg border border-[#D4DFEC] text-[12px] focus:outline-none focus:border-blue-500"
                 />
               </div>
@@ -897,7 +897,7 @@ export const StableSourceMappingStep: React.FC<StableStepProps> = ({ data, onCha
             {/* List of sources */}
             <div className="p-2 overflow-y-auto max-h-72 divide-y divide-[#F1F5FA]">
               {loadingSources ? (
-                <div className="py-8 text-center text-[#657794] text-[12px]">Loading sources...</div>
+                <div className="py-8 text-center text-[#657794] text-[12px]">Loading sources…</div>
               ) : groupedSources.length === 0 ? (
                 <div className="py-8 text-center text-[#657794] text-[12px]">No source found for this view.</div>
               ) : (
@@ -1339,7 +1339,7 @@ export const StableReviewStep: React.FC<StableStepProps> = ({ data, onChange, er
           />
           <div className="text-[12px] text-[#334568] leading-relaxed">
             <span className="font-semibold text-[#111B37]">
-              I confirm the creation of Supertable "{data.physical_name || '...'}"
+              I confirm the creation of Supertable "{data.physical_name || '…'}"
             </span>{' '}
             in database "{data.database_name}".
           </div>

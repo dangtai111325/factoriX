@@ -8,6 +8,7 @@ import { allowedChildTypes, buildResourceTree, HierarchyTreeNode } from '../../u
 import { resourceTypeLabel } from '../common/ResourceTypeIcon';
 import { useDialogA11y } from './useDialogA11y';
 import { ModalPortal } from './ModalPortal';
+import { Button } from '../common/Button';
 import { useSubmit } from '../../lib/useSubmit';
 
 export interface NewResourceInput {
@@ -572,21 +573,12 @@ export const AddResourceModal: React.FC<AddResourceModalProps> = ({
                 />
                 Add another
               </label>
-              <button
-                type="button"
-                onClick={onClose}
-                disabled={submitting}
-                className="px-4 py-2 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors"
-              >
+              <Button type="button" variant="outline" onClick={onClose} disabled={submitting}>
                 {addedNames.length ? 'Done' : 'Cancel'}
-              </button>
-              <button
-                type="submit"
-                disabled={submitting || !type}
-                className="px-4 py-2 bg-[#EF1B24] hover:bg-[#D9151E] text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 flex items-center gap-2"
-              >
+              </Button>
+              <Button type="submit" variant="primary" disabled={submitting || !type}>
                 {submitting ? 'Creating…' : 'Create resource'}
-              </button>
+              </Button>
             </div>
           </form>
         </div>

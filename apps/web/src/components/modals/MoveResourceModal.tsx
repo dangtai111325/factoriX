@@ -10,6 +10,7 @@ import {
   isValidParentFor,
 } from '../../utils/resourceHierarchy';
 import { ModalPortal } from './ModalPortal';
+import { Button } from '../common/Button';
 
 export interface MoveResourceModalProps {
   isOpen: boolean;
@@ -282,23 +283,18 @@ export const MoveResourceModal: React.FC<MoveResourceModalProps> = ({
 
           {/* Footer */}
           <div className="px-6 py-4 bg-slate-50 border-t border-slate-100 flex items-center justify-end gap-3">
-            <button
-              type="button"
-              onClick={onClose}
-              disabled={submitting}
-              className="px-4 py-2 border border-slate-200 text-slate-600 rounded-lg text-sm font-semibold hover:bg-slate-100 transition-colors"
-            >
+            <Button type="button" variant="outline" onClick={onClose} disabled={submitting}>
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
+              variant="primary"
               onClick={() => void handleConfirm()}
               disabled={unchanged || submitting || candidateParents.length === 0}
-              className="px-4 py-2 bg-[#EF1B24] hover:bg-[#D9141D] text-white rounded-lg text-sm font-semibold transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+              icon={<CheckCircle2 className="w-4 h-4" aria-hidden="true" />}
             >
-              <CheckCircle2 className="w-4 h-4" aria-hidden="true" />
-              <span>{submitting ? 'Moving…' : 'Move'}</span>
-            </button>
+              {submitting ? 'Moving…' : 'Move'}
+            </Button>
           </div>
         </div>
       </div>
