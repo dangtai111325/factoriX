@@ -1,0 +1,86 @@
+/** Registry `icon` names (lucide kebab-case) → components. Unknown names fall back to a generic glyph. */
+import React from 'react';
+import {
+  Activity,
+  ChartArea,
+  ChartBar,
+  ChartColumn,
+  ChartColumnBig,
+  ChartLine,
+  ChartNoAxesGantt,
+  ChartPie,
+  ChartScatter,
+  CircleDot,
+  CircleGauge,
+  Cpu,
+  Droplet,
+  Factory,
+  Fan,
+  Gauge,
+  Image,
+  LayoutDashboard,
+  Link,
+  List,
+  Minus,
+  Percent,
+  Rows3,
+  SquareActivity,
+  Table,
+  Table2,
+  Thermometer,
+  Type,
+  Zap,
+  type LucideIcon,
+} from 'lucide-react';
+
+const ICONS: Record<string, LucideIcon> = {
+  activity: Activity,
+  gauge: Gauge,
+  'chart-line': ChartLine,
+  'line-chart': ChartLine,
+  'chart-area': ChartArea,
+  'area-chart': ChartArea,
+  'chart-bar': ChartBar,
+  'bar-chart': ChartColumn,
+  'chart-column': ChartColumn,
+  'chart-column-big': ChartColumnBig,
+  'circle-gauge': CircleGauge,
+  percent: Percent,
+  'chart-pie': ChartPie,
+  'pie-chart': ChartPie,
+  'chart-scatter': ChartScatter,
+  'scatter-chart': ChartScatter,
+  'chart-gantt': ChartNoAxesGantt,
+  'chart-no-axes-gantt': ChartNoAxesGantt,
+  timeline: ChartNoAxesGantt,
+  'circle-dot': CircleDot,
+  status: CircleDot,
+  table: Table,
+  'table-2': Table2,
+  list: List,
+  rows: Rows3,
+  'rows-3': Rows3,
+  type: Type,
+  text: Type,
+  image: Image,
+  minus: Minus,
+  divider: Minus,
+  link: Link,
+  factory: Factory,
+  cpu: Cpu,
+  thermometer: Thermometer,
+  zap: Zap,
+  droplet: Droplet,
+  fan: Fan,
+  'square-activity': SquareActivity,
+  progress: SquareActivity,
+};
+
+export function iconFor(name: string | undefined | null): LucideIcon {
+  return (name && ICONS[name.toLowerCase()]) || LayoutDashboard;
+}
+
+export const RegistryIcon: React.FC<{ name?: string | null; className?: string }> = ({ name, className = 'w-4 h-4' }) => {
+  const Icon = iconFor(name);
+  return <Icon className={className} aria-hidden="true" />;
+};

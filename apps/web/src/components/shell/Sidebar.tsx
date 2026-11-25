@@ -64,9 +64,7 @@ const mainNav: NavGroup[] = [
     id: 'models',
     label: 'Data Models',
     icon: Layers,
-    children: [
-      { label: 'Model Catalog', path: '/models' },
-    ],
+    path: '/models',
   },
   {
     id: 'historian',
@@ -77,24 +75,18 @@ const mainNav: NavGroup[] = [
       { label: 'Historian', path: '/historian/historian' },
     ],
   },
+  {
+    id: 'dashboards',
+    label: 'Dashboard',
+    icon: LayoutDashboard,
+    path: '/dashboards',
+  },
 ];
 
 const COMING_SOON_KEY = 'fx.sidebar.comingSoon.v2';
 const COMING_SOON_GROUPS_KEY = 'fx.sidebar.comingSoonSubGroups.v2';
 
 const comingSoonNav: NavGroup[] = [
-  {
-    id: 'dashboards',
-    label: 'Dashboards',
-    icon: LayoutDashboard,
-    path: '/dashboards',
-    soon: true,
-    children: [
-      { label: 'Dashboard Library', path: '/dashboards/library' },
-      { label: 'Dashboard Builder', path: '/dashboards/builder' },
-      { label: 'Widget Library', path: '/dashboards/widgets' },
-    ],
-  },
   {
     id: 'alarms',
     label: 'Alarms & Events',
@@ -320,6 +312,9 @@ export const Sidebar: React.FC = () => {
       if (group.path === '/models') {
         return location.pathname.startsWith('/models') || location.pathname.startsWith('/signals/output-groups');
       }
+      if (group.path === '/dashboards') {
+        return location.pathname === '/dashboards' || location.pathname.startsWith('/dashboards/');
+      }
       return location.pathname === group.path;
     }
     if (group.children) {
@@ -385,9 +380,10 @@ export const Sidebar: React.FC = () => {
                   <NavLink
                     key={group.id}
                     to={group.path}
-                    className={({ isActive }) =>
+                    aria-current={active ? 'page' : undefined}
+                    className={() =>
                       `flex items-center gap-3.5 px-3 py-2.5 rounded-lg text-[14px] font-medium transition-all ${
-                        isActive
+                        active
                           ? 'bg-[#FEF2F2] text-[#EF1B24] font-semibold border-l-4 border-[#EF1B24]'
                           : 'text-[#334568] hover:bg-[#FFF5F5] hover:text-[#EF1B24]'
                       }`

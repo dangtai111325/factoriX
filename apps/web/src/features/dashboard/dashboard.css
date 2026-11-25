@@ -1,0 +1,87 @@
+/* Dashboard canvas: grid placeholder, resize handles and view menu, themed through --dash-* variables. */
+
+.dash-canvas .react-grid-item.react-grid-placeholder {
+  background: var(--dash-accent, #2a82e7);
+  opacity: 0.15;
+  border-radius: var(--dash-radius, 12px);
+  transition-duration: 100ms;
+}
+
+.dash-canvas .react-grid-item {
+  transition-property: transform, width, height;
+}
+
+.dash-canvas .react-grid-item.cssTransforms {
+  transition-property: transform, width, height;
+}
+
+.dash-canvas .react-grid-item.resizing,
+.dash-canvas .react-grid-item.react-draggable-dragging {
+  z-index: 5;
+  transition: none;
+}
+
+.dash-canvas .react-grid-item > .react-resizable-handle {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.dash-canvas.dash-editing .react-grid-item:hover > .react-resizable-handle,
+.dash-canvas.dash-editing .react-grid-item:focus-within > .react-resizable-handle {
+  opacity: 1;
+}
+
+.dash-canvas .react-grid-item > .react-resizable-handle::after {
+  border-color: var(--dash-text-muted, #94a3b8);
+}
+
+.dash-canvas .react-grid-item > .react-resizable-handle.react-resizable-handle-e,
+.dash-canvas .react-grid-item > .react-resizable-handle.react-resizable-handle-s {
+  background-image: none;
+}
+
+.dash-canvas .react-grid-item > .react-resizable-handle.react-resizable-handle-e::after,
+.dash-canvas .react-grid-item > .react-resizable-handle.react-resizable-handle-s::after {
+  display: none;
+}
+
+/* View mode: the widget menu appears on hover / keyboard focus, always on touch screens. */
+.dash-widget-menu {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.dash-widget:hover .dash-widget-menu,
+.dash-widget:focus-within .dash-widget-menu {
+  opacity: 1;
+}
+@media (hover: none) {
+  .dash-widget-menu {
+    opacity: 1;
+  }
+}
+
+/* Edit mode: toolbar buttons fade in on hover or when the widget is selected. */
+.dash-editing .dash-widget .dash-drag-handle > div:last-child {
+  opacity: 0.55;
+}
+.dash-editing .dash-widget:hover .dash-drag-handle > div:last-child,
+.dash-editing .dash-widget[data-selected='true'] .dash-drag-handle > div:last-child {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dash-canvas .react-grid-item,
+  .dash-canvas .react-grid-item.cssTransforms {
+    transition: none;
+  }
+}
+
+/* The Studio covers the main navigation; the top bar (and its menus) and banners stay above it. */
+html.fx-studio-open .fx-topbar,
+html.fx-studio-open .fx-banner-stack {
+  z-index: 42;
+}
+/* Banners span the full width over the Studio (the navigation under them is covered). */
+html.fx-studio-open .fx-banner-stack {
+  left: 0;
+}

@@ -30,6 +30,19 @@ import { DataModelsPage } from './pages/13_DataModels/DataModelsPage';
 import { ComingSoonPage } from './pages/FutureModules/ComingSoonPage';
 import { NotFoundPage } from './pages/NotFound/NotFoundPage';
 
+// Dashboards are code-split: the grid and chart libraries load only when a dashboard page opens.
+const DashboardListPage = React.lazy(() => import('./pages/15_Dashboards/DashboardListPage').then((m) => ({ default: m.DashboardListPage })));
+const DashboardViewPage = React.lazy(() => import('./pages/15_Dashboards/DashboardViewPage').then((m) => ({ default: m.DashboardViewPage })));
+const DashboardStudioPage = React.lazy(() => import('./pages/15_Dashboards/studio/DashboardStudioPage').then((m) => ({ default: m.DashboardStudioPage })));
+
+const PageLoading: React.FC = () => (
+  <div role="status" aria-live="polite" className="flex items-center justify-center py-16 text-[13px] text-[#657794]">
+    Loading…
+  </div>
+);
+
+const lazyPage = (node: React.ReactNode) => <React.Suspense fallback={<PageLoading />}>{node}</React.Suspense>;
+
 // Query-preserving redirect helper (TC-UI-NAV-06)
 const RedirectWithQuery: React.FC<{ to: string; extraParams?: Record<string, string> }> = ({
   to,
@@ -61,8 +74,8 @@ const ROUTE_TITLES: Record<string, string> = {
   '/collector/connections': 'Connections',
   '/collector/add-data': 'Add Data',
   '/collector/signals': 'Signals',
-  '/models': 'Model Catalog',
-  '/dashboards': 'Dashboards',
+  '/models': 'Data Models',
+  '/dashboards': 'Dashboard',
   '/historian/storage': 'Storage Management',
   '/historian/historian': 'Historian',
   '/historian': 'Historian & Storage',
@@ -104,6 +117,9 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/collector/signals" element={<SignalsCatalogPage />} />
               <Route path="/collector/add-data" element={<AddDataWizardPage />} />
               <Route path="/models" element={<DataModelsPage />} />
+              <Route path="/dashboards" element={lazyPage(<DashboardListPage />)} />
+              <Route path="/dashboards/:dashboardId" element={lazyPage(<DashboardViewPage />)} />
+              <Route path="/dashboards/:dashboardId/edit" element={lazyPage(<DashboardStudioPage />)} />
 
               {/* Safe Redirects for Removed Product Features (Review 4 S5.4 / S5.8) */}
               <Route path="/factory/layout" element={<Navigate to="/factory/structure" replace />} />
@@ -130,8 +146,6 @@ const ProtectedAppShell: React.FC = () => (
               <Route path="/historian/retention" element={<RedirectWithQuery to="/historian/storage" extraParams={{ tab: 'objects' }} />} />
 
               {/* Coming soon routes */}
-              <Route path="/dashboards/*" element={<ComingSoonPage />} />
-              <Route path="/dashboards" element={<ComingSoonPage />} />
               <Route path="/alarms/*" element={<ComingSoonPage />} />
               <Route path="/alarms" element={<ComingSoonPage />} />
               <Route path="/analytics/*" element={<ComingSoonPage />} />
