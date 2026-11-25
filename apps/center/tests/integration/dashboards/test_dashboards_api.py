@@ -11,6 +11,8 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from httpx import ASGITransport, AsyncClient
 
 ROOT = Path(__file__).resolve().parents[5]
@@ -41,6 +43,13 @@ from factorix.transport.app import app  # noqa: E402
 from tests.safety.test_destructive_guard import check_destructive_test_db_guard  # noqa: E402
 
 BASE = "/api/v1/dashboards"
+
+
+def _alembic_script() -> ScriptDirectory:
+    center = Path(__file__).resolve().parents[3]
+    cfg = AlembicConfig(str(center / "alembic.ini"))
+    cfg.set_main_option("script_location", str(center / "migrations"))
+    return ScriptDirectory.from_config(cfg)
 
 
 @pytest.fixture(autouse=True)
@@ -158,8 +167,12 @@ async def test_migration_0013_columns_exist() -> None:
     assert {("dashboard_revisions", "document_json"), ("dashboard_revisions", "published_by"), ("dashboard_revisions", "note"),
             ("dashboards", "published_at"), ("dashboards", "updated_by"), ("dashboard_templates", "roles_json"),
             ("dashboard_templates", "tenant_id")} <= have
+    # The DB is at the real Alembic head (0013 is one of its ancestors), not at a hard-coded revision:
+    # later migrations (0014_bulk_jobs_failed_idx, ...) must not break this test.
     version = await _sql("SELECT version_num FROM alembic_version")
-    assert version == [{"version_num": "0013_dashboard_studio"}]
+    script = _alembic_script()
+    assert version == [{"version_num": script.get_current_head()}]
+    assert "0013_dashboard_studio" in {rev.revision for rev in script.iterate_revisions(version[0]["version_num"], "base")}
 
 
 @pytest.mark.asyncio
