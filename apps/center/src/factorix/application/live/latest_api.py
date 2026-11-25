@@ -14,7 +14,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from factorix.application.live.freshness_service import FreshnessService, freshness_service
-from factorix.domain.signal_state import evaluate_signal_state  # noqa: F401 - re-exported by modules.telemetry
 from factorix.modules.live_state import (
     compute_health_dimensions,
     extract_runtime_health,

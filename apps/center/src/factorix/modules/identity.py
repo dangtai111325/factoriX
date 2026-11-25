@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import re
 import secrets
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 

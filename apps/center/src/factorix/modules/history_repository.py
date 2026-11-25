@@ -45,7 +45,6 @@ from factorix.platform.tdengine import (
     TDEngineClient,
     TDEngineError,
     model_snapshot_subtable_name,
-    op_stable_for_type,
     op_subtable_name,
     quote_fq_table,
     quote_ident,

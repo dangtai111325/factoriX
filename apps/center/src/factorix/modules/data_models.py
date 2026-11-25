@@ -22,7 +22,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from factorix.domain import body as B
 from factorix.domain import rules as R
 from factorix.application.live.freshness_service import freshness_service
-from factorix.domain.signal_state import evaluate_signal_state  # noqa: F401
 from factorix.modules import models_engine as E
 from factorix.modules.common import as_uuid, audit, execute, execute_rowcount, fetch_all, fetch_one, iso_ms, jsonb, parse_uuid, utcnow
 from factorix.platform.errors import AppError

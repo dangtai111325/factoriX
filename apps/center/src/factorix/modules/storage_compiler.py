@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factorix.modules.common import fetch_all, fetch_one, jsonb, execute, utcnow
+from factorix.modules.common import fetch_all, fetch_one, execute, utcnow
 from factorix.modules.storage_dsl import (
     CatalogModel,
     CatalogResource,

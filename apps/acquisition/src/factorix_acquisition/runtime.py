@@ -16,19 +16,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Protocol
 
-import asyncpg
 
 from factorix.domain.network import AllowedEndpoint, assert_allowed, parse_allowlist
 from factorix_acquisition.aio import bounded
 from factorix_acquisition.commissioning import Commissioner
 from factorix_acquisition.config_provider import (
     ConfigProvider,
-    ConfigUpdate,
-    LkgSnapshotStore,
-    PgLeaderLock,
     PgNotifyListener,
-    PgSecretStore,
-    checksum,
     endpoints_for,
 )
 from factorix_acquisition.connectors.errors import STATE_BY_CODE, ConnectorError
@@ -40,8 +34,7 @@ from factorix_acquisition.connectors.ws import WebSocketConnector
 from factorix_acquisition.jobs import JobRunner, JobSpec, build_specs, http_headers
 from factorix_acquisition.mapping import Sample
 from factorix_acquisition.pg_control import PgControlPlane
-from factorix_acquisition.publisher import BATCH_ROWS, FLUSH_BUDGET_S, HISTORY_SLICE_S, ObservationPublisher
-from factorix_acquisition.spool import AcquisitionSpool
+from factorix_acquisition.publisher import BATCH_ROWS, HISTORY_SLICE_S, ObservationPublisher
 from factorix_acquisition.timeutil import iso_ms, now_iso
 from factorix_core.contracts.runtime_status import QUEUES_SCHEMA_VERSION
 
