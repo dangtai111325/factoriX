@@ -18,6 +18,7 @@ from factorix.modules import storage_topology as ST
 from factorix.modules.storage_objects import StorageObjectError, is_system_stable, is_system_subtable, validate_identifier
 from factorix.modules.common import execute, fetch_all, fetch_one, iso_ms, utcnow
 from factorix.platform.errors import AppError
+from factorix_core.contracts.notify import Channel, ConfigChanged
 from factorix.platform.tdengine import is_missing_object_error, quote_str
 
 from factorix.transport.http.routers.storage.common import _assert_tenant_database_access, _bindings_of, _require_db, _storage_error, tenant_db
@@ -1084,6 +1085,13 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
              "object_key": f"{db_name}.{name}" if name and obj_kind != "database" else db_name},
         )
         SMR.invalidate_bindings(tenant_id)
+        # H7: the ingestion worker (another process) caches signal-binding targets; tell it to reload now
+        # instead of on its 30 s catalog TTL. Delivered on commit, so a rolled-back change is not announced.
+        await execute(
+            session,
+            "SELECT pg_notify(CAST(:channel AS text), CAST(:payload AS text))",
+            {"channel": Channel.CONFIG_CHANGED.value, "payload": ConfigChanged(str(tenant_id)).to_payload()},
+        )
         return {
             "id": object_id,
             "operation_id": str(op_id),
