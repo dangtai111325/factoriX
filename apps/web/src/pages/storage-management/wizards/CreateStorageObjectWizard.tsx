@@ -178,8 +178,6 @@ export const CreateStorageObjectWizard: React.FC = () => {
   // Operation In-Progress State
   const [activeOperation, setActiveOperation] = useState<StorageOperation | null>(null);
   const [created, setCreated] = useState<{ kind: string; name: string; objectId: string } | null>(null);
-  // Steps live in the browser history: Back = previous step, not out of the wizard (R1-28).
-  const stepHistory = useStepHistory(currentStep, setCurrentStep, (kind === 'database' || kind === 'stable' || kind === 'subtable') && !created);
 
   // Database wizard state
   const dbDraft = useWizardDraft<DatabaseWizardData>('fx_wizard_draft_database', INITIAL_DB_DATA);
@@ -248,6 +246,24 @@ export const CreateStorageObjectWizard: React.FC = () => {
   const [serverDraft, setServerDraft] = useState<ServerDraftRef | null>(null);
   const [draftState, setDraftState] = useState<{ loading: boolean; error: string | null; opened: string | null }>({ loading: false, error: null, opened: null });
   const wizardFor = (k: string | null) => (k === 'database' ? dbDraft : k === 'stable' ? stableDraft : subtableDraft);
+  // Steps live in the browser history: Back = previous step, not out of the wizard (R1-28 / B-07). A step in the
+  // URL (reload, deep link, browser Forward) is shown only when every earlier step passes the same checks as "Next"
+  // (the step 1 name check on the server included); otherwise the wizard starts at step 1.
+  const stepErrorsOf = (step: number): Record<string, string> =>
+    kind === 'database' ? dbStepErrors(step) : kind === 'stable' ? stableStepErrors(step) : subtableStepErrors(step);
+  useStepHistory(currentStep, setCurrentStep, {
+    enabled: (kind === 'database' || kind === 'stable' || kind === 'subtable') && !created,
+    // A reopened server draft (?draft=) is loaded before a ?step in the URL is judged.
+    ready: !draftState.loading && (!draftParam || !!serverDraft || !!draftState.error),
+    reachable: async (target) => {
+      for (let s = 0; s < target; s++) if (Object.keys(stepErrorsOf(s)).length > 0) return s;
+      const serverName = await nameCheck.check();
+      return Object.keys(serverName.errors).length > 0 ? 0 : target;
+    },
+    onRefused: (step) => {
+      setErrors(stepErrorsOf(step));
+    },
+  });
   useEffect(() => {
     if (!draftParam) {
       setServerDraft(null);
@@ -303,7 +319,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
       if (!draftParam) {
         const next = new URLSearchParams(searchParams);
         next.set('draft', saved.id);
-        setSearchParams(next, { replace: true });
+        setSearchParams(next, { replace: true, state: location.state });
       }
     } catch (err: unknown) {
       const status = (err as { status?: number }).status;
@@ -471,7 +487,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
       if (draftParam) {
         const next = new URLSearchParams(searchParams);
         next.delete('draft');
-        setSearchParams(next, { replace: true });
+        setSearchParams(next, { replace: true, state: location.state });
       }
       const noun = kind === 'stable' ? 'supertable' : kind || 'object';
       showToast({
@@ -525,9 +541,15 @@ export const CreateStorageObjectWizard: React.FC = () => {
   // Database Wizard Handlers
   // ==========================================================================
 
+  /** Show a step's field errors; true when there are none. */
+  const showStepErrors = (errs: Record<string, string>): boolean => {
+    setErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
   const DB_STEPS = ['Name', 'Settings', 'Review'];
 
-  const validateDbStep = (step: number): boolean => {
+  const dbStepErrors = (step: number): Record<string, string> => {
     const errs: Record<string, string> = {};
     if (step === 0) {
       if (!dbDraft.data.physical_name) {
@@ -556,9 +578,9 @@ export const CreateStorageObjectWizard: React.FC = () => {
         errs.confirmed = 'You must confirm before creating the physical database.';
       }
     }
-    setErrors(errs);
-    return Object.keys(errs).length === 0;
+    return errs;
   };
+  const validateDbStep = (step: number): boolean => showStepErrors(dbStepErrors(step));
 
   const handleDbNext = async () => {
     if (!validateDbStep(currentStep)) return;
@@ -583,7 +605,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
 
   const STABLE_STEPS = ['Name', 'Columns', 'Tags', 'Source mapping', 'Recording', 'Review'];
 
-  const validateStableStep = (step: number): boolean => {
+  const stableStepErrors = (step: number): Record<string, string> => {
     const errs: Record<string, string> = {};
     if (step === 0) {
       if (!stableDraft.data.database_name) {
@@ -643,9 +665,9 @@ export const CreateStorageObjectWizard: React.FC = () => {
         errs.confirmed = 'You must confirm before deploying the Supertable.';
       }
     }
-    setErrors(errs);
-    return Object.keys(errs).length === 0;
+    return errs;
   };
+  const validateStableStep = (step: number): boolean => showStepErrors(stableStepErrors(step));
 
   const handleStableNext = async () => {
     if (!validateStableStep(currentStep)) return;
@@ -670,7 +692,7 @@ export const CreateStorageObjectWizard: React.FC = () => {
 
   const SUBTABLE_STEPS = ['Name', 'Tag values', 'Bind field', 'How rows are written', 'Review'];
 
-  const validateSubtableStep = (step: number): boolean => {
+  const subtableStepErrors = (step: number): Record<string, string> => {
     const errs: Record<string, string> = {};
     if (step === 0) {
       if (!subtableDraft.data.stable_id) {
@@ -706,9 +728,9 @@ export const CreateStorageObjectWizard: React.FC = () => {
         errs.confirmed = 'You must confirm before creating the subtable.';
       }
     }
-    setErrors(errs);
-    return Object.keys(errs).length === 0;
+    return errs;
   };
+  const validateSubtableStep = (step: number): boolean => showStepErrors(subtableStepErrors(step));
 
   const handleSubtableNext = async () => {
     if (!validateSubtableStep(currentStep)) return;
@@ -812,7 +834,6 @@ export const CreateStorageObjectWizard: React.FC = () => {
   if (created) {
     const again = () => {
       setCreated(null);
-      stepHistory.resetReached();
       setCurrentStep(0);
       if (kind === 'subtable') {
         // Keep parent, mode and tag values of the same machine/line; clear name, field and binding.

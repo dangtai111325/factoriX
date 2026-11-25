@@ -90,8 +90,6 @@ export const EditStorageObjectWizard: React.FC = () => {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [versionConflict, setVersionConflict] = useState(false);
   const [activeOperation, setActiveOperation] = useState<StorageOperation | null>(null);
-  // Steps live in the browser history: Back = previous step, not out of the wizard (R1-28).
-  useStepHistory(currentStep, setCurrentStep, !loading && !!objectKind);
 
   // Subtable parent STable ref
   const [parentStable, setParentStable] = useState<TDStable | null>(null);
@@ -139,6 +137,13 @@ export const EditStorageObjectWizard: React.FC = () => {
     time_bucket_seconds: 5,
     start_recording: true,
     confirmed: false,
+  });
+
+  // Steps live in the browser history: Back = previous step, not out of the wizard (R1-28 / B-07). The object is
+  // loaded before a ?step in the URL is judged; the only "Next" check is the database name on step 1.
+  useStepHistory(currentStep, setCurrentStep, {
+    enabled: !loading && !!objectKind,
+    reachable: (target) => (objectKind === 'database' && !dbDraft.data.physical_name ? 0 : target),
   });
 
   // Load object from API
