@@ -480,6 +480,11 @@ def validate_subtable_spec(spec: SubtableSpec, stable_tags: list[TagSpec]) -> Va
             "field": "name", "code": "RESERVED_PREFIX",
             "message": "Subtable names starting with 'op_' or 'ms_' are reserved for FactoriX.",
         })
+    if len(spec.description or "") > MAX_DESCRIPTION_LEN:
+        errors.append({
+            "field": "description", "code": "DESCRIPTION_TOO_LONG",
+            "message": f"Description is limited to {MAX_DESCRIPTION_LEN} characters.",
+        })
     if not stable_tags:
         errors.append({
             "field": "stable", "code": "PARENT_NOT_FOUND",

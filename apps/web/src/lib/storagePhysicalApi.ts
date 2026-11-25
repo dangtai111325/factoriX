@@ -498,6 +498,32 @@ export async function getDatabase(nameOrId: string): Promise<TDDatabase> {
   return api(`/api/v1/storage/td/databases/${encodeURIComponent(nameOrId)}`);
 }
 
+// --- Name check (wizard step 1, R1-17a / R1-29) ---
+
+export type StorageNameErrorCode =
+  | 'RESERVED_NAME'
+  | 'IDENTIFIER_TOO_LONG'
+  | 'INVALID_IDENTIFIER'
+  | 'RESERVED_PREFIX'
+  | 'SYSTEM_OBJECT'
+  | 'DESCRIPTION_TOO_LONG'
+  | 'NAME_CONFLICT'
+  | string;
+
+export interface StorageNameCheck {
+  valid: boolean;
+  errors: { field?: string; code: StorageNameErrorCode; message: string }[];
+  exists: boolean;
+}
+
+/** `POST /storage/td/validate-name`: the create validators for the name (+ description) only, plus NAME_CONFLICT. */
+export function validateStorageName(
+  body: { kind: TDObjectType; name: string; database?: string; stable?: string; description?: string },
+  signal?: AbortSignal,
+): Promise<StorageNameCheck> {
+  return api('/api/v1/storage/td/validate-name', { method: 'POST', body: JSON.stringify(body), signal });
+}
+
 export async function createDatabase(intent: CreateDatabaseIntent, idempotencyKey?: string): Promise<StorageOperation> {
   return api('/api/v1/storage/td/databases', {
     method: 'POST',

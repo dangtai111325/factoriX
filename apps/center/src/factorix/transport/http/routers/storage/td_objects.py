@@ -15,7 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from factorix.modules import storage_model_recorder as SMR
 from factorix.modules import storage_bulk as SBULK
 from factorix.modules import storage_topology as ST
-from factorix.modules.storage_objects import StorageObjectError, is_system_stable, is_system_subtable, validate_identifier
+from factorix.modules.storage_objects import (
+    MAX_DESCRIPTION_LEN,
+    StorageObjectError,
+    is_system_stable,
+    is_system_subtable,
+    validate_identifier,
+)
 from factorix.modules.common import execute, fetch_all, fetch_one, iso_ms, utcnow
 from factorix.platform.errors import AppError
 from factorix_core.contracts.notify import Channel, ConfigChanged
@@ -978,6 +984,13 @@ def register(router: APIRouter, ctx: StorageRouterContext) -> None:
         if is_metadata_only and existing_obj:
             new_disp = body.get("display_name", existing_obj.get("display_name") or "")
             new_desc = body.get("description", existing_obj.get("description") or "")
+            # Same limit as create (validate_*_spec): a long description must not be accepted silently.
+            if len(str(new_desc or "")) > MAX_DESCRIPTION_LEN:
+                raise AppError(
+                    422, "DESCRIPTION_TOO_LONG", f"Description is limited to {MAX_DESCRIPTION_LEN} characters.",
+                    field_errors=[{"field": "description", "code": "DESCRIPTION_TOO_LONG",
+                                   "message": f"Description is limited to {MAX_DESCRIPTION_LEN} characters."}],
+                )
             new_rev = current_rev + 1
             await execute(
                 session,

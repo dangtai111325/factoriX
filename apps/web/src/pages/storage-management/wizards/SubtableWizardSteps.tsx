@@ -29,6 +29,7 @@ import {
 } from '../../../lib/storagePhysicalApi';
 import { useApp } from '../../../store/AppContext';
 import { ResourceRefValue } from '../objectViews';
+import { DESCRIPTION_MAX_LENGTH } from './useServerNameCheck';
 
 // ============================================================================
 // Types & helpers
@@ -248,8 +249,8 @@ export const SubtableIdentityStep: React.FC<SubtableStepProps> = ({ data, onChan
         <Field label="Display name">
           <input type="text" maxLength={200} value={data.display_name} onChange={(e) => onChange({ display_name: e.target.value })} className={inputCls} />
         </Field>
-        <Field label="Description" hint={`${(data.description || '').length}/1000`}>
-          <textarea maxLength={1000} rows={3} value={data.description} onChange={(e) => onChange({ description: e.target.value })}
+        <Field label="Description" error={errors.description} hint={`${(data.description || '').length}/${DESCRIPTION_MAX_LENGTH}`}>
+          <textarea maxLength={DESCRIPTION_MAX_LENGTH} rows={3} value={data.description} onChange={(e) => onChange({ description: e.target.value })}
             className="w-full px-3 py-2 rounded-lg border border-[#D4DFEC] text-[13px] focus:outline-none focus:border-blue-500" />
         </Field>
       </div>

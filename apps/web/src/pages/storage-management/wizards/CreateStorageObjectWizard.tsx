@@ -46,6 +46,7 @@ import {
   SubtableWizardData,
 } from './SubtableWizardSteps';
 import { ApiError } from '../../../api/client';
+import { descriptionLengthError, nameLengthError, NameCheckResult, useServerNameCheck } from './useServerNameCheck';
 import {
   createDatabase,
   createStable,
@@ -186,6 +187,59 @@ export const CreateStorageObjectWizard: React.FC = () => {
 
   // Subtable wizard state
   const subtableDraft = useWizardDraft<SubtableWizardData>('fx_wizard_draft_subtable', INITIAL_SUBTABLE_DATA);
+
+  // Step 1 name check on the server (R1-17a / R1-29): reserved names, length, prefixes, conflicts.
+  const dbNameCheck = useServerNameCheck(
+    { kind: 'database', name: dbDraft.data.physical_name, description: dbDraft.data.description },
+    kind === 'database' && currentStep === 0,
+  );
+  const stableNameCheck = useServerNameCheck(
+    { kind: 'stable', name: stableDraft.data.physical_name, database: stableDraft.data.database_name, description: stableDraft.data.description },
+    kind === 'stable' && currentStep === 0 && !!stableDraft.data.database_name,
+  );
+  const subtableNameCheck = useServerNameCheck(
+    {
+      kind: 'subtable',
+      name: subtableDraft.data.physical_name,
+      database: subtableDraft.data.database_name,
+      stable: subtableDraft.data.stable_name,
+      description: subtableDraft.data.description,
+    },
+    kind === 'subtable' && currentStep === 0 && !!subtableDraft.data.stable_id,
+  );
+  const nameCheck = kind === 'database' ? dbNameCheck : kind === 'stable' ? stableNameCheck : subtableNameCheck;
+  /** Step 1 field errors: what "Next" found, else what the live server check found. */
+  const stepErrors = currentStep === 0 ? { ...nameCheck.result.errors, ...errors } : errors;
+  /** "Next" on step 1: block on the server's verdict (an older server without the route never blocks). */
+  const passServerNameCheck = async (check: () => Promise<NameCheckResult>): Promise<boolean> => {
+    const r = await check();
+    if (Object.keys(r.errors).length === 0) return true;
+    setErrors(r.errors);
+    return false;
+  };
+  const conflict = currentStep === 0 ? nameCheck.result.conflict : null;
+  const nameConflictBanner = conflict ? (
+    <div className="mb-4">
+      <Banner
+        tone="error"
+        action={
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              const id = conflict.kind === 'database' ? `db:${conflict.name}` : `${conflict.kind}:${conflict.database}.${conflict.name}`;
+              navigate(`/historian/storage/object/${encodeURIComponent(id)}`, { state: { from: backTarget } });
+            }}
+          >
+            Open it
+          </Button>
+        }
+      >
+        {nameCheck.result.errors.physical_name}
+      </Banner>
+    </div>
+  ) : null;
   // ---- server draft (D5 / H14): ?draft=<id> reopens it; "Save draft" keeps it on the server
   const location = useLocation();
   const draftParam = searchParams.get('draft');
@@ -476,10 +530,13 @@ export const CreateStorageObjectWizard: React.FC = () => {
     if (step === 0) {
       if (!dbDraft.data.physical_name) {
         errs.physical_name = 'Database name is required.';
+      } else if (nameLengthError(dbDraft.data.physical_name)) {
+        errs.physical_name = nameLengthError(dbDraft.data.physical_name)!;
       } else if (!DB_NAME_REGEX.test(dbDraft.data.physical_name)) {
-        errs.physical_name =
-          'Must start with a letter and contain only lowercase letters, digits, and underscores (max 63 chars).';
+        errs.physical_name = 'Must start with a letter and contain only lowercase letters, digits, and underscores.';
       }
+      const descErr = descriptionLengthError(dbDraft.data.description);
+      if (descErr) errs.description = descErr;
     } else if (step === 1) {
       if (!dbDraft.data.precision) {
         errs.precision = 'Timestamp precision is required.';
@@ -501,10 +558,10 @@ export const CreateStorageObjectWizard: React.FC = () => {
     return Object.keys(errs).length === 0;
   };
 
-  const handleDbNext = () => {
-    if (validateDbStep(currentStep)) {
-      setCurrentStep((prev) => Math.min(prev + 1, DB_STEPS.length - 1));
-    }
+  const handleDbNext = async () => {
+    if (!validateDbStep(currentStep)) return;
+    if (currentStep === 0 && !(await passServerNameCheck(dbNameCheck.check))) return;
+    setCurrentStep((prev) => Math.min(prev + 1, DB_STEPS.length - 1));
   };
 
   const handleDbSubmit = () => {
@@ -532,10 +589,14 @@ export const CreateStorageObjectWizard: React.FC = () => {
       }
       if (!stableDraft.data.physical_name) {
         errs.physical_name = 'Supertable name is required.';
+      } else if (nameLengthError(stableDraft.data.physical_name)) {
+        errs.physical_name = nameLengthError(stableDraft.data.physical_name)!;
       } else if (!DB_NAME_REGEX.test(stableDraft.data.physical_name)) {
         errs.physical_name =
           'Must start with a letter and contain only lowercase letters, digits, and underscores.';
       }
+      const descErr = descriptionLengthError(stableDraft.data.description);
+      if (descErr) errs.description = descErr;
     } else if (step === 1) {
       if (!stableDraft.data.columns || stableDraft.data.columns.length === 0) {
         errs.columns = 'At least one column is required.';
@@ -584,10 +645,10 @@ export const CreateStorageObjectWizard: React.FC = () => {
     return Object.keys(errs).length === 0;
   };
 
-  const handleStableNext = () => {
-    if (validateStableStep(currentStep)) {
-      setCurrentStep((prev) => Math.min(prev + 1, STABLE_STEPS.length - 1));
-    }
+  const handleStableNext = async () => {
+    if (!validateStableStep(currentStep)) return;
+    if (currentStep === 0 && !(await passServerNameCheck(stableNameCheck.check))) return;
+    setCurrentStep((prev) => Math.min(prev + 1, STABLE_STEPS.length - 1));
   };
 
   const handleStableSubmit = () => {
@@ -615,10 +676,14 @@ export const CreateStorageObjectWizard: React.FC = () => {
       }
       if (!subtableDraft.data.physical_name) {
         errs.physical_name = 'Subtable name is required.';
+      } else if (nameLengthError(subtableDraft.data.physical_name)) {
+        errs.physical_name = nameLengthError(subtableDraft.data.physical_name)!;
       } else if (!DB_NAME_REGEX.test(subtableDraft.data.physical_name)) {
         errs.physical_name =
           'Must start with a letter and contain only lowercase letters, digits, and underscores.';
       }
+      const descErr = descriptionLengthError(subtableDraft.data.description);
+      if (descErr) errs.description = descErr;
     } else if (step === 1) {
       // Check if all tags have values
       if (parentStable?.tags) {
@@ -643,10 +708,10 @@ export const CreateStorageObjectWizard: React.FC = () => {
     return Object.keys(errs).length === 0;
   };
 
-  const handleSubtableNext = () => {
-    if (validateSubtableStep(currentStep)) {
-      setCurrentStep((prev) => Math.min(prev + 1, SUBTABLE_STEPS.length - 1));
-    }
+  const handleSubtableNext = async () => {
+    if (!validateSubtableStep(currentStep)) return;
+    if (currentStep === 0 && !(await passServerNameCheck(subtableNameCheck.check))) return;
+    setCurrentStep((prev) => Math.min(prev + 1, SUBTABLE_STEPS.length - 1));
   };
 
   const handleSubtableSubmit = () => {
@@ -812,11 +877,12 @@ export const CreateStorageObjectWizard: React.FC = () => {
         >
           {draftNotice}
           {!draftParam && <PendingDraftBanner draft={dbDraft.pendingDraft} onResume={dbDraft.resumeDraft} onDiscard={dbDraft.discardPendingDraft} />}
+          {nameConflictBanner}
           {currentStep === 0 && (
             <DatabaseBasicsStep
               data={dbDraft.data}
               onChange={dbDraft.updateData}
-              errors={errors}
+              errors={stepErrors}
             />
           )}
           {currentStep === 1 && (
@@ -871,11 +937,12 @@ export const CreateStorageObjectWizard: React.FC = () => {
         >
           {draftNotice}
           {!draftParam && <PendingDraftBanner draft={stableDraft.pendingDraft} onResume={stableDraft.resumeDraft} onDiscard={stableDraft.discardPendingDraft} />}
+          {nameConflictBanner}
           {currentStep === 0 && (
             <StableTargetStep
               data={stableDraft.data}
               onChange={stableDraft.updateData}
-              errors={errors}
+              errors={stepErrors}
             />
           )}
           {currentStep === 1 && (
@@ -950,11 +1017,12 @@ export const CreateStorageObjectWizard: React.FC = () => {
       >
         {draftNotice}
         {!draftParam && <PendingDraftBanner draft={subtableDraft.pendingDraft} onResume={subtableDraft.resumeDraft} onDiscard={subtableDraft.discardPendingDraft} />}
+        {nameConflictBanner}
         {currentStep === 0 && (
           <SubtableIdentityStep
             data={subtableDraft.data}
             onChange={subtableDraft.updateData}
-            errors={errors}
+            errors={stepErrors}
             parentStable={parentStable}
             onSelectStable={(st) => setParentStable(st)}
           />
