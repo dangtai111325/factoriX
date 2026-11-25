@@ -35,8 +35,9 @@ class BrokerSettings(BaseSettings):
     rabbitmq_max_length_bytes: int = Field(default=512 * 1024 * 1024, ge=65536)
     rabbitmq_live_max_length_bytes: int = Field(default=256 * 1024 * 1024, ge=65536)
     rabbitmq_delivery_limit: int = Field(default=5, ge=1, le=100)
-    rabbitmq_prefetch: int = Field(default=128, ge=1, le=4096)
-    rabbitmq_live_prefetch: int = Field(default=256, ge=1, le=4096)
+    # Small on purpose: Center's backlog must stay visible (ready) to the replay depth probe.
+    rabbitmq_prefetch: int = Field(default=8, ge=1, le=4096)
+    rabbitmq_live_prefetch: int = Field(default=32, ge=1, le=4096)
     rabbitmq_publisher_max_inflight: int = Field(default=64, ge=1, le=2048)
     rabbitmq_confirm_timeout_s: float = Field(default=10.0, ge=0.5, le=120.0)
     rabbitmq_freshness_window_s: float = Field(default=12.0, gt=0.0, le=3600.0)

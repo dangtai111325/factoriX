@@ -110,8 +110,12 @@ class BrokerConfig:
     dlq_max_length_bytes: int = 256 * 1024 * 1024
     max_length: int | None = None
     delivery_limit: int = 5
-    prefetch_count: int = 128
-    live_prefetch_count: int = 256
+    # Unacknowledged deliveries per consumer. Kept small on purpose: RabbitMQ reports only *ready*
+    # messages to the passive-declare depth probe that clocks acquisition replay, so a large
+    # prefetch hides Center's backlog inside the consumer and replay keeps pushing while live
+    # freshness degrades (2026-11-25: 128 x 500-obs replay envelopes invisible, live 5-17 s late).
+    prefetch_count: int = 8
+    live_prefetch_count: int = 32
     freshness_window_s: float = 12.0
     max_inflight_publishes: int = 64
     confirm_timeout_s: float = 10.0
