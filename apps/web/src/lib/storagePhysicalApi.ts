@@ -879,6 +879,18 @@ export async function getSources(params: {
 
 // --- PostgreSQL read-only explorer ---
 
+/** How the explorer is confined (B-14 / OP-19): read-only transaction, plus the read-only role when available. */
+export interface PgExplorerStatus {
+  read_only_transaction: boolean;
+  privilege_isolation: boolean;
+  role: string | null;
+  detail: string;
+}
+
+export async function getPgExplorerStatus(): Promise<PgExplorerStatus> {
+  return api('/api/v1/storage/pg/status');
+}
+
 export async function listPgSchemas(): Promise<PgSchema[]> {
   return api('/api/v1/storage/pg/schemas');
 }

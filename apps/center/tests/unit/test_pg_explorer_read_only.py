@@ -16,12 +16,14 @@ TENANT = "00000000-0000-0000-0000-000000000001"
 class _Session:
     """Records statements in order; answers the catalog queries the explorer issues."""
 
-    def __init__(self, *, columns: list[str] | None = None, count: int = 42, fail_count: Exception | None = None) -> None:
+    def __init__(self, *, columns: list[str] | None = None, count: int = 42, fail_count: Exception | None = None,
+                 role_usable: bool = True) -> None:
         self.info: dict[str, Any] = {}
         self.sql: list[str] = []
         self.columns = columns if columns is not None else ["id", "name"]
         self.count = count
         self.fail_count = fail_count
+        self.role_usable = role_usable
 
 
 @pytest.fixture()
@@ -42,6 +44,9 @@ def wired(monkeypatch: pytest.MonkeyPatch):
 
         async def fetch_one(s: _Session, sql: str, _p: dict[str, Any]) -> dict[str, Any] | None:
             s.sql.append(sql)
+            if sql == PE.ROLE_USABLE_SQL:
+                assert _p == {"role": PE.EXPLORER_ROLE}
+                return {"usable": s.role_usable}
             if s.fail_count is not None and "count(*)" in sql:
                 raise s.fail_count
             return {"total": s.count}
@@ -54,21 +59,75 @@ def wired(monkeypatch: pytest.MonkeyPatch):
     return install
 
 
-async def test_every_explorer_call_starts_with_set_transaction_read_only(wired: Any) -> None:
-    svc = PE.PostgresExplorerService()
-    for call in (
+SET_ROLE = f"SET LOCAL ROLE {PE.EXPLORER_ROLE}"
+
+
+def _calls(svc: PE.PostgresExplorerService) -> tuple[Any, ...]:
+    return (
         lambda s: svc.list_schemas(s),
         lambda s: svc.list_tables(s),
         lambda s: svc.get_table_details(s, table="resources"),
         lambda s: svc.list_relationships(s),
         lambda s: svc.preview_data(s, table="resources", tenant_id=TENANT),
         lambda s: svc.count_rows(s, table="resources", tenant_id=TENANT),
-    ):
+        lambda s: svc.status(s),
+    )
+
+
+async def test_every_explorer_call_runs_read_only_as_the_explorer_role(wired: Any) -> None:
+    for call in _calls(PE.PostgresExplorerService()):
         session = wired(_Session())
         await call(session)
-        assert session.sql[0] == "SET TRANSACTION READ ONLY", session.sql[:2]
+        # read-only transaction, then the role, before any catalog or data statement (B-14 / OP-19)
+        assert session.sql[:3] == ["SET TRANSACTION READ ONLY", PE.ROLE_USABLE_SQL, SET_ROLE], session.sql[:3]
         assert session.sql.count("SET TRANSACTION READ ONLY") == 1  # once per request transaction
+        assert session.sql.count(SET_ROLE) == 1
         assert all(PE._READ_STATEMENT.match(q) or q.startswith("SET ") for q in session.sql)
+
+
+async def test_without_the_role_the_explorer_falls_back_to_read_only_and_says_so(wired: Any) -> None:
+    for call in _calls(PE.PostgresExplorerService()):
+        session = wired(_Session(role_usable=False))
+        await call(session)
+        assert session.sql[:2] == ["SET TRANSACTION READ ONLY", PE.ROLE_USABLE_SQL]
+        assert not any(q.startswith("SET LOCAL ROLE") for q in session.sql)
+    out = await PE.PostgresExplorerService().status(wired(_Session(role_usable=False)))
+    assert out["read_only_transaction"] is True and out["privilege_isolation"] is False and out["role"] is None
+    assert "not available" in out["detail"]
+    out = await PE.PostgresExplorerService().status(wired(_Session()))
+    assert out["privilege_isolation"] is True and out["role"] == PE.EXPLORER_ROLE
+
+
+class _PgError(Exception):
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(f"sqlstate {sqlstate}")
+        self.sqlstate = sqlstate
+
+
+class _Wrapped(Exception):
+    """SQLAlchemy DBAPIError shape: the driver error is ``.orig``."""
+
+    def __init__(self, orig: Exception) -> None:
+        super().__init__(str(orig))
+        self.orig = orig
+
+
+async def test_a_table_postgresql_refuses_to_the_role_answers_403(wired: Any) -> None:
+    session = wired(_Session(fail_count=_Wrapped(_PgError("42501"))))
+    with pytest.raises(AppError) as exc:
+        await PE.PostgresExplorerService().count_rows(session, table="resources")
+    assert exc.value.status == 403 and exc.value.code == "EXPLORER_NOT_GRANTED"
+    # any other database error is not turned into a 403
+    with pytest.raises(_Wrapped):
+        await PE.PostgresExplorerService().count_rows(wired(_Session(fail_count=_Wrapped(_PgError("XX000")))), table="resources")
+
+
+def test_the_403_list_and_the_role_grants_share_one_list() -> None:
+    from factorix.platform import pg_explorer_role as R
+
+    assert PE.SENSITIVE_TABLES is R.SENSITIVE_TABLES
+    for table in R.SENSITIVE_TABLES:
+        assert f"'{table}'" in R.READABLE_RELATIONS_SQL  # excluded from the SELECT grants
 
 
 def test_statement_allowlist_refuses_anything_but_one_select() -> None:

@@ -38,6 +38,7 @@ from factorix_acquisition.pg_control import PgControlPlane
 from factorix_acquisition.publisher import ObservationPublisher
 from factorix_acquisition.runtime import AcquisitionRuntime
 from factorix_acquisition.spool import AcquisitionSpool
+from tests.integration_guard import isolated_topology_names
 from tests.simulators.ot_simulators import SimulatorEndpoints
 
 
@@ -66,10 +67,7 @@ def isolated_broker_cfg(amqp_url: str, mgmt_url: str) -> BrokerConfig:
     return BrokerConfig(
         amqp_url=amqp_url,
         mgmt_url=mgmt_url,
-        exchange_name=f"factorix.acq.test.ingress.{suffix}",
-        queue_name=f"factorix.acq.test.ingest.q.{suffix}",
-        dlx_name=f"factorix.acq.test.dlx.{suffix}",
-        dlq_name=f"factorix.acq.test.dlq.{suffix}",
+        **isolated_topology_names("acq", suffix),
         delivery_limit=3,
         prefetch_count=32,
         max_inflight_publishes=32,

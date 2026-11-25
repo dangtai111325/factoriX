@@ -14,6 +14,8 @@ import {
   getPgErd,
   getPgTablePreview,
   countPgRows,
+  getPgExplorerStatus,
+  PgExplorerStatus,
 } from '../../lib/storagePhysicalApi';
 import { errorText } from '../historian/hsUi';
 
@@ -56,6 +58,19 @@ const ExactCount: React.FC<{ schema: string; table: string; estimate: number | n
 };
 
 export const PostgresExplorerView: React.FC = () => {
+  // B-14 / OP-19: whether queries run as the read-only role (older Centers have no status route: null).
+  const [confinement, setConfinement] = useState<PgExplorerStatus | null>(null);
+  useEffect(() => {
+    let active = true;
+    getPgExplorerStatus()
+      .then((s) => {
+        if (active) setConfinement(s);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
   const [schemas, setSchemas] = useState<PgSchema[]>([]);
   const [selectedSchema, setSelectedSchema] = useState<string>('public');
   const [schemasError, setSchemasError] = useState<unknown | null>(null);
@@ -259,12 +274,22 @@ export const PostgresExplorerView: React.FC = () => {
 
   return (
     <div className="space-y-4">
-      {/* Read-only banner: states exactly what is enforced (P1-14) */}
-      <Banner tone="info">
+      {/* Read-only banner: states exactly what is enforced (P1-14, B-14) */}
+      <Banner tone={confinement && !confinement.privilege_isolation ? 'warning' : 'info'}>
         <span className="font-semibold">Read-only explorer.</span> Every query runs in a read-only PostgreSQL transaction (writes are refused by the
         database) and only generated SELECT statements on catalog-validated tables run here (5 s timeout for previews, 10 s for exact counts, rows of your
-        tenant only). Credential, session and audit tables are hidden and secret values are masked. It uses the application database role, not a separate
-        read-only role.
+        tenant only). Credential, session and audit tables are hidden and secret values are masked.{' '}
+        {confinement?.privilege_isolation ? (
+          <>
+            Queries run as the read-only database role <span className="font-mono">{confinement.role}</span>, which can only SELECT non-sensitive
+            tables: PostgreSQL itself refuses the hidden ones.
+          </>
+        ) : confinement ? (
+          <>
+            Privilege isolation is not available on this server: the read-only role could not be set up (the database user lacks CREATEROLE), so
+            queries run under the application role.
+          </>
+        ) : null}
       </Banner>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">

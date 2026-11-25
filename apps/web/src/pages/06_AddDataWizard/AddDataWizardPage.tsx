@@ -36,6 +36,7 @@ import { FieldTable } from './FieldTable';
 import { JsonSampleTree } from './JsonSampleTree';
 import { SimilarResourcesDialog } from './SimilarResourcesDialog';
 import { useLeaveGuard } from './useLeaveGuard';
+import { useStepHistory } from '../../lib/useStepHistory';
 import { ResourceTreeNode, buildResourceTree, resourceTreeMatches, resourceTypeGlyph } from '../../components/tree/resourceTree';
 import { isEnterSubmit } from '../08_SignalsCatalog/enterSubmit';
 import { ConfirmDialog } from '../../components/common/ConfirmDialog';
@@ -223,6 +224,8 @@ export const AddDataWizardPage: React.FC = () => {
   // (?resourceId= / ?connectionId=, e.g. "Add data" on a filtered Signals page) is restored too when
   // the link still points at the same target / connection — F5 keeps the URL, so it used to drop it.
   const restoredDraftRef = useRef(false);
+  /** The draft / deep link has been applied: a ?step in the URL can be judged against the restored state. */
+  const [draftApplied, setDraftApplied] = useState(false);
   useEffect(() => {
     const draft = readDraft();
     const matchesQuery =
@@ -252,6 +255,7 @@ export const AddDataWizardPage: React.FC = () => {
       setSelectedConnectionId(queryConnectionId);
       if (!restoredDraftRef.current) setCurrentStep(queryResourceId ? 3 : 1);
     }
+    setDraftApplied(true);
   }, [queryResourceId, queryConnectionId]);
 
   useEffect(() => {
@@ -809,6 +813,26 @@ export const AddDataWizardPage: React.FC = () => {
     }
   };
 
+  // ---------------------------------------------------------------- Steps in the browser history (R1-28 / B-07)
+  // Back / Forward move between steps; a ?step (reload, deep link, Forward) is shown only when the earlier steps
+  // pass the checks their "Next" buttons make, otherwise the wizard starts at step 1. Steps are 1-based here.
+  const reachableStep = (target: number): number => {
+    if (target >= 1 && !selectedTargetId) return 0;
+    if (target >= 2 && !selectedConnectionId) return 1;
+    if (target >= 3 && (!connDetail || step3Valid() !== null)) return 2;
+    if (target >= 4 && (fields.length === 0 || validateRows(fields, protocol, existingKeys(selectedTargetId)).hasError)) return 3;
+    return target;
+  };
+  const stepHistory = useStepHistory(currentStep - 1, (step) => setCurrentStep(step + 1), {
+    // The restored draft's connection is loaded before its steps are judged.
+    ready: draftApplied && (!selectedConnectionId || Boolean(connDetail) || Boolean(connDetailError)),
+    reachable: reachableStep,
+    onRefused: (step) => {
+      if (step === 2) setAddressError(step3Valid());
+      else if (step === 3) validateCurrentRows();
+    },
+  });
+
   // ---------------------------------------------------------------- Cancel / leave (R3-AD-02)
   const hasUnsavedSettings = !submitting && (currentStep >= 3 || fields.length > 0 || rewrites.length > 0 || Boolean(newConnCreated));
   const leaveGuard = useLeaveGuard(hasUnsavedSettings);
@@ -818,9 +842,10 @@ export const AddDataWizardPage: React.FC = () => {
       setConfirmCancelOpen(true);
       return;
     }
-    // With unsaved settings, navigate(-1) is held by the leave guard and its dialog asks first.
+    // With unsaved settings, navigate(-n) is held by the leave guard and its dialog asks first. The wizard's own
+    // step entries are skipped: Cancel returns to the page the wizard was opened from.
     if (!hasUnsavedSettings) clearDraft();
-    navigate(-1);
+    navigate(-(stepHistory.depth + 1));
   };
 
   const confirmLeave = () => {
@@ -843,7 +868,7 @@ export const AddDataWizardPage: React.FC = () => {
     clearDraft();
     setConfirmCancelOpen(false);
     leaveGuard.allowNext();
-    navigate(-1);
+    navigate(-(stepHistory.depth + 1));
   };
 
   // R2-AD-01: entering Review runs the live test automatically (Modbus / OPC keep the result of their

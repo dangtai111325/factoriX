@@ -26,6 +26,7 @@ from factorix.platform.broker import (
     probe_broker_health,
     tenant_routing_key,
 )
+from tests.integration_guard import isolated_topology_names
 
 
 def _isolated_cfg(**overrides: object) -> BrokerConfig:
@@ -35,10 +36,7 @@ def _isolated_cfg(**overrides: object) -> BrokerConfig:
     kwargs: dict[str, object] = {
         "amqp_url": amqp_url,
         "mgmt_url": mgmt_url,
-        "exchange_name": f"factorix.test.ingress.{suffix}",
-        "queue_name": f"factorix.test.ingest.q.{suffix}",
-        "dlx_name": f"factorix.test.dlx.{suffix}",
-        "dlq_name": f"factorix.test.dlq.{suffix}",
+        **isolated_topology_names("broker", suffix),
         "delivery_limit": 3,
         "prefetch_count": 16,
         "max_inflight_publishes": 16,

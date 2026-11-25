@@ -13,7 +13,13 @@ if _INT_DIR not in sys.path:
     sys.path.insert(0, _INT_DIR)
 
 from acq_int_helpers import assert_isolated_test_env, reset_ephemeral_pg  # noqa: E402
+from tests.integration_guard import refuse_production_targets  # noqa: E402
 from tests.simulators.ot_simulators import SimulatorSuite  # noqa: E402
+
+
+def pytest_configure(config):  # type: ignore[no-untyped-def]
+    """L-05: stop the whole run (``pytest.exit``) before collection if a target is the production appliance."""
+    refuse_production_targets()
 
 
 @pytest_asyncio.fixture

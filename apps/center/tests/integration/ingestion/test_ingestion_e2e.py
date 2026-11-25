@@ -25,6 +25,7 @@ from factorix.platform.security import new_token
 from factorix.platform.tdengine import TDEngineClient, TDEngineError, op_subtable_name, tenant_database_name
 from factorix.transport.hub import parse_pg_notify_events as _parse_pg_notify_events
 from factorix_core.contracts.notify import LatestIdsV2, StreamEventsV1, parse_stream_events
+from tests.integration_guard import isolated_topology_names
 
 
 def _pg_dsn() -> str:
@@ -39,10 +40,7 @@ def _broker_cfg(suffix: str, *, delivery_limit: int = 2) -> BrokerConfig:
     return BrokerConfig(
         amqp_url=os.environ["FACTORIX_RABBITMQ_URL"],
         mgmt_url=os.environ.get("FACTORIX_RABBITMQ_MGMT_URL", "http://127.0.0.1:15672"),
-        exchange_name=f"factorix.s06.ingress.{suffix}",
-        queue_name=f"factorix.s06.ingest.q.{suffix}",
-        dlx_name=f"factorix.s06.dlx.{suffix}",
-        dlq_name=f"factorix.s06.dlq.{suffix}",
+        **isolated_topology_names("s06", suffix),
         delivery_limit=delivery_limit,
         prefetch_count=64,
         consumer_concurrency=32,
