@@ -30,6 +30,7 @@ cross-process interaction goes through RabbitMQ or PostgreSQL (tables + LISTEN/N
 | Internal HTTP | [internal-http.md](internal-http.md) | none between FactoriX processes in acquisition mode; edge daemon → API (edge mode only) | URL path `/api/v1` | `test_route_table.py`, `apps/center/tests/unit/test_safety_guards.py` |
 | Freshness / health / quality | [freshness.md](freshness.md) | domain rules → every surface | none | `test_freshness_matrix.py` |
 | Browser push `/stream` | [live-stream.md](live-stream.md) | API → browser | frame `type` | `test_response_shapes.py` |
+| Dashboard Studio REST + document | [dashboard.md](dashboard.md) | API ↔ browser | document `schema_version=1`, URL `/api/v1` | `apps/center/tests/unit/test_dashboard_*.py`, `test_route_table.py` |
 
 Versioning rules for all of the above: [ADR-018](../ADR-018-contract-versioning.md).
 Who owns which table/queue/channel: [ADR-017](../ADR-017-bounded-contexts-and-ownership.md).

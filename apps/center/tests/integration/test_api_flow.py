@@ -337,10 +337,14 @@ async def test_auth_resource_ingest_formula_dashboard() -> None:
         drafted = await client.patch(
             f"/api/v1/dashboards/{dashboard.json()['id']}",
             headers=headers,
-            json={"version": 1, "draft": {"widgets": [{"id": "w1", "type": "kpi", "bindings": [{"signal_id": signal_id}]}]}},
+            # A pre-schema-v1 draft is still accepted: it is upgraded to schema v1 on save.
+            json={"version": 1, "document": {"widgets": [{"id": "w1", "type": "kpi", "bindings": [{"signal_id": signal_id}]}]}},
         )
         assert drafted.status_code == 200, drafted.text
-        assert (await client.post(f"/api/v1/dashboards/{dashboard.json()['id']}/publish", headers=headers)).status_code == 200
+        assert drafted.json()["document"]["schema_version"] == 1
+        published = await client.post(f"/api/v1/dashboards/{dashboard.json()['id']}/publish", headers=headers,
+                                      json={"version": drafted.json()["version"]})
+        assert published.status_code == 200, published.text
         overview = await client.get("/api/v1/overview")
         assert overview.json()["machines"] == 1
         assert (await client.get("/api/v1/storage/overview")).json()["observations"] >= 2
