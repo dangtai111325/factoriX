@@ -194,7 +194,9 @@ def test_two_lane_broker_config_and_routing_keys() -> None:
     assert cfg.binding_pattern == "telemetry.v1.*"
     assert cfg.live_binding_pattern == "telemetry.live.v1.*"
     assert cfg.live_max_length_bytes == 256 * 1024 * 1024
-    assert cfg.live_prefetch_count == 256
+    # Small prefetch keeps Center's backlog visible to the replay depth probe (ready messages).
+    assert cfg.prefetch_count == 8
+    assert cfg.live_prefetch_count == 32
     assert cfg.live_consumer_concurrency == 256
 
     # The live lane follows the configured topology (isolated / prefixed topologies never share a live queue
